@@ -809,10 +809,12 @@ impl Shell {
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
             .map(|d| {
+                let branch = self.git_branch_button(cx);
                 let pressure = self.pressure_chip(cx);
                 let terminal = self.terminal_footer(cx);
                 let between = pressure.is_some() && terminal.is_some();
-                d.children(pressure)
+                d.children(branch)
+                    .children(pressure)
                     .when(between, |d| {
                         d.child(
                             super::terminal_dock::footer_separator()

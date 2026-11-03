@@ -698,6 +698,7 @@ pub(crate) struct Shell {
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
     new_tab_anchor: AnchorSlot,
+    git_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
     action_terminals: HashMap<(String, String), gpui::WeakEntity<Terminal>>,
     deleting: HashSet<i64>,
@@ -1085,6 +1086,7 @@ impl Shell {
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
             new_tab_anchor: AnchorSlot::default(),
+            git_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
             deleting: HashSet::new(),
             group_writes: None,
@@ -1828,12 +1830,124 @@ impl Shell {
         else {
             return;
         };
-        changes.update(cx, |changes, cx| run(changes, window, cx));
+        let anchor = self.git_anchor.clone();
+        let blocked = self.agent_blocking_git(cx);
+        changes.update(cx, |changes, cx| {
+            changes.footer_anchor = anchor;
+            changes.set_blocked(blocked, cx);
+            run(changes, window, cx)
+        });
     }
-    fn git_overlays(&self, window: &Window, cx: &App) -> Vec<AnyElement> {
+    /// The title of an agent that is working in the project's checkout, whose
+    /// files a branch switch, merge or update would change under it. Sessions
+    /// in their own worktrees are not affected.
+    fn agent_blocking_git(&self, cx: &App) -> Option<String> {
+        let project = self.git.read(cx).project().to_owned();
+        if project.is_empty() {
+            return None;
+        }
+        self.sessions.values().find_map(|session| {
+            let view = session.read(cx);
+            if view.summary.archived || !view.responding() {
+                return None;
+            }
+            crate::changes::checkouts_overlap(&project, &view.summary.cwd)
+                .then(|| view.display_title())
+        })
+    }
+    /// Keeps the Changes panel's guard current as sessions start and stop.
+    fn sync_git_guard(&mut self, cx: &mut Context<Self>) {
+        let Some(changes) = self
+            .right_panel
+            .as_ref()
+            .map(|p| p.read(cx).changes.clone())
+        else {
+            return;
+        };
+        let blocked = self.agent_blocking_git(cx);
+        changes.update(cx, |changes, cx| changes.set_blocked(blocked, cx));
+    }
+    /// The branch button in the footer: where this checkout stands, and how to
+    /// change it, whatever the right panel is showing.
+    pub(super) fn git_branch_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.workspace.project.is_empty() || self.workspace.project.starts_with("remote://") {
+            return None;
+        }
+        let git = self.git.read(cx);
+        let index = git.index.as_ref()?;
+        let branch = index.branch.clone()?;
+        let (ahead, behind) = (index.ahead, index.behind);
+        let dirty = !index.files.is_empty();
+        let open = self
+            .right_panel
+            .as_ref()
+            .is_some_and(|p| p.read(cx).changes.read(cx).footer_picker_open());
+        let blocked = self.agent_blocking_git(cx).is_some();
+        let classic = self.workspace.boxy_layout();
+        Some(
+            div()
+                .id("footer-git-branch")
+                .role(Role::Button)
+                .aria_label(SharedString::from(format!(
+                    "Branch {branch}. Switch branch"
+                )))
+                .aria_expanded(open)
+                .relative()
+                .h(px(20.))
+                .px(px(if classic { 6. } else { 8. }))
+                .map(|d| {
+                    if classic {
+                        d.rounded_md()
+                    } else {
+                        d.rounded_full()
+                    }
+                })
+                .max_w(px(260.))
+                .min_w_0()
+                .mr(px(terminal_dock::FOOTER_GAP))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(6.))
+                .whitespace_nowrap()
+                .text_size(px(11.))
+                .cursor_pointer()
+                .text_color(content(if open { 1. } else { 0.55 }))
+                .when(open, |d| d.bg(content(0.08)))
+                .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                .child(self.git_anchor.probe())
+                .child(icon("git-branch", 12.).text_color(content(0.55)))
+                .child(div().min_w_0().truncate().child(branch))
+                .when(behind > 0, |d| {
+                    d.child(div().text_color(content(0.45)).child(format!("↓{behind}")))
+                })
+                .when(ahead > 0, |d| {
+                    d.child(div().text_color(content(0.45)).child(format!("↑{ahead}")))
+                })
+                .when(dirty, |d| {
+                    d.child(div().size(px(5.)).rounded_full().bg(content(0.4)))
+                })
+                .when(blocked, |d| {
+                    d.child(div().size(px(6.)).rounded_full().bg(rgb(0xfbbf24)))
+                })
+                .child(icon("chevron-down", 11.).text_color(content(0.45)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.git_tool(window, cx, |changes, window, cx| {
+                        changes.toggle_branch_picker(
+                            crate::changes::BranchPlace::Footer,
+                            window,
+                            cx,
+                        )
+                    })
+                }))
+                .into_any_element(),
+        )
+    }
+    fn git_overlays(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         self.right_panel
             .as_ref()
-            .map(|panel| panel.read(cx).changes.read(cx).overlays(window))
+            .map(|panel| panel.read(cx).changes.clone())
+            .map(|changes| changes.update(cx, |changes, cx| changes.overlays(window, cx)))
             .unwrap_or_default()
     }
 
@@ -8472,6 +8586,7 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
+        self.sync_git_guard(cx);
         self.sync_ui_scale(window, cx);
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
@@ -8828,7 +8943,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &GitBranches, window, cx| {
                 this.git_tool(window, cx, |changes, window, cx| {
-                    changes.toggle_branch_picker(true, window, cx)
+                    changes.toggle_branch_picker(crate::changes::BranchPlace::Modal, window, cx)
                 })
             }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {

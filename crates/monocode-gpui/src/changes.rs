@@ -75,6 +75,18 @@ impl Kind2 {
         }
     }
 }
+/// Where the branch switcher opens.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BranchPlace {
+    /// A popover under the branch name in this panel's header.
+    #[default]
+    Header,
+    /// A centred window, for the menu bar.
+    Modal,
+    /// A popover above the branch button in the footer.
+    Footer,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum FileAction {
     Stage,
@@ -247,7 +259,10 @@ pub(crate) struct Changes {
     update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
     branch_picker: Option<(Entity<GitPicker>, Subscription)>,
     /// The switcher opened from the menu bar: a centred window, not a popover.
-    branch_modal: bool,
+    branch_place: BranchPlace,
+    /// Why branch-changing Git actions are off: an agent is working in this checkout.
+    blocked: Option<String>,
+    pub(crate) footer_anchor: AnchorSlot,
     /// The shell draws this panel's windows (the right panel's), so they
     /// show from the menu bar; other hosts leave them to the panel.
     pub(crate) overlays_in_shell: bool,
@@ -291,7 +306,9 @@ impl Changes {
             commit_dialog: None,
             update_dialog: None,
             branch_picker: None,
-            branch_modal: false,
+            branch_place: BranchPlace::Header,
+            blocked: None,
+            footer_anchor: AnchorSlot::default(),
             overlays_in_shell: false,
             switch_anchor: AnchorSlot::default(),
             _subscriptions: subscriptions,
@@ -690,6 +707,13 @@ impl Changes {
         if self.update_dialog.is_some() || self.busy.is_some() || self.cwd.is_empty() {
             return;
         }
+        let what = match &source {
+            Source::Update(_) => "update the project",
+            Source::Merge(_) => "merge",
+        };
+        if self.refuse_while_agent_works(what, window, cx) {
+            return;
+        }
         let git = self.git.clone();
         let cwd = self.cwd.clone();
         let dialog = cx.new(|cx| UpdateDialog::new(git, cwd, source, window, cx));
@@ -704,10 +728,38 @@ impl Changes {
         cx.notify();
     }
 
+    pub(crate) fn footer_picker_open(&self) -> bool {
+        self.branch_picker.is_some() && self.branch_place == BranchPlace::Footer
+    }
+    /// Set by the shell: the title of an agent working in this checkout, if any.
+    pub(crate) fn set_blocked(&mut self, reason: Option<String>, cx: &mut Context<Self>) {
+        if self.blocked != reason {
+            self.blocked = reason;
+            cx.notify();
+        }
+    }
+    /// Refuses actions that rewrite the working tree while an agent is working
+    /// in it. Says why, and returns whether it refused.
+    pub(crate) fn refuse_while_agent_works(
+        &self,
+        what: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(agent) = &self.blocked else {
+            return false;
+        };
+        let message = format!(
+            "Can't {what} while \"{agent}\" is working in this checkout. Wait for it to finish or stop it first."
+        );
+        drop(window.prompt(PromptLevel::Info, &message, None, &["OK"], cx));
+        true
+    }
+
     /// The branch switcher: search, check out, create, or merge into this one.
     pub(crate) fn toggle_branch_picker(
         &mut self,
-        modal: bool,
+        place: BranchPlace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -717,6 +769,9 @@ impl Changes {
             return;
         }
         if self.busy.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        if self.refuse_while_agent_works("switch branches", window, cx) {
             return;
         }
         let current = self.index(cx).and_then(|i| i.branch);
@@ -737,7 +792,7 @@ impl Changes {
                 cx.notify();
             });
         window.focus(&picker.read(cx).focus(cx), cx);
-        self.branch_modal = modal;
+        self.branch_place = place;
         self.branch_picker = Some((picker, subscription));
         cx.emit(ChangesEvent::Overlays);
         cx.notify();
@@ -745,6 +800,9 @@ impl Changes {
 
     /// Merge `branch` into the current branch, after a confirmation.
     fn merge_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_while_agent_works("merge", window, cx) {
+            return;
+        }
         let current = self.index(cx).and_then(|i| i.branch);
         let message = match current {
             Some(current) => format!("Merge \"{branch}\" into \"{current}\"?"),
@@ -790,6 +848,9 @@ impl Changes {
     }
 
     pub(crate) fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_while_agent_works("pull", window, cx) {
+            return;
+        }
         let index = self.index(cx);
         if !index.is_some_and(|i| i.remote.is_some() && i.upstream.is_some()) {
             return;
@@ -1184,7 +1245,7 @@ impl Changes {
                         .when(!busy, |d| {
                             d.cursor_pointer()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_branch_picker(false, window, cx)
+                                    this.toggle_branch_picker(BranchPlace::Header, window, cx)
                                 }))
                         })
                         .child(self.switch_anchor.probe())
@@ -2229,12 +2290,12 @@ impl Render for Changes {
             .children(if self.overlays_in_shell {
                 Vec::new()
             } else {
-                self.overlays(window)
+                self.overlays(window, cx)
             })
             .children(
                 self.branch_picker
                     .as_ref()
-                    .filter(|_| !self.branch_modal)
+                    .filter(|_| self.branch_place == BranchPlace::Header)
                     .map(|(picker, _)| {
                         let weak = cx.weak_entity();
                         popover(
@@ -2258,10 +2319,26 @@ impl Render for Changes {
     }
 }
 
+/// Whether a session working in `cwd` shares files with the project checkout:
+/// the same folder, or one inside the other. Linked worktrees live apart.
+pub(crate) fn checkouts_overlap(project: &str, cwd: &str) -> bool {
+    let (project, cwd) = (
+        monocode_core::files::path_key(project),
+        monocode_core::files::path_key(cwd),
+    );
+    let inside = |outer: &str, inner: &str| {
+        inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    inside(&project, &cwd) || inside(&cwd, &project)
+}
+
 impl Changes {
     /// The windows this panel opens. The shell draws them, so they appear
     /// from the menu bar even where the panel itself is not on screen.
-    pub(crate) fn overlays(&self, window: &Window) -> Vec<AnyElement> {
+    pub(crate) fn overlays(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
         if let Some((dialog, _)) = &self.commit_dialog {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
@@ -2269,17 +2346,111 @@ impl Changes {
         if let Some((dialog, _)) = &self.update_dialog {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
-        if let Some((picker, _)) = self.branch_picker.as_ref().filter(|_| self.branch_modal) {
-            let card = crate::modal::card()
-                .w(px(440.))
-                .h(px(480.))
-                .overflow_hidden()
-                .child(picker.clone());
-            let weak = picker.downgrade();
-            let overlay = crate::modal::overlay("branch-switcher", card, move |_, cx| {
-                let _ = weak.update(cx, |_, cx| cx.emit(GitPicked::Dismissed));
-            });
-            out.push(crate::modal::window_overlay(window, overlay).into_any_element());
+        let Some(picker) = self
+            .branch_picker
+            .as_ref()
+            .map(|(picker, _)| picker.clone())
+        else {
+            return out;
+        };
+        match self.branch_place {
+            BranchPlace::Header => {}
+            BranchPlace::Modal => {
+                let card = crate::modal::card()
+                    .w(px(440.))
+                    .h(px(480.))
+                    .overflow_hidden()
+                    .child(picker.clone());
+                let weak = picker.downgrade();
+                let overlay = crate::modal::overlay("branch-switcher", card, move |_, cx| {
+                    let _ = weak.update(cx, |_, cx| cx.emit(GitPicked::Dismissed));
+                });
+                out.push(crate::modal::window_overlay(window, overlay).into_any_element());
+            }
+            BranchPlace::Footer => {
+                let weak = cx.weak_entity();
+                let action = |id: &'static str, label: &'static str, icon_name: &'static str| {
+                    div()
+                        .id(id)
+                        .role(Role::Button)
+                        .aria_label(label)
+                        .h(px(26.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(11.))
+                        .text_color(content(0.7))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                        .child(icon(icon_name, 12.).text_color(content(0.55)))
+                        .child(label)
+                };
+                let actions =
+                    div()
+                        .flex_shrink_0()
+                        .p(px(4.))
+                        .flex()
+                        .gap(px(2.))
+                        .border_b_1()
+                        .border_color(content(0.07))
+                        .child(
+                            action("branch-update", "Update Project", "refresh-cw").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.branch_picker = None;
+                                    cx.emit(ChangesEvent::Overlays);
+                                    this.open_update_dialog(
+                                        Source::Update(UpdateMethod::Merge),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        )
+                        .child(
+                            action("branch-fetch", "Fetch", "arrow-down-circle").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.branch_picker = None;
+                                    cx.emit(ChangesEvent::Overlays);
+                                    this.fetch(window, cx);
+                                }),
+                            ),
+                        )
+                        .child(action("branch-commit", "Commit…", "git-commit").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.branch_picker = None;
+                                cx.emit(ChangesEvent::Overlays);
+                                this.open_commit_dialog(window, cx);
+                            }),
+                        ));
+                out.push(
+                    popover(
+                        "footer-branch-picker",
+                        Anchor::Slot(self.footer_anchor.clone()),
+                    )
+                    .side(Side::Top)
+                    .align(Align::Start)
+                    .width(340.)
+                    .height(420.)
+                    .on_dismiss(move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.branch_picker = None;
+                            cx.emit(ChangesEvent::Overlays);
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .child(actions)
+                            .child(div().flex_1().min_h_0().child(picker)),
+                    )
+                    .into_any_element(),
+                );
+            }
         }
         out
     }
@@ -2288,6 +2459,18 @@ impl Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_sessions_sharing_the_checkout_block_git_changes() {
+        assert!(checkouts_overlap("/work/app", "/work/app"));
+        assert!(checkouts_overlap("/work/app", "/work/app/packages/web"));
+        assert!(checkouts_overlap("/work/app/packages/web", "/work/app"));
+        // A sibling with a common prefix, and a linked worktree, are separate.
+        assert!(!checkouts_overlap("/work/app", "/work/app-two"));
+        assert!(!checkouts_overlap(
+            "/work/app",
+            "/work/.worktrees/app-feature"
+        ));
+    }
     #[gpui::test]
     fn enabling_an_enabled_changes_panel_does_not_reload(cx: &mut gpui::TestAppContext) {
         let window = cx.update(|cx| {
