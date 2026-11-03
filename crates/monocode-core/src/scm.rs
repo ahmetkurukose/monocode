@@ -21,8 +21,8 @@ pub use review::{
 };
 pub(crate) use shell::{expand_home, path_to_js};
 pub use update::{
-    abort_update, merge_branch, range_file_diff, update_project, IncomingCommit, UpdateMethod,
-    UpdateReport,
+    abort_update, merge_branch, range_file_diff, rebase_branch, update_project, IncomingCommit,
+    UpdateMethod, UpdateReport,
 };
 
 /// The PATH a login terminal would have, for shells the app starts: a

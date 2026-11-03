@@ -1887,7 +1887,7 @@ impl Conversation {
                                 return;
                             }
                         }
-                        GitPicked::Merge(_) | GitPicked::Dismissed => {}
+                        GitPicked::Dismissed => {}
                     }
                     this.git_picker = None;
                     this.git_events = None;

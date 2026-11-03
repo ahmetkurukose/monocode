@@ -266,14 +266,175 @@ pub fn checkout(cwd: &Path, branch: &Branch) -> Result<(), String> {
     }
     valid_branch(cwd, &branch.name)?;
     if let Some(remote) = &branch.remote {
-        let reference = format!("{remote}/{}", branch.name);
-        git(
-            cwd,
-            &["switch", "--track", "-c", &branch.name, "--", &reference],
-        )?;
+        // A remote branch whose local twin exists just switches to the twin;
+        // creating it again would fail with "already exists".
+        let twin = format!("refs/heads/{}", branch.name);
+        if git(cwd, &["show-ref", "--verify", "--quiet", &twin]).is_ok() {
+            git(cwd, &["switch", "--", &branch.name])?;
+        } else {
+            let reference = format!("{remote}/{}", branch.name);
+            git(
+                cwd,
+                &["switch", "--track", "-c", &branch.name, "--", &reference],
+            )?;
+        }
     } else {
         git(cwd, &["switch", "--", &branch.name])?;
     }
+    Ok(())
+}
+/// A branch (local, or remote-tracking when `remote` is set) with how far it
+/// has drifted from its upstream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchRow {
+    pub name: String,
+    pub remote: Option<String>,
+    /// The branch it tracks, like `origin/master`.
+    pub upstream: Option<String>,
+    pub ahead: i64,
+    pub behind: i64,
+}
+/// Everything the branch popup lists, read in one pass.
+#[derive(Clone, Debug, Default)]
+pub struct BranchInfo {
+    pub current: Option<String>,
+    pub detached: bool,
+    pub default_branch: Option<String>,
+    /// Newest commit first.
+    pub branches: Vec<BranchRow>,
+    /// Local branches checked out lately, most recent first.
+    pub recent: Vec<String>,
+}
+fn parse_track(track: &str) -> (i64, i64) {
+    let number = |label: &str| {
+        track
+            .split(',')
+            .find_map(|part| part.trim().strip_prefix(label))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (number("ahead "), number("behind "))
+}
+/// Branches with upstream and drift, the default branch and recent checkouts.
+pub fn branch_info(cwd: &Path) -> Result<BranchInfo, String> {
+    if crate::files::remote::is_remote(cwd) {
+        return Err("This isn’t available for projects on another machine yet.".into());
+    }
+    git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let current = git(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_owned());
+    let listing = git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)%09%(upstream:short)%09%(upstream:track,nobracket)",
+            "refs/heads/",
+            "refs/remotes/",
+        ],
+    )?;
+    let branches: Vec<BranchRow> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let reference = fields.next()?;
+            let upstream = fields.next().filter(|s| !s.is_empty()).map(str::to_owned);
+            let (ahead, behind) = parse_track(fields.next().unwrap_or(""));
+            if let Some(name) = reference.strip_prefix("refs/heads/") {
+                Some(BranchRow {
+                    name: name.into(),
+                    remote: None,
+                    upstream,
+                    ahead,
+                    behind,
+                })
+            } else {
+                let (remote, name) = reference.strip_prefix("refs/remotes/")?.split_once('/')?;
+                (name != "HEAD").then(|| BranchRow {
+                    name: name.into(),
+                    remote: Some(remote.into()),
+                    ..Default::default()
+                })
+            }
+        })
+        .collect();
+    let default_branch = git(
+        cwd,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|s| s.trim().strip_prefix("origin/").map(str::to_owned))
+    .or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|name| {
+                branches
+                    .iter()
+                    .any(|b| b.remote.is_none() && b.name == *name)
+            })
+            .map(str::to_owned)
+    });
+    let mut recent: Vec<String> = Vec::new();
+    if let Ok(log) = git(cwd, &["reflog", "-n", "400", "--format=%gs"]) {
+        for subject in log.lines() {
+            let Some(rest) = subject.strip_prefix("checkout: moving from ") else {
+                continue;
+            };
+            let Some((_, to)) = rest.rsplit_once(" to ") else {
+                continue;
+            };
+            let exists = branches.iter().any(|b| b.remote.is_none() && b.name == to);
+            if exists && Some(to) != current.as_deref() && !recent.iter().any(|r| r == to) {
+                recent.push(to.to_owned());
+                if recent.len() == 5 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(BranchInfo {
+        detached: current.is_none(),
+        current,
+        default_branch,
+        branches,
+        recent,
+    })
+}
+/// A new branch from `base` (the current commit when `None`), checked out.
+pub fn create_branch_from(cwd: &Path, name: &str, base: Option<&str>) -> Result<(), String> {
+    if crate::files::remote::is_remote(cwd) {
+        return remote::create_branch(cwd, name);
+    }
+    valid_branch(cwd, name)?;
+    let mut args = vec!["switch", "-c", name];
+    if let Some(base) = base {
+        if base.is_empty() || base.starts_with('-') {
+            return Err("Choose a branch to start from".into());
+        }
+        args.push(base);
+    }
+    git(cwd, &args)?;
+    Ok(())
+}
+pub fn rename_branch(cwd: &Path, old: &str, new: &str) -> Result<(), String> {
+    valid_branch(cwd, new)?;
+    if old.is_empty() || old.starts_with('-') {
+        return Err("Choose a branch to rename".into());
+    }
+    git(cwd, &["branch", "-m", "--", old, new])?;
+    Ok(())
+}
+/// Deletes a local branch; git refuses the current one, and an unmerged one
+/// unless `force`.
+pub fn delete_branch(cwd: &Path, name: &str, force: bool) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err("Choose a branch to delete".into());
+    }
+    git(
+        cwd,
+        &["branch", if force { "-D" } else { "-d" }, "--", name],
+    )?;
     Ok(())
 }
 pub fn create_branch(cwd: &Path, name: &str) -> Result<(), String> {
@@ -688,5 +849,116 @@ mod tests {
             "origin/remote-feature"
         );
         assert!(create_branch(&cwd, "--orphan").is_err());
+    }
+
+    /// A bare origin and a clone `b` on main, with branch `feature/x` pushed.
+    fn clone_with_feature() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let b = root.path().join("b");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init"]).unwrap();
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        for (k, v) in [
+            ("user.name", "T"),
+            ("user.email", "t@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git(&work, &["config", k, v]).unwrap();
+        }
+        std::fs::write(work.join("a.txt"), "a\n").unwrap();
+        git(&work, &["add", "."]).unwrap();
+        git(&work, &["commit", "-m", "init"]).unwrap();
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git(&work, &["push", "-u", "origin", "main"]).unwrap();
+        git(&work, &["switch", "-c", "feature/x"]).unwrap();
+        std::fs::write(work.join("x.txt"), "x\n").unwrap();
+        git(&work, &["add", "."]).unwrap();
+        git(&work, &["commit", "-m", "x"]).unwrap();
+        git(&work, &["push", "-u", "origin", "feature/x"]).unwrap();
+        git(root.path(), &["clone", origin.to_str().unwrap(), "b"]).unwrap();
+        (root, b)
+    }
+
+    #[test]
+    fn checking_out_a_remote_branch_reuses_its_local_twin() {
+        let (_root, b) = clone_with_feature();
+        let remote = Branch {
+            name: "feature/x".into(),
+            remote: Some("origin".into()),
+        };
+        // First time: a tracking branch is created.
+        checkout(&b, &remote).unwrap();
+        assert_eq!(snapshot(&b).unwrap().current.as_deref(), Some("feature/x"));
+        git(&b, &["switch", "main"]).unwrap();
+        // The local twin now exists: choosing the remote row just switches to it.
+        checkout(&b, &remote).unwrap();
+        assert_eq!(snapshot(&b).unwrap().current.as_deref(), Some("feature/x"));
+    }
+
+    #[test]
+    fn branch_info_lists_drift_default_and_recent_branches() {
+        let (_root, b) = clone_with_feature();
+        checkout(
+            &b,
+            &Branch {
+                name: "feature/x".into(),
+                remote: Some("origin".into()),
+            },
+        )
+        .unwrap();
+        git(&b, &["switch", "main"]).unwrap();
+        let info = branch_info(&b).unwrap();
+        assert_eq!(info.current.as_deref(), Some("main"));
+        assert_eq!(info.default_branch.as_deref(), Some("main"));
+        assert_eq!(info.recent, ["feature/x"]);
+        let local = info
+            .branches
+            .iter()
+            .find(|r| r.remote.is_none() && r.name == "feature/x")
+            .unwrap();
+        assert_eq!(local.upstream.as_deref(), Some("origin/feature/x"));
+        assert!(info
+            .branches
+            .iter()
+            .any(|r| r.remote.as_deref() == Some("origin") && r.name == "feature/x"));
+        assert!(!info.branches.iter().any(|r| r.name == "HEAD"));
+    }
+
+    #[test]
+    fn parse_track_reads_ahead_and_behind() {
+        assert_eq!(parse_track(""), (0, 0));
+        assert_eq!(parse_track("behind 13"), (0, 13));
+        assert_eq!(parse_track("ahead 2, behind 5"), (2, 5));
+    }
+
+    #[test]
+    fn create_rename_and_delete_branches() {
+        let (_root, b) = clone_with_feature();
+        create_branch_from(&b, "topic", Some("origin/feature/x")).unwrap();
+        assert!(b.join("x.txt").exists());
+        rename_branch(&b, "topic", "topic2").unwrap();
+        assert_eq!(snapshot(&b).unwrap().current.as_deref(), Some("topic2"));
+        assert!(
+            delete_branch(&b, "topic2", false).is_err(),
+            "current branch"
+        );
+        git(&b, &["switch", "main"]).unwrap();
+        delete_branch(&b, "topic2", true).unwrap();
+        assert!(!snapshot(&b)
+            .unwrap()
+            .branches
+            .iter()
+            .any(|r| r.name == "topic2"));
+        assert!(create_branch_from(&b, "bad name", None).is_err());
+        assert!(delete_branch(&b, "--force", false).is_err());
     }
 }

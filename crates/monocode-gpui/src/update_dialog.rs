@@ -33,6 +33,8 @@ pub(crate) enum Source {
     Update(UpdateMethod),
     /// Merge another branch into the current one.
     Merge(String),
+    /// Rebase the current branch onto another one.
+    RebaseOnto(String),
 }
 
 enum Phase {
@@ -118,6 +120,7 @@ impl UpdateDialog {
             match source {
                 Source::Update(method) => scm::update_project(&cwd, method),
                 Source::Merge(branch) => scm::merge_branch(&cwd, &branch),
+                Source::RebaseOnto(branch) => scm::rebase_branch(&cwd, &branch),
             }
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
@@ -465,6 +468,7 @@ impl Render for UpdateDialog {
             Source::Update(UpdateMethod::Rebase) => "Update Project (Rebase)".to_string(),
             Source::Update(UpdateMethod::Merge) => "Update Project".to_string(),
             Source::Merge(branch) => format!("Merge {branch}"),
+            Source::RebaseOnto(branch) => format!("Rebase onto {branch}"),
         };
         let (subtitle, conflicts) = match &self.phase {
             Phase::Running => ("Bringing in new commits…".to_string(), vec![]),

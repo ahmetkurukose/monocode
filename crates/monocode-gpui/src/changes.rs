@@ -3,9 +3,9 @@
 //! and unstaged files as a list or a tree. Every Git call runs off-thread,
 //! one mutation at a time per checkout.
 use crate::{
+    branch_popup::{BranchPopup, PopupEvent},
     commit_dialog::{CommitDialog, CommitDialogEvent},
     file_icons::file_type_icon,
-    git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
     git_status::{GitChanged, ProjectGit},
     input::{self, Input},
     popover::{
@@ -257,7 +257,7 @@ pub(crate) struct Changes {
     commit_anchor: AnchorSlot,
     commit_dialog: Option<(Entity<CommitDialog>, Subscription)>,
     update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
-    branch_picker: Option<(Entity<GitPicker>, Subscription)>,
+    branch_picker: Option<(Entity<BranchPopup>, Subscription)>,
     /// The switcher opened from the menu bar: a centred window, not a popover.
     branch_place: BranchPlace,
     /// Why branch-changing Git actions are off: an agent is working in this checkout.
@@ -710,6 +710,7 @@ impl Changes {
         let what = match &source {
             Source::Update(_) => "update the project",
             Source::Merge(_) => "merge",
+            Source::RebaseOnto(_) => "rebase",
         };
         if self.refuse_while_agent_works(what, window, cx) {
             return;
@@ -774,28 +775,58 @@ impl Changes {
         if self.refuse_while_agent_works("switch branches", window, cx) {
             return;
         }
-        let current = self.index(cx).and_then(|i| i.branch);
         let cwd = PathBuf::from(&self.cwd);
-        let picker = cx.new(|cx| GitPicker::new(cwd, GitMode::Branch, current, cx).with_merge());
-        let subscription =
-            cx.subscribe_in(&picker, window, |this, _, event: &GitPicked, window, cx| {
+        let picker = cx.new(|cx| BranchPopup::new(cwd, cx));
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &PopupEvent, window, cx| {
                 this.branch_picker = None;
                 match event {
-                    GitPicked::Changed => {
+                    PopupEvent::Close => {}
+                    PopupEvent::Changed(what) => {
                         this.mutated(cx);
-                        this.set_status("Switched branch", cx);
+                        this.set_status(what, cx);
                     }
-                    GitPicked::Merge(branch) => this.merge_branch(branch.clone(), window, cx),
-                    _ => {}
+                    PopupEvent::Merge(branch) => this.merge_branch(branch.clone(), window, cx),
+                    PopupEvent::Rebase(branch) => this.rebase_branch(branch.clone(), window, cx),
+                    PopupEvent::Update => {
+                        this.open_update_dialog(Source::Update(UpdateMethod::Merge), window, cx)
+                    }
+                    PopupEvent::Commit => this.open_commit_dialog(window, cx),
+                    PopupEvent::Push => this.push(window, cx),
+                    PopupEvent::Fetch => this.fetch(window, cx),
                 }
                 cx.emit(ChangesEvent::Overlays);
                 cx.notify();
-            });
+            },
+        );
         window.focus(&picker.read(cx).focus(cx), cx);
         self.branch_place = place;
         self.branch_picker = Some((picker, subscription));
         cx.emit(ChangesEvent::Overlays);
         cx.notify();
+    }
+
+    /// Rebase the current branch onto `branch`, after a confirmation.
+    fn rebase_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refuse_while_agent_works("rebase", window, cx) {
+            return;
+        }
+        let current = self.index(cx).and_then(|i| i.branch);
+        let message = match current {
+            Some(current) => format!("Rebase \"{current}\" onto \"{branch}\"?"),
+            None => format!("Rebase onto \"{branch}\"?"),
+        };
+        let ask = Self::confirm(message, "Rebase", window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if ask.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.open_update_dialog(Source::RebaseOnto(branch), window, cx)
+                });
+            }
+        })
+        .detach();
     }
 
     /// Merge `branch` into the current branch, after a confirmation.
@@ -2376,82 +2407,22 @@ impl Changes {
             BranchPlace::Header => {}
             BranchPlace::Modal => {
                 let card = crate::modal::card()
-                    .w(px(440.))
-                    .h(px(480.))
+                    .w(px(560.))
+                    .h(px(560.))
                     .overflow_hidden()
                     .child(picker.clone());
-                let weak = picker.downgrade();
+                let weak = cx.weak_entity();
                 let overlay = crate::modal::overlay("branch-switcher", card, move |_, cx| {
-                    let _ = weak.update(cx, |_, cx| cx.emit(GitPicked::Dismissed));
+                    let _ = weak.update(cx, |this, cx| {
+                        this.branch_picker = None;
+                        cx.emit(ChangesEvent::Overlays);
+                        cx.notify();
+                    });
                 });
                 out.push(crate::modal::window_overlay(window, overlay).into_any_element());
             }
             BranchPlace::Footer => {
                 let weak = cx.weak_entity();
-                let action = |id: &'static str, label: &'static str, icon_name: &'static str| {
-                    div()
-                        .id(id)
-                        .role(Role::Button)
-                        .aria_label(label)
-                        .h(px(26.))
-                        .px(px(8.))
-                        .rounded(px(6.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .text_size(px(11.))
-                        .text_color(content(0.7))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
-                        .child(icon(icon_name, 12.).text_color(content(0.55)))
-                        .child(label)
-                };
-                let actions =
-                    div()
-                        .flex_shrink_0()
-                        .p(px(4.))
-                        .flex()
-                        .gap(px(2.))
-                        .border_b_1()
-                        .border_color(content(0.07))
-                        .child(
-                            action("branch-update", "Update Project", "refresh-cw").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.branch_picker = None;
-                                    cx.emit(ChangesEvent::Overlays);
-                                    this.open_update_dialog(
-                                        Source::Update(UpdateMethod::Merge),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            ),
-                        )
-                        .child(
-                            action("branch-fetch", "Fetch", "arrow-down-circle").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.branch_picker = None;
-                                    cx.emit(ChangesEvent::Overlays);
-                                    this.fetch(window, cx);
-                                }),
-                            ),
-                        )
-                        .child(
-                            action("branch-push", "Push", "cloud-upload").on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.branch_picker = None;
-                                    cx.emit(ChangesEvent::Overlays);
-                                    this.push(window, cx);
-                                },
-                            )),
-                        )
-                        .child(action("branch-commit", "Commit…", "git-commit").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.branch_picker = None;
-                                cx.emit(ChangesEvent::Overlays);
-                                this.open_commit_dialog(window, cx);
-                            }),
-                        ));
                 out.push(
                     popover(
                         "footer-branch-picker",
@@ -2459,8 +2430,8 @@ impl Changes {
                     )
                     .side(Side::Top)
                     .align(Align::Start)
-                    .width(390.)
-                    .height(420.)
+                    .width(560.)
+                    .height(560.)
                     .on_dismiss(move |_, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.branch_picker = None;
@@ -2468,14 +2439,7 @@ impl Changes {
                             cx.notify();
                         });
                     })
-                    .child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_col()
-                            .child(actions)
-                            .child(div().flex_1().min_h_0().child(picker)),
-                    )
+                    .child(picker)
                     .into_any_element(),
                 );
             }

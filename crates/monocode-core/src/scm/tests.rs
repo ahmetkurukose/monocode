@@ -1275,3 +1275,24 @@ fn fetch_downloads_remote_commits_without_moving_the_branch() {
     assert_eq!(index(&b).behind, 1);
     assert!(fetch(tmp().path()).is_err());
 }
+
+#[test]
+fn rebase_branch_replays_the_current_branch_onto_another() {
+    let dir = tmp();
+    assert!(init_git_commit(dir.path(), &[("a.txt", "a\n")]));
+    assert!(git(dir.path(), &["switch", "-c", "base"]));
+    std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    assert!(git(dir.path(), &["add", "."]) && git(dir.path(), &["commit", "-m", "on base"]));
+    assert!(git(dir.path(), &["switch", "-c", "topic", "main"]));
+    std::fs::write(dir.path().join("t.txt"), "t\n").unwrap();
+    assert!(git(dir.path(), &["add", "."]) && git(dir.path(), &["commit", "-m", "on topic"]));
+    let report = rebase_branch(dir.path(), "base").unwrap();
+    assert!(report.rebase && report.conflicts.is_empty());
+    assert_eq!(report.commits.len(), 1);
+    let log = git_stdout(dir.path(), &["log", "--format=%s", "-3"]).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        ["on topic", "on base", "init"]
+    );
+    assert!(rebase_branch(dir.path(), "--abort").is_err());
+}

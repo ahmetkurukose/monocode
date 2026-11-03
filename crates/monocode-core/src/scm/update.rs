@@ -163,6 +163,27 @@ pub fn merge_branch(cwd: &Path, branch: &str) -> Result<UpdateReport, String> {
     bring_in(&root, branch.to_string(), branch, UpdateMethod::Merge)
 }
 
+/// Rebase the current branch onto another one and report it like an update.
+pub fn rebase_branch(cwd: &Path, branch: &str) -> Result<UpdateReport, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("Rebasing isn't available on remote workspaces yet".into());
+    }
+    let root = expand_home(cwd);
+    if !git_is_work_tree(&root) {
+        return Err("Not a git repository".into());
+    }
+    let branch = branch.trim();
+    if branch.is_empty() || branch.starts_with('-') || branch.contains(char::is_whitespace) {
+        return Err("Choose a branch to rebase onto".into());
+    }
+    git_stdout(
+        &root,
+        &["rev-parse", "--verify", &format!("{branch}^{{commit}}")],
+    )
+    .ok_or_else(|| format!("Unknown branch {branch}"))?;
+    bring_in(&root, branch.to_string(), branch, UpdateMethod::Rebase)
+}
+
 fn bring_in(
     root: &Path,
     label: String,

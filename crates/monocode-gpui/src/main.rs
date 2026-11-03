@@ -10,6 +10,7 @@ mod app_menu;
 mod arcade;
 mod assets;
 mod automations;
+mod branch_popup;
 mod change_tree;
 mod changes;
 mod commit_dialog;
