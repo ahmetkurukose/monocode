@@ -5,6 +5,8 @@ mod media;
 pub use media::png as media_png;
 pub mod azure_devops;
 pub use avatar::png as avatar_png;
+mod commits;
+pub use commits::PrCommit;
 mod github;
 pub mod gitlab;
 pub mod jira;

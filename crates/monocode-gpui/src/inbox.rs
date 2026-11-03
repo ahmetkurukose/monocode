@@ -73,6 +73,14 @@ pub(crate) struct Inbox {
     diff_selected: Option<String>,
     /// Every file of the pull request; the review shows only the selected one.
     diff_files: Vec<crate::diff_view::DiffFile>,
+    /// The pull request's commits (oldest first), the one the review is
+    /// scoped to (`None` is every commit together), and each commit's diff
+    /// once read.
+    commits: Vec<model::PrCommit>,
+    commit_scope: Option<String>,
+    commit_diffs: std::collections::HashMap<String, (Diff, Vec<crate::diff_view::DiffFile>)>,
+    commits_loading: bool,
+    commit_loading: bool,
     checks: Option<Checks>,
     tab: Tab,
     loading: bool,
@@ -138,13 +146,14 @@ impl Inbox {
     /// The review shows one file at a time: the one picked in the tree.
     fn show_diff_file(&mut self, cx: &mut Context<Self>) {
         let selected = self.diff_selected.clone();
+        let scope = self.scope_files();
         let files = match selected
             .as_deref()
             .map(diff::file_id)
-            .and_then(|id| self.diff_files.iter().find(|f| f.id == id))
+            .and_then(|id| scope.iter().find(|f| f.id == id))
         {
             Some(file) => vec![file.clone()],
-            None => self.diff_files.clone(),
+            None => scope.to_vec(),
         };
         let single = files.len() == 1;
         let first = files.first().map(|f| f.id.clone());
@@ -156,6 +165,127 @@ impl Inbox {
                 view.reveal_file(id, cx);
             }
         });
+    }
+    /// The diff the review is scoped to: one commit's, or the whole pull
+    /// request's.
+    fn scope_diff(&self) -> Option<&Diff> {
+        match &self.commit_scope {
+            Some(sha) => self.commit_diffs.get(sha).map(|(diff, _)| diff),
+            None => self.diff.as_ref(),
+        }
+    }
+    fn scope_files(&self) -> &[crate::diff_view::DiffFile] {
+        match &self.commit_scope {
+            Some(sha) => self
+                .commit_diffs
+                .get(sha)
+                .map_or(&[][..], |(_, files)| files.as_slice()),
+            None => &self.diff_files,
+        }
+    }
+    /// Review one commit (`Some`) or all of them together (`None`).
+    fn select_scope(&mut self, sha: Option<String>, cx: &mut Context<Self>) {
+        if self.commit_scope == sha {
+            return;
+        }
+        self.commit_scope = sha.clone();
+        self.diff_collapsed.clear();
+        self.extra_error = None;
+        let Some(sha) = sha else {
+            self.diff_selected = self
+                .diff
+                .as_ref()
+                .and_then(|d| d.files.first())
+                .map(|f| f.path.clone());
+            self.commit_loading = false;
+            self.show_diff_file(cx);
+            cx.notify();
+            return;
+        };
+        if let Some((diff, _)) = self.commit_diffs.get(&sha) {
+            self.diff_selected = diff.files.first().map(|f| f.path.clone());
+            self.commit_loading = false;
+            self.show_diff_file(cx);
+            cx.notify();
+            return;
+        }
+        let Some(item) = self.item() else {
+            return;
+        };
+        self.commit_loading = true;
+        self.diff_selected = None;
+        self.diff_view
+            .update(cx, |view, cx| view.set_files(vec![], cx));
+        let key = item.key();
+        let service = self.service.clone();
+        let wanted = sha.clone();
+        let task = cx.background_executor().spawn(async move {
+            service.pr_commit_diff(&item, &wanted).map(|diff| {
+                let files = diff::models(&diff);
+                (diff, files)
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selected.as_ref() != Some(&key) {
+                    return;
+                }
+                match result {
+                    Ok(loaded) => {
+                        let first = loaded.0.files.first().map(|f| f.path.clone());
+                        this.commit_diffs.insert(sha.clone(), loaded);
+                        if this.commit_scope.as_ref() == Some(&sha) {
+                            this.commit_loading = false;
+                            this.diff_selected = first;
+                            this.show_diff_file(cx);
+                        }
+                    }
+                    Err(error) => {
+                        if this.commit_scope.as_ref() == Some(&sha) {
+                            this.commit_loading = false;
+                            this.extra_error = Some(error);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    /// The pull request's commit list, read once alongside its diff.
+    fn load_commits(&mut self, cx: &mut Context<Self>) {
+        if !self.commits.is_empty() || self.commits_loading {
+            return;
+        }
+        let Some(item) = self
+            .item()
+            .filter(|i| i.provider == "github" && i.kind == "pr")
+        else {
+            return;
+        };
+        self.commits_loading = true;
+        let key = item.key();
+        let service = self.service.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { service.pr_commits(&item) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selected.as_ref() != Some(&key) {
+                    return;
+                }
+                this.commits_loading = false;
+                // The list is a convenience: a failure leaves the whole diff.
+                if let Ok(commits) = result {
+                    this.commits = commits;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
     fn copy_link(&mut self, url: String, cx: &mut Context<Self>) {
         if url.is_empty() {
@@ -306,6 +436,11 @@ impl Inbox {
             diff_collapsed: Default::default(),
             diff_selected: None,
             diff_files: vec![],
+            commits: vec![],
+            commit_scope: None,
+            commit_diffs: Default::default(),
+            commits_loading: false,
+            commit_loading: false,
             checks: None,
             tab: Tab::Summary,
             loading: false,
@@ -620,6 +755,11 @@ impl Inbox {
         self.diff_collapsed.clear();
         self.diff_selected = None;
         self.diff_files.clear();
+        self.commits.clear();
+        self.commit_scope = None;
+        self.commit_diffs.clear();
+        self.commits_loading = false;
+        self.commit_loading = false;
         self.extra_request += 1;
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));
@@ -754,6 +894,9 @@ impl Inbox {
         let Some(item) = self.item() else {
             return;
         };
+        if tab == Tab::Code {
+            self.load_commits(cx);
+        }
         if tab == Tab::Summary
             || (tab == Tab::Code && self.diff.is_some())
             || (tab == Tab::Checks && self.checks.is_some())

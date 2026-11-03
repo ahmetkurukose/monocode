@@ -2037,12 +2037,9 @@ impl Inbox {
             .id("inbox-diff-tree")
             .role(Role::Tree)
             .aria_label("Changed files")
-            .w(px(260.))
-            .flex_shrink_0()
-            .h_full()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
-            .border_r_1()
-            .border_color(content(0.07))
             .py(px(6.))
             .children(rows.into_iter().enumerate().map(|(ix, row)| {
                 let path = row.path.clone();
@@ -2107,40 +2104,152 @@ impl Inbox {
             .into_any_element()
     }
 
+    /// "All changes" and each commit of the pull request, to review them
+    /// together or one by one.
+    fn commits_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let all = self.diff.as_ref();
+        let rows = self.commits.iter().enumerate().map(|(ix, commit)| {
+            let selected = self.commit_scope.as_deref() == Some(commit.sha.as_str());
+            let sha = commit.sha.clone();
+            div()
+                .id(("inbox-commit", ix))
+                .role(Role::ListBoxOption)
+                .aria_selected(selected)
+                .min_h(px(34.))
+                .mx(px(6.))
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(5.))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(content(0.1)))
+                .hover(|s| s.bg(content(0.06)))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(content(if selected { 1. } else { 0.85 }))
+                        .child(commit.headline.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .text_size(px(10.))
+                        .text_color(content(0.4))
+                        .child(
+                            div()
+                                .font_family(crate::fonts::mono())
+                                .child(commit.short_sha.clone()),
+                        )
+                        .child(div().truncate().child(commit.author.clone()))
+                        .child(div().flex_shrink_0().child(relative_time(&commit.date))),
+                )
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.select_scope(Some(sha.clone()), cx)),
+                )
+        });
+        div()
+            .id("inbox-commits")
+            .role(Role::ListBox)
+            .aria_label("Commits")
+            .flex_shrink_0()
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(content(0.07))
+            .py(px(6.))
+            .child(
+                div()
+                    .id("inbox-commit-all")
+                    .role(Role::ListBoxOption)
+                    .aria_selected(self.commit_scope.is_none())
+                    .h(px(30.))
+                    .mx(px(6.))
+                    .px(px(8.))
+                    .rounded(px(5.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(content(if self.commit_scope.is_none() {
+                        1.
+                    } else {
+                        0.85
+                    }))
+                    .when(self.commit_scope.is_none(), |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.06)))
+                    .child(icon("git-merge", 12.).text_color(content(0.5)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(format!("All changes · {} commits", self.commits.len())),
+                    )
+                    .when_some(all, |d, diff| {
+                        d.child(crate::diff_view::diff_counts(
+                            diff.additions.max(0) as u32,
+                            diff.deletions.max(0) as u32,
+                        ))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.select_scope(None, cx))),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
     fn diff_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_commits = self.commits.len() > 1;
         let tree = self
-            .diff
-            .as_ref()
-            .filter(|diff| diff.files.len() > 1)
+            .scope_diff()
+            .filter(|diff| diff.files.len() > 1 || (has_commits && !diff.files.is_empty()))
             .map(|diff| self.diff_tree(diff, cx));
+        let commits = has_commits.then(|| self.commits_panel(cx));
+        let sidebar = (tree.is_some() || commits.is_some()).then(|| {
+            div()
+                .id("inbox-diff-sidebar")
+                .w(px(300.))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .border_r_1()
+                .border_color(content(0.07))
+                .children(commits)
+                .children(tree)
+                .into_any_element()
+        });
         div()
             .min_h_0()
             .flex_1()
             .flex()
             .flex_col()
-            .when(self.extra_loading, |d| d.child(message("Loading changes…")))
+            .when(self.extra_loading || self.commit_loading, |d| {
+                d.child(message("Loading changes…"))
+            })
             .when_some(self.extra_error.clone(), |d, text| d.child(error(text)))
             .when(self.diff.is_some(), |d| {
                 d.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .when_some(tree, |d, tree| d.child(tree))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .child(self.diff_view.clone()),
-                        ),
+                    div().flex_1().min_h_0().flex().children(sidebar).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.diff_view.clone()),
+                    ),
                 )
             })
-            .when(self.diff.as_ref().is_some_and(|diff| diff.truncated), |d| {
-                d.child(message(
-                    "This diff is truncated. Open the pull request to see all changes.",
-                ))
-            })
+            .when(
+                self.commit_scope.is_none()
+                    && self.diff.as_ref().is_some_and(|diff| diff.truncated),
+                |d| {
+                    d.child(message(
+                        "This diff is truncated. Open the pull request to see all changes.",
+                    ))
+                },
+            )
             .into_any_element()
     }
 
