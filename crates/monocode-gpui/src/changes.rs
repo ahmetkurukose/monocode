@@ -834,17 +834,36 @@ impl Changes {
     }
     pub(crate) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.index(cx);
-        if !index.is_some_and(|i| i.branch.is_some()) {
+        let Some(branch) = index.as_ref().and_then(|i| i.branch.clone()) else {
+            return;
+        };
+        let on_default = Self::on_default(index.as_ref());
+        let start = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.status = None;
+            this.run_git(
+                "push".into(),
+                |path| scm::push(&path),
+                |this, _, cx| this.set_status("Pushed", cx),
+                window,
+                cx,
+            );
+        };
+        if !on_default {
+            start(self, window, cx);
             return;
         }
-        self.status = None;
-        self.run_git(
-            "push".into(),
-            |path| scm::push(&path),
-            |this, _, cx| this.set_status("Pushed", cx),
+        let ask = Self::confirm(
+            format!("Push to default branch \"{branch}\"?"),
+            "Push",
             window,
             cx,
         );
+        cx.spawn_in(window, async move |this, cx| {
+            if ask.await {
+                let _ = this.update_in(cx, start);
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2417,6 +2436,15 @@ impl Changes {
                                 }),
                             ),
                         )
+                        .child(
+                            action("branch-push", "Push", "cloud-upload").on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.branch_picker = None;
+                                    cx.emit(ChangesEvent::Overlays);
+                                    this.push(window, cx);
+                                },
+                            )),
+                        )
                         .child(action("branch-commit", "Commit…", "git-commit").on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.branch_picker = None;
@@ -2431,7 +2459,7 @@ impl Changes {
                     )
                     .side(Side::Top)
                     .align(Align::Start)
-                    .width(340.)
+                    .width(390.)
                     .height(420.)
                     .on_dismiss(move |_, cx| {
                         let _ = weak.update(cx, |this, cx| {
