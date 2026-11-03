@@ -33,8 +33,8 @@ echo "Newest upstream preview: $latest"
 echo "  $branch is missing $behind_tag commits of that release and $behind_main of upstream/main."
 
 if [ "$main" = 1 ]; then
+  # Tags stay out of the fork: they would start upstream's release workflows there.
   git push origin refs/remotes/upstream/main:refs/heads/main
-  git push origin --tags --quiet
 fi
 
 if [ "$rebase" = 0 ]; then
