@@ -52,3 +52,5 @@ jobs:
           else
             gh issue create --title "$title" --body "$body"
           fi
+
+# The schedule only runs from the default branch, which is AK/monocode_enhancements.
