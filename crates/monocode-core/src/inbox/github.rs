@@ -197,14 +197,23 @@ pub(super) fn git_github_work_items_for(
         "--json".into(),
         fields.into(),
     ];
+    // Pull requests also match when my review is requested, in one query:
+    // `is:pr (review-requested:@me OR assignee:@me)`.
+    let mut query = search.trim().to_string();
     if assigned_to_me {
-        args.push("--assignee".into());
-        args.push("@me".into());
+        if kind == "pr" {
+            if !query.is_empty() {
+                query.push(' ');
+            }
+            query.push_str("(review-requested:@me OR assignee:@me)");
+        } else {
+            args.push("--assignee".into());
+            args.push("@me".into());
+        }
     }
-    let search = search.trim();
-    if !search.is_empty() {
+    if !query.is_empty() {
         args.push("--search".into());
-        args.push(search.to_string());
+        args.push(query);
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let json = gh_checked(root, &refs)?;

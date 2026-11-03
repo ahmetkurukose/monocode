@@ -68,6 +68,11 @@ pub(crate) struct Inbox {
     comments: Vec<(model::Comment, Entity<document::InboxDocument>)>,
     diff: Option<Diff>,
     diff_view: Entity<DiffView>,
+    /// Folders folded in the changed-files tree, and the file last opened from it.
+    diff_collapsed: std::collections::HashSet<String>,
+    diff_selected: Option<String>,
+    /// Every file of the pull request; the review shows only the selected one.
+    diff_files: Vec<crate::diff_view::DiffFile>,
     checks: Option<Checks>,
     tab: Tab,
     loading: bool,
@@ -130,6 +135,28 @@ impl Focusable for Inbox {
 }
 
 impl Inbox {
+    /// The review shows one file at a time: the one picked in the tree.
+    fn show_diff_file(&mut self, cx: &mut Context<Self>) {
+        let selected = self.diff_selected.clone();
+        let files = match selected
+            .as_deref()
+            .map(diff::file_id)
+            .and_then(|id| self.diff_files.iter().find(|f| f.id == id))
+        {
+            Some(file) => vec![file.clone()],
+            None => self.diff_files.clone(),
+        };
+        let single = files.len() == 1;
+        let first = files.first().map(|f| f.id.clone());
+        self.diff_view.update(cx, |view, cx| {
+            view.file_count = single.then_some(1);
+            view.totals = None;
+            view.set_files(files, cx);
+            if let Some(id) = first.filter(|_| single) {
+                view.reveal_file(id, cx);
+            }
+        });
+    }
     fn copy_link(&mut self, url: String, cx: &mut Context<Self>) {
         if url.is_empty() {
             return;
@@ -186,6 +213,10 @@ impl Inbox {
         let connect_token =
             cx.new(|cx| Input::field("API token", "Personal access token", content(0.4), cx));
         let diff_view = cx.new(DiffView::new);
+        diff_view.update(cx, |view, cx| {
+            view.allow_split = true;
+            view.set_split(true, cx);
+        });
         let subscriptions = vec![
             cx.subscribe(&search, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&comment, |this, _, _: &input::Changed, cx| {
@@ -272,6 +303,9 @@ impl Inbox {
             comments: vec![],
             diff: None,
             diff_view,
+            diff_collapsed: Default::default(),
+            diff_selected: None,
+            diff_files: vec![],
             checks: None,
             tab: Tab::Summary,
             loading: false,
@@ -583,6 +617,9 @@ impl Inbox {
         self.focus_comment = false;
         self.tab = Tab::Summary;
         self.diff = None;
+        self.diff_collapsed.clear();
+        self.diff_selected = None;
+        self.diff_files.clear();
         self.extra_request += 1;
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));
@@ -753,14 +790,15 @@ impl Inbox {
                 match result {
                     Ok((diff, checks)) => {
                         if let Some((diff, files)) = diff {
-                            this.diff_view.update(cx, |view, cx| {
-                                view.file_count = Some(diff.files.len());
-                                view.totals = Some((
-                                    diff.additions.max(0).min(u32::MAX as i64) as u32,
-                                    diff.deletions.max(0).min(u32::MAX as i64) as u32,
-                                ));
-                                view.set_files(files, cx);
-                            });
+                            this.diff_files = files;
+                            if !this
+                                .diff_selected
+                                .as_ref()
+                                .is_some_and(|p| diff.files.iter().any(|f| &f.path == p))
+                            {
+                                this.diff_selected = diff.files.first().map(|f| f.path.clone());
+                            }
+                            this.show_diff_file(cx);
                             this.diff = Some(diff);
                         }
                         if let Some(checks) = checks {

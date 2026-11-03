@@ -768,40 +768,57 @@ impl Service {
                     }
                     .ok()
                 });
+                let mut first_error: Option<String> = None;
                 for (project, repo) in checkouts {
                     for kind in ["issue", "pr"] {
-                        let rows: Vec<Item> = match provider {
-                            "github" => convert(github::git_github_work_items_for(
-                                project,
-                                &repo,
-                                kind,
-                                state.filters.assigned_to_me,
-                                state.filters.fetch_state(),
-                                "",
-                                limit,
-                            )?)?,
-                            "gitlab" => convert(gitlab::gitlab_list_work_items(
-                                self.data_dir.clone(),
-                                project.to_string_lossy().into_owned(),
-                                kind.into(),
-                                false,
-                                state.filters.fetch_state().into(),
-                                Some(limit),
-                            )?)?,
-                            _ => convert(azure_devops::azure_devops_list_work_items(
-                                self.data_dir.clone(),
-                                project.to_string_lossy().into_owned(),
-                                kind.into(),
-                                false,
-                                state.filters.fetch_state().into(),
-                                Some(limit),
-                            )?)?,
+                        let fetched: Result<Vec<Item>, String> = (|| {
+                            Ok(match provider {
+                                "github" => convert(github::git_github_work_items_for(
+                                    project,
+                                    &repo,
+                                    kind,
+                                    state.filters.assigned_to_me,
+                                    state.filters.fetch_state(),
+                                    "",
+                                    limit,
+                                )?)?,
+                                "gitlab" => convert(gitlab::gitlab_list_work_items(
+                                    self.data_dir.clone(),
+                                    project.to_string_lossy().into_owned(),
+                                    kind.into(),
+                                    false,
+                                    state.filters.fetch_state().into(),
+                                    Some(limit),
+                                )?)?,
+                                _ => convert(azure_devops::azure_devops_list_work_items(
+                                    self.data_dir.clone(),
+                                    project.to_string_lossy().into_owned(),
+                                    kind.into(),
+                                    false,
+                                    state.filters.fetch_state().into(),
+                                    Some(limit),
+                                )?)?,
+                            })
+                        })();
+                        // One kind failing (e.g. a repository with issues
+                        // disabled) must not hide the other kind's rows.
+                        let rows = match fetched {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                                continue;
+                            }
                         };
                         items.extend(rows.into_iter().map(|mut item| {
                             item.provider = provider.into();
                             item.project_path = project.to_string_lossy().into_owned();
                             item
                         }));
+                    }
+                }
+                if items.is_empty() {
+                    if let Some(error) = first_error {
+                        return Err(error);
                     }
                 }
                 Ok(items)

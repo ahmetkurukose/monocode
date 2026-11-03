@@ -102,6 +102,12 @@ enum RowKind {
         line: usize,
         stage: Option<usize>,
     },
+    /// Side by side: the removed line on the left, the added one on the right.
+    Pair {
+        block: usize,
+        left: Option<usize>,
+        right: Option<usize>,
+    },
     Hunk(SharedString),
     Notice(SharedString),
 }
@@ -118,11 +124,12 @@ struct Body {
     blocks: Arc<Vec<Block>>,
     message: Option<String>,
     stageable: bool,
+    split: bool,
     rows: Vec<Row>,
     columns: usize,
     digits: usize,
 }
-fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body {
+fn build_body(file: &DiffFile, message: Option<String>, stageable: bool, split: bool) -> Body {
     let mut rows = Vec::new();
     let (mut columns, mut digits) = (40, 3);
     if let Some(text) = &message {
@@ -145,6 +152,58 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
                     kind: RowKind::Hunk(hunk_range(lines).into()),
                     height: HUNK,
                 });
+            }
+            if split {
+                let (mut dels, mut adds): (Vec<usize>, Vec<usize>) = (vec![], vec![]);
+                let flush = |rows: &mut Vec<Row>, dels: &mut Vec<usize>, adds: &mut Vec<usize>| {
+                    for k in 0..dels.len().max(adds.len()) {
+                        rows.push(Row {
+                            file: 0,
+                            kind: RowKind::Pair {
+                                block: b,
+                                left: dels.get(k).copied(),
+                                right: adds.get(k).copied(),
+                            },
+                            height: LINE,
+                        });
+                    }
+                    dels.clear();
+                    adds.clear();
+                };
+                for (i, line) in lines.iter().enumerate() {
+                    match line.kind {
+                        LineKind::Del => dels.push(i),
+                        LineKind::Add => adds.push(i),
+                        LineKind::Hunk => {
+                            flush(&mut rows, &mut dels, &mut adds);
+                            rows.push(Row {
+                                file: 0,
+                                kind: RowKind::Hunk(line.text.clone().into()),
+                                height: HUNK,
+                            });
+                        }
+                        _ => {
+                            flush(&mut rows, &mut dels, &mut adds);
+                            rows.push(Row {
+                                file: 0,
+                                kind: RowKind::Pair {
+                                    block: b,
+                                    left: Some(i),
+                                    right: Some(i),
+                                },
+                                height: LINE,
+                            });
+                        }
+                    }
+                    if line.kind != LineKind::Hunk {
+                        columns = columns.max(diff::visual_columns(&line.text));
+                        digits = digits
+                            .max(line.old_number.unwrap_or(0).to_string().len())
+                            .max(line.new_number.unwrap_or(0).to_string().len());
+                    }
+                }
+                flush(&mut rows, &mut dels, &mut adds);
+                continue;
             }
             for (i, line) in lines.iter().enumerate() {
                 if line.kind == LineKind::Hunk {
@@ -178,6 +237,7 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
         blocks: file.blocks.clone(),
         message,
         stageable,
+        split,
         rows,
         columns,
         digits,
@@ -292,6 +352,9 @@ pub(crate) struct DiffView {
     number_width: f32,
     list: ListState,
     scroll_x: f32,
+    /// Side by side instead of unified; `allow_split` shows the toggle.
+    split: bool,
+    pub(crate) allow_split: bool,
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     char_width: Cell<Option<f32>>,
     hovered: Option<usize>,
@@ -345,6 +408,8 @@ impl DiffView {
             number_width: 36.,
             list,
             scroll_x: 0.,
+            split: false,
+            allow_split: false,
             viewport: Rc::default(),
             char_width: Cell::new(None),
             hovered: None,
@@ -404,12 +469,33 @@ impl DiffView {
         }
     }
 
+    /// Scrolls to a file and opens it, even when it is the one already focused.
+    pub(crate) fn reveal_file(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        self.focus_id = Some(id.clone());
+        if self.open.insert(id.clone()) {
+            self.rebuild(cx);
+        }
+        if let Some(&ix) = self.by_id.get(&id) {
+            self.pending = Some(ix);
+            self.apply_pending(cx);
+        }
+    }
+    pub(crate) fn set_split(&mut self, split: bool, cx: &mut Context<Self>) {
+        if self.split != split {
+            self.split = split;
+            self.rebuild(cx);
+        }
+    }
+
     fn row_key(&self, ix: usize) -> Option<RowKey> {
         let row = self.rows.get(ix)?;
         let id = self.files.get(row.file)?.id.clone();
         Some(match &row.kind {
             RowKind::File => RowKey(id, 0, 0, 0),
             RowKind::Line { block, line, .. } => RowKey(id, 1, *block, *line),
+            RowKind::Pair { block, left, right } => {
+                RowKey(id, 1, *block, left.or(*right).unwrap_or(0))
+            }
             RowKind::Hunk(_) => RowKey(id, 2, ix, 0),
             RowKind::Notice(_) => RowKey(id, 3, 0, 0),
         })
@@ -440,10 +526,13 @@ impl DiffView {
                 !Arc::ptr_eq(&b.blocks, &file.blocks)
                     || b.message != message
                     || b.stageable != stageable
+                    || b.split != self.split
             });
             if stale {
-                self.bodies
-                    .insert(file.id.clone(), build_body(file, message, stageable));
+                self.bodies.insert(
+                    file.id.clone(),
+                    build_body(file, message, stageable, self.split),
+                );
             }
             let body = &self.bodies[&file.id];
             let expanded = self.open.contains(&file.id);
@@ -700,9 +789,13 @@ impl DiffView {
         (self.max_columns as f32 + 2.) * self.char_width.get().unwrap_or(7.5) + 24.
     }
     fn lane_width(&self) -> f32 {
-        self.viewport
-            .get()
-            .map_or(0., |b| b.size.width.as_f32() - self.gutter_width())
+        self.viewport.get().map_or(0., |b| {
+            if self.split {
+                (b.size.width.as_f32() - 2. * (self.number_width + 3.)) / 2.
+            } else {
+                b.size.width.as_f32() - self.gutter_width()
+            }
+        })
     }
     fn max_scroll_x(&self) -> f32 {
         (self.code_width() - self.lane_width()).max(0.)
@@ -923,6 +1016,25 @@ impl DiffView {
                             }),
                     )
                     .child(div().mx_1().h(px(12.)).w(px(1.)).bg(stroke()))
+                    .when(self.allow_split, |d| {
+                        let split = self.split;
+                        d.child(
+                            tool_button(
+                                "split-view",
+                                if split {
+                                    "Unified view"
+                                } else {
+                                    "Side by side"
+                                },
+                                "sidebar",
+                                true,
+                            )
+                            .when(split, |d| d.bg(content(0.1)))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.set_split(!split, cx)),
+                            ),
+                        )
+                    })
                     .child(
                         tool_button("expand-all", "Expand all files", "unfold-vertical", true)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1106,6 +1218,150 @@ impl DiffView {
                         .child(text),
                 )
                 .into_any_element(),
+            RowKind::Pair { block, left, right } => {
+                let file = &self.files[row.file];
+                let Some(lines) = file.blocks.get(block).map(|b| b.lines()) else {
+                    return div().h(px(LINE)).into_any_element();
+                };
+                let scroll_x = self.scroll_x;
+                let hovered = self.hovered == Some(ix);
+                let file_ix = row.file;
+                let slot = self.action_slots.entry(ix).or_default().clone();
+                let comment_target = right.or(left).and_then(|i| lines.get(i)).cloned();
+                let mut halves = Vec::new();
+                for (side, index) in [(0usize, left), (1usize, right)] {
+                    let l = index.and_then(|i| lines.get(i));
+                    let ink: Option<Hsla> = match l.map(|l| l.kind) {
+                        Some(LineKind::Add) => Some(rgb(DIFF_ADD).into()),
+                        Some(LineKind::Del) => Some(rgb(DIFF_DEL).into()),
+                        _ => None,
+                    };
+                    let number = l.and_then(|l| {
+                        if side == 0 {
+                            l.old_number
+                        } else {
+                            l.new_number
+                        }
+                    });
+                    let text = l
+                        .map(|l| expand_tabs(&l.text).into_owned())
+                        .unwrap_or_default();
+                    let styles: Vec<_> = match (l, index) {
+                        (Some(_), Some(i)) => self
+                            .tokens(file, block, i)
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|span| span.range.end <= text.len())
+                            .map(|span| {
+                                (
+                                    span.range.clone(),
+                                    HighlightStyle {
+                                        color: Some(rgb(span.color).into()),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect(),
+                        _ => vec![],
+                    };
+                    let half = div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .when(side == 1, |d| d.border_l_1().border_color(content(0.07)))
+                        .when_some(ink, |d, ink| d.bg(ink.opacity(0.06)))
+                        .when(l.is_none(), |d| d.bg(content(0.025)))
+                        .child(
+                            div()
+                                .w(px(3.))
+                                .flex_shrink_0()
+                                .when_some(ink, |d, ink| d.bg(ink.opacity(0.55))),
+                        )
+                        .child(
+                            div()
+                                .w(px(number_width))
+                                .flex_shrink_0()
+                                .pr_2()
+                                .text_right()
+                                .text_size(px(11.))
+                                .font_features(tabular())
+                                .text_color(ink.unwrap_or(content(0.4)))
+                                .child(number.map(|n| n.to_string()).unwrap_or_default()),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(-scroll_x))
+                                        .pl_3()
+                                        .pr_6()
+                                        .whitespace_nowrap()
+                                        .font_family(crate::fonts::mono())
+                                        .text_size(px(CODE_SIZE))
+                                        .text_color(content(0.92))
+                                        .child(StyledText::new(text).with_highlights(styles)),
+                                ),
+                        );
+                    halves.push(half);
+                }
+                let _ = window;
+                div()
+                    .id(("diff-pair", ix))
+                    .relative()
+                    .h(px(LINE))
+                    .w_full()
+                    .flex()
+                    .line_height(px(LINE))
+                    .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+                        let next = if *hovering {
+                            Some(ix)
+                        } else if this.hovered == Some(ix) {
+                            None
+                        } else {
+                            this.hovered
+                        };
+                        if next != this.hovered {
+                            this.hovered = next;
+                            cx.notify();
+                        }
+                    }))
+                    .children(halves)
+                    .when(hovered && comment_target.is_some(), |d| {
+                        let line = comment_target.clone().unwrap();
+                        d.child(
+                            div()
+                                .id(("diff-comment", ix))
+                                .role(Role::Button)
+                                .aria_label("Comment on line")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right(px(6.))
+                                .w(px(22.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(content(0.08))
+                                .hover(|s| s.bg(content(0.16)))
+                                .child(slot.probe())
+                                .child(icon("comment-add", 12.).text_color(content(1.)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_comment(file_ix, line.clone(), ix, window, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
             RowKind::Line { block, line, stage } => {
                 let file = &self.files[row.file];
                 let Some(l) = file.blocks.get(block).and_then(|b| b.lines().get(line)) else {
@@ -1477,7 +1733,7 @@ impl Render for DiffView {
             .partition_point(|o| *o <= self.offsets.get(top).copied().unwrap_or(0.) + height);
         let mut visible: Vec<usize> = self.rows[top.min(self.rows.len())..end.min(self.rows.len())]
             .iter()
-            .filter(|r| matches!(r.kind, RowKind::Line { .. }))
+            .filter(|r| matches!(r.kind, RowKind::Line { .. } | RowKind::Pair { .. }))
             .map(|r| r.file)
             .collect();
         visible.dedup();
@@ -1921,9 +2177,61 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn split_bodies_pair_removed_and_added_lines() {
+        let line = |kind, text: &str| Line {
+            kind,
+            text: text.into(),
+            old_number: None,
+            new_number: None,
+            chunk: None,
+        };
+        let file = DiffFile {
+            id: "f".into(),
+            path: "f".into(),
+            label: "f".into(),
+            binary: false,
+            too_large: false,
+            empty_message: None,
+            additions: 3,
+            deletions: 1,
+            blocks: Arc::new(vec![Block::Hunk {
+                lines: vec![
+                    line(LineKind::Context, "keep"),
+                    line(LineKind::Del, "old"),
+                    line(LineKind::Add, "new1"),
+                    line(LineKind::Add, "new2"),
+                    line(LineKind::Context, "tail"),
+                ],
+                chunk: None,
+            }]),
+            can_stage: false,
+            can_discard: false,
+            can_stage_hunk: false,
+        };
+        let body = build_body(&file, None, false, true);
+        let pairs = body
+            .rows
+            .iter()
+            .filter_map(|r| match r.kind {
+                RowKind::Pair { left, right, .. } => Some((left, right)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                (Some(0), Some(0)),
+                (Some(1), Some(2)),
+                (None, Some(3)),
+                (Some(4), Some(4))
+            ]
+        );
+    }
+
+    #[test]
     fn bodies_number_hunks_and_mark_stageable_lines() {
         let f = file("a.rs", "one\ntwo\nthree\n", "one\nTWO\nthree\n");
-        let body = build_body(&f, f.message(), true);
+        let body = build_body(&f, f.message(), true, false);
         assert!(
             matches!(&body.rows[0].kind, RowKind::Hunk(text) if text.as_ref() == "@@ -1,3 +1,3 @@")
         );
@@ -1941,7 +2249,7 @@ mod tests {
             ..f.clone()
         };
         assert!(
-            matches!(&build_body(&binary, binary.message(), true).rows[0].kind,
+            matches!(&build_body(&binary, binary.message(), true, false).rows[0].kind,
             RowKind::Notice(t) if t.as_ref() == "Binary file changed")
         );
         assert_eq!(expand_tabs("\tab\tc"), "    ab  c");

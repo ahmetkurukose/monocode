@@ -1052,7 +1052,7 @@ impl Inbox {
             );
         let body = match self.tab {
             Tab::Summary => self.summary_view(&item, window, cx),
-            Tab::Code => self.diff_view(),
+            Tab::Code => self.diff_view(cx),
             Tab::Checks => self.checks_view(cx),
         };
         div()
@@ -2031,7 +2031,88 @@ impl Inbox {
             .into_any_element()
     }
 
-    fn diff_view(&self) -> AnyElement {
+    fn diff_tree(&self, diff: &Diff, cx: &mut Context<Self>) -> AnyElement {
+        let rows = diff::tree_rows(diff, &self.diff_collapsed);
+        div()
+            .id("inbox-diff-tree")
+            .role(Role::Tree)
+            .aria_label("Changed files")
+            .w(px(260.))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(content(0.07))
+            .py(px(6.))
+            .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                let path = row.path.clone();
+                let selected = !row.dir && self.diff_selected.as_deref() == Some(row.path.as_str());
+                let folded = row.dir && self.diff_collapsed.contains(&row.path);
+                let name = row
+                    .label
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&row.label)
+                    .to_owned();
+                div()
+                    .id(("inbox-diff-tree-row", ix))
+                    .role(Role::TreeItem)
+                    .aria_label(SharedString::from(row.label.clone()))
+                    .h(px(26.))
+                    .mx(px(6.))
+                    .pl(px(6. + row.depth as f32 * 12.))
+                    .pr(px(6.))
+                    .rounded(px(5.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(content(if selected { 1. } else { 0.75 }))
+                    .when(selected, |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.06)))
+                    .child(div().w(px(12.)).flex_shrink_0().when(row.dir, |d| {
+                        d.child(
+                            icon(
+                                if folded {
+                                    "chevron-right"
+                                } else {
+                                    "chevron-down"
+                                },
+                                11.,
+                            )
+                            .text_color(content(0.45)),
+                        )
+                    }))
+                    .child(crate::file_icons::file_type_icon(
+                        &name, row.dir, !folded, 14.,
+                    ))
+                    .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                    .child(crate::diff_view::diff_counts(
+                        row.additions.max(0) as u32,
+                        row.deletions.max(0) as u32,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if row.dir {
+                            if !this.diff_collapsed.remove(&path) {
+                                this.diff_collapsed.insert(path.clone());
+                            }
+                        } else {
+                            this.diff_selected = Some(path.clone());
+                            this.show_diff_file(cx);
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn diff_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tree = self
+            .diff
+            .as_ref()
+            .filter(|diff| diff.files.len() > 1)
+            .map(|diff| self.diff_tree(diff, cx));
         div()
             .min_h_0()
             .flex_1()
@@ -2040,7 +2121,20 @@ impl Inbox {
             .when(self.extra_loading, |d| d.child(message("Loading changes…")))
             .when_some(self.extra_error.clone(), |d, text| d.child(error(text)))
             .when(self.diff.is_some(), |d| {
-                d.child(div().flex_1().min_h_0().child(self.diff_view.clone()))
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .when_some(tree, |d, tree| d.child(tree))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.diff_view.clone()),
+                        ),
+                )
             })
             .when(self.diff.as_ref().is_some_and(|diff| diff.truncated), |d| {
                 d.child(message(
@@ -2119,6 +2213,8 @@ impl Inbox {
                 "inbox-assigned",
                 if matches!(self.state.source.as_str(), "gitlab" | "azuredevops") {
                     "Needs my attention"
+                } else if self.state.source == "github" {
+                    "Assigned or review requested"
                 } else {
                     "Assigned to me"
                 },
