@@ -1,0 +1,54 @@
+name: Upstream watch
+
+# Fork-only: tells us when hardbeat920/monocode ships a new native preview that
+# AK/monocode_enhancements has not been rebased onto yet, and whether the
+# rebase would apply cleanly. Opens (or updates) one issue per release.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    if: github.repository == 'ahmetkurukose/monocode'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: AK/monocode_enhancements
+          fetch-depth: 0
+      - name: Look for a newer upstream preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/hardbeat920/monocode.git
+          git fetch upstream --tags --quiet
+          latest=$(git tag -l 'native-v*' | sort -V | tail -1)
+          if git merge-base --is-ancestor "$latest" HEAD; then
+            echo "Already on top of $latest."
+            exit 0
+          fi
+          git config user.name "upstream-watch"
+          git config user.email "upstream-watch@users.noreply.github.com"
+          git checkout --quiet -b trial
+          if git rebase "$latest" >/tmp/rebase.log 2>&1; then
+            verdict="The rebase applies cleanly."
+          else
+            files=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            verdict=$(printf 'The rebase stops on conflicts in:\n\n%s' "$files")
+            git rebase --abort || true
+          fi
+          ahead=$(git rev-list --count "AK/monocode_enhancements..$latest" 2>/dev/null || echo '?')
+          title="Upstream $latest is available"
+          body=$(printf '%s\n\n%s commits to bring in. Run `scripts/sync-upstream.sh --rebase --install` on the Mac.\n\nUpstream release: https://github.com/hardbeat920/monocode/releases/tag/%s\n' "$verdict" "$ahead" "$latest")
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
