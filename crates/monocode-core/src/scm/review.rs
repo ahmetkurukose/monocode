@@ -245,6 +245,38 @@ pub fn file_diff(cwd: &Path, relative: &str, staged: bool) -> Result<FileDiff, S
     ))
 }
 
+/// One file's working-tree content against HEAD, whatever is staged: what a
+/// commit of that file would record. Remote workspaces fall back to the
+/// unstaged side.
+pub fn file_diff_head(cwd: &Path, relative: &str) -> Result<FileDiff, String> {
+    if remote_workspace::is_remote(cwd) {
+        return file_diff(cwd, relative, false);
+    }
+    let root = expand_home(cwd);
+    let relative = resolve_repo_path(&root, relative)?;
+    let abs = root.join(&relative);
+    if !git_is_work_tree(&root) {
+        return Err("Not a git repository".into());
+    }
+    let prefix = git_stdout(&root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let original = git_blob(&root, &format!("HEAD:{prefix}{relative}"));
+    let current = abs
+        .is_file()
+        .then(|| std::fs::read(&abs).unwrap_or_default());
+    let status = match (original.is_some(), current.is_some()) {
+        (false, true) => "added",
+        (true, false) => "deleted",
+        _ => "modified",
+    };
+    Ok(text_diff(
+        path_to_js(&abs),
+        relative,
+        status,
+        original.unwrap_or_default(),
+        current.unwrap_or_default(),
+    ))
+}
+
 /// The files a commit changed, against its first parent (or nothing).
 pub fn commit_files(cwd: &Path, sha: &str) -> Result<Vec<ChangedFile>, String> {
     if remote_workspace::is_remote(cwd) {
@@ -368,7 +400,7 @@ pub fn stage_contents(cwd: &Path, relative: &str, contents: &[u8]) -> Result<(),
     )
 }
 
-fn text_diff(
+pub(super) fn text_diff(
     path: String,
     relative: String,
     status: &str,
@@ -396,7 +428,7 @@ fn text_diff(
         too_large,
     }
 }
-fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
+pub(super) fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
     git_output(root, &["cat-file", "-p", spec])
 }
 fn peel_commit(root: &Path, spec: &str) -> Result<String, String> {

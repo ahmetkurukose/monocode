@@ -3,6 +3,7 @@
 mod review;
 pub(crate) mod shell;
 pub(crate) mod text;
+mod update;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -15,10 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use review::{
-    commit_file_diff, commit_files, diff_files, file_diff, file_diff_versions, review_index,
-    stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
+    commit_file_diff, commit_files, diff_files, file_diff, file_diff_head, file_diff_versions,
+    review_index, stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
 };
 pub(crate) use shell::{expand_home, path_to_js};
+pub use update::{
+    abort_update, merge_branch, range_file_diff, update_project, IncomingCommit, UpdateMethod,
+    UpdateReport,
+};
 
 /// The PATH a login terminal would have, for shells the app starts: a
 /// Finder-launched app inherits launchd's bare PATH.
@@ -243,6 +248,59 @@ pub fn commit(cwd: &Path, message: &str, amend: bool) -> Result<(), String> {
     commit_args(&expand_home(cwd), message, extra)
 }
 
+/// Commit exactly `paths` (working-tree content, new and deleted files
+/// included) and leave every other staged entry staged.
+pub fn commit_paths(
+    cwd: &Path,
+    message: &str,
+    paths: &[String],
+    amend: bool,
+) -> Result<(), String> {
+    if remote_workspace::is_remote(cwd) {
+        if amend {
+            return Err("Amending selected files is not supported on remote workspaces".into());
+        }
+        return remote_workspace::command(
+            "git_commit",
+            json!({"cwd":cwd,"message":message,"amend":false,"paths":paths}),
+        );
+    }
+    let root = expand_home(cwd);
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("Commit message cannot be empty".into());
+    }
+    if paths.is_empty() && !amend {
+        return Err("Select at least one file".into());
+    }
+    let mut selected = Vec::with_capacity(paths.len());
+    for path in paths {
+        selected.push(resolve_repo_path(&root, path)?);
+    }
+    // `add -A` makes new files eligible for `--only`; staged deletions no
+    // longer match `add` but still match `commit`.
+    let existing: Vec<&str> = selected
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(root.join(path)).is_ok())
+        .map(String::as_str)
+        .collect();
+    if !existing.is_empty() {
+        let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
+        add.extend(existing);
+        git_checked(&root, &add)?;
+    }
+    let mut args = vec!["--literal-pathspecs", "commit", "--only"];
+    if amend {
+        args.push("--amend");
+    }
+    args.extend(["--cleanup=strip", "-m", message]);
+    if !selected.is_empty() {
+        args.push("--");
+        args.extend(selected.iter().map(String::as_str));
+    }
+    git_checked(&root, &args).map_err(with_signing_hint)
+}
+
 /// Full message (subject and body) of the commit at HEAD.
 pub fn head_message(cwd: &Path) -> Result<String, String> {
     if remote_workspace::is_remote(cwd) {
@@ -313,6 +371,65 @@ pub fn staged_context(cwd: &Path) -> Result<StagedContext, String> {
 
     Ok(StagedContext {
         branch: git_branch(root),
+        summary,
+        patch,
+    })
+}
+
+/// What a commit of exactly `paths` would record, for message generation: the
+/// chosen files against HEAD, read through a scratch index so the real one is
+/// untouched. Remote workspaces describe their staged changes instead.
+pub fn selected_context(cwd: &Path, paths: &[String]) -> Result<StagedContext, String> {
+    if remote_workspace::is_remote(cwd) {
+        return staged_context(cwd);
+    }
+    let root = expand_home(cwd);
+    if paths.is_empty() {
+        return Err("Select at least one file".into());
+    }
+    let mut selected = Vec::with_capacity(paths.len());
+    for path in paths {
+        selected.push(resolve_repo_path(&root, path)?);
+    }
+    let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let index = scratch.path().join("index");
+    let run = |args: &[&str]| -> Result<String, String> {
+        let output = git_cmd()
+            .arg("--literal-pathspecs")
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    if git_stdout(&root, &["rev-parse", "--verify", "HEAD"]).is_some() {
+        run(&["read-tree", "HEAD"])?;
+    } else {
+        run(&["read-tree", "--empty"])?;
+    }
+    let mut add = vec!["add", "-A", "--"];
+    add.extend(selected.iter().map(String::as_str));
+    run(&add)?;
+    let summary = run(&["diff", "--cached", "--stat", "--no-renames"])?;
+    let patch = run(&[
+        "diff",
+        "--cached",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+    ])?;
+    if summary.trim().is_empty() && patch.trim().is_empty() {
+        return Err("No changes to summarize".into());
+    }
+    Ok(StagedContext {
+        branch: git_branch(&root),
         summary,
         patch,
     })
@@ -1161,7 +1278,7 @@ fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) 
     let args = args.strip_prefix(&["--literal-pathspecs"]).unwrap_or(args);
     if matches!(
         args.first().copied(),
-        Some("commit" | "push" | "pull" | "fetch" | "clone")
+        Some("commit" | "push" | "pull" | "fetch" | "clone" | "merge" | "rebase")
     ) {
         // Signers, hooks, and credential helpers may only be on the login-shell PATH.
         cmd.env("PATH", gui_path());

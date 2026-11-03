@@ -1032,3 +1032,234 @@ fn commit_files_and_diffs_include_the_root_commit() {
     assert_eq!(commit_files(dir.path(), &root).unwrap().len(), 1);
     assert!(commit_files(dir.path(), "not-a-sha").is_err());
 }
+
+#[test]
+fn commit_paths_commits_only_the_chosen_files_and_keeps_other_staged_entries() {
+    let dir = tmp();
+    assert!(init_git_commit(
+        dir.path(),
+        &[("a.txt", "a\n"), ("b.txt", "b\n"), ("gone.txt", "g\n")]
+    ));
+    std::fs::write(dir.path().join("a.txt"), "a2\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b2\n").unwrap();
+    std::fs::write(dir.path().join("new.txt"), "n\n").unwrap();
+    std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+    std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+    assert!(git(dir.path(), &["add", "b.txt"]));
+
+    commit_paths(
+        dir.path(),
+        "pick",
+        &["a.txt".into(), "new.txt".into(), "gone.txt".into()],
+        false,
+    )
+    .unwrap();
+
+    let names = git_stdout(dir.path(), &["show", "--name-status", "--format=", "HEAD"]).unwrap();
+    let mut lines: Vec<_> = names.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["A\tnew.txt", "D\tgone.txt", "M\ta.txt"]);
+    // b.txt stays staged, other.txt stays untracked.
+    let status = git_stdout(dir.path(), &["status", "--porcelain"]).unwrap();
+    assert!(status.contains("M  b.txt"), "{status}");
+    assert!(status.contains("?? other.txt"), "{status}");
+    assert!(commit_paths(dir.path(), " ", &["b.txt".into()], false).is_err());
+    assert!(commit_paths(dir.path(), "m", &[], false).is_err());
+    assert!(commit_paths(dir.path(), "m", &["../x".into()], false).is_err());
+}
+
+#[test]
+fn commit_paths_amend_without_files_rewrites_only_the_message() {
+    let dir = tmp();
+    assert!(init_git_commit(dir.path(), &[("a.txt", "a\n")]));
+    std::fs::write(dir.path().join("a.txt"), "a2\n").unwrap();
+    commit_paths(dir.path(), "reworded", &[], true).unwrap();
+    assert_eq!(head_message(dir.path()).unwrap().trim(), "reworded");
+    let status = git_stdout(dir.path(), &["status", "--porcelain"]).unwrap();
+    assert!(status.contains("M a.txt"), "{status}");
+}
+
+#[test]
+fn file_diff_head_compares_the_working_tree_with_head_whatever_is_staged() {
+    let dir = tmp();
+    assert!(init_git_commit(dir.path(), &[("a.txt", "one\n")]));
+    std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+    assert!(git(dir.path(), &["add", "a.txt"]));
+    std::fs::write(dir.path().join("a.txt"), "three\n").unwrap();
+    std::fs::write(dir.path().join("new.txt"), "n\n").unwrap();
+    let diff = file_diff_head(dir.path(), "a.txt").unwrap();
+    assert_eq!(
+        (diff.original.as_str(), diff.current.as_str()),
+        ("one\n", "three\n")
+    );
+    assert_eq!(
+        file_diff_head(dir.path(), "new.txt").unwrap().status,
+        "added"
+    );
+}
+
+#[test]
+fn selected_context_describes_only_the_chosen_files_and_leaves_the_index_alone() {
+    let dir = tmp();
+    assert!(init_git_commit(
+        dir.path(),
+        &[("a.txt", "a\n"), ("b.txt", "b\n")]
+    ));
+    std::fs::write(dir.path().join("a.txt"), "a2\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b2\n").unwrap();
+    std::fs::write(dir.path().join("new.txt"), "n\n").unwrap();
+    let context = selected_context(dir.path(), &["a.txt".into(), "new.txt".into()]).unwrap();
+    assert!(context.patch.contains("a2") && context.patch.contains("+n"));
+    assert!(!context.patch.contains("b2"));
+    assert!(context.summary.contains("new.txt") && !context.summary.contains("b.txt"));
+    assert_eq!(
+        git_stdout(dir.path(), &["diff", "--cached", "--name-only"]).unwrap_or_default(),
+        ""
+    );
+    assert!(selected_context(dir.path(), &[]).is_err());
+}
+
+/// A bare origin with two clones, `a` and `b`, both on main at the same commit.
+fn two_clones() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let root = tmp();
+    let origin = root.path().join("origin.git");
+    let (a, b) = (root.path().join("a"), root.path().join("b"));
+    std::fs::create_dir_all(&origin).unwrap();
+    assert!(init_bare(&origin));
+    assert!(git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]));
+    std::fs::create_dir_all(&a).unwrap();
+    assert!(init_git_commit(
+        &a,
+        &[("shared.txt", "one\n"), ("keep.txt", "k\n")]
+    ));
+    assert!(git(
+        &a,
+        &["remote", "add", "origin", origin.to_str().unwrap()]
+    ));
+    assert!(git(&a, &["push", "-u", "origin", "main"]));
+    assert!(git(root.path(), &["clone", origin.to_str().unwrap(), "b"]));
+    assert!(git(&b, &["config", "user.name", "MonoCode"]));
+    assert!(git(&b, &["config", "user.email", "monocode@test"]));
+    assert!(git(&b, &["config", "commit.gpgsign", "false"]));
+    (root, a, b)
+}
+
+#[test]
+fn update_project_fetches_merges_and_reports_commits_and_files() {
+    let (_root, a, b) = two_clones();
+    std::fs::write(a.join("shared.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(a.join("added.txt"), "new\n").unwrap();
+    assert!(git(&a, &["add", "."]) && git(&a, &["commit", "-m", "first"]));
+    std::fs::write(a.join("keep.txt"), "k2\n").unwrap();
+    assert!(git(&a, &["commit", "-am", "second"]) && git(&a, &["push"]));
+
+    let report = update_project(&b, UpdateMethod::Merge).unwrap();
+    assert_eq!(
+        report
+            .commits
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+    assert_ne!(report.old, report.new);
+    let files: Vec<_> = report
+        .files
+        .iter()
+        .map(|f| (f.relative.as_str(), f.status.as_str()))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("added.txt", "added"),
+            ("keep.txt", "modified"),
+            ("shared.txt", "modified")
+        ]
+    );
+    assert!(report.conflicts.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(b.join("shared.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+
+    let diff = range_file_diff(&b, &report.old, &report.new, "shared.txt").unwrap();
+    assert_eq!(
+        (diff.original.as_str(), diff.current.as_str()),
+        ("one\n", "one\ntwo\n")
+    );
+
+    // Nothing more to bring in.
+    let again = update_project(&b, UpdateMethod::Merge).unwrap();
+    assert!(again.commits.is_empty() && again.files.is_empty() && again.old == again.new);
+}
+
+#[test]
+fn update_project_rebases_local_commits_onto_the_upstream() {
+    let (_root, a, b) = two_clones();
+    std::fs::write(a.join("keep.txt"), "remote\n").unwrap();
+    assert!(git(&a, &["commit", "-am", "remote change"]) && git(&a, &["push"]));
+    std::fs::write(b.join("local.txt"), "l\n").unwrap();
+    assert!(git(&b, &["add", "."]) && git(&b, &["commit", "-m", "local change"]));
+    let report = update_project(&b, UpdateMethod::Rebase).unwrap();
+    assert!(report.rebase && report.conflicts.is_empty());
+    let log = git_stdout(&b, &["log", "--format=%s", "-3"]).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        ["local change", "remote change", "init"]
+    );
+    assert_eq!(
+        git_stdout(&b, &["rev-list", "--merges", "--count", "HEAD"]).unwrap(),
+        "0"
+    );
+}
+
+#[test]
+fn update_project_stops_on_conflicts_and_can_be_aborted() {
+    let (_root, a, b) = two_clones();
+    std::fs::write(a.join("shared.txt"), "from a\n").unwrap();
+    assert!(git(&a, &["commit", "-am", "a edit"]) && git(&a, &["push"]));
+    std::fs::write(b.join("shared.txt"), "from b\n").unwrap();
+    assert!(git(&b, &["commit", "-am", "b edit"]));
+    let before = git_stdout(&b, &["rev-parse", "HEAD"]).unwrap();
+    let report = update_project(&b, UpdateMethod::Merge).unwrap();
+    assert_eq!(report.conflicts, ["shared.txt"]);
+    assert_eq!(report.old, report.new);
+    abort_update(&b).unwrap();
+    assert_eq!(git_stdout(&b, &["rev-parse", "HEAD"]).unwrap(), before);
+    assert!(git_stdout(&b, &["status", "--porcelain"])
+        .unwrap_or_default()
+        .is_empty());
+    assert!(abort_update(&b).is_err());
+}
+
+#[test]
+fn update_project_needs_an_upstream() {
+    let dir = tmp();
+    assert!(init_git_commit(dir.path(), &[("a.txt", "a\n")]));
+    assert!(update_project(dir.path(), UpdateMethod::Merge)
+        .unwrap_err()
+        .contains("upstream"));
+}
+
+#[test]
+fn merge_branch_brings_in_another_branch_and_reports_it() {
+    let dir = tmp();
+    assert!(init_git_commit(dir.path(), &[("a.txt", "a\n")]));
+    assert!(git(dir.path(), &["switch", "-c", "feature"]));
+    std::fs::write(dir.path().join("f.txt"), "f\n").unwrap();
+    assert!(git(dir.path(), &["add", "."]) && git(dir.path(), &["commit", "-m", "feature work"]));
+    assert!(git(dir.path(), &["switch", "main"]));
+    let report = merge_branch(dir.path(), "feature").unwrap();
+    assert_eq!(report.upstream, "feature");
+    assert_eq!(report.commits.len(), 1);
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].relative, "f.txt");
+    assert!(dir.path().join("f.txt").exists());
+    // Merging again changes nothing.
+    assert!(merge_branch(dir.path(), "feature")
+        .unwrap()
+        .commits
+        .is_empty());
+    assert!(merge_branch(dir.path(), "nope").is_err());
+    assert!(merge_branch(dir.path(), "--abort").is_err());
+}
