@@ -412,6 +412,7 @@ pub(crate) fn git_action(
                 harness,
                 root.to_path_buf(),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )?;
             Ok(json!({ "message": message }))
         }

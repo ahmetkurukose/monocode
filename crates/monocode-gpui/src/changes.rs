@@ -3,14 +3,18 @@
 //! and unstaged files as a list or a tree. Every Git call runs off-thread,
 //! one mutation at a time per checkout.
 use crate::{
+    commit_dialog::{CommitDialog, CommitDialogEvent},
     file_icons::file_type_icon,
+    git_picker::{GitPicker, Mode as GitMode, Picked as GitPicked},
     git_status::{GitChanged, ProjectGit},
     input::{self, Input},
     popover::{
-        Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, menu_popover,
+        Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
+        menu_popover, popover,
     },
     right_panel::*,
     theme::*,
+    update_dialog::{Source, UpdateDialog, UpdateDialogEvent},
 };
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FontWeight, Hsla, PromptLevel, Role,
@@ -19,7 +23,7 @@ use gpui::{
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
-    scm::{self, ChangedFile, DiffIndex, Pr},
+    scm::{self, ChangedFile, DiffIndex, Pr, UpdateMethod},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -237,6 +241,10 @@ pub(crate) struct Changes {
     menu: Option<OpenMenu>,
     branch_anchor: AnchorSlot,
     commit_anchor: AnchorSlot,
+    commit_dialog: Option<(Entity<CommitDialog>, Subscription)>,
+    update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
+    branch_picker: Option<(Entity<GitPicker>, Subscription)>,
+    switch_anchor: AnchorSlot,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<ChangesEvent> for Changes {}
@@ -273,6 +281,10 @@ impl Changes {
             menu: None,
             branch_anchor: AnchorSlot::default(),
             commit_anchor: AnchorSlot::default(),
+            commit_dialog: None,
+            update_dialog: None,
+            branch_picker: None,
+            switch_anchor: AnchorSlot::default(),
             _subscriptions: subscriptions,
         };
         this.rebuild(cx);
@@ -620,6 +632,111 @@ impl Changes {
         );
     }
 
+    /// IntelliJ's Commit window: pick files from a tree, review each diff.
+    pub(crate) fn open_commit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit_dialog.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        let git = self.git.clone();
+        let cwd = self.cwd.clone();
+        let draft = self.message.read(cx).content.to_string();
+        let provider = self.text_provider;
+        let dialog = cx.new(|cx| CommitDialog::new(git, cwd, draft, provider, window, cx));
+        let subscription = cx.subscribe_in(
+            &dialog,
+            window,
+            |this, _, event: &CommitDialogEvent, window, cx| {
+                this.commit_dialog = None;
+                match event {
+                    CommitDialogEvent::Close => {}
+                    CommitDialogEvent::Finished(error) => {
+                        this.message
+                            .update(cx, |m, cx| m.set_text(String::new(), cx));
+                        this.amend = None;
+                        this.mutated(cx);
+                        match error {
+                            None => this.set_status("Committed", cx),
+                            Some(error) => Self::fail(error.clone(), window, cx),
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+        self.commit_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    /// Fetch and merge (or rebase onto) the upstream, then show what came in.
+    pub(crate) fn open_update_dialog(
+        &mut self,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.update_dialog.is_some() || self.busy.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        let git = self.git.clone();
+        let cwd = self.cwd.clone();
+        let dialog = cx.new(|cx| UpdateDialog::new(git, cwd, source, window, cx));
+        let subscription = cx.subscribe(&dialog, |this, _, _: &UpdateDialogEvent, cx| {
+            this.update_dialog = None;
+            this.mutated(cx);
+            cx.notify();
+        });
+        self.update_dialog = Some((dialog, subscription));
+        cx.notify();
+    }
+
+    /// The branch switcher: search, check out, create, or merge into this one.
+    fn toggle_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branch_picker.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.busy.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        let current = self.index(cx).and_then(|i| i.branch);
+        let cwd = PathBuf::from(&self.cwd);
+        let picker = cx.new(|cx| GitPicker::new(cwd, GitMode::Branch, current, cx).with_merge());
+        let subscription =
+            cx.subscribe_in(&picker, window, |this, _, event: &GitPicked, window, cx| {
+                this.branch_picker = None;
+                match event {
+                    GitPicked::Changed => {
+                        this.mutated(cx);
+                        this.set_status("Switched branch", cx);
+                    }
+                    GitPicked::Merge(branch) => this.merge_branch(branch.clone(), window, cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        window.focus(&picker.read(cx).focus(cx), cx);
+        self.branch_picker = Some((picker, subscription));
+        cx.notify();
+    }
+
+    /// Merge `branch` into the current branch, after a confirmation.
+    fn merge_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.index(cx).and_then(|i| i.branch);
+        let message = match current {
+            Some(current) => format!("Merge \"{branch}\" into \"{current}\"?"),
+            None => format!("Merge \"{branch}\" into the current checkout?"),
+        };
+        let ask = Self::confirm(message, "Merge", window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if ask.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.open_update_dialog(Source::Merge(branch), window, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
     fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.index(cx);
         if !index.is_some_and(|i| i.remote.is_some() && i.upstream.is_some()) {
@@ -644,7 +761,7 @@ impl Changes {
     }
     /// pickTextHarness: the background model picked in Settings, else the
     /// conversation's provider when installed, else Claude Code, then Codex.
-    fn text_harness(&self, cx: &App) -> Option<TextHarness> {
+    pub(crate) fn text_harness(&self, cx: &App) -> Option<TextHarness> {
         let chosen = cx
             .try_global::<crate::settings::Preferences>()
             .and_then(|p| p.background_text_model());
@@ -671,7 +788,7 @@ impl Changes {
         let flag = cancel.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { generate_commit_message(harness, cwd, flag) });
+            .spawn(async move { generate_commit_message(harness, cwd, flag, None) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -895,6 +1012,14 @@ impl Changes {
                     .is_some_and(|i| i.remote.is_some() && i.upstream.is_some());
                 let pulling = self.busy.as_deref() == Some("pull");
                 vec![
+                    MenuAction::new("update", "Update Project")
+                        .icon("refresh-cw")
+                        .disabled(self.busy.is_some() || !can_pull)
+                        .into(),
+                    MenuAction::new("update-rebase", "Update Project (Rebase)")
+                        .disabled(self.busy.is_some() || !can_pull)
+                        .into(),
+                    MenuItem::Separator,
                     MenuAction::new("pull", if pulling { "Pulling…" } else { "Pull" })
                         .icon(if pulling { "loader" } else { "refresh-cw" })
                         .disabled(self.busy.is_some() || !can_pull)
@@ -904,6 +1029,10 @@ impl Changes {
             MenuKind::Commit => {
                 let (can_push, can_push_pr) = self.push_options(cx);
                 vec![
+                    MenuAction::new("dialog", "Commit…")
+                        .disabled(self.busy.is_some())
+                        .into(),
+                    MenuItem::Separator,
                     MenuAction::new("push", "Commit & Push")
                         .disabled(!can_push)
                         .into(),
@@ -918,7 +1047,7 @@ impl Changes {
             }
         };
         let (label, width) = match kind {
-            MenuKind::Branch => ("Branch actions", 144.),
+            MenuKind::Branch => ("Branch actions", 204.),
             MenuKind::Commit => ("Commit options", 192.),
         };
         let menu = cx.new(|cx| {
@@ -934,6 +1063,15 @@ impl Changes {
                 if let MenuEvent::Picked(id, _) = event {
                     match id.as_ref() {
                         "pull" => this.pull(window, cx),
+                        "update" => {
+                            this.open_update_dialog(Source::Update(UpdateMethod::Merge), window, cx)
+                        }
+                        "update-rebase" => this.open_update_dialog(
+                            Source::Update(UpdateMethod::Rebase),
+                            window,
+                            cx,
+                        ),
+                        "dialog" => this.open_commit_dialog(window, cx),
                         "push" => this.commit(true, false, window, cx),
                         "push-pr" => this.commit(true, true, window, cx),
                         "amend" => this.toggle_amend(window, cx),
@@ -974,12 +1112,30 @@ impl Changes {
         let index = index.unwrap_or_default();
         pane_header("changes-header", "Changes")
             .when_some(branch.clone(), |d, branch| {
+                let picker_open = self.branch_picker.is_some();
                 d.child(
                     div()
+                        .id("branch-switcher")
+                        .role(Role::Button)
+                        .aria_label("Switch branch")
+                        .aria_expanded(picker_open)
+                        .relative()
                         .min_w_0()
                         .flex()
                         .items_center()
                         .gap_1()
+                        .h(px(24.))
+                        .px_1()
+                        .rounded_md()
+                        .when(picker_open, |d| d.bg(content(0.1)))
+                        .when(!busy && !picker_open, |d| d.hover(|s| s.bg(content(0.05))))
+                        .when(!busy, |d| {
+                            d.cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_branch_picker(window, cx)
+                                }))
+                        })
+                        .child(self.switch_anchor.probe())
                         .child(icon("git-branch-hi", 12.).text_color(content(0.5)))
                         .child(div().min_w_0().truncate().child(branch))
                         .when(index.ahead > 0, |d| {
@@ -1001,7 +1157,8 @@ impl Changes {
                                     .text_color(content(0.4))
                                     .child(format!("↓{}", index.behind)),
                             )
-                        }),
+                        })
+                        .child(icon("chevron-down", 11.).text_color(content(0.4))),
                 )
             })
             .when(branch.is_none(), |d| {
@@ -1020,6 +1177,32 @@ impl Changes {
                 )
             })
             .child(div().ml_auto())
+            .when(index.upstream.is_some(), |d| {
+                d.child(
+                    icon_action("open-update-dialog", "Update Project", "refresh-cw", !busy).when(
+                        !busy,
+                        |d| {
+                            d.on_click(cx.listener(|this, _, window, cx| {
+                                this.open_update_dialog(
+                                    Source::Update(UpdateMethod::Merge),
+                                    window,
+                                    cx,
+                                )
+                            }))
+                        },
+                    ),
+                )
+            })
+            .child(
+                icon_action("open-commit-dialog", "Commit…", "git-commit", !busy).when(
+                    !busy,
+                    |d| {
+                        d.on_click(
+                            cx.listener(|this, _, window, cx| this.open_commit_dialog(window, cx)),
+                        )
+                    },
+                ),
+            )
             .when(branch.is_some(), |d| {
                 d.child(
                     div()
@@ -1829,9 +2012,13 @@ pub(crate) fn generate_commit_message(
     harness: TextHarness,
     cwd: PathBuf,
     cancel: Arc<AtomicBool>,
+    paths: Option<&[String]>,
 ) -> Result<String, String> {
     let kind = harness.0;
-    let context = scm::staged_context(&cwd)?;
+    let context = match paths {
+        Some(paths) => scm::selected_context(&cwd, paths)?,
+        None => scm::staged_context(&cwd)?,
+    };
     let prompt =
         scm::commit_message_prompt(context.branch.as_deref(), &context.summary, &context.patch);
     let output = text_prompt(harness, cwd, prompt, cancel)?;
@@ -1923,7 +2110,7 @@ fn text_prompt(
 }
 
 impl Render for Changes {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let available = !self.cwd.is_empty() && self.cwd != "~";
         if !available {
             return div()
@@ -1987,6 +2174,34 @@ impl Render for Changes {
                 ),
             })
             .children(menu)
+            .children(
+                self.commit_dialog
+                    .as_ref()
+                    .map(|(dialog, _)| crate::modal::window_overlay(window, dialog.clone())),
+            )
+            .children(
+                self.update_dialog
+                    .as_ref()
+                    .map(|(dialog, _)| crate::modal::window_overlay(window, dialog.clone())),
+            )
+            .children(self.branch_picker.as_ref().map(|(picker, _)| {
+                let weak = cx.weak_entity();
+                popover(
+                    "changes-branch-picker",
+                    Anchor::Slot(self.switch_anchor.clone()),
+                )
+                .side(Side::Bottom)
+                .align(Align::Start)
+                .width(320.)
+                .height(360.)
+                .on_dismiss(move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.branch_picker = None;
+                        cx.notify();
+                    });
+                })
+                .child(picker.clone())
+            }))
             .into_any_element()
     }
 }

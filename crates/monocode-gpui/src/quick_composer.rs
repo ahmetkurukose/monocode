@@ -594,7 +594,7 @@ impl QuickComposer {
                                 };
                                 this.load_git(cx);
                             }
-                            GitPicked::Dismissed => {}
+                            GitPicked::Merge(_) | GitPicked::Dismissed => {}
                         }
                         this.close_picker(window, cx);
                     },

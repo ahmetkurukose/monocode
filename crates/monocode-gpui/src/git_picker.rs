@@ -81,6 +81,8 @@ pub(crate) enum Picked {
     Changed,
     Base(String),
     Worktree(String),
+    /// Merge this branch into the current one (`with_merge` pickers only).
+    Merge(String),
     Dismissed,
 }
 pub(crate) struct GitPicker {
@@ -92,6 +94,7 @@ pub(crate) struct GitPicker {
     active: usize,
     busy: bool,
     existing_only: bool,
+    merge_action: bool,
     error: Option<String>,
     _changed: Subscription,
 }
@@ -154,6 +157,7 @@ impl GitPicker {
             active: 0,
             busy: false,
             existing_only: false,
+            merge_action: false,
             error: None,
             _changed: changed,
         }
@@ -168,6 +172,11 @@ impl GitPicker {
     /// already offers the project folder through Current checkout.
     pub(crate) fn existing_worktrees(mut self) -> Self {
         self.existing_only = true;
+        self
+    }
+    /// Branch rows get a Merge button beside the checkout they already do.
+    pub(crate) fn with_merge(mut self) -> Self {
+        self.merge_action = true;
         self
     }
     fn choices(&self, cx: &gpui::App) -> Vec<Choice> {
@@ -286,6 +295,7 @@ impl gpui::Render for GitPicker {
             .into_iter()
             .enumerate()
             .map(|(ix, choice)| {
+                let mut merge_target: Option<String> = None;
                 let (label, detail, selected, disabled, path) = match choice {
                     Choice::Branch(branch) => {
                         let full = branch
@@ -299,6 +309,9 @@ impl gpui::Render for GitPicker {
                                 && self.state.as_ref().and_then(|s| s.current.as_ref())
                                     == Some(&branch.name)
                         };
+                        if self.merge_action && self.mode == Mode::Branch && !selected {
+                            merge_target = Some(full);
+                        }
                         (branch.name, branch.remote, selected, false, "git-branch")
                     }
                     Choice::Create(name) => (
@@ -376,6 +389,36 @@ impl gpui::Render for GitPicker {
                             }),
                     )
                     .when(selected, |d| d.child(icon("check-2", 14.)))
+                    .when_some(merge_target, |d, target| {
+                        let busy = self.busy;
+                        d.child(
+                            div()
+                                .id(("git-option-merge", ix))
+                                .role(Role::Button)
+                                .aria_label(format!("Merge {target} into the current branch"))
+                                .flex_shrink_0()
+                                .h(px(22.))
+                                .px(px(8.))
+                                .rounded(px(5.))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_size(px(11.))
+                                .text_color(content(0.55))
+                                .when(!busy, |d| {
+                                    d.cursor_pointer()
+                                        .hover(|s| s.bg(content(0.12)).text_color(content(1.)))
+                                })
+                                .child(icon("git-merge", 12.))
+                                .child("Merge")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.busy {
+                                        cx.emit(Picked::Merge(target.clone()));
+                                    }
+                                })),
+                        )
+                    })
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered {
                             this.active = ix;

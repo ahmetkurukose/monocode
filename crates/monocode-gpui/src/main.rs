@@ -10,7 +10,9 @@ mod app_menu;
 mod arcade;
 mod assets;
 mod automations;
+mod change_tree;
 mod changes;
+mod commit_dialog;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;
@@ -91,6 +93,7 @@ mod theme;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
 mod transcript;
+mod update_dialog;
 mod usage_footer;
 mod visuals;
 #[cfg(test)]
