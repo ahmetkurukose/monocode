@@ -52,6 +52,8 @@ pub(crate) enum ChangesView {
 }
 pub(crate) enum ChangesEvent {
     View(ChangesView),
+    /// A dialog or the branch switcher opened or closed: the shell redraws.
+    Overlays,
     /// A file's review, or all of one side's when `path` is None.
     OpenDiff {
         cwd: String,
@@ -244,6 +246,11 @@ pub(crate) struct Changes {
     commit_dialog: Option<(Entity<CommitDialog>, Subscription)>,
     update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
     branch_picker: Option<(Entity<GitPicker>, Subscription)>,
+    /// The switcher opened from the menu bar: a centred window, not a popover.
+    branch_modal: bool,
+    /// The shell draws this panel's windows (the right panel's), so they
+    /// show from the menu bar; other hosts leave them to the panel.
+    pub(crate) overlays_in_shell: bool,
     switch_anchor: AnchorSlot,
     _subscriptions: Vec<Subscription>,
 }
@@ -284,6 +291,8 @@ impl Changes {
             commit_dialog: None,
             update_dialog: None,
             branch_picker: None,
+            branch_modal: false,
+            overlays_in_shell: false,
             switch_anchor: AnchorSlot::default(),
             _subscriptions: subscriptions,
         };
@@ -637,6 +646,8 @@ impl Changes {
         if self.commit_dialog.is_some() || self.cwd.is_empty() {
             return;
         }
+        // The window may open from a view that never showed this panel.
+        self.git.update(cx, |git, cx| git.changed(cx));
         let git = self.git.clone();
         let cwd = self.cwd.clone();
         let draft = self.message.read(cx).content.to_string();
@@ -660,10 +671,12 @@ impl Changes {
                         }
                     }
                 }
+                cx.emit(ChangesEvent::Overlays);
                 cx.notify();
             },
         );
         self.commit_dialog = Some((dialog, subscription));
+        cx.emit(ChangesEvent::Overlays);
         cx.notify();
     }
 
@@ -683,15 +696,23 @@ impl Changes {
         let subscription = cx.subscribe(&dialog, |this, _, _: &UpdateDialogEvent, cx| {
             this.update_dialog = None;
             this.mutated(cx);
+            cx.emit(ChangesEvent::Overlays);
             cx.notify();
         });
         self.update_dialog = Some((dialog, subscription));
+        cx.emit(ChangesEvent::Overlays);
         cx.notify();
     }
 
     /// The branch switcher: search, check out, create, or merge into this one.
-    fn toggle_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_branch_picker(
+        &mut self,
+        modal: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.branch_picker.take().is_some() {
+            cx.emit(ChangesEvent::Overlays);
             cx.notify();
             return;
         }
@@ -712,10 +733,13 @@ impl Changes {
                     GitPicked::Merge(branch) => this.merge_branch(branch.clone(), window, cx),
                     _ => {}
                 }
+                cx.emit(ChangesEvent::Overlays);
                 cx.notify();
             });
         window.focus(&picker.read(cx).focus(cx), cx);
+        self.branch_modal = modal;
         self.branch_picker = Some((picker, subscription));
+        cx.emit(ChangesEvent::Overlays);
         cx.notify();
     }
 
@@ -737,7 +761,35 @@ impl Changes {
         .detach();
     }
 
-    fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cwd.is_empty() {
+            return;
+        }
+        self.status = None;
+        self.run_git(
+            "fetch".into(),
+            |path| scm::fetch(&path),
+            |this, _, cx| this.set_status("Fetched", cx),
+            window,
+            cx,
+        );
+    }
+    pub(crate) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.index(cx);
+        if !index.is_some_and(|i| i.branch.is_some()) {
+            return;
+        }
+        self.status = None;
+        self.run_git(
+            "push".into(),
+            |path| scm::push(&path),
+            |this, _, cx| this.set_status("Pushed", cx),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.index(cx);
         if !index.is_some_and(|i| i.remote.is_some() && i.upstream.is_some()) {
             return;
@@ -1132,7 +1184,7 @@ impl Changes {
                         .when(!busy, |d| {
                             d.cursor_pointer()
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_branch_picker(window, cx)
+                                    this.toggle_branch_picker(false, window, cx)
                                 }))
                         })
                         .child(self.switch_anchor.probe())
@@ -2174,35 +2226,62 @@ impl Render for Changes {
                 ),
             })
             .children(menu)
+            .children(if self.overlays_in_shell {
+                Vec::new()
+            } else {
+                self.overlays(window)
+            })
             .children(
-                self.commit_dialog
+                self.branch_picker
                     .as_ref()
-                    .map(|(dialog, _)| crate::modal::window_overlay(window, dialog.clone())),
+                    .filter(|_| !self.branch_modal)
+                    .map(|(picker, _)| {
+                        let weak = cx.weak_entity();
+                        popover(
+                            "changes-branch-picker",
+                            Anchor::Slot(self.switch_anchor.clone()),
+                        )
+                        .side(Side::Bottom)
+                        .align(Align::Start)
+                        .width(320.)
+                        .height(360.)
+                        .on_dismiss(move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.branch_picker = None;
+                                cx.notify();
+                            });
+                        })
+                        .child(picker.clone())
+                    }),
             )
-            .children(
-                self.update_dialog
-                    .as_ref()
-                    .map(|(dialog, _)| crate::modal::window_overlay(window, dialog.clone())),
-            )
-            .children(self.branch_picker.as_ref().map(|(picker, _)| {
-                let weak = cx.weak_entity();
-                popover(
-                    "changes-branch-picker",
-                    Anchor::Slot(self.switch_anchor.clone()),
-                )
-                .side(Side::Bottom)
-                .align(Align::Start)
-                .width(320.)
-                .height(360.)
-                .on_dismiss(move |_, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.branch_picker = None;
-                        cx.notify();
-                    });
-                })
-                .child(picker.clone())
-            }))
             .into_any_element()
+    }
+}
+
+impl Changes {
+    /// The windows this panel opens. The shell draws them, so they appear
+    /// from the menu bar even where the panel itself is not on screen.
+    pub(crate) fn overlays(&self, window: &Window) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        if let Some((dialog, _)) = &self.commit_dialog {
+            out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
+        }
+        if let Some((dialog, _)) = &self.update_dialog {
+            out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
+        }
+        if let Some((picker, _)) = self.branch_picker.as_ref().filter(|_| self.branch_modal) {
+            let card = crate::modal::card()
+                .w(px(440.))
+                .h(px(480.))
+                .overflow_hidden()
+                .child(picker.clone());
+            let weak = picker.downgrade();
+            let overlay = crate::modal::overlay("branch-switcher", card, move |_, cx| {
+                let _ = weak.update(cx, |_, cx| cx.emit(GitPicked::Dismissed));
+            });
+            out.push(crate::modal::window_overlay(window, overlay).into_any_element());
+        }
+        out
     }
 }
 

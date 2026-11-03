@@ -283,7 +283,11 @@ impl RightPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let explorer = cx.new(|cx| Explorer::new(git.clone(), window, cx));
-        let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
+        let changes = cx.new(|cx| {
+            let mut changes = Changes::new(git.clone(), window, cx);
+            changes.overlays_in_shell = true;
+            changes
+        });
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),

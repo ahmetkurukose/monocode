@@ -81,7 +81,7 @@ use gpui::{
     StyleRefinement, Subscription, Window, WindowControlArea, actions, canvas, div, prelude::*, px,
     rgb, rgba,
 };
-use monocode_core::{provider::Kind, store::Session};
+use monocode_core::{provider::Kind, scm::UpdateMethod, store::Session};
 use session_groups::local_reminder_label;
 use std::{
     collections::{HashMap, HashSet},
@@ -137,6 +137,13 @@ actions!(
         OpenCommandPalette,
         OpenInbox,
         OpenNotes,
+        GitCommit,
+        GitUpdate,
+        GitUpdateRebase,
+        GitFetch,
+        GitPull,
+        GitPush,
+        GitBranches,
         CheckForUpdates,
         MinimizeWindow,
         ZoomWindow,
@@ -212,6 +219,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-p"), GoToFile, context),
         KeyBinding::new(&format!("{modifier}-shift-p"), OpenCommandPalette, context),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
+        KeyBinding::new(&format!("{modifier}-alt-k"), GitCommit, context),
+        KeyBinding::new(&format!("{modifier}-alt-u"), GitUpdate, context),
         KeyBinding::new(&format!("{modifier}-w"), CloseTab, context),
         KeyBinding::new(&format!("{modifier}-shift-w"), CloseAllTabs, context),
         KeyBinding::new(
@@ -1799,6 +1808,35 @@ impl Shell {
         self.persist(cx);
         cx.notify();
     }
+    /// Runs a Git action from the menu bar against the Changes panel, which
+    /// exists (hidden) even in views that do not show it.
+    fn git_tool(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run: impl FnOnce(
+            &mut crate::changes::Changes,
+            &mut Window,
+            &mut Context<crate::changes::Changes>,
+        ),
+    ) {
+        self.ensure_right_panel(window, cx);
+        let Some(changes) = self
+            .right_panel
+            .as_ref()
+            .map(|p| p.read(cx).changes.clone())
+        else {
+            return;
+        };
+        changes.update(cx, |changes, cx| run(changes, window, cx));
+    }
+    fn git_overlays(&self, window: &Window, cx: &App) -> Vec<AnyElement> {
+        self.right_panel
+            .as_ref()
+            .map(|panel| panel.read(cx).changes.read(cx).overlays(window))
+            .unwrap_or_default()
+    }
+
     fn ensure_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel.is_some() {
             return;
@@ -1882,6 +1920,7 @@ impl Shell {
             &changes,
             window,
             |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
+                crate::changes::ChangesEvent::Overlays => cx.notify(),
                 crate::changes::ChangesEvent::View(view) => {
                     this.workspace.changes_view = *view;
                     this.persist(cx);
@@ -8761,6 +8800,37 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &OpenInbox, window, cx| this.open_inbox(window, cx)))
             .on_action(cx.listener(|this, _: &OpenNotes, window, cx| this.open_notes(window, cx)))
+            .on_action(cx.listener(|this, _: &GitCommit, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.open_commit_dialog(window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &GitUpdate, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    let source = crate::update_dialog::Source::Update(UpdateMethod::Merge);
+                    changes.open_update_dialog(source, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &GitUpdateRebase, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    let source = crate::update_dialog::Source::Update(UpdateMethod::Rebase);
+                    changes.open_update_dialog(source, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &GitFetch, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| changes.fetch(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &GitPull, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| changes.pull(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &GitPush, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| changes.push(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &GitBranches, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.toggle_branch_picker(true, window, cx)
+                })
+            }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
                 this.notification_state
                     .updater
@@ -9161,6 +9231,7 @@ impl Render for Shell {
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
             .children(self.quick_open_modal(window, cx))
+            .children(self.git_overlays(window, cx))
             .children(self.search_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))

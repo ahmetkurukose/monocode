@@ -135,6 +135,17 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Sidebar Appearance…", SidebarAppearance),
         ]),
+        Menu::new("Git").items([
+            MenuItem::action("Commit…", GitCommit),
+            MenuItem::action("Update Project", GitUpdate),
+            MenuItem::action("Update Project (Rebase)", GitUpdateRebase),
+            MenuItem::separator(),
+            MenuItem::action("Fetch", GitFetch),
+            MenuItem::action("Pull", GitPull),
+            MenuItem::action("Push", GitPush),
+            MenuItem::separator(),
+            MenuItem::action("Branches…", GitBranches),
+        ]),
         // AppKit adds its window list here once the menu is named "Window".
         Menu::new("Window").items([
             MenuItem::action("Minimize", MinimizeWindow),

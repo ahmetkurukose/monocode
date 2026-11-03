@@ -357,6 +357,7 @@ impl Monos {
                     crate::changes::ChangesEvent::View(mode) => {
                         view.update(cx, |v, cx| v.set_view(*mode, cx))
                     }
+                    crate::changes::ChangesEvent::Overlays => {}
                     crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                         this.open_change_review(&event_key, cwd, path.as_deref(), *staged, cx)
                     }

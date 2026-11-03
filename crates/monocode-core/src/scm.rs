@@ -318,6 +318,15 @@ pub fn push(cwd: &Path) -> Result<(), String> {
     push_for(&expand_home(cwd))
 }
 
+/// Download new commits and branches from the remotes without touching the
+/// working tree (`git fetch --prune`).
+pub fn fetch(cwd: &Path) -> Result<(), String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("Fetch isn't available on remote workspaces yet".into());
+    }
+    git_checked(&expand_home(cwd), &["fetch", "--prune"]).map_err(with_signing_hint)
+}
+
 /// Fast-forward the current branch from its upstream.
 pub fn pull(cwd: &Path) -> Result<(), String> {
     if remote_workspace::is_remote(cwd) {

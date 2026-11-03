@@ -1263,3 +1263,15 @@ fn merge_branch_brings_in_another_branch_and_reports_it() {
     assert!(merge_branch(dir.path(), "nope").is_err());
     assert!(merge_branch(dir.path(), "--abort").is_err());
 }
+
+#[test]
+fn fetch_downloads_remote_commits_without_moving_the_branch() {
+    let (_root, a, b) = two_clones();
+    std::fs::write(a.join("keep.txt"), "remote\n").unwrap();
+    assert!(git(&a, &["commit", "-am", "remote change"]) && git(&a, &["push"]));
+    let before = git_stdout(&b, &["rev-parse", "HEAD"]).unwrap();
+    fetch(&b).unwrap();
+    assert_eq!(git_stdout(&b, &["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(index(&b).behind, 1);
+    assert!(fetch(tmp().path()).is_err());
+}
