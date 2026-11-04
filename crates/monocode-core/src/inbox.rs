@@ -414,6 +414,8 @@ impl Seen {
         }
     }
 }
+/// The file tree's width until it is dragged.
+pub const DIFF_TREE_WIDTH: f32 = 300.;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewState {
@@ -423,6 +425,8 @@ pub struct ViewState {
     pub hidden_linear_teams: Vec<String>,
     pub hidden_jira_projects: Vec<String>,
     pub list_width: f32,
+    /// Width of the pull request's file tree.
+    pub diff_tree_width: f32,
 }
 impl Default for ViewState {
     fn default() -> Self {
@@ -433,6 +437,7 @@ impl Default for ViewState {
             hidden_linear_teams: vec![],
             hidden_jira_projects: vec![],
             list_width: 280.,
+            diff_tree_width: DIFF_TREE_WIDTH,
         }
     }
 }

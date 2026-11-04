@@ -2284,7 +2284,8 @@ impl Inbox {
         let sidebar = (tree.is_some() || commits.is_some()).then(|| {
             div()
                 .id("inbox-diff-sidebar")
-                .w(px(300.))
+                .relative()
+                .w(px(self.state.diff_tree_width.clamp(200., 900.)))
                 .flex_shrink_0()
                 .h_full()
                 .flex()
@@ -2293,6 +2294,34 @@ impl Inbox {
                 .border_color(content(0.07))
                 .children(commits)
                 .children(tree)
+                .child(
+                    div()
+                        .id("inbox-diff-tree-resize")
+                        .role(Role::Splitter)
+                        .aria_label("Resize file tree")
+                        .absolute()
+                        .right(px(-3.))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(6.))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                if event.click_count >= 2 {
+                                    this.state.diff_tree_width = model::DIFF_TREE_WIDTH;
+                                    this.save();
+                                } else {
+                                    this.tree_resize = Some((
+                                        f32::from(event.position.x),
+                                        this.state.diff_tree_width,
+                                    ));
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .into_any_element()
         });
         div()
@@ -3130,6 +3159,12 @@ impl gpui::Render for Inbox {
             }))
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if let Some((start, width)) = this.tree_resize {
+                        let max = (f32::from(window.viewport_size().width) * 0.6).clamp(240., 900.);
+                        this.state.diff_tree_width =
+                            (width + f32::from(event.position.x) - start).clamp(200., max);
+                        cx.notify();
+                    }
                     if let Some((start, width)) = this.resize_start {
                         let max = (f32::from(window.viewport_size().width) * 0.5).clamp(240., 420.);
                         this.state.list_width =
@@ -3141,7 +3176,7 @@ impl gpui::Render for Inbox {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.resize_start.take().is_some() {
+                    if this.resize_start.take().is_some() | this.tree_resize.take().is_some() {
                         this.save();
                         cx.notify();
                     }
@@ -3150,7 +3185,7 @@ impl gpui::Render for Inbox {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.resize_start.take().is_some() {
+                    if this.resize_start.take().is_some() | this.tree_resize.take().is_some() {
                         this.save();
                         cx.notify();
                     }
