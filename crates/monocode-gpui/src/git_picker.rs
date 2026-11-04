@@ -2,7 +2,7 @@
 use crate::{input, popover, theme::*};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, Subscription, Window,
-    div, prelude::*, px,
+    div, prelude::*, px, uniform_list,
 };
 use monocode_core::git::{self, Snapshot};
 use std::path::PathBuf;
@@ -92,6 +92,9 @@ pub(crate) struct GitPicker {
     active: usize,
     busy: bool,
     existing_only: bool,
+    /// The rows for the current search, rebuilt when the search or the data
+    /// changes rather than on every frame.
+    choices: Vec<Choice>,
     error: Option<String>,
     _changed: Subscription,
 }
@@ -127,6 +130,7 @@ impl GitPicker {
         });
         let changed = cx.subscribe(&search, |this, _, _: &input::Changed, cx| {
             this.active = 0;
+            this.refresh_choices(cx);
             cx.notify();
         });
         let state = crate::git_cache::get(&cwd.to_string_lossy());
@@ -141,11 +145,12 @@ impl GitPicker {
                     Ok(state) => this.state = Some(state),
                     Err(error) => this.error = Some(error),
                 }
+                this.refresh_choices(cx);
                 cx.notify();
             });
         })
         .detach();
-        Self {
+        let mut this = Self {
             cwd,
             mode,
             selected,
@@ -154,9 +159,12 @@ impl GitPicker {
             active: 0,
             busy: false,
             existing_only: false,
+            choices: Vec::new(),
             error: None,
             _changed: changed,
-        }
+        };
+        this.refresh_choices(cx);
+        this
     }
     pub(crate) fn focus(&self, cx: &gpui::App) -> FocusHandle {
         self.search.focus_handle(cx)
@@ -168,9 +176,19 @@ impl GitPicker {
     /// already offers the project folder through Current checkout.
     pub(crate) fn existing_worktrees(mut self) -> Self {
         self.existing_only = true;
+        // Rows built before this call listed every working copy.
+        self.choices
+            .retain(|c| matches!(c, Choice::Worktree(tree) if !tree.main && !tree.missing));
         self
     }
-    fn choices(&self, cx: &gpui::App) -> Vec<Choice> {
+    #[cfg(test)]
+    fn choices(&self, _: &gpui::App) -> &[Choice] {
+        &self.choices
+    }
+    fn refresh_choices(&mut self, cx: &gpui::App) {
+        self.choices = self.compute_choices(cx);
+    }
+    fn compute_choices(&self, cx: &gpui::App) -> Vec<Choice> {
         let query = self.search.read(cx).content.trim().to_owned();
         let needle = query.to_lowercase();
         let Some(state) = &self.state else {
@@ -220,14 +238,14 @@ impl GitPicker {
         self.active = self
             .active
             .saturating_add_signed(delta)
-            .min(self.choices(cx).len().saturating_sub(1));
+            .min(self.choices.len().saturating_sub(1));
         cx.notify();
     }
     fn pick(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let Some(choice) = self.choices(cx).get(ix).cloned() else {
+        let Some(choice) = self.choices.get(ix).cloned() else {
             return;
         };
         match choice {
@@ -278,114 +296,113 @@ impl GitPicker {
         cx.notify();
     }
 }
+impl GitPicker {
+    fn option_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(choice) = self.choices.get(ix).cloned() else {
+            return div().h(px(40.)).into_any_element();
+        };
+        let (label, detail, selected, disabled, path) = match choice {
+            Choice::Branch(branch) => {
+                let full = branch
+                    .remote
+                    .as_ref()
+                    .map_or(branch.name.clone(), |r| format!("{r}/{}", branch.name));
+                let selected = if self.mode == Mode::Base {
+                    self.selected.as_ref() == Some(&full)
+                } else {
+                    branch.remote.is_none()
+                        && self.state.as_ref().and_then(|s| s.current.as_ref())
+                            == Some(&branch.name)
+                };
+                (branch.name, branch.remote, selected, false, "git-branch")
+            }
+            Choice::Create(name) => (
+                format!("Create branch ‘{name}’"),
+                None,
+                false,
+                false,
+                "plus",
+            ),
+            Choice::Worktree(tree) => {
+                let selected = if self.existing_only {
+                    self.selected.as_deref().is_some_and(|path| {
+                        monocode_core::files::path_key(path)
+                            == monocode_core::files::path_key(&tree.path)
+                    })
+                } else {
+                    std::fs::canonicalize(&tree.path)
+                        .ok()
+                        .is_some_and(|path| Some(path) == std::fs::canonicalize(&self.cwd).ok())
+                };
+                (
+                    tree.branch.unwrap_or_else(|| {
+                        format!("Detached {}", tree.head.chars().take(7).collect::<String>())
+                    }),
+                    Some(if tree.main {
+                        "Project folder".into()
+                    } else {
+                        tree.path
+                    }),
+                    selected,
+                    tree.missing,
+                    if tree.main {
+                        "git-branch"
+                    } else {
+                        "folder-tree"
+                    },
+                )
+            }
+        };
+        div()
+            .id(("git-option", ix))
+            .debug_selector(move || format!("git-option-{ix}"))
+            .role(Role::ListBoxOption)
+            .aria_label(label.clone())
+            .aria_selected(selected)
+            .flex_shrink_0()
+            .h(px(40.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_color(content(if disabled || self.busy { 0.35 } else { 0.9 }))
+            .when(ix == self.active, |d| d.bg(content(0.08)))
+            .child(icon(path, 14.).text_color(content(0.5)))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().text_size(px(12.)).child(label))
+                    .when_some(detail, |d, detail| {
+                        d.child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.))
+                                .text_color(content(0.4))
+                                .child(detail),
+                        )
+                    }),
+            )
+            .when(selected, |d| d.child(icon("check-2", 14.)))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.active = ix;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
+            .into_any_element()
+    }
+}
 impl gpui::Render for GitPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let choices = self.choices(cx);
-        let empty = choices.is_empty();
-        let rows: Vec<AnyElement> = choices
-            .into_iter()
-            .enumerate()
-            .map(|(ix, choice)| {
-                let (label, detail, selected, disabled, path) = match choice {
-                    Choice::Branch(branch) => {
-                        let full = branch
-                            .remote
-                            .as_ref()
-                            .map_or(branch.name.clone(), |r| format!("{r}/{}", branch.name));
-                        let selected = if self.mode == Mode::Base {
-                            self.selected.as_ref() == Some(&full)
-                        } else {
-                            branch.remote.is_none()
-                                && self.state.as_ref().and_then(|s| s.current.as_ref())
-                                    == Some(&branch.name)
-                        };
-                        (branch.name, branch.remote, selected, false, "git-branch")
-                    }
-                    Choice::Create(name) => (
-                        format!("Create branch ‘{name}’"),
-                        None,
-                        false,
-                        false,
-                        "plus",
-                    ),
-                    Choice::Worktree(tree) => {
-                        let selected = if self.existing_only {
-                            self.selected.as_deref().is_some_and(|path| {
-                                monocode_core::files::path_key(path)
-                                    == monocode_core::files::path_key(&tree.path)
-                            })
-                        } else {
-                            std::fs::canonicalize(&tree.path).ok().is_some_and(|path| {
-                                Some(path) == std::fs::canonicalize(&self.cwd).ok()
-                            })
-                        };
-                        (
-                            tree.branch.unwrap_or_else(|| {
-                                format!(
-                                    "Detached {}",
-                                    tree.head.chars().take(7).collect::<String>()
-                                )
-                            }),
-                            Some(if tree.main {
-                                "Project folder".into()
-                            } else {
-                                tree.path
-                            }),
-                            selected,
-                            tree.missing,
-                            if tree.main {
-                                "git-branch"
-                            } else {
-                                "folder-tree"
-                            },
-                        )
-                    }
-                };
-                div()
-                    .id(("git-option", ix))
-                    .debug_selector(move || format!("git-option-{ix}"))
-                    .role(Role::ListBoxOption)
-                    .aria_label(label.clone())
-                    .aria_selected(selected)
-                    .flex_shrink_0()
-                    .min_h(px(32.))
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .text_color(content(if disabled || self.busy { 0.35 } else { 0.9 }))
-                    .when(ix == self.active, |d| d.bg(content(0.08)))
-                    .child(icon(path, 14.).text_color(content(0.5)))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(div().truncate().text_size(px(12.)).child(label))
-                            .when_some(detail, |d, detail| {
-                                d.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(10.))
-                                        .text_color(content(0.4))
-                                        .child(detail),
-                                )
-                            }),
-                    )
-                    .when(selected, |d| d.child(icon("check-2", 14.)))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered {
-                            this.active = ix;
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, cx)))
-                    .into_any_element()
-            })
-            .collect();
+        let empty = self.choices.is_empty();
+        let count = self.choices.len();
+        let entity = cx.entity();
         let existing_only = self.existing_only;
         div()
             .id("git-picker")
@@ -461,13 +478,24 @@ impl gpui::Render for GitPicker {
                     .role(Role::ListBox)
                     .aria_label("Working copy options")
                     .when(!existing_only, |d| d.flex_1())
-                    .when(existing_only, |d| d.max_h(px(284.)))
+                    .when(existing_only, |d| {
+                        d.h(px((count as f32 * 40. + 8.).clamp(48., 284.)))
+                    })
                     .min_h_0()
-                    .overflow_y_scroll()
                     .p(px(4.))
                     .flex()
                     .flex_col()
-                    .children(rows)
+                    .when(!empty, |d| {
+                        d.child(
+                            uniform_list("git-options", count, move |range, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    range.map(|ix| this.option_row(ix, cx)).collect::<Vec<_>>()
+                                })
+                            })
+                            .flex_1()
+                            .min_h_0(),
+                        )
+                    })
                     .when(empty, |d| {
                         d.child(
                             div()

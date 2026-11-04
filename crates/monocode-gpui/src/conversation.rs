@@ -1782,6 +1782,19 @@ impl Conversation {
             }
         });
     }
+    /// The project's checkout switched branches elsewhere (the footer): read
+    /// the new one so the branch under the composer follows.
+    pub(crate) fn git_branch_changed(
+        &mut self,
+        cwd: &str,
+        branch: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        // A detached HEAD has no branch to compare; leave it to the picker.
+        if branch.is_some() && self.execution_cwd() == cwd && self.branch.as_deref() != branch {
+            self.load_git(cx);
+        }
+    }
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
         self.sync_review(cx);
         self.load_git(cx);
@@ -1877,6 +1890,8 @@ impl Conversation {
                                 this.save_settings(cx);
                             }
                             this.refresh_git(cx);
+                            // The footer's branch button follows the checkout.
+                            cx.emit(SessionChanged);
                         }
                         GitPicked::Base(base) => {
                             this.settings.worktree_base = Some(base.clone());

@@ -970,6 +970,12 @@ impl Shell {
         let git = cx.new(|cx| crate::git_status::ProjectGit::new(git_project, cx));
         let git_observation = cx.observe(&git, |this, git, cx| {
             let cwd = git.read(cx).root.clone();
+            let branch = git.read(cx).index.as_ref().and_then(|i| i.branch.clone());
+            for view in this.sessions.values() {
+                view.update(cx, |view, cx| {
+                    view.git_branch_changed(&cwd, branch.as_deref(), cx)
+                });
+            }
             for view in this.sessions.values() {
                 if view.read(cx).review.read(cx).session().1 == cwd {
                     view.update(cx, |view, cx| view.refresh_git_actions(cx));
