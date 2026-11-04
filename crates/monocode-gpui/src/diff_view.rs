@@ -12,10 +12,11 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, App, Bounds, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Role, ScrollWheelEvent, SharedString, StyledText,
-    Subscription, Task, Window, actions, canvas, div, list, prelude::*, px, rgb,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Div, EventEmitter, FocusHandle,
+    Focusable, FontWeight, HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Role, ScrollWheelEvent, SharedString,
+    Stateful, StyledText, Subscription, Task, Window, actions, canvas, div, list, prelude::*, px,
+    rgb,
 };
 use monocode_core::diff::{self, Block, Line, LineKind};
 use std::{
@@ -40,6 +41,15 @@ pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("alt-up", PreviousHunk, Some("DiffReview")),
         KeyBinding::new("alt-down", NextHunk, Some("DiffReview")),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-c"
+            },
+            crate::input::Copy,
+            Some("DiffReview"),
+        ),
     ]);
 }
 
@@ -117,6 +127,74 @@ struct Row {
     kind: RowKind,
     height: f32,
 }
+/// Text selected in the code: from one row and column to another, in one
+/// lane (`side` 0 is the unified code, or the left of a side-by-side).
+#[derive(Clone, Copy)]
+struct Selection {
+    side: usize,
+    anchor: (usize, usize),
+    head: (usize, usize),
+    dragging: bool,
+}
+impl Selection {
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Characters of `text` whose columns fall in `[from, to)`, where a tab takes
+/// the columns `expand_tabs` gives it.
+fn slice_columns(text: &str, from: usize, to: usize) -> String {
+    let mut out = String::new();
+    let mut column = 0;
+    for ch in text.chars() {
+        let width = if ch == '\t' { 4 - column % 4 } else { 1 };
+        if column + width > from && column < to {
+            out.push(ch);
+        }
+        column += width;
+    }
+    out
+}
+fn columns_of(text: &str) -> usize {
+    expand_tabs(text).chars().count()
+}
+/// The word under `column`, as columns: letters, digits and underscores, or
+/// the run of whatever else is there.
+fn word_columns(text: &str, column: usize) -> (usize, usize) {
+    let expanded: Vec<char> = expand_tabs(text).chars().collect();
+    if expanded.is_empty() {
+        return (0, 0);
+    }
+    let at = column.min(expanded.len() - 1);
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let kind = word(expanded[at]);
+    let blank = expanded[at].is_whitespace();
+    let same = |c: char| {
+        if blank {
+            c.is_whitespace()
+        } else {
+            !c.is_whitespace() && word(c) == kind
+        }
+    };
+    let mut start = at;
+    while start > 0 && same(expanded[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < expanded.len() && same(expanded[end]) {
+        end += 1;
+    }
+    (start, end)
+}
+
 /// What a changed run of rows shows on the overview rail.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
@@ -363,6 +441,9 @@ pub(crate) struct DiffView {
     total: f32,
     /// Where the changes are, for the overview rail beside the scrollbar.
     markers: Vec<Marker>,
+    selection: Option<Selection>,
+    /// Where each lane's code starts on screen, noted as rows paint.
+    lane_x: Rc<Cell<[Option<f32>; 2]>>,
     /// Hunk rows in order: (file, row index when expanded).
     hunks: Vec<(usize, Option<usize>)>,
     file_rows: Vec<usize>,
@@ -421,6 +502,8 @@ impl DiffView {
             offsets: vec![0.],
             total: 0.,
             markers: Vec::new(),
+            selection: None,
+            lane_x: Rc::default(),
             hunks: Vec::new(),
             file_rows: Vec::new(),
             max_columns: 40,
@@ -504,6 +587,211 @@ impl DiffView {
             self.split = split;
             self.rebuild(cx);
         }
+    }
+
+    /// The code a row shows in a lane, as written.
+    fn line_text(&self, ix: usize, side: usize) -> Option<&str> {
+        let row = self.rows.get(ix)?;
+        let file = self.files.get(row.file)?;
+        let line = |block: usize, line: usize| {
+            file.blocks
+                .get(block)
+                .and_then(|b| b.lines().get(line))
+                .map(|l| l.text.as_ref())
+        };
+        match &row.kind {
+            RowKind::Line { block, line: l, .. } => line(*block, *l),
+            RowKind::Pair { block, left, right } => {
+                line(*block, if side == 0 { *left } else { *right }?)
+            }
+            _ => None,
+        }
+    }
+    /// The column under a pointer's x in a lane.
+    fn column_at(&self, x: f32, side: usize) -> usize {
+        let Some(left) = self.lane_x.get()[side] else {
+            return 0;
+        };
+        let width = self.char_width.get().unwrap_or(7.5).max(1.);
+        // The code is indented by `pl_3` (12px) inside its lane.
+        (((x - left + self.scroll_x - 12.) / width).round().max(0.)) as usize
+    }
+    /// The row under a pointer's y, clamped to the rows there are.
+    fn row_at(&self, y: f32) -> Option<usize> {
+        let top = self.viewport.get()?.origin.y.as_f32();
+        let at = (y - top + self.top_px()).clamp(0., self.total.max(0.));
+        let ix = self.offsets.partition_point(|o| *o <= at).saturating_sub(1);
+        (!self.rows.is_empty()).then(|| ix.min(self.rows.len() - 1))
+    }
+    fn select_start(
+        &mut self,
+        ix: usize,
+        side: usize,
+        x: f32,
+        clicks: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self.line_text(ix, side).map(str::to_owned) else {
+            return;
+        };
+        let column = self.column_at(x, side);
+        self.selection = Some(match clicks {
+            1 => Selection {
+                side,
+                anchor: (ix, column),
+                head: (ix, column),
+                dragging: true,
+            },
+            2 => {
+                let (a, b) = word_columns(&text, column);
+                Selection {
+                    side,
+                    anchor: (ix, a),
+                    head: (ix, b),
+                    dragging: false,
+                }
+            }
+            _ => Selection {
+                side,
+                anchor: (ix, 0),
+                head: (ix, columns_of(&text)),
+                dragging: false,
+            },
+        });
+        cx.notify();
+    }
+    /// Extends a selection being dragged to the pointer, scrolling when it
+    /// leaves the diff.
+    fn select_drag(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.filter(|s| s.dragging) else {
+            return;
+        };
+        let Some(bounds) = self.viewport.get() else {
+            return;
+        };
+        if y < bounds.top().as_f32() {
+            self.scroll_to_px(self.top_px() - 28.);
+        } else if y > bounds.bottom().as_f32() {
+            self.scroll_to_px(self.top_px() + 28.);
+        }
+        let Some(row) = self.row_at(y) else {
+            return;
+        };
+        let column = self.column_at(x, selection.side);
+        if let Some(selection) = self.selection.as_mut() {
+            selection.head = (row, column);
+        }
+        cx.notify();
+    }
+    /// The columns of row `ix` that the selection covers in `side`, over
+    /// `columns` columns of code (a row inside the selection counts its end).
+    fn selected_columns(&self, ix: usize, side: usize, columns: usize) -> Option<(usize, usize)> {
+        let selection = self.selection.filter(|s| s.side == side && !s.is_empty())?;
+        let ((r0, c0), (r1, c1)) = selection.ordered();
+        if ix < r0 || ix > r1 {
+            return None;
+        }
+        let start = if ix == r0 { c0 } else { 0 };
+        let end = if ix == r1 { c1 } else { columns + 1 };
+        (end > start).then_some((start, end))
+    }
+    /// The selected code, one line per row, as written (tabs stay tabs).
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.filter(|s| !s.is_empty())?;
+        let ((r0, c0), (r1, c1)) = selection.ordered();
+        let mut lines = Vec::new();
+        for ix in r0..=r1.min(self.rows.len().saturating_sub(1)) {
+            let Some(text) = self.line_text(ix, selection.side) else {
+                // A side-by-side row with nothing on this side reads as blank.
+                if matches!(self.rows[ix].kind, RowKind::Pair { .. }) {
+                    lines.push(String::new());
+                }
+                continue;
+            };
+            let from = if ix == r0 { c0 } else { 0 };
+            let to = if ix == r1 { c1 } else { usize::MAX };
+            lines.push(slice_columns(text, from, to));
+        }
+        Some(lines.join("\n"))
+    }
+    /// A drag ends; a click that selected nothing clears the selection.
+    fn end_selection(&mut self) {
+        if let Some(selection) = self.selection.as_mut() {
+            selection.dragging = false;
+        }
+        if self.selection.is_some_and(|s| s.is_empty()) {
+            self.selection = None;
+        }
+    }
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// The code of one row in one lane: selectable, with the selection
+    /// painted behind it.
+    fn code_lane(
+        &self,
+        ix: usize,
+        side: usize,
+        text: String,
+        styles: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let width = self.char_width.get().unwrap_or(7.5);
+        let selected = self.selected_columns(ix, side, text.chars().count());
+        let lane_x = self.lane_x.clone();
+        div()
+            .id(("diff-code", ix * 2 + side))
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.select_start(ix, side, event.position.x.as_f32(), event.click_count, cx);
+                }),
+            )
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, _, _| {
+                        let mut lanes = lane_x.get();
+                        lanes[side] = Some(bounds.origin.x.as_f32());
+                        lane_x.set(lanes);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(selected, |d, (start, end)| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(12. - self.scroll_x + start as f32 * width))
+                        .w(px((end - start) as f32 * width))
+                        .bg(accent_color().opacity(0.28)),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(-self.scroll_x))
+                    .pl_3()
+                    .pr_6()
+                    .whitespace_nowrap()
+                    .font_family(crate::fonts::mono())
+                    .text_size(px(CODE_SIZE))
+                    .text_color(content(0.92))
+                    .child(StyledText::new(text).with_highlights(styles)),
+            )
     }
 
     /// The kind of change a row shows, if it shows one.
@@ -633,6 +921,7 @@ impl DiffView {
         self.offsets = offsets;
         self.total = at;
         self.markers = self.change_markers();
+        self.selection = None;
         self.hunks = hunks;
         self.file_rows = file_rows;
         self.max_columns = columns;
@@ -1331,7 +1620,6 @@ impl DiffView {
                 let Some(lines) = file.blocks.get(block).map(|b| b.lines()) else {
                     return div().h(px(LINE)).into_any_element();
                 };
-                let scroll_x = self.scroll_x;
                 let hovered = self.hovered == Some(ix);
                 let file_ix = row.file;
                 let slot = self.action_slots.entry(ix).or_default().clone();
@@ -1398,27 +1686,7 @@ impl DiffView {
                                 .text_color(ink.unwrap_or(content(0.4)))
                                 .child(number.map(|n| n.to_string()).unwrap_or_default()),
                         )
-                        .child(
-                            div()
-                                .relative()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left(px(-scroll_x))
-                                        .pl_3()
-                                        .pr_6()
-                                        .whitespace_nowrap()
-                                        .font_family(crate::fonts::mono())
-                                        .text_size(px(CODE_SIZE))
-                                        .text_color(content(0.92))
-                                        .child(StyledText::new(text).with_highlights(styles)),
-                                ),
-                        );
+                        .child(self.code_lane(ix, side, text, styles, cx));
                     halves.push(half);
                 }
                 let _ = window;
@@ -1518,7 +1786,6 @@ impl DiffView {
                         .when(hide, |d| d.invisible())
                         .child(n.map(|n| n.to_string()).unwrap_or_default())
                 };
-                let scroll_x = self.scroll_x;
                 let _ = window;
                 div()
                     .id(("diff-line", ix))
@@ -1631,27 +1898,7 @@ impl DiffView {
                                 })
                             }),
                     )
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left(px(-scroll_x))
-                                    .pl_3()
-                                    .pr_6()
-                                    .whitespace_nowrap()
-                                    .font_family(crate::fonts::mono())
-                                    .text_size(px(CODE_SIZE))
-                                    .text_color(content(0.92))
-                                    .child(StyledText::new(text).with_highlights(styles)),
-                            ),
-                    )
+                    .child(self.code_lane(ix, 0, text, styles, cx))
                     .into_any_element()
             }
         }
@@ -1967,6 +2214,7 @@ impl Render for DiffView {
             .overflow_hidden()
             .on_action(cx.listener(|this, _: &PreviousHunk, _, cx| this.navigate(-1, cx)))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.navigate(1, cx)))
+            .on_action(cx.listener(|this, _: &crate::input::Copy, _, cx| this.copy_selection(cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -1977,6 +2225,13 @@ impl Render for DiffView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.selection.is_some_and(|s| s.dragging) {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.select_drag(event.position.x.as_f32(), event.position.y.as_f32(), cx);
+                    } else if let Some(selection) = this.selection.as_mut() {
+                        selection.dragging = false;
+                    }
+                }
                 if this.overview_drag.is_some() {
                     if event.pressed_button == Some(MouseButton::Left) {
                         this.overview_scroll(event.position.y, cx);
@@ -2003,6 +2258,7 @@ impl Render for DiffView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.end_selection();
                     if this.overview_drag.take().is_some() {
                         cx.notify();
                     }
@@ -2014,6 +2270,7 @@ impl Render for DiffView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.end_selection();
                     if this.overview_drag.take().is_some() | this.thumb_drag.take().is_some() {
                         cx.notify();
                     }
@@ -2290,6 +2547,166 @@ mod tests {
             })
             .unwrap();
     }
+    #[test]
+    fn column_slices_and_words_follow_tab_stops() {
+        assert_eq!(slice_columns("abcdef", 1, 4), "bcd");
+        assert_eq!(slice_columns("a\tb", 0, 5), "a\tb");
+        // A tab fills columns 1-3: a selection touching any of them keeps it.
+        assert_eq!(slice_columns("a\tb", 2, 4), "\t");
+        assert_eq!(slice_columns("abc", 5, 9), "");
+        assert_eq!(columns_of("a\tb"), 5);
+        assert_eq!(word_columns("let foo_bar = 1;", 6), (4, 11));
+        assert_eq!(word_columns("let foo_bar = 1;", 3), (3, 4));
+        assert_eq!(word_columns("x = (y)", 4), (4, 5));
+        assert_eq!(word_columns("", 3), (0, 0));
+    }
+
+    #[gpui::test]
+    fn dragging_across_rows_selects_the_code_to_copy(cx: &mut gpui::TestAppContext) {
+        let model = file(
+            "select",
+            "alpha\nbeta\ngamma\n",
+            "alpha\nbeta changed\ngamma\n",
+        );
+        let unified = diff::build_unified_file(
+            "alpha\nbeta\ngamma\n",
+            "alpha\nbeta changed\ngamma\n",
+            usize::MAX,
+        );
+        let mut model = model;
+        model.blocks = Arc::new(unified.blocks);
+        let window = cx.update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                        gpui::point(px(0.), px(0.)),
+                        gpui::size(px(500.), px(300.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(DiffView::new),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| view.set_files(vec![model], cx))
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |view, _, cx| {
+                let code: Vec<usize> = (0..view.rows.len())
+                    .filter(|&ix| view.line_text(ix, 0).is_some())
+                    .collect();
+                assert_eq!(code.len(), 4, "alpha, beta, beta changed, gamma");
+                assert_eq!(view.selected_text(), None, "nothing selected yet");
+                view.selection = Some(Selection {
+                    side: 0,
+                    anchor: (code[0], 2),
+                    head: (code[3], 3),
+                    dragging: false,
+                });
+                assert_eq!(
+                    view.selected_text().as_deref(),
+                    Some("pha\nbeta\nbeta changed\ngam")
+                );
+                // Dragged backwards, the same text.
+                view.selection = Some(Selection {
+                    side: 0,
+                    anchor: (code[3], 3),
+                    head: (code[0], 2),
+                    dragging: false,
+                });
+                assert_eq!(
+                    view.selected_text().as_deref(),
+                    Some("pha\nbeta\nbeta changed\ngam")
+                );
+                // The middle rows are covered whole, their ends included.
+                assert_eq!(view.selected_columns(code[1], 0, 4), Some((0, 5)));
+                assert_eq!(view.selected_columns(code[0], 0, 5), Some((2, 6)));
+                assert_eq!(view.selected_columns(code[3], 0, 5), Some((0, 3)));
+                // The other lane of a side-by-side diff is not selected.
+                assert_eq!(view.selected_columns(code[1], 1, 4), None);
+                view.end_selection();
+                assert!(view.selection.is_some());
+                view.selection = Some(Selection {
+                    side: 0,
+                    anchor: (code[1], 1),
+                    head: (code[1], 1),
+                    dragging: true,
+                });
+                view.end_selection();
+                assert!(view.selection.is_none(), "a plain click selects nothing");
+                cx.notify();
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn dragging_the_pointer_selects_code_and_copy_puts_it_on_the_clipboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (original, current) = ("alpha\nbeta\ngamma\n", "alpha\nbeta changed\ngamma\n");
+        let mut model = file("pointer", original, current);
+        model.blocks = Arc::new(diff::build_unified_file(original, current, usize::MAX).blocks);
+        let window = cx.update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                        gpui::point(px(0.), px(0.)),
+                        gpui::size(px(500.), px(300.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(DiffView::new),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| view.set_files(vec![model], cx))
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        // The pointer positions of "alpha" column 2 and "gamma" column 3.
+        let (from, to) = window
+            .update(visual, |view, _, _| {
+                let code: Vec<usize> = (0..view.rows.len())
+                    .filter(|&ix| view.line_text(ix, 0).is_some())
+                    .collect();
+                let top = view.viewport.get().unwrap().origin.y.as_f32();
+                let left = view.lane_x.get()[0].expect("rows have painted");
+                let width = view.char_width.get().unwrap();
+                let at = |row: usize, column: usize| {
+                    gpui::point(
+                        px(left + 12. + column as f32 * width + 1.),
+                        px(top + view.offsets[row] - view.top_px() + 10.),
+                    )
+                };
+                (at(code[0], 2), at(code[3], 3))
+            })
+            .unwrap();
+        visual.simulate_mouse_down(from, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(to, Some(MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |view, _, cx| {
+                assert_eq!(
+                    view.selected_text().as_deref(),
+                    Some("pha\nbeta\nbeta changed\ngam")
+                );
+                view.copy_selection(cx);
+            })
+            .unwrap();
+        assert_eq!(
+            visual
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("pha\nbeta\nbeta changed\ngam")
+        );
+    }
+
     #[test]
     fn split_bodies_pair_removed_and_added_lines() {
         let line = |kind, text: &str| Line {
