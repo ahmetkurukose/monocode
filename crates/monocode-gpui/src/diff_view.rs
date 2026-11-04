@@ -117,6 +117,22 @@ struct Row {
     kind: RowKind,
     height: f32,
 }
+/// What a changed run of rows shows on the overview rail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Add,
+    Del,
+    /// A removed line paired with an added one, side by side.
+    Mod,
+}
+/// A run of changed rows as a span of the document, in pixels from its top.
+#[derive(Clone, Copy)]
+struct Marker {
+    top: f32,
+    bottom: f32,
+    mark: Mark,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct RowKey(SharedString, u8, usize, usize);
 
@@ -345,6 +361,8 @@ pub(crate) struct DiffView {
     rows: Vec<Row>,
     offsets: Vec<f32>,
     total: f32,
+    /// Where the changes are, for the overview rail beside the scrollbar.
+    markers: Vec<Marker>,
     /// Hunk rows in order: (file, row index when expanded).
     hunks: Vec<(usize, Option<usize>)>,
     file_rows: Vec<usize>,
@@ -402,6 +420,7 @@ impl DiffView {
             rows: Vec::new(),
             offsets: vec![0.],
             total: 0.,
+            markers: Vec::new(),
             hunks: Vec::new(),
             file_rows: Vec::new(),
             max_columns: 40,
@@ -487,6 +506,52 @@ impl DiffView {
         }
     }
 
+    /// The kind of change a row shows, if it shows one.
+    fn row_mark(&self, row: &Row) -> Option<Mark> {
+        let file = self.files.get(row.file)?;
+        let kind_of = |block: usize, line: usize| {
+            file.blocks
+                .get(block)
+                .and_then(|b| b.lines().get(line))
+                .map(|l| l.kind)
+        };
+        match &row.kind {
+            RowKind::Line { block, line, .. } => match kind_of(*block, *line)? {
+                LineKind::Add => Some(Mark::Add),
+                LineKind::Del => Some(Mark::Del),
+                _ => None,
+            },
+            RowKind::Pair { block, left, right } => {
+                let removed = left.and_then(|l| kind_of(*block, l)) == Some(LineKind::Del);
+                let added = right.and_then(|r| kind_of(*block, r)) == Some(LineKind::Add);
+                match (removed, added) {
+                    (true, true) => Some(Mark::Mod),
+                    (true, false) => Some(Mark::Del),
+                    (false, true) => Some(Mark::Add),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    /// Runs of neighbouring changed rows of one kind, merged into spans.
+    fn change_markers(&self) -> Vec<Marker> {
+        let mut markers: Vec<Marker> = Vec::new();
+        for (ix, row) in self.rows.iter().enumerate() {
+            let Some(mark) = self.row_mark(row) else {
+                continue;
+            };
+            let (top, bottom) = (self.offsets[ix], self.offsets[ix + 1]);
+            match markers.last_mut() {
+                Some(last) if last.mark == mark && (top - last.bottom).abs() < 0.5 => {
+                    last.bottom = bottom;
+                }
+                _ => markers.push(Marker { top, bottom, mark }),
+            }
+        }
+        markers
+    }
+
     fn row_key(&self, ix: usize) -> Option<RowKey> {
         let row = self.rows.get(ix)?;
         let id = self.files.get(row.file)?.id.clone();
@@ -567,6 +632,7 @@ impl DiffView {
         self.rows = rows;
         self.offsets = offsets;
         self.total = at;
+        self.markers = self.change_markers();
         self.hunks = hunks;
         self.file_rows = file_rows;
         self.max_columns = columns;
@@ -643,6 +709,8 @@ impl DiffView {
         let total = self.total.max(1.);
         let top = self.top_px();
         let active = self.overview_drag.is_some() || self.overview_hovered;
+        let markers = self.markers.clone();
+        let (add, del) = crate::editor_scrollbar::diff_colors(cx);
         div()
             .id("diff-overview")
             .debug_selector(|| "diff-overview".into())
@@ -667,6 +735,46 @@ impl DiffView {
                             Bounds::new(bounds.origin, gpui::size(px(1.), bounds.size.height)),
                             content(0.07),
                         ));
+                        // Where the changes are, under the thumb so that it still
+                        // reads as the window onto the file.
+                        let height = bounds.size.height.as_f32();
+                        for marker in &markers {
+                            let y = marker.top / total * height;
+                            let span = ((marker.bottom - marker.top) / total * height).max(3.);
+                            let area = Bounds::new(
+                                bounds.origin + gpui::point(px(3.), px(y)),
+                                gpui::size(px(WIDTH - 5.), px(span)),
+                            );
+                            match marker.mark {
+                                Mark::Add => window
+                                    .paint_quad(gpui::fill(area, rgb(add)).corner_radii(px(1.))),
+                                Mark::Del => window
+                                    .paint_quad(gpui::fill(area, rgb(del)).corner_radii(px(1.))),
+                                Mark::Mod => {
+                                    let half = area.size.width / 2.;
+                                    window.paint_quad(
+                                        gpui::fill(
+                                            Bounds::new(
+                                                area.origin,
+                                                gpui::size(half, area.size.height),
+                                            ),
+                                            rgb(del),
+                                        )
+                                        .corner_radii(px(1.)),
+                                    );
+                                    window.paint_quad(
+                                        gpui::fill(
+                                            Bounds::new(
+                                                area.origin + gpui::point(half, px(0.)),
+                                                gpui::size(half, area.size.height),
+                                            ),
+                                            rgb(add),
+                                        )
+                                        .corner_radii(px(1.)),
+                                    );
+                                }
+                            }
+                        }
                         if m.scrollable {
                             window.paint_quad(
                                 gpui::fill(
@@ -1973,7 +2081,7 @@ impl Render for DiffView {
 mod tests {
     use super::*;
     #[gpui::test]
-    fn review_overview_has_no_change_markers_and_supports_scrolling_and_dragging(
+    fn review_overview_marks_the_changes_and_supports_scrolling_and_dragging(
         cx: &mut gpui::TestAppContext,
     ) {
         let original: String = (0..200).map(|n| format!("line {n}\n")).collect();
@@ -2016,10 +2124,16 @@ mod tests {
                     })
                     .collect();
                 assert!(!rail_quads.is_empty());
-                assert!(rail_quads.iter().all(|quad| {
-                    quad.background != gpui::Hsla::from(rgb(add)).into()
-                        && quad.background != gpui::Hsla::from(rgb(del)).into()
-                }));
+                // The two edited lines show up on the rail, one added and one
+                // removed each, merged where neighbouring rows share a kind.
+                let marked = |colour: u32| {
+                    rail_quads
+                        .iter()
+                        .filter(|quad| quad.background == gpui::Hsla::from(rgb(colour)).into())
+                        .count()
+                };
+                assert_eq!(marked(add), 2);
+                assert_eq!(marked(del), 2);
             })
             .unwrap();
         let track = rail.origin + gpui::point(px(8.), rail.size.height * 0.75);

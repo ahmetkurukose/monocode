@@ -1,6 +1,6 @@
 //! The commits of a GitHub pull request and what each one changed, so a
 //! review can go commit by commit as well as over the whole diff.
-use super::{run_gh, Diff, DiffFile, Item, Service};
+use super::{run_gh, run_gh_raw, run_git, run_git_raw, Diff, DiffFile, Item, Service};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -157,6 +157,12 @@ fn encode_path(path: &str) -> String {
     out
 }
 
+/// Whether the checkout has this commit, which a fetch of the pull request's
+/// branch (or of the base) brings in.
+fn has_commit(root: &Path, sha: &str) -> bool {
+    run_git(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
 fn valid_sha(sha: &str) -> bool {
     (7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -205,7 +211,8 @@ impl Service {
     }
     /// The two commits a review scope compares: where the pull request
     /// branched from the base and its head, or one commit's parent and the
-    /// commit. An empty `old` means the commit has no parent.
+    /// commit. An empty `old` means the commit has no parent. Commits the
+    /// checkout already has answer without the network.
     pub fn pr_scope_shas(
         &self,
         item: &Item,
@@ -219,6 +226,14 @@ impl Service {
         if let Some(sha) = commit {
             if !valid_sha(sha) {
                 return Err("Unknown commit".into());
+            }
+            if has_commit(root, sha) {
+                let parent = run_git(
+                    root,
+                    &["rev-parse", "--verify", "--quiet", &format!("{sha}^")],
+                )
+                .unwrap_or_default();
+                return Ok((parent, sha.to_string()));
             }
             let parent = gh(
                 root,
@@ -245,15 +260,19 @@ impl Service {
             ],
         )?;
         let (base, head) = parse_pr_oids(&json)?;
-        let merge_base = gh(
-            root,
-            &[
-                "api",
-                &format!("repos/{owner}/{name}/compare/{base}...{head}"),
-                "--jq",
-                ".merge_base_commit.sha",
-            ],
-        )?;
+        let merge_base = if has_commit(root, &base) && has_commit(root, &head) {
+            run_git(root, &["merge-base", &base, &head]).unwrap_or_default()
+        } else {
+            gh(
+                root,
+                &[
+                    "api",
+                    &format!("repos/{owner}/{name}/compare/{base}...{head}"),
+                    "--jq",
+                    ".merge_base_commit.sha",
+                ],
+            )?
+        };
         let merge_base = merge_base.trim();
         Ok((
             if valid_sha(merge_base) {
@@ -267,7 +286,9 @@ impl Service {
     }
 
     /// A file before and after, whole, as `(original, current)`. A side that
-    /// does not exist at its commit (added or deleted file, no parent) is empty.
+    /// does not exist at its commit (added or deleted file, no parent) is
+    /// empty. Each side comes from the checkout's own history when it has the
+    /// commit (milliseconds), else from GitHub.
     pub fn pr_file_pair(
         &self,
         item: &Item,
@@ -287,23 +308,31 @@ impl Service {
             if !valid_sha(sha) {
                 return Err("Unknown commit".into());
             }
-            let endpoint = format!(
-                "repos/{owner}/{name}/contents/{}?ref={sha}",
-                encode_path(path)
-            );
-            match gh(
-                root,
-                &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
-            ) {
-                Ok(text) if text.len() > MAX_COMMIT_DIFF_BYTES => {
-                    Err("This file is too large to show whole".into())
+            let text = if has_commit(root, sha) {
+                // The commit is here, so a failure means the file is not in it.
+                run_git_raw(root, &["show", &format!("{sha}:{path}")]).unwrap_or_default()
+            } else {
+                let endpoint = format!(
+                    "repos/{owner}/{name}/contents/{}?ref={sha}",
+                    encode_path(path)
+                );
+                match run_gh_raw(
+                    root,
+                    &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
+                ) {
+                    Ok(text) => text,
+                    Err(error) if error.contains("404") || error.contains("Not Found") => {
+                        String::new()
+                    }
+                    Err(error) => return Err(error),
                 }
-                Ok(text) if text.contains('\0') => Err("This is a binary file".into()),
-                Ok(text) => Ok(text),
-                Err(error) if error.contains("404") || error.contains("Not Found") => {
-                    Ok(String::new())
-                }
-                Err(error) => Err(error),
+            };
+            if text.len() > MAX_COMMIT_DIFF_BYTES {
+                Err("This file is too large to show whole".into())
+            } else if text.contains('\0') {
+                Err("This is a binary file".into())
+            } else {
+                Ok(text)
             }
         };
         Ok((side(old)?, side(new)?))
@@ -386,5 +415,67 @@ mod tests {
         assert!(repo_parts("a/b/c").is_err());
         assert!(repo_parts("owner/na me").is_err());
         assert!(repo_parts("noslash").is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn whole_files_come_from_the_checkouts_history_exactly_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        std::fs::write(path.join("a.txt"), "\n\n  indented first\nsecond\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-q", "-m", "one"]);
+        let old = git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("a.txt"), "\n\n  indented first\nsecond\nthird\n").unwrap();
+        std::fs::write(path.join("b.txt"), "new\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-q", "-m", "two"]);
+        let new = git(path, &["rev-parse", "HEAD"]);
+
+        let service = Service {
+            data_dir: path.to_path_buf(),
+            cwd: path.to_path_buf(),
+        };
+        let item = Item {
+            provider: "github".into(),
+            repo: "acme/app".into(),
+            number: 1,
+            ..Item::default()
+        };
+        // Leading blank lines, indentation and the final newline survive.
+        let (before, after) = service.pr_file_pair(&item, &old, &new, "a.txt").unwrap();
+        assert_eq!(before, "\n\n  indented first\nsecond\n");
+        assert_eq!(after, "\n\n  indented first\nsecond\nthird\n");
+        // A file the old commit lacks is empty on that side.
+        let (before, after) = service.pr_file_pair(&item, &old, &new, "b.txt").unwrap();
+        assert_eq!((before.as_str(), after.as_str()), ("", "new\n"));
+        // A commit's scope is its parent and itself, without the network.
+        let (parent, commit) = service.pr_scope_shas(&item, Some(&new)).unwrap();
+        assert_eq!((parent, commit), (old.clone(), new.clone()));
+        let (parent, _) = service.pr_scope_shas(&item, Some(&old)).unwrap();
+        assert_eq!(parent, "", "a root commit has no parent");
+        assert!(service.pr_file_pair(&item, &old, &new, "../x").is_err());
     }
 }

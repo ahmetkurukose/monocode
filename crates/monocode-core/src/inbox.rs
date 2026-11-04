@@ -1036,6 +1036,22 @@ fn run_command(
     args: &[&str],
     allow_empty: bool,
 ) -> Result<String, String> {
+    let stdout = run_command_raw(program, root, args)?.trim().to_owned();
+    if stdout.is_empty() && !allow_empty {
+        Err(format!("{program} returned no output"))
+    } else {
+        Ok(stdout)
+    }
+}
+/// The command's output exactly as written, for file contents, where leading
+/// blank lines and the last newline are part of the answer.
+pub(super) fn run_gh_raw(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_command_raw("gh", root, args)
+}
+pub(super) fn run_git_raw(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_command_raw("git", root, args)
+}
+fn run_command_raw(program: &str, root: &Path, args: &[&str]) -> Result<String, String> {
     let binary = crate::scm::resolve_gui_binary(program).ok_or_else(|| {
         format!(
             "{} is not installed. Install {} and check again.",
@@ -1058,16 +1074,16 @@ fn run_command(
     crate::scm::shell::apply_gui_env(&mut command);
     crate::process::configure_child(&mut command);
     let output = command.output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() { stdout } else { stderr });
+        return Err(if stderr.is_empty() {
+            stdout.trim().to_owned()
+        } else {
+            stderr
+        });
     }
-    if stdout.is_empty() && !allow_empty {
-        Err(format!("{program} returned no output"))
-    } else {
-        Ok(stdout)
-    }
+    Ok(stdout)
 }
 
 #[cfg(test)]
