@@ -3,7 +3,7 @@ use crate::popover::{Align, Anchor, popover};
 use gpui::{
     Animation, AnimationExt, AnyElement, ClipboardItem, CursorStyle, Div, FontWeight, Hsla,
     MouseButton, Pixels, Role, SharedString, Stateful, Window, canvas, div, list, prelude::*, px,
-    rgb,
+    rgb, uniform_list,
 };
 
 fn action(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Stateful<Div> {
@@ -2104,100 +2104,174 @@ impl Inbox {
             .into_any_element()
     }
 
-    /// "All changes" and each commit of the pull request, to review them
-    /// together or one by one.
-    fn commits_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let all = self.diff.as_ref();
-        let rows = self.commits.iter().enumerate().map(|(ix, commit)| {
-            let selected = self.commit_scope.as_deref() == Some(commit.sha.as_str());
-            let sha = commit.sha.clone();
-            div()
-                .id(("inbox-commit", ix))
-                .role(Role::ListBoxOption)
+    /// The commit dropdown's button: what the review covers now.
+    fn commit_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .commit_scope
+            .as_ref()
+            .and_then(|sha| self.commits.iter().find(|c| &c.sha == sha));
+        let open = self.commit_menu;
+        div()
+            .id("inbox-commit-dropdown")
+            .role(Role::Button)
+            .aria_label("Choose commits to review")
+            .aria_expanded(open)
+            .relative()
+            .flex_shrink_0()
+            .h(px(40.))
+            .mx(px(8.))
+            .my(px(6.))
+            .px(px(10.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(content(if open { 0.2 } else { 0.1 }))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.05)))
+            .child(self.commit_anchor.probe())
+            .child(icon("git-commit", 14.).text_color(content(0.55)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(content(0.95))
+                            .child(match current {
+                                Some(commit) => commit.headline.clone(),
+                                None => format!("All commits ({})", self.commits.len()),
+                            }),
+                    )
+                    .when_some(current, |d, commit| {
+                        d.child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.))
+                                .text_color(content(0.4))
+                                .child(format!("{} · {}", commit.short_sha, commit.author)),
+                        )
+                    }),
+            )
+            .child(icon("chevron-down", 12.).text_color(content(0.5)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.commit_menu = !this.commit_menu;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Row 0 is "All commits"; the rest are the pull request's commits.
+    fn commit_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let base = div()
+            .id(("inbox-commit-row", ix))
+            .role(Role::ListBoxOption)
+            .h(px(44.))
+            .mx(px(4.))
+            .px(px(10.))
+            .rounded(px(6.))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(content(0.07)));
+        if ix == 0 {
+            let selected = self.commit_scope.is_none();
+            return base
                 .aria_selected(selected)
-                .min_h(px(34.))
-                .mx(px(6.))
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(5.))
-                .flex()
-                .flex_col()
-                .justify_center()
-                .cursor_pointer()
                 .when(selected, |d| d.bg(content(0.1)))
-                .hover(|s| s.bg(content(0.06)))
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(content(if selected { 1. } else { 0.85 }))
-                        .child(commit.headline.clone()),
-                )
                 .child(
                     div()
                         .flex()
-                        .gap(px(6.))
-                        .text_size(px(10.))
-                        .text_color(content(0.4))
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(12.))
+                        .text_color(content(0.95))
+                        .child(icon("git-merge", 12.).text_color(content(0.5)))
                         .child(
                             div()
-                                .font_family(crate::fonts::mono())
-                                .child(commit.short_sha.clone()),
+                                .flex_1()
+                                .child(format!("All commits ({})", self.commits.len())),
                         )
-                        .child(div().truncate().child(commit.author.clone()))
-                        .child(div().flex_shrink_0().child(relative_time(&commit.date))),
+                        .when_some(self.diff.as_ref(), |d, diff| {
+                            d.child(crate::diff_view::diff_counts(
+                                diff.additions.max(0) as u32,
+                                diff.deletions.max(0) as u32,
+                            ))
+                        }),
                 )
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.select_scope(Some(sha.clone()), cx)),
-                )
-        });
-        div()
-            .id("inbox-commits")
-            .role(Role::ListBox)
-            .aria_label("Commits")
-            .flex_shrink_0()
-            .max_h(px(260.))
-            .overflow_y_scroll()
-            .border_b_1()
-            .border_color(content(0.07))
-            .py(px(6.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.commit_menu = false;
+                    this.select_scope(None, cx);
+                }))
+                .into_any_element();
+        }
+        let Some(commit) = self.commits.get(ix - 1) else {
+            return base.into_any_element();
+        };
+        let selected = self.commit_scope.as_deref() == Some(commit.sha.as_str());
+        let sha = commit.sha.clone();
+        base.aria_selected(selected)
+            .when(selected, |d| d.bg(content(0.1)))
             .child(
                 div()
-                    .id("inbox-commit-all")
-                    .role(Role::ListBoxOption)
-                    .aria_selected(self.commit_scope.is_none())
-                    .h(px(30.))
-                    .mx(px(6.))
-                    .px(px(8.))
-                    .rounded(px(5.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .cursor_pointer()
+                    .truncate()
                     .text_size(px(12.))
-                    .text_color(content(if self.commit_scope.is_none() {
-                        1.
-                    } else {
-                        0.85
-                    }))
-                    .when(self.commit_scope.is_none(), |d| d.bg(content(0.1)))
-                    .hover(|s| s.bg(content(0.06)))
-                    .child(icon("git-merge", 12.).text_color(content(0.5)))
+                    .text_color(content(0.9))
+                    .child(commit.headline.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .text_size(px(10.))
+                    .text_color(content(0.4))
                     .child(
                         div()
-                            .flex_1()
-                            .child(format!("All changes · {} commits", self.commits.len())),
+                            .font_family(crate::fonts::mono())
+                            .child(commit.short_sha.clone()),
                     )
-                    .when_some(all, |d, diff| {
-                        d.child(crate::diff_view::diff_counts(
-                            diff.additions.max(0) as u32,
-                            diff.deletions.max(0) as u32,
-                        ))
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.select_scope(None, cx))),
+                    .child(div().truncate().child(commit.author.clone()))
+                    .child(div().flex_shrink_0().child(relative_time(&commit.date))),
             )
-            .children(rows)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.commit_menu = false;
+                this.select_scope(Some(sha.clone()), cx);
+            }))
             .into_any_element()
+    }
+
+    fn commit_menu_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let entity = cx.entity();
+        let count = self.commits.len() + 1;
+        popover(
+            "inbox-commit-menu",
+            Anchor::Slot(self.commit_anchor.clone()),
+        )
+        .width(440.)
+        .height((count as f32 * 44. + 8.).min(420.))
+        .padding(4.)
+        .on_dismiss(move |_, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                this.commit_menu = false;
+                cx.notify();
+            });
+        })
+        .child(
+            uniform_list("inbox-commit-rows", count, move |range, _, cx| {
+                entity.update(cx, |this, cx| {
+                    range.map(|ix| this.commit_row(ix, cx)).collect::<Vec<_>>()
+                })
+            })
+            .size_full(),
+        )
+        .into_any_element()
     }
 
     fn diff_view(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2206,7 +2280,7 @@ impl Inbox {
             .scope_diff()
             .filter(|diff| diff.files.len() > 1 || (has_commits && !diff.files.is_empty()))
             .map(|diff| self.diff_tree(diff, cx));
-        let commits = has_commits.then(|| self.commits_panel(cx));
+        let commits = has_commits.then(|| self.commit_dropdown(cx));
         let sidebar = (tree.is_some() || commits.is_some()).then(|| {
             div()
                 .id("inbox-diff-sidebar")
@@ -3096,6 +3170,9 @@ impl gpui::Render for Inbox {
             .when(self.filters_open, |d| d.child(self.filters_menu(cx)))
             .when(self.connections_open, |d| d.child(self.connection_menu(cx)))
             .when(self.project_picker, |d| d.child(self.project_menu(cx)))
+            .when(self.commit_menu && !self.commits.is_empty(), |d| {
+                d.child(self.commit_menu_view(cx))
+            })
             .when(self.action_menu, |d| d.child(self.action_menu_view(cx)))
             .when(self.connect_provider.is_some(), |d| {
                 d.child(crate::modal::window_overlay(

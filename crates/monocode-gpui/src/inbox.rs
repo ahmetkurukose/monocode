@@ -112,6 +112,8 @@ pub(crate) struct Inbox {
     start_project: PathBuf,
     project_picker: bool,
     project_anchor: AnchorSlot,
+    commit_menu: bool,
+    commit_anchor: AnchorSlot,
     action_menu: bool,
     action_anchor: AnchorSlot,
     pr_action_anchors: [AnchorSlot; 4],
@@ -472,6 +474,8 @@ impl Inbox {
             start_project: cwd,
             project_picker: false,
             project_anchor: AnchorSlot::default(),
+            commit_menu: false,
+            commit_anchor: AnchorSlot::default(),
             action_menu: false,
             action_anchor: AnchorSlot::default(),
             pr_action_anchors: std::array::from_fn(|_| AnchorSlot::default()),
@@ -757,6 +761,7 @@ impl Inbox {
         self.diff_files.clear();
         self.commits.clear();
         self.commit_scope = None;
+        self.commit_menu = false;
         self.commit_diffs.clear();
         self.commits_loading = false;
         self.commit_loading = false;
