@@ -24,6 +24,8 @@ const ROW: f32 = 26.;
 
 pub(crate) enum UpdateDialogEvent {
     Close,
+    /// The push went through.
+    Pushed,
 }
 
 /// What the dialog runs.
@@ -35,6 +37,9 @@ pub(crate) enum Source {
     Merge(String),
     /// Rebase the current branch onto another one.
     RebaseOnto(String),
+    /// Show what a push would send, then push on request. `warn` is shown
+    /// beside the Push button (pushing the default branch, say).
+    Push { warn: Option<String> },
 }
 
 enum Phase {
@@ -55,6 +60,7 @@ pub(crate) struct UpdateDialog {
     diff_request: u64,
     _tasks: Vec<Task<()>>,
     aborting: bool,
+    pushing: bool,
     error: Option<String>,
     focus: FocusHandle,
 }
@@ -106,6 +112,7 @@ impl UpdateDialog {
             diff_request: 0,
             _tasks: vec![],
             aborting: false,
+            pushing: false,
             error: None,
             focus,
         };
@@ -121,6 +128,7 @@ impl UpdateDialog {
                 Source::Update(method) => scm::update_project(&cwd, method),
                 Source::Merge(branch) => scm::merge_branch(&cwd, &branch),
                 Source::RebaseOnto(branch) => scm::rebase_branch(&cwd, &branch),
+                Source::Push { .. } => scm::outgoing(&cwd),
             }
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
@@ -222,6 +230,32 @@ impl UpdateDialog {
         }));
     }
 
+    /// Sends the commits listed, then closes.
+    fn push_now(&mut self, cx: &mut Context<Self>) {
+        if self.pushing || !matches!(self.phase, Phase::Done(_)) {
+            return;
+        }
+        self.pushing = true;
+        self.error = None;
+        cx.notify();
+        let cwd = PathBuf::from(&self.cwd);
+        let work = cx
+            .background_executor()
+            .spawn(async move { scm::push(&cwd) });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.pushing = false;
+                this.git.update(cx, |git, cx| git.changed(cx));
+                match result {
+                    Ok(()) => cx.emit(UpdateDialogEvent::Pushed),
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn abort(&mut self, cx: &mut Context<Self>) {
         if self.aborting {
             return;
@@ -248,7 +282,8 @@ impl UpdateDialog {
     }
 
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" && !matches!(self.phase, Phase::Running) {
+        if event.keystroke.key == "escape" && !matches!(self.phase, Phase::Running) && !self.pushing
+        {
             cx.emit(UpdateDialogEvent::Close);
             cx.stop_propagation();
         }
@@ -336,6 +371,20 @@ impl UpdateDialog {
     }
 
     fn summary(&self, report: &UpdateReport) -> String {
+        if matches!(self.source, Source::Push { .. }) {
+            let n = report.commits.len();
+            return if n == 0 {
+                format!("Nothing to push to {}", report.upstream)
+            } else {
+                format!(
+                    "{n} commit{} to push to {} · {} file{} changed",
+                    if n == 1 { "" } else { "s" },
+                    report.upstream,
+                    report.files.len(),
+                    if report.files.len() == 1 { "" } else { "s" },
+                )
+            };
+        }
         let verb = if report.rebase {
             "Rebased onto"
         } else {
@@ -469,8 +518,12 @@ impl Render for UpdateDialog {
             Source::Update(UpdateMethod::Merge) => "Update Project".to_string(),
             Source::Merge(branch) => format!("Merge {branch}"),
             Source::RebaseOnto(branch) => format!("Rebase onto {branch}"),
+            Source::Push { .. } => "Push".to_string(),
         };
         let (subtitle, conflicts) = match &self.phase {
+            Phase::Running if matches!(self.source, Source::Push { .. }) => {
+                ("Reading what will be pushed…".to_string(), vec![])
+            }
             Phase::Running => ("Bringing in new commits…".to_string(), vec![]),
             Phase::Failed(_) => ("Update failed".to_string(), vec![]),
             Phase::Done(report) => (self.summary(report), report.conflicts.clone()),
@@ -529,7 +582,11 @@ impl Render for UpdateDialog {
                 .justify_center()
                 .text_size(px(13.))
                 .text_color(content(0.5))
-                .child("Everything is up to date.")
+                .child(if matches!(self.source, Source::Push { .. }) {
+                    "Nothing to push."
+                } else {
+                    "Everything is up to date."
+                })
                 .into_any_element(),
             Phase::Done(report) => div()
                 .flex_1()
@@ -589,6 +646,21 @@ impl Render for UpdateDialog {
                 )
                 .into_any_element(),
         };
+        let (can_push, push_notes) = match (&self.source, &self.phase) {
+            (Source::Push { warn }, Phase::Done(report)) => {
+                let mut notes: Vec<String> = warn.iter().cloned().collect();
+                if report.behind > 0 {
+                    notes.push(format!(
+                        "{} is {} commit{} ahead of this branch; the push will be rejected until you update.",
+                        report.upstream,
+                        report.behind,
+                        if report.behind == 1 { "" } else { "s" }
+                    ));
+                }
+                (!report.commits.is_empty(), notes)
+            }
+            _ => (false, Vec::new()),
+        };
         let card = modal::card()
             .w(px(width))
             .h(px(height))
@@ -631,9 +703,15 @@ impl Render for UpdateDialog {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex()
+                            .flex_col()
                             .text_size(px(12.))
-                            .text_color(rgb(0xf87171))
-                            .children(self.error.clone()),
+                            .children(
+                                push_notes
+                                    .into_iter()
+                                    .map(|note| div().text_color(rgb(0xfbbf24)).child(note)),
+                            )
+                            .child(div().text_color(rgb(0xf87171)).children(self.error.clone())),
                     )
                     .when(!conflicts.is_empty(), |d| {
                         d.child(
@@ -651,17 +729,32 @@ impl Render for UpdateDialog {
                             .on_click(cx.listener(|this, _, _, cx| this.abort(cx))),
                         )
                     })
+                    .when(can_push, |d| {
+                        d.child(
+                            modal::disabled(
+                                modal::primary_button(
+                                    "update-push",
+                                    if self.pushing { "Pushing…" } else { "Push" },
+                                ),
+                                self.pushing,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.push_now(cx))),
+                        )
+                    })
                     .child(
                         modal::disabled(
-                            if conflicts.is_empty() {
+                            if conflicts.is_empty() && !can_push {
                                 modal::primary_button("update-close", "Close")
                             } else {
-                                modal::ghost_button("update-close", "Close")
+                                modal::ghost_button(
+                                    "update-close",
+                                    if can_push { "Cancel" } else { "Close" },
+                                )
                             },
-                            running,
+                            running || self.pushing,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if !matches!(this.phase, Phase::Running) {
+                            if !matches!(this.phase, Phase::Running) && !this.pushing {
                                 cx.emit(UpdateDialogEvent::Close)
                             }
                         })),
@@ -676,7 +769,7 @@ impl Render for UpdateDialog {
                 let weak = cx.weak_entity();
                 move |_, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        if !matches!(this.phase, Phase::Running) {
+                        if !matches!(this.phase, Phase::Running) && !this.pushing {
                             cx.emit(UpdateDialogEvent::Close);
                         }
                     });

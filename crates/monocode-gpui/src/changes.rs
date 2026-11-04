@@ -707,19 +707,26 @@ impl Changes {
         if self.update_dialog.is_some() || self.busy.is_some() || self.cwd.is_empty() {
             return;
         }
+        // Pushing leaves the working tree alone, so only the others wait on agents.
         let what = match &source {
-            Source::Update(_) => "update the project",
-            Source::Merge(_) => "merge",
-            Source::RebaseOnto(_) => "rebase",
+            Source::Update(_) => Some("update the project"),
+            Source::Merge(_) => Some("merge"),
+            Source::RebaseOnto(_) => Some("rebase"),
+            Source::Push { .. } => None,
         };
-        if self.refuse_while_agent_works(what, window, cx) {
+        if let Some(what) = what
+            && self.refuse_while_agent_works(what, window, cx)
+        {
             return;
         }
         let git = self.git.clone();
         let cwd = self.cwd.clone();
         let dialog = cx.new(|cx| UpdateDialog::new(git, cwd, source, window, cx));
-        let subscription = cx.subscribe(&dialog, |this, _, _: &UpdateDialogEvent, cx| {
+        let subscription = cx.subscribe(&dialog, |this, _, event: &UpdateDialogEvent, cx| {
             this.update_dialog = None;
+            if matches!(event, UpdateDialogEvent::Pushed) {
+                this.set_status("Pushed", cx);
+            }
             this.mutated(cx);
             cx.emit(ChangesEvent::Overlays);
             cx.notify();
@@ -863,38 +870,16 @@ impl Changes {
             cx,
         );
     }
+    /// Opens the Push window: the commits and files a push would send, with
+    /// Push to send them.
     pub(crate) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.index(cx);
         let Some(branch) = index.as_ref().and_then(|i| i.branch.clone()) else {
             return;
         };
-        let on_default = Self::on_default(index.as_ref());
-        let start = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            this.status = None;
-            this.run_git(
-                "push".into(),
-                |path| scm::push(&path),
-                |this, _, cx| this.set_status("Pushed", cx),
-                window,
-                cx,
-            );
-        };
-        if !on_default {
-            start(self, window, cx);
-            return;
-        }
-        let ask = Self::confirm(
-            format!("Push to default branch \"{branch}\"?"),
-            "Push",
-            window,
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if ask.await {
-                let _ = this.update_in(cx, start);
-            }
-        })
-        .detach();
+        let warn = Self::on_default(index.as_ref())
+            .then(|| format!("\"{branch}\" is the default branch."));
+        self.open_update_dialog(Source::Push { warn }, window, cx);
     }
 
     pub(crate) fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {

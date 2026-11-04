@@ -1296,3 +1296,62 @@ fn rebase_branch_replays_the_current_branch_onto_another() {
     );
     assert!(rebase_branch(dir.path(), "--abort").is_err());
 }
+
+#[test]
+fn outgoing_lists_the_commits_and_files_a_push_would_send() {
+    let (_root, _a, b) = two_clones();
+    std::fs::write(b.join("keep.txt"), "k2\n").unwrap();
+    assert!(git(&b, &["commit", "-am", "edit keep"]));
+    std::fs::write(b.join("new.txt"), "n\n").unwrap();
+    assert!(git(&b, &["add", "."]) && git(&b, &["commit", "-m", "add new"]));
+    let report = outgoing(&b).unwrap();
+    assert_eq!(report.upstream, "origin/main");
+    assert!(!report.no_upstream && report.behind == 0);
+    assert_eq!(
+        report
+            .commits
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["add new", "edit keep"]
+    );
+    let files: Vec<_> = report
+        .files
+        .iter()
+        .map(|f| (f.relative.as_str(), f.status.as_str()))
+        .collect();
+    assert_eq!(files, [("keep.txt", "modified"), ("new.txt", "added")]);
+    let diff = range_file_diff(&b, &report.old, &report.new, "keep.txt").unwrap();
+    assert_eq!(
+        (diff.original.as_str(), diff.current.as_str()),
+        ("k\n", "k2\n")
+    );
+    assert!(git(&b, &["push"]));
+    assert!(outgoing(&b).unwrap().commits.is_empty());
+}
+
+#[test]
+fn outgoing_for_a_new_branch_counts_commits_no_remote_has() {
+    let (_root, _a, b) = two_clones();
+    assert!(git(&b, &["switch", "-c", "topic"]));
+    std::fs::write(b.join("t.txt"), "t\n").unwrap();
+    assert!(git(&b, &["add", "."]) && git(&b, &["commit", "-m", "topic work"]));
+    let report = outgoing(&b).unwrap();
+    assert!(report.no_upstream);
+    assert_eq!(report.upstream, "origin (new branch)");
+    assert_eq!(report.commits.len(), 1);
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].relative, "t.txt");
+}
+
+#[test]
+fn outgoing_notes_how_far_the_branch_is_behind() {
+    let (_root, a, b) = two_clones();
+    std::fs::write(a.join("shared.txt"), "from a\n").unwrap();
+    assert!(git(&a, &["commit", "-am", "a edit"]) && git(&a, &["push"]));
+    std::fs::write(b.join("keep.txt"), "k2\n").unwrap();
+    assert!(git(&b, &["commit", "-am", "b edit"]));
+    assert!(git(&b, &["fetch"]));
+    let report = outgoing(&b).unwrap();
+    assert_eq!((report.commits.len(), report.behind), (1, 1));
+}

@@ -35,6 +35,10 @@ pub struct UpdateReport {
     pub files: Vec<ChangedFile>,
     /// Files left unmerged; the update is then still in progress.
     pub conflicts: Vec<String>,
+    /// Outgoing reports only: commits the upstream has that this branch lacks.
+    pub behind: i64,
+    /// Outgoing reports only: the branch has no upstream yet.
+    pub no_upstream: bool,
 }
 
 const MAX_INCOMING: u32 = 300;
@@ -44,16 +48,15 @@ fn head(root: &Path) -> Result<String, String> {
 }
 
 fn incoming_commits(root: &Path, spec: &str) -> Vec<IncomingCommit> {
+    commits_in(root, &[&format!("HEAD..{spec}")])
+}
+
+/// Commits selected by `revs` (newest first, capped), as `git log` takes them.
+fn commits_in(root: &Path, revs: &[&str]) -> Vec<IncomingCommit> {
     let limit = format!("--max-count={MAX_INCOMING}");
-    let Some(text) = git_run(
-        root,
-        &[
-            "log",
-            &limit,
-            "--format=%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e",
-            &format!("HEAD..{spec}"),
-        ],
-    ) else {
+    let mut args = vec!["log", &limit, "--format=%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e"];
+    args.extend_from_slice(revs);
+    let Some(text) = git_run(root, &args) else {
         return vec![];
     };
     text.split('\u{1e}')
@@ -219,6 +222,55 @@ fn bring_in(
     Ok(report)
 }
 
+/// What a push would send: the commits the branch has beyond its upstream (or
+/// beyond every remote, for a branch with no upstream yet) and the files they
+/// change. `old` is where the remote's history meets this branch.
+pub fn outgoing(cwd: &Path) -> Result<UpdateReport, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("Push preview isn't available on remote workspaces yet".into());
+    }
+    let root = expand_home(cwd);
+    if !git_is_work_tree(&root) {
+        return Err("Not a git repository".into());
+    }
+    let new = head(&root)?;
+    let mut report = UpdateReport {
+        new: new.clone(),
+        ..Default::default()
+    };
+    if let Some(upstream) = git_stdout(&root, &["rev-parse", "--abbrev-ref", "@{upstream}"]) {
+        report.old = git_stdout(&root, &["merge-base", "HEAD", "@{upstream}"])
+            .unwrap_or_else(|| new.clone());
+        report.behind = git_stdout(&root, &["rev-list", "--count", "HEAD..@{upstream}"])
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        report.commits = commits_in(&root, &["@{upstream}..HEAD"]);
+        report.upstream = upstream;
+    } else {
+        let remote = git_remote_name(&root).ok_or("No git remote to push to")?;
+        report.no_upstream = true;
+        report.commits = commits_in(&root, &["HEAD", "--not", "--remotes"]);
+        report.upstream = format!("{remote} (new branch)");
+        // The first new commit's parent, or nothing when the history is new.
+        report.old = report
+            .commits
+            .last()
+            .and_then(|oldest| {
+                git_stdout(
+                    &root,
+                    &["rev-parse", "--verify", &format!("{}^", oldest.sha)],
+                )
+            })
+            .unwrap_or_else(|| EMPTY_TREE.to_string());
+    }
+    if !report.commits.is_empty() {
+        report.files = range_files_for(&root, &report.old, &report.new);
+    }
+    Ok(report)
+}
+/// The object every repository knows as "no files at all".
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// Gives up an update stopped by conflicts, restoring the branch.
 pub fn abort_update(cwd: &Path) -> Result<(), String> {
     if remote_workspace::is_remote(cwd) {
@@ -274,9 +326,11 @@ fn peel(root: &Path, spec: &str) -> Result<String, String> {
     if spec.len() < 4 || spec.len() > 64 || !spec.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Invalid commit".into());
     }
+    // A tree answers too: a branch with no history on the remote starts from
+    // the empty one.
     git_stdout(
         root,
-        &["rev-parse", "--verify", &format!("{spec}^{{commit}}")],
+        &["rev-parse", "--verify", &format!("{spec}^{{tree}}")],
     )
     .ok_or_else(|| "Unknown commit".into())
 }
