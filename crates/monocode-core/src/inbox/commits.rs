@@ -356,6 +356,37 @@ impl Service {
     }
 }
 
+/// Switch the checkout at `project` to a pull request's branch with `gh pr
+/// checkout`, which also fetches it and sets it to track the remote. Returns the
+/// branch now checked out. Refuses when the folder is not a checkout of `repo`,
+/// since gh would otherwise fetch the branch into whatever repository is there.
+pub fn pr_checkout(project: &Path, repo: &str, number: i64) -> Result<String, String> {
+    if number <= 0 {
+        return Err("Invalid pull request number".into());
+    }
+    let (owner, name) = repo_parts(repo)?;
+    let slug = format!("{owner}/{name}").to_lowercase();
+    let remotes = run_git(project, &["remote", "-v"])?.to_lowercase();
+    if !remotes.contains(&slug) {
+        return Err(format!(
+            "{} isn't a checkout of {owner}/{name}",
+            project.display()
+        ));
+    }
+    run_gh(
+        project,
+        &[
+            "pr",
+            "checkout",
+            &number.to_string(),
+            "--repo",
+            &format!("{owner}/{name}"),
+        ],
+        true,
+    )?;
+    run_git(project, &["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +438,29 @@ mod tests {
         );
         assert!(parse_pr_oids(r#"{"baseRefOid":"","headRefOid":"2222222bbbb"}"#).is_err());
         assert!(parse_pr_oids(r#"{"baseRefOid":"zz","headRefOid":"2222222bbbb"}"#).is_err());
+    }
+
+    #[test]
+    fn a_pull_request_is_only_checked_out_in_a_checkout_of_its_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/other/thing.git",
+        ]);
+        let error = pr_checkout(dir.path(), "acme/app", 7).unwrap_err();
+        assert!(error.contains("isn't a checkout of acme/app"), "{error}");
+        assert!(pr_checkout(dir.path(), "acme/app", 0).is_err());
+        assert!(pr_checkout(dir.path(), "not a repo", 7).is_err());
     }
 
     #[test]

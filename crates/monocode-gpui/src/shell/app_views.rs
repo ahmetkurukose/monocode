@@ -297,6 +297,9 @@ impl Shell {
                     inbox::Event::StartSession { item, prompt } => {
                         this.start_inbox_session(item.as_ref().clone(), prompt.clone(), cx);
                     }
+                    inbox::Event::CheckoutPr(item) => {
+                        this.checkout_pr(item.as_ref().clone(), cx);
+                    }
                     inbox::Event::ItemsChanged(items) => {
                         this.inbox_automation_events(items.clone(), cx)
                     }

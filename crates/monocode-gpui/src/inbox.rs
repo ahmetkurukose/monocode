@@ -30,7 +30,13 @@ use std::{
 pub(crate) enum Event {
     Close,
     OpenSession(i64),
-    StartSession { item: Box<Item>, prompt: String },
+    StartSession {
+        item: Box<Item>,
+        prompt: String,
+    },
+    /// Check out the pull request's branch in its project; the shell answers
+    /// through `finish_checkout`.
+    CheckoutPr(Box<Item>),
     ItemsChanged(Vec<Item>),
 }
 
@@ -120,6 +126,7 @@ pub(crate) struct Inbox {
     project_anchor: AnchorSlot,
     commit_menu: bool,
     commit_anchor: AnchorSlot,
+    checking_out: bool,
     action_menu: bool,
     action_anchor: AnchorSlot,
     pr_action_anchors: [AnchorSlot; 4],
@@ -188,6 +195,26 @@ impl Inbox {
                 view.reveal_file(id, cx);
             }
         });
+    }
+    /// The shell has started checking the pull request's branch out.
+    pub(crate) fn begin_checkout(&mut self, cx: &mut Context<Self>) {
+        self.checking_out = true;
+        self.action_error = None;
+        self.action_notice = None;
+        cx.notify();
+    }
+    /// The branch now checked out, or why it could not be.
+    pub(crate) fn finish_checkout(
+        &mut self,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.checking_out = false;
+        match result {
+            Ok(branch) => self.action_notice = Some(format!("Checked out {branch}")),
+            Err(error) => self.action_error = Some(error),
+        }
+        cx.notify();
     }
     /// The diff the review is scoped to: one commit's, or the whole pull
     /// request's.
@@ -554,6 +581,7 @@ impl Inbox {
             project_anchor: AnchorSlot::default(),
             commit_menu: false,
             commit_anchor: AnchorSlot::default(),
+            checking_out: false,
             action_menu: false,
             action_anchor: AnchorSlot::default(),
             pr_action_anchors: std::array::from_fn(|_| AnchorSlot::default()),

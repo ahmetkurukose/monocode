@@ -1163,6 +1163,33 @@ impl Inbox {
                         ),
                 )
             })
+            .when(
+                open && item.provider == "github" && !item.project_path.is_empty(),
+                |d| {
+                    let busy = self.checking_out;
+                    let target = item.clone();
+                    d.child(
+                        icon_action(
+                            "inbox-pr-checkout",
+                            if busy {
+                                "Checking out…"
+                            } else {
+                                "Checkout branch"
+                            },
+                            "git-branch",
+                        )
+                        .border_1()
+                        .border_color(content(0.15))
+                        .px(px(12.))
+                        .when(busy, |d| d.opacity(0.4))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.checking_out {
+                                cx.emit(Event::CheckoutPr(Box::new(target.clone())));
+                            }
+                        })),
+                    )
+                },
+            )
             .children(
                 [
                     (open && item.draft, "ready", "Ready for review"),
@@ -1216,6 +1243,21 @@ impl Inbox {
                         .child(notice),
                 )
             })
+            // A failed checkout has no dialog of its own to show its error in.
+            .when_some(
+                self.action_error
+                    .clone()
+                    .filter(|_| self.confirm_action.is_none()),
+                |d, text| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xf87171))
+                            .child(text),
+                    )
+                },
+            )
             .into_any_element()
     }
 

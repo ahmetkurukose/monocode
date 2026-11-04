@@ -1849,6 +1849,10 @@ impl Shell {
     /// in their own worktrees are not affected.
     fn agent_blocking_git(&self, cx: &App) -> Option<String> {
         let project = self.git.read(cx).project().to_owned();
+        self.agent_working_in(&project, cx)
+    }
+    /// The same for any checkout, by its folder.
+    fn agent_working_in(&self, project: &str, cx: &App) -> Option<String> {
         if project.is_empty() {
             return None;
         }
@@ -1857,9 +1861,40 @@ impl Shell {
             if view.summary.archived || !view.responding() {
                 return None;
             }
-            crate::changes::checkouts_overlap(&project, &view.summary.cwd)
+            crate::changes::checkouts_overlap(project, &view.summary.cwd)
                 .then(|| view.display_title())
         })
+    }
+    /// Checks a pull request's branch out in its project, unless an agent is
+    /// working in that checkout.
+    pub(super) fn checkout_pr(&mut self, item: monocode_core::inbox::Item, cx: &mut Context<Self>) {
+        let Some(inbox) = self.inbox.clone() else {
+            return;
+        };
+        let project = item.project_path.clone();
+        if let Some(agent) = self.agent_working_in(&project, cx) {
+            let message = format!(
+                "Can't switch branches while \"{agent}\" is working in this checkout. Wait for it to finish or stop it first."
+            );
+            inbox.update(cx, |inbox, cx| inbox.finish_checkout(Err(message), cx));
+            return;
+        }
+        inbox.update(cx, |inbox, cx| inbox.begin_checkout(cx));
+        let (repo, number) = (item.repo.clone(), item.number);
+        let work = cx.background_executor().spawn(async move {
+            monocode_core::inbox::pr_checkout(std::path::Path::new(&project), &repo, number)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                // The footer and the Changes panel follow the new branch.
+                this.git.update(cx, |git, cx| git.changed(cx));
+                if let Some(inbox) = this.inbox.clone() {
+                    inbox.update(cx, |inbox, cx| inbox.finish_checkout(result, cx));
+                }
+            });
+        })
+        .detach();
     }
     /// Keeps the Changes panel's guard current as sessions start and stop.
     fn sync_git_guard(&mut self, cx: &mut Context<Self>) {
