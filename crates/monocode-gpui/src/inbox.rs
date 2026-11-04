@@ -81,6 +81,12 @@ pub(crate) struct Inbox {
     commit_diffs: std::collections::HashMap<String, (Diff, Vec<crate::diff_view::DiffFile>)>,
     commits_loading: bool,
     commit_loading: bool,
+    /// Show the selected file whole rather than its hunks. Whole files come from
+    /// GitHub per (scope, path), with the two commits each scope compares.
+    full_file: bool,
+    full_cache: std::collections::HashMap<(Option<String>, String), crate::diff_view::DiffFile>,
+    full_loading: Option<(Option<String>, String)>,
+    scope_shas: std::collections::HashMap<Option<String>, (String, String)>,
     checks: Option<Checks>,
     tab: Tab,
     loading: bool,
@@ -149,14 +155,28 @@ impl Inbox {
     /// The review shows one file at a time: the one picked in the tree.
     fn show_diff_file(&mut self, cx: &mut Context<Self>) {
         let selected = self.diff_selected.clone();
-        let scope = self.scope_files();
-        let files = match selected
-            .as_deref()
-            .map(diff::file_id)
-            .and_then(|id| scope.iter().find(|f| f.id == id))
+        // The whole file replaces the hunks once it has arrived; the hunks
+        // stay up while it loads.
+        let mut whole = None;
+        if self.full_file
+            && let Some(path) = selected.clone()
         {
-            Some(file) => vec![file.clone()],
-            None => scope.to_vec(),
+            match self
+                .full_cache
+                .get(&(self.commit_scope.clone(), path.clone()))
+            {
+                Some(model) => whole = Some(model.clone()),
+                None => self.load_full_file(path, cx),
+            }
+        }
+        let scope = self.scope_files();
+        let files = match (whole, selected.as_deref().map(diff::file_id)) {
+            (Some(model), _) => vec![model],
+            (None, Some(id)) => match scope.iter().find(|f| f.id == id) {
+                Some(file) => vec![file.clone()],
+                None => scope.to_vec(),
+            },
+            (None, None) => scope.to_vec(),
         };
         let single = files.len() == 1;
         let first = files.first().map(|f| f.id.clone());
@@ -289,6 +309,59 @@ impl Inbox {
             });
         })
         .detach();
+    }
+    /// Reads one file whole, before and after, from GitHub and shows it.
+    fn load_full_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = (self.commit_scope.clone(), path.clone());
+        if self.full_cache.contains_key(&key) || self.full_loading.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(item) = self.item() else {
+            return;
+        };
+        self.full_loading = Some(key.clone());
+        self.extra_error = None;
+        let service = self.service.clone();
+        let known = self.scope_shas.get(&key.0).cloned();
+        let scope = key.0.clone();
+        let item_key = item.key();
+        let task = cx.background_executor().spawn(async move {
+            let shas = match known {
+                Some(shas) => shas,
+                None => service.pr_scope_shas(&item, scope.as_deref())?,
+            };
+            let (original, current) = service.pr_file_pair(&item, &shas.0, &shas.1, &path)?;
+            Ok::<_, String>((shas, diff::full_file_model(&path, &original, &current)))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selected.as_ref() != Some(&item_key) {
+                    return;
+                }
+                if this.full_loading.as_ref() == Some(&key) {
+                    this.full_loading = None;
+                }
+                match result {
+                    Ok((shas, model)) => {
+                        this.scope_shas.insert(key.0.clone(), shas);
+                        this.full_cache.insert(key.clone(), model);
+                        if this.full_file
+                            && this.commit_scope == key.0
+                            && this.diff_selected.as_deref() == Some(key.1.as_str())
+                        {
+                            this.show_diff_file(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.extra_error = Some(format!("Couldn’t show the whole file: {error}"))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn copy_link(&mut self, url: String, cx: &mut Context<Self>) {
         if url.is_empty() {
@@ -444,6 +517,10 @@ impl Inbox {
             commit_diffs: Default::default(),
             commits_loading: false,
             commit_loading: false,
+            full_file: false,
+            full_cache: Default::default(),
+            full_loading: None,
+            scope_shas: Default::default(),
             checks: None,
             tab: Tab::Summary,
             loading: false,
@@ -767,6 +844,9 @@ impl Inbox {
         self.commit_diffs.clear();
         self.commits_loading = false;
         self.commit_loading = false;
+        self.full_cache.clear();
+        self.full_loading = None;
+        self.scope_shas.clear();
         self.extra_request += 1;
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));

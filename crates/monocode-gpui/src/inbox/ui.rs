@@ -2274,6 +2274,55 @@ impl Inbox {
         .into_any_element()
     }
 
+    /// "Whole file": shows the selected file in full instead of its hunks.
+    fn full_file_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.full_file;
+        div()
+            .flex_shrink_0()
+            .h(px(34.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .justify_end()
+            .border_b_1()
+            .border_color(content(0.07))
+            .child(
+                div()
+                    .id("inbox-full-file")
+                    .role(Role::Switch)
+                    .aria_label("Show the whole file")
+                    .aria_toggled(if on {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(content(if on { 1. } else { 0.6 }))
+                    .when(on, |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                    .child(icon("unfold-vertical", 12.).text_color(content(if on {
+                        0.9
+                    } else {
+                        0.5
+                    })))
+                    .child("Whole file")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.full_file = !this.full_file;
+                        this.extra_error = None;
+                        this.show_diff_file(cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn diff_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_commits = self.commits.len() > 1;
         let tree = self
@@ -2332,7 +2381,11 @@ impl Inbox {
             .when(self.extra_loading || self.commit_loading, |d| {
                 d.child(message("Loading changes…"))
             })
+            .when(self.full_loading.is_some(), |d| {
+                d.child(message("Loading the whole file…"))
+            })
             .when_some(self.extra_error.clone(), |d, text| d.child(error(text)))
+            .when(self.diff.is_some(), |d| d.child(self.full_file_toggle(cx)))
             .when(self.diff.is_some(), |d| {
                 d.child(
                     div().flex_1().min_h_0().flex().children(sidebar).child(

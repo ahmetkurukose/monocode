@@ -138,6 +138,45 @@ pub(super) fn parse_commit_diff(json: &str) -> Result<Diff, String> {
     Ok(diff)
 }
 
+/// One path as GitHub's contents API wants it: each segment percent-encoded.
+fn encode_path(path: &str) -> String {
+    let mut out = String::new();
+    for (ix, segment) in path.split('/').enumerate() {
+        if ix > 0 {
+            out.push('/');
+        }
+        for byte in segment.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+    }
+    out
+}
+
+fn valid_sha(sha: &str) -> bool {
+    (7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+pub(super) fn parse_pr_oids(json: &str) -> Result<(String, String), String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        #[serde(default)]
+        base_ref_oid: String,
+        #[serde(default)]
+        head_ref_oid: String,
+    }
+    let row: Row = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    if !valid_sha(&row.base_ref_oid) || !valid_sha(&row.head_ref_oid) {
+        return Err("Pull request is missing its base or head commit".into());
+    }
+    Ok((row.base_ref_oid, row.head_ref_oid))
+}
+
 fn gh(root: &Path, args: &[&str]) -> Result<String, String> {
     run_gh(root, args, false)
 }
@@ -164,6 +203,112 @@ impl Service {
         )?;
         parse_commits(&json)
     }
+    /// The two commits a review scope compares: where the pull request
+    /// branched from the base and its head, or one commit's parent and the
+    /// commit. An empty `old` means the commit has no parent.
+    pub fn pr_scope_shas(
+        &self,
+        item: &Item,
+        commit: Option<&str>,
+    ) -> Result<(String, String), String> {
+        if item.provider != "github" || item.number <= 0 {
+            return Err("Whole files are only available for GitHub pull requests".into());
+        }
+        let (owner, name) = repo_parts(&item.repo)?;
+        let root = self.project(item);
+        if let Some(sha) = commit {
+            if !valid_sha(sha) {
+                return Err("Unknown commit".into());
+            }
+            let parent = gh(
+                root,
+                &[
+                    "api",
+                    &format!("repos/{owner}/{name}/commits/{sha}"),
+                    "--jq",
+                    ".parents[0].sha // \"\"",
+                ],
+            )?;
+            return Ok((parent.trim().to_string(), sha.to_string()));
+        }
+        let number = item.number.to_string();
+        let json = gh(
+            root,
+            &[
+                "pr",
+                "view",
+                &number,
+                "--repo",
+                &format!("{owner}/{name}"),
+                "--json",
+                "baseRefOid,headRefOid",
+            ],
+        )?;
+        let (base, head) = parse_pr_oids(&json)?;
+        let merge_base = gh(
+            root,
+            &[
+                "api",
+                &format!("repos/{owner}/{name}/compare/{base}...{head}"),
+                "--jq",
+                ".merge_base_commit.sha",
+            ],
+        )?;
+        let merge_base = merge_base.trim();
+        Ok((
+            if valid_sha(merge_base) {
+                merge_base
+            } else {
+                &base
+            }
+            .to_string(),
+            head,
+        ))
+    }
+
+    /// A file before and after, whole, as `(original, current)`. A side that
+    /// does not exist at its commit (added or deleted file, no parent) is empty.
+    pub fn pr_file_pair(
+        &self,
+        item: &Item,
+        old: &str,
+        new: &str,
+        path: &str,
+    ) -> Result<(String, String), String> {
+        if path.is_empty() || path.split('/').any(|part| part == ".." || part.is_empty()) {
+            return Err("Invalid path".into());
+        }
+        let (owner, name) = repo_parts(&item.repo)?;
+        let root = self.project(item);
+        let side = |sha: &str| -> Result<String, String> {
+            if sha.is_empty() {
+                return Ok(String::new());
+            }
+            if !valid_sha(sha) {
+                return Err("Unknown commit".into());
+            }
+            let endpoint = format!(
+                "repos/{owner}/{name}/contents/{}?ref={sha}",
+                encode_path(path)
+            );
+            match gh(
+                root,
+                &["api", "-H", "Accept: application/vnd.github.raw", &endpoint],
+            ) {
+                Ok(text) if text.len() > MAX_COMMIT_DIFF_BYTES => {
+                    Err("This file is too large to show whole".into())
+                }
+                Ok(text) if text.contains('\0') => Err("This is a binary file".into()),
+                Ok(text) => Ok(text),
+                Err(error) if error.contains("404") || error.contains("Not Found") => {
+                    Ok(String::new())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        Ok((side(old)?, side(new)?))
+    }
+
     /// What one commit of the pull request changed.
     pub fn pr_commit_diff(&self, item: &Item, sha: &str) -> Result<Diff, String> {
         let sha = sha.trim();
@@ -215,6 +360,24 @@ mod tests {
         assert!(sections[0].contains("+++ b/src/a.rs") && sections[0].contains("+new"));
         assert!(sections[1].contains("Binary files"));
         assert!(!diff.truncated);
+    }
+
+    #[test]
+    fn paths_are_encoded_per_segment_for_the_contents_api() {
+        assert_eq!(encode_path("src/app/a b#c.rs"), "src/app/a%20b%23c.rs");
+        assert_eq!(encode_path("ünï/x.py"), "%C3%BCn%C3%AF/x.py");
+        assert_eq!(encode_path("plain-name_1.rs"), "plain-name_1.rs");
+    }
+
+    #[test]
+    fn a_pull_requests_base_and_head_must_be_commit_ids() {
+        let json = r#"{"baseRefOid":"1111111aaaa","headRefOid":"2222222bbbb"}"#;
+        assert_eq!(
+            parse_pr_oids(json).unwrap(),
+            ("1111111aaaa".to_string(), "2222222bbbb".to_string())
+        );
+        assert!(parse_pr_oids(r#"{"baseRefOid":"","headRefOid":"2222222bbbb"}"#).is_err());
+        assert!(parse_pr_oids(r#"{"baseRefOid":"zz","headRefOid":"2222222bbbb"}"#).is_err());
     }
 
     #[test]

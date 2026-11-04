@@ -226,6 +226,27 @@ pub(super) fn tree_rows(diff: &Diff, collapsed: &HashSet<String>) -> Vec<TreeRow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whole_file_keeps_every_line_in_one_block() {
+        let original: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let current = original.replace("line 20\n", "line twenty\n");
+        let file = full_file_model("src/a.rs", &original, &current);
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        assert_eq!(file.blocks.len(), 1, "no folded gaps");
+        let lines = file.blocks[0].lines();
+        assert_eq!(lines.len(), 41, "40 lines plus the replaced one");
+        let hunks = monocode_core::diff::build_unified_file(
+            &original,
+            &current,
+            monocode_core::diff::CONTEXT_DEFAULT,
+        );
+        assert!(
+            hunks.blocks.len() > 1,
+            "the hunk view folds the unchanged runs"
+        );
+    }
+
     use monocode_core::inbox::DiffFile as Changed;
 
     fn changed(path: &str, additions: i64, deletions: i64) -> Changed {
@@ -263,5 +284,25 @@ mod tests {
         assert_eq!((rows[0].additions, rows[0].deletions), (3, 1));
         let folded = tree_rows(&diff, &HashSet::from(["src/app/model".to_string()]));
         assert_eq!(folded.len(), 2);
+    }
+}
+
+/// A file shown whole: every line of it, with the changes marked, rather than
+/// only the hunks and three lines around them.
+pub(super) fn full_file_model(path: &str, original: &str, current: &str) -> DiffFile {
+    let unified = monocode_core::diff::build_unified_file(original, current, usize::MAX);
+    DiffFile {
+        id: file_id(path),
+        path: path.to_owned(),
+        label: path.to_owned(),
+        binary: false,
+        too_large: false,
+        empty_message: None,
+        additions: unified.additions,
+        deletions: unified.deletions,
+        blocks: Arc::new(unified.blocks),
+        can_stage: false,
+        can_discard: false,
+        can_stage_hunk: false,
     }
 }
