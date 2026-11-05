@@ -121,6 +121,22 @@ impl Shell {
 
     /// The session a pulled-out terminal borrows its scope from: the
     /// focused chat, else the project's last focused one.
+    /// A session of the current project, preferring the one last focused, whose
+    /// scope a terminal can take while no session is showing.
+    fn project_session_for_terminal(&self) -> Option<i64> {
+        let project = monocode_core::files::path_key(&self.workspace.project);
+        let in_project = |id: &i64| {
+            self.session_summaries
+                .get(id)
+                .is_some_and(|s| !s.archived && monocode_core::files::path_key(&s.cwd) == project)
+        };
+        self.workspace
+            .project_focus
+            .get(&self.workspace.project)
+            .map(|pane| self.workspace.session_for_pane(*pane))
+            .filter(in_project)
+            .or_else(|| self.order.iter().copied().find(in_project))
+    }
     fn terminal_owner(&self) -> Option<i64> {
         let known = |id: i64| self.session_summaries.contains_key(&id).then_some(id);
         self.workspace
@@ -202,12 +218,12 @@ impl Shell {
     /// Title bar placement: a fresh shell opens as its own title tab. With
     /// no session to borrow a scope from, it opens in the dock instead.
     pub(super) fn new_title_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // An app view (the Inbox, say) has no active session to borrow; leave
-        // it for the session it covers, as a click on that tab would.
-        if self.app_view_open() && self.terminal_owner().is_none() {
-            self.close_app_view(window, cx);
-        }
-        let Some(owner) = self.terminal_owner() else {
+        // An app view (the Inbox, say) has no active session to borrow; the
+        // project's own sessions can lend their scope, without being opened.
+        let Some(owner) = self
+            .terminal_owner()
+            .or_else(|| self.project_session_for_terminal())
+        else {
             self.new_terminal(window, cx);
             return;
         };
@@ -766,12 +782,31 @@ mod tests {
                 shell.workspace.preferences.set_terminal_placement("title");
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
+                // Only the Inbox is open: the session has history and its tab is
+                // closed, so nothing blank is waiting to be reused.
+                if let Some(summary) = shell.session_summaries.get_mut(&b) {
+                    summary.has_messages = true;
+                }
+                if let Some(view) = shell.sessions.get(&b) {
+                    view.update(cx, |view, _| view.summary.has_messages = true);
+                }
+                shell.workspace.close(b);
+                // Every session tab is closed, so no pane is active or focused.
+                for id in shell.workspace.open_sessions() {
+                    shell.workspace.close(id);
+                }
+                shell.workspace.active = None;
+                shell.workspace.project_focus.clear();
                 shell.open_inbox(w, cx);
                 assert!(shell.app_view_open());
+                assert!(shell.workspace.tab_of(b).is_none());
             })
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
+        let sessions = window
+            .update(&mut visual, |shell, _, _| shell.order.len())
+            .unwrap();
         window
             .update(&mut visual, |shell, window, cx| {
                 shell.run_menu(MenuTarget::NewTab, "terminal", None, window, cx);
@@ -779,6 +814,11 @@ mod tests {
                 assert_eq!(panes.len(), 1, "a terminal opened");
                 assert!(!shell.app_view_open(), "and the Inbox gave way to it");
                 assert_eq!(shell.workspace.active, Some(panes[0]));
+                assert_eq!(shell.order.len(), sessions, "without starting a session");
+                assert!(
+                    shell.workspace.tab_of(b).is_none(),
+                    "or opening a session tab"
+                );
             })
             .unwrap();
         // The dock's New terminal (cmd-`) works from the Inbox too.
