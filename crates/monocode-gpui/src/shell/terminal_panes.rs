@@ -202,6 +202,11 @@ impl Shell {
     /// Title bar placement: a fresh shell opens as its own title tab. With
     /// no session to borrow a scope from, it opens in the dock instead.
     pub(super) fn new_title_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An app view (the Inbox, say) has no active session to borrow; leave
+        // it for the session it covers, as a click on that tab would.
+        if self.app_view_open() && self.terminal_owner().is_none() {
+            self.close_app_view(window, cx);
+        }
         let Some(owner) = self.terminal_owner() else {
             self.new_terminal(window, cx);
             return;
@@ -742,6 +747,50 @@ mod tests {
                 // Back at the bottom, cmd-j toggles the dock again.
                 shell.workspace.preferences.set_terminal_placement("bottom");
                 assert!(!shell.terminal_in_title());
+            })
+            .unwrap();
+    }
+
+    /// The plus menu's New terminal worked beside a session tab but did
+    /// nothing while the Inbox tab was showing.
+    #[gpui::test]
+    fn new_terminal_from_the_plus_menu_works_while_the_inbox_is_showing(cx: &mut TestAppContext) {
+        let (window, _, b) = window(cx);
+        cx.update(|cx| {
+            bind_keys(cx);
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.set_terminal_placement("title");
+                shell.open(b, w, cx);
+                shell.focus_active(w, cx);
+                shell.open_inbox(w, cx);
+                assert!(shell.app_view_open());
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.run_menu(MenuTarget::NewTab, "terminal", None, window, cx);
+                let panes: Vec<i64> = shell.workspace.terminal_panes.keys().copied().collect();
+                assert_eq!(panes.len(), 1, "a terminal opened");
+                assert!(!shell.app_view_open(), "and the Inbox gave way to it");
+                assert_eq!(shell.workspace.active, Some(panes[0]));
+            })
+            .unwrap();
+        // The dock's New terminal (cmd-`) works from the Inbox too.
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.open_inbox(window, cx);
+                assert!(shell.app_view_open());
+                shell.new_terminal(window, cx);
+                let project = shell.workspace.project.clone();
+                assert_eq!(shell.terminals.get(&project).map_or(0, Vec::len), 1);
+                assert!(!shell.app_view_open());
             })
             .unwrap();
     }

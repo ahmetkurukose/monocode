@@ -3258,8 +3258,10 @@ impl Shell {
             cx.notify();
             return;
         }
+        // The dock is not drawn under an app view: go back to the session
+        // first, so the new terminal is the one you see.
         if self.app_view_open() {
-            return;
+            self.close_app_view(window, cx);
         }
         let project = self.workspace.project.clone();
         let cwd = self.terminal_cwd(cx);
