@@ -12,7 +12,7 @@ use std::{
 };
 
 const PERIOD: Duration = Duration::from_secs(1);
-const STALL: Duration = Duration::from_secs(5);
+const STALL: Duration = Duration::from_secs(2);
 const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_REPORTS: usize = 5;
 
@@ -153,39 +153,42 @@ mod tests {
 
     #[test]
     fn healthy_heartbeats_do_not_capture_and_a_stall_is_sampled_once() {
+        let stall = STALL.as_secs();
         let mut watch = Watch::default();
         for time in 1..10 {
             assert!(!watch.poll(seconds(time), seconds(time)));
         }
-        for time in 10..14 {
+        for time in 10..9 + stall {
             assert!(!watch.poll(seconds(time), seconds(9)));
         }
-        assert!(watch.poll(seconds(14), seconds(9)));
-        for time in 15..100 {
+        assert!(watch.poll(seconds(9 + stall), seconds(9)));
+        for time in 10 + stall..100 {
             assert!(!watch.poll(seconds(time), seconds(9)));
         }
         assert!(!watch.poll(seconds(100), seconds(100)));
-        for time in 101..105 {
+        for time in 101..100 + stall {
             assert!(!watch.poll(seconds(time), seconds(100)));
         }
-        assert!(watch.poll(seconds(105), seconds(100)));
+        assert!(watch.poll(seconds(100 + stall), seconds(100)));
     }
 
     #[test]
     fn sleep_and_repeated_short_stalls_do_not_flood_reports() {
+        let stall = STALL.as_secs();
         let mut watch = Watch::default();
         assert!(!watch.poll(seconds(1), seconds(1)));
         assert!(!watch.poll(seconds(600), seconds(1)));
         assert!(!watch.poll(seconds(601), seconds(601)));
-        for time in 602..606 {
+        for time in 602..601 + stall {
             assert!(!watch.poll(seconds(time), seconds(601)));
         }
-        assert!(watch.poll(seconds(606), seconds(601)));
-        assert!(!watch.poll(seconds(607), seconds(607)));
-        for time in 608..666 {
-            assert!(!watch.poll(seconds(time), seconds(607)));
+        let first = 601 + stall;
+        assert!(watch.poll(seconds(first), seconds(601)));
+        assert!(!watch.poll(seconds(first + 1), seconds(first + 1)));
+        for time in first + 2..first + 60 {
+            assert!(!watch.poll(seconds(time), seconds(first + 1)));
         }
-        assert!(watch.poll(seconds(666), seconds(607)));
+        assert!(watch.poll(seconds(first + 60), seconds(first + 1)));
     }
 
     #[test]
