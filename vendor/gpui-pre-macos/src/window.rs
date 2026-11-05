@@ -1158,6 +1158,14 @@ impl MacWindowState {
         }
     }
 
+    /// Whether other windows share this one's native tab group.
+    fn has_native_tab_siblings(&self) -> bool {
+        unsafe {
+            let tabs: id = msg_send![self.native_window, tabbedWindows];
+            !tabs.is_null() && cocoa::foundation::NSArray::count(tabs) > 1
+        }
+    }
+
     fn is_fullscreen(&self) -> bool {
         unsafe {
             let style_mask = self.native_window.styleMask();
@@ -3585,7 +3593,19 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let mut lock = window_state.lock();
 
         if lock.activated_least_once {
-            if let Some(mut callback) = lock.request_frame_callback.take() {
+            // Monocode: that synchronous frame stalled the main thread for
+            // about a second whenever the window came back from another Space
+            // after a long absence (measured: "frame on becoming key took
+            // 1021ms"): with presents-with-transaction it waits on the GPU
+            // and the window server before it returns. Only windows sharing
+            // a native tab group need it, to avoid tab flicker; the display
+            // link draws everything else a vsync later without blocking.
+            let callback = if lock.has_native_tab_siblings() {
+                lock.request_frame_callback.take()
+            } else {
+                None
+            };
+            if let Some(mut callback) = callback {
                 // Monocode: the synchronous frame runs on the main thread, so
                 // the display link cannot interleave with it; keep it running
                 // rather than risk losing it on the restart below.
