@@ -97,7 +97,18 @@ impl Shell {
         } else {
             Vec::new()
         };
-        let shown = agents.len() >= LIVE_AGENT_MIN;
+        // Two or more agents always make a card. A lone agent only does when it
+        // is not the one on screen, whose chat already shows its progress: the
+        // one working in another project, or while the Inbox covers the chat.
+        let viewing = if self.app_view_open() {
+            None
+        } else {
+            self.workspace
+                .active
+                .map(|pane| self.workspace.session_for_pane(pane))
+        };
+        let shown =
+            agents.len() >= LIVE_AGENT_MIN || agents.iter().any(|agent| Some(agent.id) != viewing);
         self.live_marks
             .retain(|id, _| shown && agents.iter().any(|a| a.id == *id && !a.done));
         let ticking = shown && agents.iter().any(|a| !a.done && a.started_at.is_some());

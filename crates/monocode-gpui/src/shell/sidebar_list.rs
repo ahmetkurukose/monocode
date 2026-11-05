@@ -1285,6 +1285,44 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_lone_agent_shows_in_the_working_card_unless_its_chat_is_on_screen(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, a, b) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open(a, w, cx);
+                // One agent, working in the session on screen: its chat shows it.
+                shell.sessions[&b].update(cx, |session, _| session.busy = false);
+                shell.sessions[&a].update(cx, |session, _| session.busy = true);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-activity-card").is_none());
+        // Looking at another session, the lone agent gets its card.
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(b, w, cx);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-activity-card").is_some());
+        // And while the Inbox covers the chat, even the one it left.
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(a, w, cx);
+                shell.open_inbox(w, cx);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-activity-card").is_some());
+    }
+
+    #[gpui::test]
     fn scroll_and_hover_redraws_reuse_the_sidebar_index(cx: &mut TestAppContext) {
         let (window, _, _) = super::super::tests::window(cx);
         window
