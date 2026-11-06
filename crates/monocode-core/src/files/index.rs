@@ -93,8 +93,7 @@ pub fn list_project_files_with(
 
 const MAX_LS_FILES_BYTES: usize = 8 * 1024 * 1024;
 /// Ignored folders listed one by one, and the most one listing may hold.
-const MAX_IGNORED_DIRS: usize = 64;
-const MAX_IGNORED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_IGNORED_BYTES: usize = 4 * 1024 * 1024;
 
 fn project_file(root: &Path, relative: String) -> Option<ProjectFile> {
     if relative.ends_with('/') || path_has_skipped_dir(&relative) {
@@ -116,68 +115,34 @@ fn project_file(root: &Path, relative: String) -> Option<ProjectFile> {
 /// `node_modules` costs a line rather than a hundred thousand; the ones that
 /// are not dependency or build output are then listed.
 fn ignored_files(root: &Path, cancel: Option<&AtomicBool>, room: usize) -> Vec<ProjectFile> {
-    let mut out = Vec::new();
-    let Some((top, _)) = git_output_capped(
-        root,
-        &[
-            "ls-files",
-            "-o",
-            "-i",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ],
-        MAX_IGNORED_BYTES,
-        cancel,
-    ) else {
-        return out;
+    // One listing with the dependency folders excluded by pathspec. Listing
+    // folder-by-folder (`--directory`) ran out of its folder budget in a repo
+    // with hundreds of ignored folders and silently dropped real files.
+    let mut args: Vec<String> = [
+        "ls-files",
+        "-o",
+        "-i",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    args.extend(skipped_dir_excludes());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some((raw, _)) = git_output_capped(root, &args, MAX_IGNORED_BYTES, cancel) else {
+        return Vec::new();
     };
-    let mut folders = 0;
-    for entry in top.split(|b| *b == 0) {
-        if cancel.is_some_and(|token| token.load(Ordering::Acquire)) || out.len() >= room {
+    let mut out = Vec::new();
+    for file in raw.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+        if out.len() >= room || cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
             break;
         }
-        if entry.is_empty() {
-            continue;
-        }
-        let relative = path_to_js(Path::new(String::from_utf8_lossy(entry).as_ref()));
-        if path_has_skipped_dir(&relative) {
-            continue;
-        }
-        if !relative.ends_with('/') {
-            out.extend(project_file(root, relative));
-            continue;
-        }
-        folders += 1;
-        if folders > MAX_IGNORED_DIRS {
-            continue;
-        }
-        let spec = format!(":(literal){relative}");
-        let Some((inner, _)) = git_output_capped(
-            root,
-            &[
-                "ls-files",
-                "-o",
-                "-i",
-                "--exclude-standard",
-                "-z",
-                "--",
-                &spec,
-            ],
-            MAX_IGNORED_BYTES,
-            cancel,
-        ) else {
-            continue;
-        };
-        for file in inner.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-            let relative = path_to_js(Path::new(String::from_utf8_lossy(file).as_ref()));
-            out.extend(project_file(root, relative));
-            if out.len() >= room {
-                break;
-            }
-        }
+        let relative = path_to_js(Path::new(String::from_utf8_lossy(file).as_ref()));
+        out.extend(project_file(root, relative));
     }
-    out.truncate(room);
     out
 }
 
@@ -557,7 +522,10 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         };
-        write(".gitignore", ".env\nsecrets/\nnode_modules/\n*.local\n");
+        write(
+            ".gitignore",
+            ".env\nsecrets/\nnode_modules/\n*.local\n/gen/\n",
+        );
         write("src/a.rs", "fn main() {}\n");
         write(".env", "TOKEN=1\n");
         write("cfg.local", "x\n");
@@ -565,6 +533,9 @@ mod tests {
         write("secrets/deep/more.txt", "m\n");
         write("node_modules/pkg/index.js", "x\n");
         write("nested/node_modules/pkg/index.js", "x\n");
+        for n in 0..100 {
+            write(&format!("gen/d{n:03}/f.txt"), "x\n");
+        }
         let names = |include: bool| {
             let mut found: Vec<String> =
                 list_project_files_with(&root.to_string_lossy(), None, include)
@@ -576,17 +547,11 @@ mod tests {
             found
         };
         assert_eq!(names(false), [".gitignore", "src/a.rs"]);
-        assert_eq!(
-            names(true),
-            [
-                ".env",
-                ".gitignore",
-                "cfg.local",
-                "secrets/deep/more.txt",
-                "secrets/key.txt",
-                "src/a.rs"
-            ]
-        );
+        let all = names(true);
+        assert_eq!(all.len(), 6 + 100);
+        assert!(all.contains(&"gen/d099/f.txt".to_owned()));
+        assert!(all.contains(&"secrets/deep/more.txt".to_owned()));
+        assert!(!all.iter().any(|f| f.contains("node_modules")));
     }
 
     #[test]
