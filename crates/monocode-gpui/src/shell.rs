@@ -2366,6 +2366,7 @@ impl Shell {
                 review
             }
         };
+        let is_file = matches!(tab, crate::review::ReviewTab::File { .. });
         let entering = self
             .review_slide
             .as_ref()
@@ -2381,6 +2382,16 @@ impl Shell {
         });
         self.review_focused = true;
         review.update(cx, |r, cx| r.focus_active(window, cx));
+        // Settings > File tabs: "Top bar" gives a file its own tab in the title
+        // bar, the same pane a grip drag detaches; once it is there, further
+        // files join it. Diffs and other reviews stay beside their chat.
+        if is_file
+            && self.workspace.preferences.file_tabs == "workspace"
+            && !review.read(cx).state.chat_hidden
+            && let Some(pane) = self.independent_file_pane(id, cx)
+        {
+            self.open_file_pane(pane, window, cx);
+        }
         self.fit_sidebar(cx);
         cx.notify();
     }

@@ -642,6 +642,80 @@ mod tests {
         }
     }
 
+    /// Settings > General > File tabs: "Top bar" opens a file as its own tab in
+    /// the title bar; "Beside chat" keeps it in the chat's file pane.
+    #[gpui::test]
+    fn file_tabs_decide_where_a_file_opens(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let dir = std::env::temp_dir().join(format!("monocode-file-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "text\n").unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let (beside, top, second) = (path("beside.txt"), path("top.txt"), path("second.txt"));
+        // Beside chat: the file joins the chat's own pane.
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(shell.workspace.preferences.file_tabs, "pane");
+                shell.open_review(
+                    ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path: beside.clone(),
+                    },
+                    w,
+                    cx,
+                );
+                assert_eq!(shell.workspace.active, Some(session));
+                assert!(shell.workspace.review_owners.is_empty());
+                assert!(shell.reviews.contains_key(&session));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Top bar: the next file opens as a tab of its own.
+        let pane = window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.file_tabs = "workspace".into();
+                shell.open_review(
+                    ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path: top.clone(),
+                    },
+                    w,
+                    cx,
+                );
+                let pane = shell.workspace.active.unwrap();
+                assert_ne!(pane, session, "the file has its own pane");
+                assert_eq!(shell.workspace.review_owners.get(&pane), Some(&session));
+                assert!(
+                    shell.workspace.tab_of(pane).is_some(),
+                    "shown in the title bar"
+                );
+                assert!(shell.reviews[&pane].read(cx).state.chat_hidden);
+                pane
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // And the one after joins that file tab instead of making another.
+        window
+            .update(cx, |shell, w, cx| {
+                let panes = shell.workspace.review_owners.len();
+                shell.open_review(
+                    ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path: second.clone(),
+                    },
+                    w,
+                    cx,
+                );
+                assert_eq!(shell.workspace.active, Some(pane));
+                assert_eq!(shell.workspace.review_owners.len(), panes);
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn file_pane_grip_detaches_and_redocks_without_recreating_dirty_editors(
         cx: &mut TestAppContext,
