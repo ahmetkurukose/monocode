@@ -77,8 +77,9 @@ pub fn list_project_files_with(
     }
     if let Some(mut files) = git_ls_files(&root, cancel) {
         if include_ignored {
-            let room = MAX_PROJECT_FILES.saturating_sub(files.len());
-            files.extend(ignored_files(&root, cancel, room));
+            // Its own budget: a large tracked tree must not leave the ignored
+            // files (configs, local env) with a few thousand slots.
+            files.extend(ignored_files(&root, cancel, MAX_PROJECT_FILES));
         }
         return Ok(files);
     }
@@ -131,6 +132,7 @@ fn ignored_files(root: &Path, cancel: Option<&AtomicBool>, room: usize) -> Vec<P
     .map(str::to_owned)
     .collect();
     args.extend(skipped_dir_excludes());
+    args.extend(virtualenv_excludes(root, cancel));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let Some((raw, _)) = git_output_capped(root, &args, MAX_IGNORED_BYTES, cancel) else {
         return Vec::new();
@@ -144,6 +146,42 @@ fn ignored_files(root: &Path, cancel: Option<&AtomicBool>, room: usize) -> Vec<P
         out.extend(project_file(root, relative));
     }
     out
+}
+
+/// Virtualenvs under any name (`env3.15/`, `py/`, ...) are recognised by their
+/// `pyvenv.cfg`, so they stay out like `.venv` does.
+fn virtualenv_excludes(root: &Path, cancel: Option<&AtomicBool>) -> Vec<String> {
+    let Some((raw, _)) = git_output_capped(
+        root,
+        &[
+            "ls-files",
+            "-o",
+            "-i",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ":(glob)**/pyvenv.cfg",
+        ],
+        MAX_IGNORED_BYTES,
+        cancel,
+    ) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .filter_map(|file| {
+            let path = String::from_utf8_lossy(file).into_owned();
+            let dir = path
+                .strip_suffix("pyvenv.cfg")?
+                .trim_end_matches('/')
+                .to_owned();
+            Some(if dir.is_empty() {
+                return None;
+            } else {
+                format!(":(exclude,literal){dir}")
+            })
+        })
+        .collect()
 }
 
 fn git_ls_files(root: &Path, cancel: Option<&AtomicBool>) -> Option<Vec<ProjectFile>> {
@@ -524,7 +562,7 @@ mod tests {
         };
         write(
             ".gitignore",
-            ".env\nsecrets/\nnode_modules/\n*.local\n/gen/\n",
+            ".env\nsecrets/\nnode_modules/\n*.local\n/gen/\n/env3.15/\n",
         );
         write("src/a.rs", "fn main() {}\n");
         write(".env", "TOKEN=1\n");
@@ -533,6 +571,8 @@ mod tests {
         write("secrets/deep/more.txt", "m\n");
         write("node_modules/pkg/index.js", "x\n");
         write("nested/node_modules/pkg/index.js", "x\n");
+        write("env3.15/pyvenv.cfg", "home = x\n");
+        write("env3.15/lib/site.py", "x\n");
         for n in 0..100 {
             write(&format!("gen/d{n:03}/f.txt"), "x\n");
         }
@@ -551,7 +591,9 @@ mod tests {
         assert_eq!(all.len(), 6 + 100);
         assert!(all.contains(&"gen/d099/f.txt".to_owned()));
         assert!(all.contains(&"secrets/deep/more.txt".to_owned()));
-        assert!(!all.iter().any(|f| f.contains("node_modules")));
+        assert!(!all
+            .iter()
+            .any(|f| f.contains("node_modules") || f.contains("env3.15")));
     }
 
     #[test]
