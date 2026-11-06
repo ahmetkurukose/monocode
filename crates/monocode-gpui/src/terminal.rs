@@ -1345,7 +1345,21 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
         };
         return meta(&[code]);
     }
-    // Option is Meta (`macOptionIsMeta`): the key itself, after ESC.
+    // Option is Meta (`macOptionIsMeta`): the key itself, after ESC. Except on
+    // layouts whose Option layer holds ASCII symbols: Turkish and German type
+    // @ with Option-Q or Option-L, | with Option-Shift-L or Option-7, and so on.
+    // Those keys type what the layout says; Meta would turn them into ESC q.
+    // US Option combinations make non-ASCII symbols (Option-b is a dotless
+    // integral), which stay Meta.
+    if m.alt
+        && let Some(typed) = keystroke.key_char.as_deref()
+        && typed.chars().count() == 1
+        && typed.is_ascii()
+        && !typed.starts_with(|c: char| c.is_ascii_control())
+        && !typed.eq_ignore_ascii_case(key)
+    {
+        return Some(typed.as_bytes().to_vec());
+    }
     if m.alt {
         let text = if key == "space" {
             " ".to_owned()
@@ -1615,6 +1629,28 @@ mod tests {
         assert_eq!(bytes("cmd-backspace"), Some(b"\x15".to_vec()));
         // Option is Meta.
         assert_eq!(bytes("alt-b"), Some(b"\x1bb".to_vec()));
+        // A layout with ASCII on its Option layer types it (Turkish Q: @ is
+        // Option-Q and | is Option-Shift-L), while US Option symbols stay Meta.
+        let option = |key: &str, typed: &str, shift: bool| Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                shift,
+                ..Modifiers::default()
+            },
+            key: key.into(),
+            key_char: Some(typed.into()),
+        };
+        let send = |k: Keystroke| key_bytes(&k, TermMode::empty());
+        assert_eq!(send(option("q", "@", false)), Some(b"@".to_vec()));
+        assert_eq!(send(option("l", "|", true)), Some(b"|".to_vec()));
+        assert_eq!(send(option("8", "[", false)), Some(b"[".to_vec()));
+        assert_eq!(send(option("9", "]", false)), Some(b"]".to_vec()));
+        assert_eq!(send(option("7", "|", false)), Some(b"|".to_vec()));
+        assert_eq!(send(option("b", "∫", false)), Some(b"\x1bb".to_vec()));
+        assert_eq!(send(option("f", "ƒ", false)), Some(b"\x1bf".to_vec()));
+        // A key that types its own letter stays Meta.
+        assert_eq!(send(option("b", "b", false)), Some(b"\x1bb".to_vec()));
+        assert_eq!(send(option("b", "B", true)), Some(b"\x1bB".to_vec()));
         // App shortcuts stay with the app.
         assert_eq!(bytes("cmd-j"), None);
         assert_eq!(bytes("cmd-shift-d"), None);
