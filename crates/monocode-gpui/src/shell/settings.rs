@@ -373,6 +373,15 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        // Terminals read their text size when they paint.
+        for terminal in self
+            .terminals
+            .values()
+            .flatten()
+            .chain(self.terminal_pane_views.values())
+        {
+            terminal.update(cx, |_, cx| cx.notify());
+        }
         self.sync_right_panel(cx);
         if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {
@@ -716,6 +725,7 @@ mod tests {
             "settings-nav-general",
             "settings-nav-connections",
             "settings-nav-appearance",
+            "settings-nav-terminal",
             "settings-nav-keybindings",
             "settings-nav-chat",
             "settings-nav-providers",

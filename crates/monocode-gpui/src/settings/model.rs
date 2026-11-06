@@ -9,6 +9,7 @@ pub(crate) enum Section {
     General,
     Connections,
     Appearance,
+    Terminal,
     Keybindings,
     Chat,
     Providers,
@@ -27,6 +28,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
             Section::General,
             Section::Connections,
             Section::Appearance,
+            Section::Terminal,
             Section::Keybindings,
         ],
     ),
@@ -47,10 +49,11 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 12] = [
+    pub(crate) const ALL: [Section; 13] = [
         Section::General,
         Section::Connections,
         Section::Appearance,
+        Section::Terminal,
         Section::Keybindings,
         Section::Chat,
         Section::Providers,
@@ -66,6 +69,7 @@ impl Section {
             Section::General => "general",
             Section::Connections => "connections",
             Section::Appearance => "appearance",
+            Section::Terminal => "terminal",
             Section::Keybindings => "keybindings",
             Section::Chat => "chat",
             Section::Providers => "providers",
@@ -82,6 +86,7 @@ impl Section {
             Section::General => "General",
             Section::Connections => "Connections",
             Section::Appearance => "Appearance",
+            Section::Terminal => "Terminal",
             Section::Keybindings => "Keybindings",
             Section::Chat => "Chat",
             Section::Providers => "Providers",
@@ -101,6 +106,9 @@ impl Section {
             Section::Connections => "Connect your machines and run agents remotely through SSH.",
             Section::Appearance => {
                 "Theme, tint, translucency, workspace layout, and conversation backgrounds."
+            }
+            Section::Terminal => {
+                "The size of the text in terminals, and what selecting in them does."
             }
             Section::Keybindings => {
                 "Every shortcut the workspace handles, from the app menu and the key handler."
@@ -130,6 +138,7 @@ impl Section {
             Section::Appearance => {
                 "theme dark light color accent glass blur zoom scale wallpaper rail sidebar"
             }
+            Section::Terminal => "shell font size text zoom select copy clipboard selection iterm",
             Section::Keybindings => "shortcut hotkey keyboard binding",
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
@@ -155,6 +164,7 @@ impl Section {
             Section::General => "sliders",
             Section::Connections => "internet",
             Section::Appearance => "palette",
+            Section::Terminal => "terminal",
             Section::Keybindings => "keyboard",
             Section::Chat => "message-square",
             Section::Providers => "bot",
@@ -170,6 +180,18 @@ impl Section {
 
 /// SETTINGS_INDEX: (id, section, label, keywords).
 pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
+    (
+        "terminal-font-size",
+        Section::Terminal,
+        "Terminal font size",
+        "text zoom smaller larger shell grid",
+    ),
+    (
+        "terminal-copy-on-select",
+        Section::Terminal,
+        "Copy on select",
+        "selection clipboard copy highlight iterm",
+    ),
     (
         "remote-machines",
         Section::Connections,

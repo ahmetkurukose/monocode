@@ -257,6 +257,7 @@ impl SettingsView {
                     | "working-agents"
                     | "action-opens-terminal"
                     | "close-to-tray"
+                    | "terminal-copy-on-select"
                     | "main-pane-glass"
                     | "show-excluded-files"
                     | "anchor-prompts"

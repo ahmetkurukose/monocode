@@ -144,6 +144,7 @@ pub(crate) enum SliderKind {
     SidebarOpacity,
     BackgroundEmpty,
     BackgroundSession,
+    TerminalFontSize,
 }
 impl SliderKind {
     fn id(self) -> &'static str {
@@ -154,6 +155,7 @@ impl SliderKind {
             SliderKind::SidebarOpacity => "sidebar-opacity",
             SliderKind::BackgroundEmpty => "background-empty",
             SliderKind::BackgroundSession => "background-session",
+            SliderKind::TerminalFontSize => "terminal-font-size",
         }
     }
     fn label(self) -> &'static str {
@@ -164,6 +166,7 @@ impl SliderKind {
             SliderKind::SidebarOpacity => "Sidebar opacity",
             SliderKind::BackgroundEmpty => "Empty chat background visibility",
             SliderKind::BackgroundSession => "Session background visibility",
+            SliderKind::TerminalFontSize => "Terminal font size",
         }
     }
     fn range(self) -> (u32, u32) {
@@ -173,6 +176,7 @@ impl SliderKind {
             SliderKind::DarkLightness => (0, 30),
             SliderKind::SidebarOpacity => (15, 100),
             SliderKind::BackgroundEmpty | SliderKind::BackgroundSession => (5, 65),
+            SliderKind::TerminalFontSize => (9, 20),
         }
     }
     fn get(self, p: &Preferences) -> u32 {
@@ -183,6 +187,7 @@ impl SliderKind {
             SliderKind::SidebarOpacity => p.sidebar_opacity,
             SliderKind::BackgroundEmpty => p.chat_background_empty,
             SliderKind::BackgroundSession => p.chat_background_session,
+            SliderKind::TerminalFontSize => p.terminal_font_size,
         }
     }
     fn set(self, p: &mut Preferences, value: u32) {
@@ -193,6 +198,7 @@ impl SliderKind {
             SliderKind::SidebarOpacity => p.sidebar_opacity = value,
             SliderKind::BackgroundEmpty => p.chat_background_empty = value,
             SliderKind::BackgroundSession => p.chat_background_session = value,
+            SliderKind::TerminalFontSize => p.terminal_font_size = value,
         }
     }
 }

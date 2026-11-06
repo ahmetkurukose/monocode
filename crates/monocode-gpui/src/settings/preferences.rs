@@ -31,6 +31,10 @@ pub(crate) struct Preferences {
     /// Terminal tab) or "title" (their own title bar tabs). Empty falls back
     /// to `terminal_in_panel`.
     pub terminal_placement: String,
+    /// The terminal's text size in points.
+    pub terminal_font_size: u32,
+    /// Selecting text in a terminal copies it.
+    pub terminal_copy_on_select: bool,
     // Appearance
     pub theme: String,
     pub wayland_window_decorations: bool,
@@ -130,6 +134,8 @@ impl Default for Preferences {
             action_opens_terminal: true,
             terminal_in_panel: false,
             terminal_placement: String::new(),
+            terminal_font_size: 13,
+            terminal_copy_on_select: false,
             theme: "dark".into(),
             wayland_window_decorations: true,
             workspace_theme: "default".into(),

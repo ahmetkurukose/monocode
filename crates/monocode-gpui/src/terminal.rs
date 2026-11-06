@@ -60,6 +60,11 @@ pub(crate) fn bind(cx: &mut App) {
 }
 
 const FONT_SIZE: f32 = 13.;
+/// The size Settings > Terminal chose, in points.
+fn font_size(cx: &App) -> f32 {
+    cx.try_global::<crate::settings::Preferences>()
+        .map_or(FONT_SIZE, |p| p.terminal_font_size.clamp(8, 28) as f32)
+}
 /// TerminalView's `scrollback`, retained for every open terminal.
 const SCROLLBACK: usize = 2000;
 const PADDING: f32 = 8.;
@@ -590,7 +595,15 @@ impl Terminal {
     /// A click that pressed and released on the same link, without
     /// dragging out a selection, opens it as the web build's xterm does.
     fn mouse_up(&mut self, event: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+        let was_selecting = self.selecting;
         self.stop_selection();
+        if was_selecting
+            && cx
+                .try_global::<crate::settings::Preferences>()
+                .is_some_and(|p| p.terminal_copy_on_select)
+        {
+            self.copy(cx);
+        }
         let Some(link) = self.pressed_link.take() else {
             return;
         };
@@ -825,7 +838,7 @@ impl Element for Grid {
         window: &mut Window,
         cx: &mut App,
     ) -> Painted {
-        let font_size = px(FONT_SIZE);
+        let font_size = px(font_size(cx));
         let base = crate::fonts::terminal(cx);
         let text_system = window.text_system().clone();
         let font_id = text_system.resolve_font(&base);
@@ -1603,6 +1616,71 @@ mod tests {
             assert_eq!(terminal.term.lock().grid().display_offset(), 0);
             terminal.stop_selection();
             assert!(!terminal.scroll_selection(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_copies_only_when_copy_on_select_is_on(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        let release = |cx: &mut gpui::TestAppContext| {
+            view.update(cx, |terminal, cx| {
+                write_note(&terminal.term, "copy-me please");
+                terminal.term.lock().selection = Some({
+                    let mut selection = Selection::new(
+                        SelectionType::Simple,
+                        GridPoint::new(Line(0), Column(0)),
+                        Side::Left,
+                    );
+                    selection.update(GridPoint::new(Line(0), Column(6)), Side::Right);
+                    selection
+                });
+                terminal.selecting = true;
+                terminal.mouse_up(
+                    &gpui::MouseUpEvent {
+                        position: point(px(0.), px(0.)),
+                        modifiers: Default::default(),
+                        button: MouseButton::Left,
+                        click_count: 1,
+                    },
+                    cx,
+                );
+            });
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string("untouched".into()));
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        release(cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("untouched"),
+            "off by default"
+        );
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences {
+                terminal_copy_on_select: true,
+                ..Default::default()
+            })
+        });
+        release(cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("copy-me")
+        );
+    }
+
+    #[gpui::test]
+    fn the_text_size_follows_the_preference(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(font_size(cx), 13., "the default without preferences");
+            cx.set_global(crate::settings::Preferences {
+                terminal_font_size: 10,
+                ..Default::default()
+            });
+            assert_eq!(font_size(cx), 10.);
+            cx.set_global(crate::settings::Preferences {
+                terminal_font_size: 99,
+                ..Default::default()
+            });
+            assert_eq!(font_size(cx), 28., "a saved value out of range is clamped");
         });
     }
 

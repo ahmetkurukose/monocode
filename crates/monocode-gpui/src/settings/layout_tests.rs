@@ -1,7 +1,7 @@
 use super::*;
 use gpui::{
-    Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowHandle, WindowOptions, point,
-    size,
+    Bounds, MouseButton, TestAppContext, VisualTestContext, WindowBounds, WindowHandle,
+    WindowOptions, point, size,
 };
 
 fn window(section: Section, cx: &mut TestAppContext) -> WindowHandle<SettingsView> {
@@ -193,4 +193,64 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
         .unwrap();
     assert_eq!(switch.size, size(px(36.), px(20.)));
     assert!(switch.right() <= px(700.));
+}
+
+#[gpui::test]
+fn the_terminal_page_sets_the_font_size_and_copy_on_select(cx: &mut TestAppContext) {
+    let window = window(Section::Terminal, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    // The slider's track runs from the smallest size to the largest.
+    let track = visual
+        .debug_bounds("settings-slider-terminal-font-size")
+        .unwrap();
+    visual.simulate_mouse_down(
+        point(track.left() + px(2.), track.center().y),
+        MouseButton::Left,
+        Default::default(),
+    );
+    visual.simulate_mouse_up(
+        point(track.left() + px(2.), track.center().y),
+        MouseButton::Left,
+        Default::default(),
+    );
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.prefs.terminal_font_size, 9, "the smallest size");
+            assert!(!view.prefs.terminal_copy_on_select, "off until chosen");
+        })
+        .unwrap();
+    let toggle = visual
+        .debug_bounds("settings-row-terminal-copy-on-select")
+        .unwrap();
+    visual.simulate_click(
+        point(toggle.right() - px(30.), toggle.top() + px(24.)),
+        Default::default(),
+    );
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.prefs.terminal_copy_on_select);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn terminal_settings_are_in_the_rail_and_found_by_search(cx: &mut TestAppContext) {
+    let _ = cx;
+    assert!(Section::ALL.contains(&Section::Terminal));
+    assert!(
+        model::GROUPS
+            .iter()
+            .any(|(_, sections)| sections.contains(&Section::Terminal))
+    );
+    let found = |query: &str| {
+        model::search(query, "")
+            .iter()
+            .any(|r| r.section == Section::Terminal)
+    };
+    assert!(found("font size"));
+    assert!(found("copy on select"));
+    assert!(found("clipboard"));
 }

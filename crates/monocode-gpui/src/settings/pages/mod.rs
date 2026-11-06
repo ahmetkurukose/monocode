@@ -11,6 +11,7 @@ mod mobile;
 mod monos;
 mod providers;
 mod skills;
+mod terminal;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
@@ -34,6 +35,7 @@ impl SettingsView {
                 page
             }
             Section::Appearance => self.appearance_page(window, cx),
+            Section::Terminal => self.terminal_page(cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Chat => self.chat_page(cx),
             Section::Providers => self.providers_page(cx),
