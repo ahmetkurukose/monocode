@@ -106,8 +106,9 @@ impl SearchView {
         let listing_cancel = Arc::new(AtomicBool::new(false));
         let flag = listing_cancel.clone();
         let root = cwd.clone();
+        let include_ignored = crate::settings::show_excluded_files(cx);
         let work = cx.background_executor().spawn(async move {
-            monocode_core::files::list_project_files_sync_cancellable(&root, Some(&flag))
+            monocode_core::files::list_project_files_with(&root, Some(&flag), include_ignored)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -348,6 +349,7 @@ impl SearchView {
         if self.scope.files() {
             let cwd = self.cwd.clone();
             let query = self.query.clone();
+            let include_ignored = crate::settings::show_excluded_files(cx);
             let flag = self.cancel.clone();
             let check = flag.clone();
             let work = cx.background_executor().spawn(async move {
@@ -362,6 +364,7 @@ impl SearchView {
                         include: None,
                         exclude: None,
                         search_id: String::new(),
+                        include_ignored,
                     },
                     &flag,
                 )

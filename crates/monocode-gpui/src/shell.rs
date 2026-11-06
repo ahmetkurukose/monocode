@@ -2011,6 +2011,17 @@ impl Shell {
         let explorer = panel.read(cx).explorer.clone();
         self.observations.push(cx.subscribe(
             &explorer,
+            |this, _, _: &crate::explorer::ToggleExcluded, cx| {
+                let on = !this.workspace.preferences.show_excluded_files;
+                this.workspace.preferences.show_excluded_files = on;
+                this.apply_preferences(cx);
+                this.persist(cx);
+                this.sync_settings(cx);
+                cx.notify();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &explorer,
             |this, _, event: &crate::explorer::FileActionError, cx| {
                 this.notification_state
                     .file_error

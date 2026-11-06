@@ -642,6 +642,49 @@ mod tests {
         }
     }
 
+    /// The explorer's eye flips Settings > Appearance > Show excluded files.
+    #[gpui::test]
+    fn the_explorer_eye_toggles_ignored_files(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                assert!(!shell.workspace.preferences.show_excluded_files);
+                shell.ensure_right_panel(w, cx);
+                let explorer = shell
+                    .right_panel
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .explorer
+                    .clone();
+                explorer.update(cx, |_, cx| cx.emit(crate::explorer::ToggleExcluded));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.workspace.preferences.show_excluded_files);
+                assert!(crate::settings::show_excluded_files(cx), "search follows");
+                let explorer = shell
+                    .right_panel
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .explorer
+                    .clone();
+                explorer.update(cx, |_, cx| cx.emit(crate::explorer::ToggleExcluded));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.workspace.preferences.show_excluded_files);
+                assert!(!crate::settings::show_excluded_files(cx));
+            })
+            .unwrap();
+    }
+
     /// Settings > General > File tabs: "Top bar" opens a file as its own tab in
     /// the title bar; "Beside chat" keeps it in the chat's file pane.
     #[gpui::test]

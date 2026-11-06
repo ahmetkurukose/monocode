@@ -2,8 +2,11 @@
 //! pure name and path helpers from the files feature model.
 pub mod document;
 mod index;
+pub(crate) use index::skipped_dir_excludes;
 pub(crate) use index::{git_output_capped, is_indexable_root};
-pub use index::{list_project_files, list_project_files_sync_cancellable, ProjectFile};
+pub use index::{
+    list_project_files, list_project_files_sync_cancellable, list_project_files_with, ProjectFile,
+};
 mod name;
 mod paths;
 pub mod remote;

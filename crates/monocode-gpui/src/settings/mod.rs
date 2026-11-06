@@ -20,6 +20,13 @@ pub(crate) use model::Section;
 pub(crate) use pages::{ACCENTS, command_shortcut, swatch};
 pub(crate) use preferences::{ModelChoice, Preferences, UI_SCALE_PERCENTS};
 
+/// Whether the explorer, Quick Open and search include the files `.gitignore`
+/// hides (Settings > Appearance > Show excluded files).
+pub(crate) fn show_excluded_files(cx: &gpui::App) -> bool {
+    cx.try_global::<Preferences>()
+        .is_some_and(|p| p.show_excluded_files)
+}
+
 use crate::{
     input::{self, Input},
     popover::{Align, Anchor, AnchorSlot, Side, popover},

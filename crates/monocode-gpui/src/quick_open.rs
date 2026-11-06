@@ -97,8 +97,9 @@ impl QuickOpen {
         });
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
+        let include_ignored = crate::settings::show_excluded_files(cx);
         let work = cx.background_executor().spawn(async move {
-            monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&flag))
+            monocode_core::files::list_project_files_with(&cwd, Some(&flag), include_ignored)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;

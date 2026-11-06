@@ -229,6 +229,9 @@ impl EventEmitter<OpenFile> for Explorer {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileActionError(pub Option<String>);
 impl EventEmitter<FileActionError> for Explorer {}
+/// The header's eye was pressed: flip Settings > Show excluded files.
+pub(crate) struct ToggleExcluded;
+impl EventEmitter<ToggleExcluded> for Explorer {}
 pub(crate) struct OpenSearchMatch {
     pub cwd: String,
     pub matched: monocode_core::search::project::SearchMatch,
@@ -1643,6 +1646,21 @@ impl Render for Explorer {
                             true,
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
+                    )
+                    .child(
+                        Self::header_icon(
+                            "explorer-show-ignored",
+                            if self.show_excluded {
+                                "Hide ignored files"
+                            } else {
+                                "Show ignored files"
+                            }
+                            .into(),
+                            "eye",
+                            true,
+                        )
+                        .when(self.show_excluded, |d| d.bg(content(0.1)))
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ToggleExcluded))),
                     )
                     .child(
                         Self::header_icon(

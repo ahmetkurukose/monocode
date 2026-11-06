@@ -1,5 +1,5 @@
 //! Project content search ported from the Tauri search service.
-use crate::files::list_project_files_sync_cancellable;
+use crate::files::list_project_files_with;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,10 @@ pub struct SearchOptions {
     pub exclude: Option<String>,
     #[serde(default)]
     pub search_id: String,
+    /// Search the files `.gitignore` hides too (dependency and build folders
+    /// stay out).
+    #[serde(default)]
+    pub include_ignored: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -135,6 +139,11 @@ fn git_grep_capped(
         args.push("-w".to_string());
     }
     args.push(if options.regex { "-E" } else { "-F" }.to_string());
+    if options.include_ignored {
+        // Untracked files and the ignored ones too, minus dependency folders.
+        args.push("--untracked".to_string());
+        args.push("--no-exclude-standard".to_string());
+    }
     args.push("-e".to_string());
     args.push(query.to_string());
 
@@ -142,6 +151,13 @@ fn git_grep_capped(
     // as a pathspec instead of a git grep flag.
     args.push("--".to_string());
     args.extend(pathspecs(&options.include, &options.exclude));
+    if options.include_ignored {
+        // A leading pathspec is needed for the excludes to subtract from.
+        if glob_tokens(&options.include).is_empty() {
+            args.push(".".to_string());
+        }
+        args.extend(crate::files::skipped_dir_excludes());
+    }
 
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let (mut raw, mut truncated) =
@@ -238,7 +254,11 @@ fn scan_files(
         });
     }
 
-    let files = list_project_files_sync_cancellable(&root.to_string_lossy(), Some(cancel))?;
+    let files = list_project_files_with(
+        &root.to_string_lossy(),
+        Some(cancel),
+        options.include_ignored,
+    )?;
     if cancel.load(Ordering::Acquire) {
         return Ok(SearchResult {
             matches: Vec::new(),
@@ -354,6 +374,7 @@ fn match_column(
             include: None,
             exclude: None,
             search_id: String::new(),
+            include_ignored: false,
         },
     )
     .unwrap_or(1)
@@ -414,6 +435,7 @@ mod tests {
             include: None,
             exclude: None,
             search_id: String::new(),
+            include_ignored: false,
         }
     }
     fn git(root: &Path, args: &[&str]) {
@@ -425,6 +447,42 @@ mod tests {
             .status
             .success());
     }
+    #[test]
+    fn git_search_reaches_ignored_files_only_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(".gitignore", ".env\nnode_modules/\n");
+        write("src/a.rs", "let key = \"zzneedle\";\n");
+        write(".env", "KEY=zzneedle\n");
+        write("node_modules/pkg/index.js", "zzneedle\n");
+        git(root, &["add", ".gitignore", "src/a.rs"]);
+        let found = |include: bool| {
+            let mut found: Vec<String> = search_project(
+                root,
+                &SearchOptions {
+                    include_ignored: include,
+                    ..options("zzneedle")
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .matches
+            .into_iter()
+            .map(|m| m.relative)
+            .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(found(false), ["src/a.rs"]);
+        assert_eq!(found(true), [".env", "src/a.rs"], "node_modules stays out");
+    }
+
     #[test]
     fn fallback_finds_literal_content_and_unicode_columns_and_skips_binary() {
         let dir = tempfile::tempdir().unwrap();

@@ -310,7 +310,7 @@ impl SettingsView {
                 Some("show-excluded-files"),
                 false,
                 "Show excluded files",
-                Some("Show files and folders Git excludes, such as build output and dependencies, in the explorer.".into()),
+                Some("Show files and folders Git ignores, such as .env and local config, in the explorer, and include them in Quick Open and search. Dependency and build folders stay out of the lists.".into()),
                 vec![self.toggle(
                     "show-excluded-files",
                     "Show excluded files",

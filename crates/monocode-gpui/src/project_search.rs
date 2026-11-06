@@ -166,6 +166,7 @@ impl ProjectSearch {
             include: filter(&self.include),
             exclude: filter(&self.exclude),
             search_id: String::new(),
+            include_ignored: crate::settings::show_excluded_files(cx),
         }
     }
 

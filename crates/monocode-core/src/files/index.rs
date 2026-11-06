@@ -41,6 +41,17 @@ pub fn list_project_files_sync_cancellable(
     cwd: &str,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<ProjectFile>, String> {
+    list_project_files_with(cwd, cancel, false)
+}
+
+/// The same listing, with the files `.gitignore` hides too when
+/// `include_ignored` is set (`.env`, local config, generated folders), still
+/// leaving out dependency and build directories such as `node_modules`.
+pub fn list_project_files_with(
+    cwd: &str,
+    cancel: Option<&AtomicBool>,
+    include_ignored: bool,
+) -> Result<Vec<ProjectFile>, String> {
     if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
         return Ok(Vec::new());
     }
@@ -64,7 +75,11 @@ pub fn list_project_files_sync_cancellable(
     if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
         return Ok(Vec::new());
     }
-    if let Some(files) = git_ls_files(&root, cancel) {
+    if let Some(mut files) = git_ls_files(&root, cancel) {
+        if include_ignored {
+            let room = MAX_PROJECT_FILES.saturating_sub(files.len());
+            files.extend(ignored_files(&root, cancel, room));
+        }
         return Ok(files);
     }
     // `git_ls_files` returns `None` for "not a git repo", truncation, and
@@ -73,10 +88,98 @@ pub fn list_project_files_sync_cancellable(
     if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
         return Ok(Vec::new());
     }
-    Ok(walk_project_files(&root, cancel.into()))
+    Ok(walk_project_files(&root, cancel.into(), include_ignored))
 }
 
 const MAX_LS_FILES_BYTES: usize = 8 * 1024 * 1024;
+/// Ignored folders listed one by one, and the most one listing may hold.
+const MAX_IGNORED_DIRS: usize = 64;
+const MAX_IGNORED_BYTES: usize = 2 * 1024 * 1024;
+
+fn project_file(root: &Path, relative: String) -> Option<ProjectFile> {
+    if relative.ends_with('/') || path_has_skipped_dir(&relative) {
+        return None;
+    }
+    let path = root.join(&relative);
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    if name == ".DS_Store" {
+        return None;
+    }
+    Some(ProjectFile {
+        name: name.to_string(),
+        path: path_to_js(&path),
+        relative,
+    })
+}
+
+/// Files git ignores. Ignored folders come back as one entry each, so a
+/// `node_modules` costs a line rather than a hundred thousand; the ones that
+/// are not dependency or build output are then listed.
+fn ignored_files(root: &Path, cancel: Option<&AtomicBool>, room: usize) -> Vec<ProjectFile> {
+    let mut out = Vec::new();
+    let Some((top, _)) = git_output_capped(
+        root,
+        &[
+            "ls-files",
+            "-o",
+            "-i",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+        MAX_IGNORED_BYTES,
+        cancel,
+    ) else {
+        return out;
+    };
+    let mut folders = 0;
+    for entry in top.split(|b| *b == 0) {
+        if cancel.is_some_and(|token| token.load(Ordering::Acquire)) || out.len() >= room {
+            break;
+        }
+        if entry.is_empty() {
+            continue;
+        }
+        let relative = path_to_js(Path::new(String::from_utf8_lossy(entry).as_ref()));
+        if path_has_skipped_dir(&relative) {
+            continue;
+        }
+        if !relative.ends_with('/') {
+            out.extend(project_file(root, relative));
+            continue;
+        }
+        folders += 1;
+        if folders > MAX_IGNORED_DIRS {
+            continue;
+        }
+        let spec = format!(":(literal){relative}");
+        let Some((inner, _)) = git_output_capped(
+            root,
+            &[
+                "ls-files",
+                "-o",
+                "-i",
+                "--exclude-standard",
+                "-z",
+                "--",
+                &spec,
+            ],
+            MAX_IGNORED_BYTES,
+            cancel,
+        ) else {
+            continue;
+        };
+        for file in inner.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+            let relative = path_to_js(Path::new(String::from_utf8_lossy(file).as_ref()));
+            out.extend(project_file(root, relative));
+            if out.len() >= room {
+                break;
+            }
+        }
+    }
+    out.truncate(room);
+    out
+}
 
 fn git_ls_files(root: &Path, cancel: Option<&AtomicBool>) -> Option<Vec<ProjectFile>> {
     // Routed through the bounded reader rather than `Command::output()`: this
@@ -274,8 +377,9 @@ impl<'a> From<Option<&'a AtomicBool>> for WalkStop<'a> {
     }
 }
 
-fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
+fn walk_project_files(root: &Path, stop: WalkStop<'_>, include_ignored: bool) -> Vec<ProjectFile> {
     let ignore = Ignore::load(root);
+    let hidden = |name: &str| !include_ignored && ignore.matches(name);
     let mut files = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     let mut visited = 0usize;
@@ -310,13 +414,13 @@ fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
                 Err(_) => path.is_dir(),
             };
             if is_dir {
-                if skip_walk_dir_name(name) || ignore.matches(name) || is_private_dir(&path) {
+                if skip_walk_dir_name(name) || hidden(name) || is_private_dir(&path) {
                     continue;
                 }
                 dirs.push(path);
                 continue;
             }
-            if ignore.matches(name) {
+            if hidden(name) {
                 continue;
             }
             let Ok(relative) = path.strip_prefix(root) else {
@@ -336,38 +440,50 @@ fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
     files
 }
 
+/// Directories a listing or search never enters: dependencies, build output
+/// and tool caches.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".cache",
+    ".turbo",
+    ".parcel-cache",
+    ".vercel",
+    ".svelte-kit",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".gradle",
+    ".idea",
+    "Pods",
+    "vendor",
+    "bower_components",
+    ".yarn",
+    ".pnpm-store",
+];
+
 fn skip_walk_dir_name(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | "out"
-            | ".next"
-            | ".nuxt"
-            | ".output"
-            | ".cache"
-            | ".turbo"
-            | ".parcel-cache"
-            | ".vercel"
-            | ".svelte-kit"
-            | "coverage"
-            | "__pycache__"
-            | ".venv"
-            | "venv"
-            | ".tox"
-            | ".mypy_cache"
-            | ".pytest_cache"
-            | ".gradle"
-            | ".idea"
-            | "Pods"
-            | "vendor"
-            | "bower_components"
-            | ".yarn"
-            | ".pnpm-store"
-    )
+    SKIP_DIRS.contains(&name)
+}
+
+/// Git pathspecs leaving those directories out of a `git grep`.
+pub(crate) fn skipped_dir_excludes() -> Vec<String> {
+    SKIP_DIRS
+        .iter()
+        .filter(|name| **name != ".git")
+        .map(|name| format!(":(exclude,glob)**/{name}/**"))
+        .collect()
 }
 
 fn path_has_skipped_dir(relative: &str) -> bool {
@@ -426,6 +542,53 @@ pub(crate) fn is_indexable_root(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ignored_files_are_listed_on_request_but_dependency_folders_stay_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(".gitignore", ".env\nsecrets/\nnode_modules/\n*.local\n");
+        write("src/a.rs", "fn main() {}\n");
+        write(".env", "TOKEN=1\n");
+        write("cfg.local", "x\n");
+        write("secrets/key.txt", "k\n");
+        write("secrets/deep/more.txt", "m\n");
+        write("node_modules/pkg/index.js", "x\n");
+        write("nested/node_modules/pkg/index.js", "x\n");
+        let names = |include: bool| {
+            let mut found: Vec<String> =
+                list_project_files_with(&root.to_string_lossy(), None, include)
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.relative)
+                    .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(names(false), [".gitignore", "src/a.rs"]);
+        assert_eq!(
+            names(true),
+            [
+                ".env",
+                ".gitignore",
+                "cfg.local",
+                "secrets/deep/more.txt",
+                "secrets/key.txt",
+                "src/a.rs"
+            ]
+        );
+    }
+
     #[test]
     fn indexes_untracked_files_respects_ignores_and_cancels() {
         let temp = tempfile::tempdir().unwrap();
