@@ -9,13 +9,14 @@ use crate::{
     git_status::ProjectGit,
     input::{self, Input},
     modal,
+    popover::{Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover},
     right_panel::{DIFF_ADD, DIFF_DEL, stroke},
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, PromptLevel, Role, SharedString, Stateful, Subscription, Task, Window, div,
-    prelude::*, px, rgb, uniform_list,
+    AnyElement, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, KeyDownEvent, PromptLevel, Role, SharedString, Stateful, Subscription, Task,
+    Window, div, prelude::*, px, rgb, uniform_list,
 };
 use monocode_core::provider::Kind;
 use monocode_core::{
@@ -66,6 +67,31 @@ enum Outcome {
     Failed(String),
 }
 
+/// What a rollback or a delete would touch, before the user agrees.
+struct Pending {
+    /// Tracked files: changes are dropped (or an added file leaves the index).
+    tracked: Vec<(String, String)>,
+    /// Unversioned files, deleted from the disk.
+    untracked: Vec<String>,
+    /// Also remove newly added files from the disk, not just from the index.
+    delete_added: bool,
+}
+
+/// The files at `members` split into tracked and unversioned ones.
+fn plan(files: &[ChangedFile], members: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    members
+        .iter()
+        .copied()
+        .partition(|&ix| !is_untracked(&files[ix]))
+}
+
+struct OpenMenu {
+    row: usize,
+    anchor: gpui::Point<gpui::Pixels>,
+    menu: Entity<Menu>,
+    _events: Subscription,
+}
+
 pub(crate) struct CommitDialog {
     git: Entity<ProjectGit>,
     cwd: String,
@@ -86,6 +112,8 @@ pub(crate) struct CommitDialog {
     generate_cancel: Option<Arc<AtomicBool>>,
     busy: Option<&'static str>,
     error: Option<String>,
+    menu: Option<OpenMenu>,
+    pending: Option<Pending>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -145,6 +173,8 @@ impl CommitDialog {
             generate_cancel: None,
             busy: None,
             error: None,
+            menu: None,
+            pending: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
@@ -474,7 +504,180 @@ impl CommitDialog {
         .detach();
     }
 
+    /// The files a row stands for: a group's, a folder's, or the file itself.
+    fn members(&self, ix: usize) -> Vec<usize> {
+        match self.rows.get(ix) {
+            Some(Row::Group { files, .. }) | Some(Row::Tree(TreeRow::Dir { files, .. })) => {
+                files.clone()
+            }
+            Some(Row::Tree(TreeRow::File { ix, .. })) => vec![*ix],
+            None => Vec::new(),
+        }
+    }
+
+    fn open_menu(
+        &mut self,
+        row: usize,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let members = self.members(row);
+        let (tracked, untracked) = plan(&self.files, &members);
+        let one_file = matches!(self.rows.get(row), Some(Row::Tree(TreeRow::File { .. })));
+        let mut items: Vec<MenuItem> = Vec::new();
+        if !tracked.is_empty() {
+            items.push(
+                MenuAction::new("rollback", "Rollback…")
+                    .shortcut("⌘⌥Z")
+                    .into(),
+            );
+        }
+        if !untracked.is_empty() {
+            items.push(MenuAction::new("delete", "Delete…").danger().into());
+        }
+        if one_file {
+            items.push(MenuItem::Separator);
+            items.push(MenuAction::new("diff", "Show Diff").into());
+            items.push(MenuAction::new("copy-path", "Copy Path").into());
+            items.push(MenuAction::new("copy-relative", "Copy Relative Path").into());
+        }
+        items.push(MenuItem::Separator);
+        let all_checked = self.state(&members) == Check::All;
+        items.push(MenuAction::new("check", if all_checked { "Uncheck" } else { "Check" }).into());
+        self.menu = None;
+        let menu = cx.new(|cx| Menu::new("Change actions", items, window, cx));
+        let events = cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
+            let Some(open) = this.menu.take() else {
+                return;
+            };
+            if let MenuEvent::Picked(id, _) = event {
+                this.run_menu_action(id, open.row, window, cx);
+            }
+            window.focus(&this.focus, cx);
+            cx.notify();
+        });
+        self.menu = Some(OpenMenu {
+            row,
+            anchor: at,
+            menu,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn run_menu_action(&mut self, id: &str, row: usize, _: &mut Window, cx: &mut Context<Self>) {
+        let members = self.members(row);
+        match id {
+            "rollback" | "delete" => self.ask_rollback(&members, id == "delete", cx),
+            "diff" => {
+                if let Some(&ix) = members.first() {
+                    self.select(ix, cx);
+                }
+            }
+            "copy-path" | "copy-relative" => {
+                if let Some(&ix) = members.first() {
+                    let relative = &self.files[ix].relative;
+                    let text = if id == "copy-path" {
+                        format!("{}/{relative}", self.cwd.trim_end_matches('/'))
+                    } else {
+                        relative.clone()
+                    };
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            "check" => self.toggle_files(&members, cx),
+            _ => {}
+        }
+    }
+
+    /// Opens the confirmation for rolling back (or deleting) `members`.
+    fn ask_rollback(&mut self, members: &[usize], delete: bool, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let (tracked, untracked) = plan(&self.files, members);
+        let pending = Pending {
+            tracked: if delete {
+                Vec::new()
+            } else {
+                tracked
+                    .iter()
+                    .map(|&ix| {
+                        (
+                            self.files[ix].relative.clone(),
+                            self.files[ix].status.clone(),
+                        )
+                    })
+                    .collect()
+            },
+            untracked: if delete {
+                untracked
+                    .iter()
+                    .map(|&ix| self.files[ix].relative.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            delete_added: false,
+        };
+        if pending.tracked.is_empty() && pending.untracked.is_empty() {
+            return;
+        }
+        self.pending = Some(pending);
+        cx.notify();
+    }
+
+    /// Does what the confirmation described.
+    fn confirm_rollback(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.busy = Some("rollback");
+        self.error = None;
+        let cwd = PathBuf::from(&self.cwd);
+        let work = cx.background_executor().spawn(async move {
+            if !pending.tracked.is_empty() {
+                let paths: Vec<String> = pending.tracked.iter().map(|(p, _)| p.clone()).collect();
+                scm::rollback_files(&cwd, &paths, pending.delete_added)?;
+            }
+            for path in &pending.untracked {
+                scm::discard_file(&cwd, path)?;
+            }
+            Ok::<_, String>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.busy = None;
+                this.git.update(cx, |git, cx| git.changed(cx));
+                if let Err(error) = result {
+                    this.error = Some(error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.pending.is_some() {
+            self.pending = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "z"
+            && event.keystroke.modifiers.platform
+            && event.keystroke.modifiers.alt
+            && let Some(file) = self.selected.as_ref()
+            && let Some(ix) = self.files.iter().position(|f| &f.relative == file)
+        {
+            self.ask_rollback(&[ix], is_untracked(&self.files[ix]), cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.generate_cancel.is_some() {
             self.cancel_generate(cx);
             cx.stop_propagation();
@@ -507,6 +710,147 @@ impl CommitDialog {
             })
     }
 
+    fn pending_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pending = self.pending.as_ref()?;
+        let deleting = !pending.untracked.is_empty();
+        let added = pending.tracked.iter().any(|(_, status)| status == "added");
+        let names: Vec<(String, &str)> = if deleting {
+            pending
+                .untracked
+                .iter()
+                .map(|p| (p.clone(), "unversioned"))
+                .collect()
+        } else {
+            pending
+                .tracked
+                .iter()
+                .map(|(p, status)| {
+                    (
+                        p.clone(),
+                        match status.as_str() {
+                            "added" => "added",
+                            "deleted" => "deleted",
+                            _ => "modified",
+                        },
+                    )
+                })
+                .collect()
+        };
+        let count = names.len();
+        let title = format!(
+            "{} {count} file{}?",
+            if deleting { "Delete" } else { "Roll back" },
+            if count == 1 { "" } else { "s" }
+        );
+        let body = if deleting {
+            "These files are not under version control. They are removed from the disk and cannot be restored."
+        } else {
+            "Your changes to these files are discarded and they go back to the last commit. This cannot be undone."
+        };
+        let delete_added = pending.delete_added;
+        let card = modal::card().w(px(480.)).child(
+            modal::card_body()
+                .gap(px(10.))
+                .child(modal::title(title))
+                .child(modal::body(body))
+                .child(
+                    div()
+                        .max_h(px(180.))
+                        .overflow_hidden()
+                        .rounded(px(6.))
+                        .bg(content(0.05))
+                        .py(px(6.))
+                        .children(names.iter().take(8).map(|(path, status)| {
+                            div()
+                                .px(px(10.))
+                                .py(px(2.))
+                                .flex()
+                                .gap(px(8.))
+                                .text_size(px(12.))
+                                .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(content(0.4))
+                                        .child(*status),
+                                )
+                        }))
+                        .when(count > 8, |d| {
+                            d.child(
+                                div()
+                                    .px(px(10.))
+                                    .pt(px(2.))
+                                    .text_size(px(11.))
+                                    .text_color(content(0.45))
+                                    .child(format!("and {} more", count - 8)),
+                            )
+                        }),
+                )
+                .when(added && !deleting, |d| {
+                    d.child(
+                        div()
+                            .id("commit-rollback-delete-added")
+                            .role(Role::Switch)
+                            .aria_label("Also delete the new files from disk")
+                            .aria_selected(delete_added)
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(content(0.8))
+                            .child(Self::checkbox(
+                                "commit-rollback-delete-added-box",
+                                if delete_added {
+                                    Check::All
+                                } else {
+                                    Check::None
+                                },
+                            ))
+                            .child("Also delete the new files from disk")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(p) = this.pending.as_mut() {
+                                    p.delete_added = !p.delete_added;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            crate::project_settings::button("commit-rollback-cancel", "Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pending = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            modal::danger_button(
+                                "commit-rollback-confirm",
+                                if deleting { "Delete" } else { "Roll back" },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_rollback(cx))),
+                        ),
+                ),
+        );
+        Some(
+            modal::overlay("commit-rollback", card, {
+                let weak = cx.weak_entity();
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.pending = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .into_any_element(),
+        )
+    }
+
     fn row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return div().h(px(ROW)).into_any_element();
@@ -521,7 +865,14 @@ impl CommitDialog {
             .items_center()
             .gap(px(6.))
             .text_size(px(12.))
-            .cursor_pointer();
+            .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.open_menu(ix, event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
         match row {
             Row::Group {
                 key,
@@ -954,6 +1305,12 @@ impl Render for CommitDialog {
                     });
                 }
             }))
+            .children(self.pending_overlay(cx))
+            .children(
+                self.menu
+                    .as_ref()
+                    .map(|open| menu_popover(&open.menu, Anchor::Point(open.anchor), cx).gap(0.)),
+            )
     }
 }
 
@@ -1018,5 +1375,138 @@ mod tests {
 
     fn files_name(files: &[ChangedFile], ix: usize) -> &str {
         basename(&files[ix].relative)
+    }
+
+    #[test]
+    fn plan_splits_tracked_from_unversioned() {
+        let files = vec![
+            file("a.rs", "modified"),
+            file("b.rs", "untracked"),
+            file("c.rs", "added"),
+        ];
+        assert_eq!(plan(&files, &[0, 1, 2]), (vec![0, 2], vec![1]));
+        assert_eq!(plan(&files, &[1]), (vec![], vec![1]));
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bravo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        std::fs::write(dir.path().join("loose.txt"), "x\n").unwrap();
+        dir
+    }
+
+    #[gpui::test]
+    fn rolling_back_asks_first_then_restores_the_file_and_the_list_follows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(input::bind);
+        let dir = repo();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| CommitDialog::new(git, cwd, String::new(), Kind::Codex, window, cx))
+            })
+            .unwrap()
+        });
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |dialog, window, cx| {
+                let names: Vec<&str> = dialog.files.iter().map(|f| f.relative.as_str()).collect();
+                assert_eq!(names, ["a.txt", "b.txt", "loose.txt"], "{names:?}");
+                let a = dialog
+                    .files
+                    .iter()
+                    .position(|f| f.relative == "a.txt")
+                    .unwrap();
+                // A right click offers Rollback for a tracked file, and asks first.
+                let row = dialog
+                    .rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Tree(TreeRow::File { ix, .. }) if *ix == a))
+                    .unwrap();
+                dialog.open_menu(row, gpui::point(px(10.), px(10.)), window, cx);
+                assert!(dialog.menu.is_some());
+                dialog.run_menu_action("rollback", row, window, cx);
+                let pending = dialog.pending.as_ref().expect("a confirmation");
+                assert_eq!(
+                    pending.tracked,
+                    [("a.txt".to_owned(), "modified".to_owned())]
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                    "changed\n",
+                    "nothing happens before the user agrees"
+                );
+                // Cancelling leaves everything alone.
+                dialog.pending = None;
+                // A folder or group scope covers its files; an unversioned file is only deleted.
+                dialog.ask_rollback(&[0, 1, 2], false, cx);
+                let pending = dialog.pending.as_ref().unwrap();
+                assert_eq!(
+                    pending.tracked.len(),
+                    2,
+                    "unversioned files are not rolled back"
+                );
+                assert!(pending.untracked.is_empty());
+                dialog.ask_rollback(&[2], true, cx);
+                assert_eq!(dialog.pending.as_ref().unwrap().untracked, ["loose.txt"]);
+                dialog.pending = None;
+                dialog.ask_rollback(&[0, 1], false, cx);
+                dialog.confirm_rollback(cx);
+                assert_eq!(dialog.busy, Some("rollback"));
+            })
+            .unwrap();
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "bravo\n"
+        );
+        assert!(dir.path().join("loose.txt").exists());
+        window
+            .update(cx, |dialog, _, _| {
+                assert_eq!(dialog.busy, None);
+                assert!(dialog.error.is_none(), "{:?}", dialog.error);
+                let names: Vec<&str> = dialog.files.iter().map(|f| f.relative.as_str()).collect();
+                assert_eq!(
+                    names,
+                    ["loose.txt"],
+                    "the list follows: only the unversioned file is left"
+                );
+            })
+            .unwrap();
+        cx.refresh().unwrap();
     }
 }

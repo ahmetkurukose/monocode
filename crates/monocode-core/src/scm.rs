@@ -1085,6 +1085,52 @@ fn git_remote_names(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Puts files back to what HEAD has, like a rollback in an IDE: every change
+/// to a tracked file, staged or not, is dropped and a deleted file comes back.
+/// A file that was only added (in the index, not in HEAD) leaves the index;
+/// with `delete_added` it is also removed from the disk. Unversioned files are
+/// left alone: they have no earlier state (use [`discard_file`] to delete them).
+pub fn rollback_files(cwd: &Path, relatives: &[String], delete_added: bool) -> Result<(), String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("Rollback is not available in remote workspaces yet.".into());
+    }
+    rollback_files_for(&expand_home(cwd), relatives, delete_added)
+}
+
+fn rollback_files_for(root: &Path, relatives: &[String], delete_added: bool) -> Result<(), String> {
+    let mut restore: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    for relative in relatives {
+        let relative = resolve_repo_path(root, relative)?;
+        let spec = format!(":(literal){relative}");
+        if git_checked(root, &["cat-file", "-e", &format!("HEAD:{relative}")]).is_ok() {
+            restore.push(spec);
+        } else if git_checked(root, &["ls-files", "--error-unmatch", "--", &spec]).is_ok() {
+            added.push(relative);
+        }
+    }
+    if !restore.is_empty() {
+        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+        args.extend(restore.iter().map(String::as_str));
+        git_checked(root, &args)?;
+    }
+    if !added.is_empty() {
+        let specs: Vec<String> = added.iter().map(|r| format!(":(literal){r}")).collect();
+        let mut args = vec!["rm", "--cached", "-q", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        git_checked(root, &args)?;
+        if delete_added {
+            for relative in &added {
+                let abs = root.join(relative);
+                if abs.is_file() {
+                    std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
     let abs = root.join(&relative);

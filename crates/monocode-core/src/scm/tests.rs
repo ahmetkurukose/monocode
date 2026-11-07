@@ -1355,3 +1355,78 @@ fn outgoing_notes_how_far_the_branch_is_behind() {
     let report = outgoing(&b).unwrap();
     assert_eq!((report.commits.len(), report.behind), (1, 1));
 }
+
+#[test]
+fn rollback_drops_staged_and_unstaged_changes_and_restores_deleted_files() {
+    let dir = tmp();
+    let dir = dir.path();
+    assert!(init_git_commit(
+        dir,
+        &[
+            ("a.txt", "alpha\n"),
+            ("b.txt", "bravo\n"),
+            ("c.txt", "charlie\n")
+        ]
+    ));
+    // a: staged edit then another unstaged edit; b: deleted; c: untouched.
+    std::fs::write(dir.join("a.txt"), "staged\n").unwrap();
+    stage_file(dir, "a.txt").unwrap();
+    std::fs::write(dir.join("a.txt"), "unstaged\n").unwrap();
+    std::fs::remove_file(dir.join("b.txt")).unwrap();
+    rollback_files(dir, &["a.txt".into(), "b.txt".into()], false).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "bravo\n"
+    );
+    assert!(index(dir).files.is_empty(), "nothing is left to commit");
+}
+
+#[test]
+fn rollback_unstages_an_added_file_and_keeps_or_deletes_it_as_asked() {
+    let dir = tmp();
+    let dir = dir.path();
+    assert!(init_git_commit(dir, &[("a.txt", "alpha\n")]));
+    std::fs::write(dir.join("new.txt"), "hello\n").unwrap();
+    std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
+    stage_file(dir, "new.txt").unwrap();
+    stage_file(dir, "gone.txt").unwrap();
+    assert_eq!(file(dir, "new.txt").status, "added");
+    rollback_files(dir, &["new.txt".into()], false).unwrap();
+    assert!(dir.join("new.txt").exists(), "kept on disk");
+    assert_eq!(file(dir, "new.txt").status, "untracked");
+    rollback_files(dir, &["gone.txt".into()], true).unwrap();
+    assert!(!dir.join("gone.txt").exists(), "deleted on request");
+    assert!(index(dir).files.iter().all(|f| f.relative != "gone.txt"));
+}
+
+#[test]
+fn rollback_leaves_unversioned_files_and_odd_names_alone() {
+    let dir = tmp();
+    let dir = dir.path();
+    assert!(init_git_commit(
+        dir,
+        &[("a[1].txt", "alpha\n"), ("b.txt", "bravo\n")]
+    ));
+    std::fs::write(dir.join("a[1].txt"), "changed\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "changed\n").unwrap();
+    std::fs::write(dir.join("loose.txt"), "x\n").unwrap();
+    // The brackets are part of the name, not a pattern: only that file goes back.
+    rollback_files(dir, &["a[1].txt".into(), "loose.txt".into()], false).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a[1].txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "changed\n"
+    );
+    assert!(
+        dir.join("loose.txt").exists(),
+        "an unversioned file is not rolled back"
+    );
+    assert!(rollback_files(dir, &["../outside".into()], false).is_err());
+}
