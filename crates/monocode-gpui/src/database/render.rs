@@ -1067,6 +1067,55 @@ impl DatabaseView {
                     .is_some_and(|r| r.rows.len() >= self.limit),
             )
         });
+        let tabs = (console.all.len() > 1).then(|| {
+            let current = console.current;
+            let labels: Vec<(usize, String)> = console
+                .all
+                .iter()
+                .enumerate()
+                .map(|(n, r)| {
+                    let text: String = r.statement.split_whitespace().collect::<Vec<_>>().join(" ");
+                    (
+                        n,
+                        format!("{} · {}", n + 1, text.chars().take(22).collect::<String>()),
+                    )
+                })
+                .collect();
+            div()
+                .h(px(28.))
+                .flex_shrink_0()
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .border_b_1()
+                .border_color(content(0.07))
+                .children(labels.into_iter().map(|(n, label)| {
+                    div()
+                        .id(("database-result-tab", n))
+                        .role(Role::Tab)
+                        .aria_label(label.clone())
+                        .aria_selected(n == current)
+                        .h(px(22.))
+                        .px(px(8.))
+                        .rounded(px(5.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .font_family("monospace")
+                        .text_color(content(if n == current { 1. } else { 0.5 }))
+                        .when(n == current, |d| d.bg(content(0.1)))
+                        .hover(|s| s.bg(content(0.07)))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(ix) = this.active_index() {
+                                this.consoles[ix].select_result(n);
+                            }
+                            cx.notify();
+                        }))
+                }))
+        });
         let body: AnyElement = if let Some((error, statement)) = console.error.clone() {
             Self::error_panel(&error, &statement)
         } else if let Some(result) = console.result.clone() {
@@ -1094,6 +1143,7 @@ impl DatabaseView {
             .min_h_0()
             .flex()
             .flex_col()
+            .children(tabs)
             .child(body)
             .child(
                 div()

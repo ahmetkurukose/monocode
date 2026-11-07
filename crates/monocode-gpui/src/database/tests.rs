@@ -656,3 +656,33 @@ fn an_expanded_table_shows_its_folders_and_hiding_results_survives_a_restart(
         .update(cx, |view, _, _| assert!(view.results_hidden))
         .unwrap();
 }
+
+#[gpui::test]
+fn a_script_with_several_queries_gets_a_tab_per_result(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let console = &mut view.consoles[0];
+            let mut first = sample();
+            first.statement = "select 1".into();
+            let mut second = long_result();
+            second.statement = "select * from t".into();
+            console.all = vec![Arc::new(first), Arc::new(second)];
+            console.select_result(1);
+            console.scroll_y = 500.;
+            assert_eq!(
+                console.result.as_ref().unwrap().statement,
+                "select * from t"
+            );
+            assert_eq!(console.widths.len(), 30);
+            console.select_result(0);
+            assert_eq!(console.widths.len(), 2, "the grid follows the tab");
+            assert_eq!(console.scroll_y, 0., "and starts at the top");
+            console.select_result(9);
+            assert_eq!(console.current, 0, "an unknown tab changes nothing");
+        })
+        .unwrap();
+    cx.refresh().unwrap();
+}

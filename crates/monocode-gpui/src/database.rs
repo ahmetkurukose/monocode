@@ -239,6 +239,9 @@ struct Console {
     editor: Entity<Input>,
     conn: Option<Arc<Connection>>,
     result: Option<Arc<QueryResult>>,
+    /// Every result of the last run that returned rows; `result` is one of them.
+    all: Vec<Arc<QueryResult>>,
+    current: usize,
     widths: Vec<f32>,
     numeric: Vec<bool>,
     error: Option<(DbError, String)>,
@@ -396,6 +399,22 @@ fn title_of(text: &str, id: u32) -> String {
 
 fn group_key(source: &str, schema: &str, table: &str, kind: GroupKind) -> String {
     format!("g:{source}/{schema}/{table}/{}", kind.label())
+}
+
+impl Console {
+    /// Makes result `i` of the last run the one the grid shows.
+    fn select_result(&mut self, i: usize) {
+        let Some(result) = self.all.get(i).cloned() else {
+            return;
+        };
+        self.current = i;
+        self.widths = grid::column_widths(&result);
+        self.numeric = grid::numeric_columns(&result);
+        self.result = Some(result);
+        self.selected = None;
+        self.scroll_x = 0.;
+        self.scroll_y = 0.;
+    }
 }
 
 fn quote_ident(name: &str) -> String {
@@ -627,6 +646,8 @@ impl DatabaseView {
             editor,
             conn: None,
             result: None,
+            all: Vec::new(),
+            current: 0,
             widths: Vec::new(),
             numeric: Vec::new(),
             error: None,
@@ -867,7 +888,7 @@ impl DatabaseView {
                         .map_err(|e| (None, e, String::new()))?,
                 ),
             };
-            let mut last = None;
+            let mut all = Vec::new();
             for statement in statements {
                 let outcome = conn.execute(&statement, limit).await;
                 let (rows, error, elapsed_ms) = match &outcome {
@@ -893,11 +914,11 @@ impl DatabaseView {
                     },
                 );
                 match outcome {
-                    Ok(result) => last = Some(result),
+                    Ok(result) => all.push(result),
                     Err(error) => return Err((Some(conn), error, statement)),
                 }
             }
-            Ok((conn, last))
+            Ok((conn, all))
         };
         let task = self.spawn_db(cx, work, move |this, out, cx| {
             let Some(ix) = this.console_index(&key.0, key.1) else {
@@ -907,15 +928,23 @@ impl DatabaseView {
             console.running = false;
             console.task = None;
             match out {
-                Some(Ok((conn, result))) => {
+                Some(Ok((conn, results))) => {
                     console.conn = Some(conn.clone());
-                    if let Some(result) = result {
-                        console.widths = grid::column_widths(&result);
-                        console.numeric = grid::numeric_columns(&result);
-                        console.result = Some(Arc::new(result));
-                        console.selected = None;
-                        console.scroll_x = 0.;
-                        console.scroll_y = 0.;
+                    if !results.is_empty() {
+                        // Statements that return rows get a tab each; when none
+                        // does, the last one (its status) is what is shown.
+                        let mut shown: Vec<Arc<QueryResult>> = results
+                            .iter()
+                            .filter(|r| !r.columns.is_empty())
+                            .cloned()
+                            .map(Arc::new)
+                            .collect();
+                        if shown.is_empty() {
+                            shown.extend(results.last().cloned().map(Arc::new));
+                        }
+                        let last = shown.len() - 1;
+                        console.all = shown;
+                        console.select_result(last);
                         console.note = None;
                         console.export_sql = paging.as_ref().map(table_sql);
                         console.paging = paging;
