@@ -76,6 +76,10 @@ PLIST
 native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"
 if [ "$native_identity" = - ]; then
   codesign --force --sign - "$native_bundle"
+elif [ -n "${MONOCODE_NATIVE_LOCAL_SIGNING:-}" ]; then
+  # A certificate made on this Mac (not notarized): the signature stays the
+  # same from build to build, so the keychain's "Always Allow" survives updates.
+  codesign --force --sign "$native_identity" "$native_bundle"
 else
   codesign --force --sign "$native_identity" --options runtime --timestamp \
     --entitlements src-tauri/Entitlements.plist "$native_bundle"
