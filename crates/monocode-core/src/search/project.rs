@@ -4,6 +4,34 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 const MAX_MATCHES: usize = 500;
+/// The most characters of a matching line kept as its preview.
+const PREVIEW_CHARS: usize = 240;
+/// How many of those come before the match.
+const PREVIEW_LEAD: usize = 60;
+
+/// `line` cut to a window around the match at `column` (1-based, in
+/// characters), with … where text was left out. A minified bundle is one
+/// line of megabytes; nothing may hand that to the text shaper.
+fn clip_preview(line: &str, column: u32) -> String {
+    if line.char_indices().nth(PREVIEW_CHARS).is_none() {
+        return line.to_owned();
+    }
+    let at = (column.max(1) as usize - 1).saturating_sub(PREVIEW_LEAD);
+    let mut chars = line.char_indices().skip(at);
+    let Some((from, _)) = chars.next() else {
+        return String::new();
+    };
+    let to = line[from..]
+        .char_indices()
+        .nth(PREVIEW_CHARS)
+        .map_or(line.len(), |(i, _)| from + i);
+    format!(
+        "{}{}{}",
+        if from > 0 { "…" } else { "" },
+        &line[from..to],
+        if to < line.len() { "…" } else { "" }
+    )
+}
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_GIT_GREP_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -225,7 +253,7 @@ fn git_grep_capped(
             relative,
             line,
             column,
-            preview,
+            preview: clip_preview(&preview, column),
         });
         if matches.len() >= MAX_MATCHES {
             truncated = true;
@@ -316,7 +344,7 @@ fn scan_files(
                     relative: file.relative.clone(),
                     line: (index + 1) as u32,
                     column,
-                    preview: line.to_string(),
+                    preview: clip_preview(line, column),
                 });
                 if matches.len() >= MAX_MATCHES {
                     truncated = true;
@@ -535,6 +563,51 @@ mod tests {
             .matches
             .is_empty());
     }
+    #[test]
+    fn a_huge_line_is_previewed_as_a_short_window_around_the_match() {
+        assert_eq!(clip_preview("short line", 3), "short line");
+        let line = format!("{}needle{}", "é".repeat(5000), "ü".repeat(5000));
+        let preview = clip_preview(&line, 5001);
+        assert!(
+            preview.chars().count() <= PREVIEW_CHARS + 2,
+            "{}",
+            preview.chars().count()
+        );
+        assert!(preview.contains("needle"), "the match stays in view");
+        assert!(preview.starts_with('…') && preview.ends_with('…'));
+        // A match near the start keeps the start.
+        let head = format!("needle{}", "x".repeat(10_000));
+        let preview = clip_preview(&head, 1);
+        assert!(
+            preview.starts_with("needle") && preview.ends_with('…') && !preview.starts_with('…')
+        );
+        // A column past the end (regex searches report 1) never panics.
+        assert!(clip_preview(&"y".repeat(1000), 99_999).is_empty());
+        // Searching a repository gives the same short windows.
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet"]);
+        std::fs::write(
+            dir.path().join("bundle.min.js"),
+            format!("{}needle{}\n", "a".repeat(400_000), "b".repeat(400_000)),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "."]);
+        let found =
+            search_project(dir.path(), &options("needle"), &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.matches.len(), 1);
+        let m = &found.matches[0];
+        assert!(
+            m.preview.chars().count() <= PREVIEW_CHARS + 2,
+            "{}",
+            m.preview.len()
+        );
+        assert!(m.preview.contains("needle"));
+        assert_eq!(
+            m.column, 400_001,
+            "opening the file still lands on the match"
+        );
+    }
+
     #[test]
     fn whole_word_unicode_does_not_slice_inside_utf8() {
         let mut opts = options("é");

@@ -345,6 +345,7 @@ impl Render for ProjectSearch {
             .enumerate()
             .map(|(group_index, group)| {
                 div()
+                    .debug_selector(move || format!("project-search-group-{group_index}"))
                     .w_full()
                     .min_w_0()
                     .flex_shrink_0()
@@ -402,6 +403,9 @@ impl Render for ProjectSearch {
                             }));
                         div()
                             .id(("project-search-match", group_index * 501 + index))
+                            .debug_selector(move || {
+                                format!("project-search-match-{group_index}-{index}")
+                            })
                             .role(Role::Button)
                             .aria_label(format!(
                                 "{}:{} {}",
@@ -607,6 +611,7 @@ impl Render for ProjectSearch {
             .child(
                 div()
                     .id("project-search-results")
+                    .debug_selector(|| "project-search-results".into())
                     .min_h_0()
                     .min_w_0()
                     .flex_1()
@@ -617,5 +622,82 @@ impl Render for ProjectSearch {
                     .children(groups),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn results(groups: usize, per_group: usize) -> Vec<Group> {
+        (0..groups)
+            .map(|g| Group {
+                relative: format!("src/module_{g}/file_{g}.py"),
+                name: format!("file_{g}.py"),
+                matches: (0..per_group)
+                    .map(|m| Match {
+                        source: SearchMatch {
+                            path: format!("/p/src/module_{g}/file_{g}.py"),
+                            relative: format!("src/module_{g}/file_{g}.py"),
+                            line: (m + 1) as u32,
+                            column: 1,
+                            preview: format!(
+                                "    hydra_call_{g}_{m}(argument, another_argument)  # note"
+                            ),
+                        },
+                        highlight: Some(4..9),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn results_fill_the_panel_and_stay_inside_it(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| ProjectSearch::new("/p".into(), true, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |search, _, cx| {
+                search.groups = results(24, 3);
+                search.count = 72;
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let viewport = window.update(visual, |_, w, _| w.viewport_size()).unwrap();
+        let list = visual
+            .debug_bounds("project-search-results")
+            .expect("results list");
+        let first = visual
+            .debug_bounds("project-search-group-0")
+            .expect("first group");
+        let row = visual
+            .debug_bounds("project-search-match-0-0")
+            .expect("first match");
+        assert!(list.size.height > px(100.), "the list has height: {list:?}");
+        assert!(
+            list.bottom() <= viewport.height,
+            "{list:?} within {viewport:?}"
+        );
+        assert!(
+            first.size.height > px(30.) && first.size.height < px(400.),
+            "{first:?}"
+        );
+        assert!(
+            row.size.height >= px(20.) && row.size.height < px(60.),
+            "a match row is one or two lines: {row:?}"
+        );
+        assert!(
+            row.top() >= list.top() && row.bottom() <= list.bottom(),
+            "{row:?} inside {list:?}"
+        );
+        assert!(row.size.width > px(100.), "{row:?}");
     }
 }
