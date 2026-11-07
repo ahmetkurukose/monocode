@@ -51,6 +51,39 @@ pub struct TriggerInfo {
     pub definition: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineInfo {
+    /// `pg_proc.oid`, which tells overloads apart.
+    pub oid: String,
+    pub name: String,
+    /// `a integer, b text`.
+    pub arguments: String,
+    pub kind: RoutineKind,
+    /// The return type; empty for a procedure.
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceInfo {
+    pub name: String,
+    pub data_type: String,
+    pub start: String,
+    pub increment: String,
+}
+
+/// The objects of a schema that are not tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaObjects {
+    pub routines: Vec<RoutineInfo>,
+    pub sequences: Vec<SequenceInfo>,
+}
+
 /// Everything about a table beyond its columns.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableDetails {
@@ -172,6 +205,103 @@ impl Connection {
                 comment: r[3].clone().filter(|c| !c.is_empty()),
             })
             .collect())
+    }
+
+    /// Functions, procedures and sequences of `schema` (extension-owned
+    /// routines are left out).
+    pub async fn schema_objects(&self, schema: &str) -> Result<SchemaObjects, DbError> {
+        let routines = self
+            .rows(&format!(
+                "select p.oid::text, p.proname, pg_get_function_identity_arguments(p.oid), p.prokind::text, \
+                        coalesce(pg_get_function_result(p.oid), '') \
+                 from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
+                 where n.nspname = {} and p.prokind in ('f', 'p') \
+                   and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') \
+                 order by p.proname, 3",
+                literal(schema)
+            ))
+            .await?;
+        let sequences = self
+            .rows(&format!(
+                "select sequencename, data_type::text, start_value::text, increment_by::text \
+                 from pg_sequences where schemaname = {} order by sequencename",
+                literal(schema)
+            ))
+            .await?;
+        let text = |v: &Option<String>| v.clone().unwrap_or_default();
+        Ok(SchemaObjects {
+            routines: routines
+                .iter()
+                .map(|r| RoutineInfo {
+                    oid: text(&r[0]),
+                    name: text(&r[1]),
+                    arguments: text(&r[2]),
+                    kind: if r[3].as_deref() == Some("p") {
+                        RoutineKind::Procedure
+                    } else {
+                        RoutineKind::Function
+                    },
+                    result: text(&r[4]),
+                })
+                .collect(),
+            sequences: sequences
+                .iter()
+                .map(|r| SequenceInfo {
+                    name: text(&r[0]),
+                    data_type: text(&r[1]),
+                    start: text(&r[2]),
+                    increment: text(&r[3]),
+                })
+                .collect(),
+        })
+    }
+
+    /// The `CREATE FUNCTION` / `CREATE PROCEDURE` script of a routine.
+    pub async fn routine_ddl(&self, oid: &str) -> Result<String, DbError> {
+        let oid: u32 = oid.parse().map_err(|_| DbError {
+            message: "Not a routine id".into(),
+            ..DbError::default()
+        })?;
+        let rows = self
+            .rows(&format!("select pg_get_functiondef({oid}::oid)"))
+            .await?;
+        let mut text = rows.first().and_then(|r| r[0].clone()).unwrap_or_default();
+        if !text.trim_end().ends_with(';') {
+            text = format!("{};", text.trim_end());
+        }
+        Ok(format!("{text}\n"))
+    }
+
+    /// A `CREATE SEQUENCE` script for a sequence.
+    pub async fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        let rows = self
+            .rows(&format!(
+                "select data_type::text, start_value::text, min_value::text, max_value::text, \
+                        increment_by::text, cycle::text, cache_size::text \
+                 from pg_sequences where schemaname = {} and sequencename = {}",
+                literal(schema),
+                literal(name)
+            ))
+            .await?;
+        let Some(r) = rows.first() else {
+            return Err(DbError {
+                message: format!("Sequence {schema}.{name} not found"),
+                ..DbError::default()
+            });
+        };
+        let text = |i: usize| r[i].clone().unwrap_or_default();
+        Ok(format!(
+            "create sequence {}.{}\n    as {}\n    increment by {}\n    minvalue {}\n    maxvalue {}\n    start with {}\n    cache {}\n    {};\n",
+            quote(schema),
+            quote(name),
+            text(0),
+            text(4),
+            text(2),
+            text(3),
+            text(1),
+            text(6),
+            if text(5) == "true" { "cycle" } else { "no cycle" }
+        ))
     }
 
     pub async fn table_details(&self, schema: &str, table: &str) -> Result<TableDetails, DbError> {
@@ -429,6 +559,38 @@ mod tests {
             assert_eq!(details.triggers.len(), 1);
             let parent = conn.table_details("mc_probe", "t").await.unwrap();
             assert!(parent.referenced_by.iter().any(|(table, def)| table.contains("child") && def.contains("FOREIGN KEY")));
+            conn.execute(
+                "create sequence mc_probe.ticket_seq as bigint increment by 5 start 100 cycle; \
+                 create function mc_probe.add_one(a integer) returns integer language sql as $$ select a + 1 $$; \
+                 create function mc_probe.add_one(a text) returns text language sql as $$ select a || '1' $$; \
+                 create procedure mc_probe.reset_all() language sql as $$ select 1 $$",
+                1,
+            )
+            .await
+            .unwrap();
+            let objects = conn.schema_objects("mc_probe").await.unwrap();
+            let names: Vec<(&str, RoutineKind, &str)> = objects
+                .routines
+                .iter()
+                .map(|r| (r.name.as_str(), r.kind, r.arguments.as_str()))
+                .collect();
+            assert!(names.contains(&("add_one", RoutineKind::Function, "a integer")), "{names:?}");
+            assert!(names.contains(&("add_one", RoutineKind::Function, "a text")), "overloads are listed apart");
+            assert!(names.contains(&("reset_all", RoutineKind::Procedure, "")));
+            assert!(objects.routines.iter().all(|r| r.name != "noop" || r.kind == RoutineKind::Function));
+            let seq = objects.sequences.iter().find(|s| s.name == "ticket_seq").unwrap();
+            assert_eq!((seq.data_type.as_str(), seq.start.as_str(), seq.increment.as_str()), ("bigint", "100", "5"));
+            let int_version = objects.routines.iter().find(|r| r.arguments == "a integer").unwrap();
+            let fn_ddl = conn.routine_ddl(&int_version.oid).await.unwrap();
+            assert!(fn_ddl.contains("FUNCTION mc_probe.add_one(a integer)") && fn_ddl.trim_end().ends_with(';'), "{fn_ddl}");
+            let proc_ddl = conn.routine_ddl(&objects.routines.iter().find(|r| r.name == "reset_all").unwrap().oid).await.unwrap();
+            assert!(proc_ddl.contains("PROCEDURE mc_probe.reset_all"), "{proc_ddl}");
+            let seq_ddl = conn.sequence_ddl("mc_probe", "ticket_seq").await.unwrap();
+            assert!(seq_ddl.contains("increment by 5") && seq_ddl.contains("start with 100") && seq_ddl.contains("cycle"), "{seq_ddl}");
+            // The scripts run: drop the objects and recreate them from the scripts.
+            conn.execute("drop sequence mc_probe.ticket_seq; drop procedure mc_probe.reset_all", 1).await.unwrap();
+            conn.execute(&seq_ddl, 1).await.unwrap();
+            conn.execute(&proc_ddl, 1).await.unwrap();
             let ddl = conn.ddl("mc_probe", "child", TableKind::Table).await.unwrap();
             assert!(ddl.starts_with("create table mc_probe.child ("), "{ddl}");
             assert!(ddl.contains("constraint") && ddl.contains("FOREIGN KEY") && ddl.contains("id serial"), "{ddl}");

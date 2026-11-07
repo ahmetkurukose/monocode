@@ -82,7 +82,7 @@ impl DatabaseView {
                 let name = table.map(|t| t.info.name.clone()).unwrap_or_default();
                 let kind = table.map(|t| t.info.kind);
                 (
-                    2,
+                    3,
                     Some(
                         self.expanded
                             .contains(&format!("t:{source}/{schema}/{name}")),
@@ -128,7 +128,7 @@ impl DatabaseView {
                         .len()
                     });
                 (
-                    3,
+                    4,
                     Some(
                         self.expanded
                             .contains(&group_key(source, schema, table, *kind)),
@@ -145,13 +145,72 @@ impl DatabaseView {
                 detail,
                 ..
             } => (
-                4,
+                5,
                 None,
                 glyph,
                 label.clone(),
                 (!detail.is_empty()).then(|| detail.clone()),
                 false,
             ),
+            TreeRow::Folder(source, schema, folder) => {
+                let count = self.schema_node(source, schema).map(|s| match folder {
+                    SchemaFolder::Functions => s
+                        .objects
+                        .routines
+                        .iter()
+                        .filter(|r| r.kind == RoutineKind::Function)
+                        .count(),
+                    SchemaFolder::Procedures => s
+                        .objects
+                        .routines
+                        .iter()
+                        .filter(|r| r.kind == RoutineKind::Procedure)
+                        .count(),
+                    SchemaFolder::Sequences => s.objects.sequences.len(),
+                    _ => s
+                        .tables
+                        .iter()
+                        .flatten()
+                        .filter(|t| folder.holds(t.info.kind))
+                        .count(),
+                });
+                (
+                    2,
+                    Some(self.expanded.contains(&folder_key(source, schema, *folder))),
+                    "",
+                    folder.label().to_owned(),
+                    count.map(|n| n.to_string()),
+                    false,
+                )
+            }
+            TreeRow::Routine(source, schema, i) => {
+                let routine = self
+                    .schema_node(source, schema)
+                    .and_then(|s| s.objects.routines.get(*i));
+                (
+                    3,
+                    None,
+                    "db-console",
+                    routine
+                        .map(|r| format!("{}({})", r.name, r.arguments))
+                        .unwrap_or_default(),
+                    routine.map(|r| r.result.clone()).filter(|r| !r.is_empty()),
+                    false,
+                )
+            }
+            TreeRow::Sequence(source, schema, i) => {
+                let sequence = self
+                    .schema_node(source, schema)
+                    .and_then(|s| s.objects.sequences.get(*i));
+                (
+                    3,
+                    None,
+                    "db-column",
+                    sequence.map(|q| q.name.clone()).unwrap_or_default(),
+                    sequence.map(|q| format!("{} · by {}", q.data_type, q.increment)),
+                    false,
+                )
+            }
             TreeRow::Consoles(source) => (
                 1,
                 Some(self.expanded.contains(&format!("c:{source}"))),
@@ -322,6 +381,18 @@ impl DatabaseView {
                                 cx.stop_propagation();
                             }),
                         ),
+                )
+            })
+            .when(!is_note, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let row = row.clone();
+                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            this.open_menu(row.clone(), event.position, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }),
                 )
             })
             .when(!is_note, |d| {
@@ -2043,6 +2114,11 @@ impl Render for DatabaseView {
             .children(self.remove_overlay(cx))
             .children(self.history_overlay(cx))
             .children(self.rename_overlay(cx))
+            .children(
+                self.menu
+                    .as_ref()
+                    .map(|open| menu_popover(&open.menu, Anchor::Point(open.anchor), cx).gap(0.)),
+            )
             .children(self.export_overlay(cx))
             .children(self.pending_overlay(cx))
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))

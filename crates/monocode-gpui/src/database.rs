@@ -13,6 +13,7 @@ mod tests;
 use crate::{
     input::{self, Input},
     modal,
+    popover::{Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover},
     theme::*,
 };
 use dialog::{DialogEvent, SourceDialog};
@@ -23,8 +24,8 @@ use gpui::{
 };
 use monocode_core::db::{
     ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError,
-    HistoryEntry, HistoryStore, QueryResult, TableDetails, TableInfo, TableKind, analysis, format,
-    params, runtime::runtime, source, split,
+    HistoryEntry, HistoryStore, QueryResult, RoutineKind, SchemaObjects, TableDetails, TableInfo,
+    TableKind, analysis, format, params, runtime::runtime, source, split,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -135,7 +136,7 @@ fn group_rows(
         return match kind {
             GroupKind::Columns => columns
                 .iter()
-                .map(|c| TreeRow::Column(4, c.clone()))
+                .map(|c| TreeRow::Column(5, c.clone()))
                 .collect(),
             _ => Vec::new(),
         };
@@ -143,7 +144,7 @@ fn group_rows(
     match kind {
         GroupKind::Columns => columns
             .iter()
-            .map(|c| TreeRow::Column(4, c.clone()))
+            .map(|c| TreeRow::Column(5, c.clone()))
             .collect(),
         GroupKind::Indexes => details
             .indexes
@@ -215,6 +216,87 @@ fn group_rows(
 struct SchemaNode {
     name: String,
     tables: Option<Vec<TableNode>>,
+    /// Functions, procedures and sequences, loaded with the tables.
+    objects: SchemaObjects,
+}
+
+/// The folders under an expanded schema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SchemaFolder {
+    Tables,
+    Views,
+    MaterializedViews,
+    Functions,
+    Procedures,
+    Sequences,
+}
+
+impl SchemaFolder {
+    const ALL: [Self; 6] = [
+        Self::Tables,
+        Self::Views,
+        Self::MaterializedViews,
+        Self::Functions,
+        Self::Procedures,
+        Self::Sequences,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tables => "Tables",
+            Self::Views => "Views",
+            Self::MaterializedViews => "Materialized views",
+            Self::Functions => "Functions",
+            Self::Procedures => "Procedures",
+            Self::Sequences => "Sequences",
+        }
+    }
+
+    fn holds(self, kind: TableKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::Tables, TableKind::Table | TableKind::Foreign)
+                | (Self::Views, TableKind::View)
+                | (Self::MaterializedViews, TableKind::MaterializedView)
+        )
+    }
+}
+
+fn folder_key(source: &str, schema: &str, folder: SchemaFolder) -> String {
+    format!("f:{source}/{schema}/{}", folder.label())
+}
+
+/// What a DDL request is for.
+#[derive(Clone)]
+enum DdlTarget {
+    Table {
+        schema: String,
+        table: String,
+        kind: TableKind,
+    },
+    Routine {
+        oid: String,
+        label: String,
+    },
+    Sequence {
+        schema: String,
+        name: String,
+    },
+}
+
+/// What to do with a fetched script.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DdlThen {
+    Preview,
+    Clipboard,
+    Console,
+}
+
+struct OpenMenu {
+    row: TreeRow,
+    anchor: gpui::Point<gpui::Pixels>,
+    menu: Entity<Menu>,
+    _events: Subscription,
 }
 
 struct SourceNode {
@@ -379,6 +461,11 @@ enum TreeRow {
     Table(String, String, usize),
     /// A folder under a table: source, schema, table, kind.
     Group(String, String, String, GroupKind),
+    /// A folder under a schema: source, schema, folder.
+    Folder(String, String, SchemaFolder),
+    /// Index into the schema's `objects.routines` / `objects.sequences`.
+    Routine(String, String, usize),
+    Sequence(String, String, usize),
     Column(usize, ColumnInfo),
     Leaf {
         glyph: &'static str,
@@ -409,6 +496,7 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    menu: Option<OpenMenu>,
     export_format: monocode_core::db::ExportFormat,
     export_header: bool,
     export_transpose: bool,
@@ -482,6 +570,11 @@ impl Console {
     }
 }
 
+fn uuid_like() -> String {
+    // A fresh id for a duplicated data source.
+    DataSource::new("").id
+}
+
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -533,6 +626,7 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            menu: None,
             export_format: monocode_core::db::ExportFormat::Csv,
             export_header: true,
             export_transpose: false,
@@ -1530,23 +1624,384 @@ impl DatabaseView {
         kind: TableKind,
         cx: &mut Context<Self>,
     ) {
+        let target = DdlTarget::Table {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+            kind,
+        };
+        self.fetch_ddl(source, target, DdlThen::Preview, cx);
+    }
+
+    fn routine_target(&self, source: &str, schema: &str, ix: usize) -> Option<DdlTarget> {
+        let routine = self.schema_node(source, schema)?.objects.routines.get(ix)?;
+        Some(DdlTarget::Routine {
+            oid: routine.oid.clone(),
+            label: format!("{schema}.{}({})", routine.name, routine.arguments),
+        })
+    }
+
+    fn sequence_target(&self, source: &str, schema: &str, ix: usize) -> Option<DdlTarget> {
+        let sequence = self
+            .schema_node(source, schema)?
+            .objects
+            .sequences
+            .get(ix)?;
+        Some(DdlTarget::Sequence {
+            schema: schema.to_owned(),
+            name: sequence.name.clone(),
+        })
+    }
+
+    fn schema_node(&self, source: &str, schema: &str) -> Option<&SchemaNode> {
+        self.nodes
+            .get(source)?
+            .schemas
+            .as_ref()?
+            .iter()
+            .find(|s| s.name == schema)
+    }
+
+    /// Fetches a CREATE script and shows it, copies it, or puts it in the console.
+    fn fetch_ddl(
+        &mut self,
+        source: &str,
+        target: DdlTarget,
+        then: DdlThen,
+        cx: &mut Context<Self>,
+    ) {
         let Some(conn) = self.nodes.get(source).and_then(|n| n.conn.clone()) else {
             self.notice = Some("Connect first".into());
             cx.notify();
             return;
         };
-        let (s, t) = (schema.to_owned(), table.to_owned());
-        let title = format!("{schema}.{table}");
-        let work = async move { conn.ddl(&s, &t, kind).await };
+        let title = match &target {
+            DdlTarget::Table { schema, table, .. } => format!("{schema}.{table}"),
+            DdlTarget::Routine { label, .. } => label.clone(),
+            DdlTarget::Sequence { schema, name } => format!("{schema}.{name}"),
+        };
+        let work = async move {
+            match target {
+                DdlTarget::Table {
+                    schema,
+                    table,
+                    kind,
+                } => conn.ddl(&schema, &table, kind).await,
+                DdlTarget::Routine { oid, .. } => conn.routine_ddl(&oid).await,
+                DdlTarget::Sequence { schema, name } => conn.sequence_ddl(&schema, &name).await,
+            }
+        };
         self.spawn_db(cx, work, move |this, out, cx| {
-            this.preview = Some(match out {
-                Some(Ok(text)) => (title, text),
-                Some(Err(error)) => (title, format!("-- {}", error.message)),
-                None => (title, "-- The request stopped".into()),
-            });
+            let text = match out {
+                Some(Ok(text)) => text,
+                Some(Err(error)) => format!("-- {}", error.message),
+                None => "-- The request stopped".into(),
+            };
+            match then {
+                DdlThen::Preview => this.preview = Some((title, text)),
+                DdlThen::Clipboard => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    this.notice = Some("DDL copied".into());
+                }
+                DdlThen::Console => {
+                    if let Some(ix) = this.active_index() {
+                        this.append_to_console(ix, &text, cx);
+                    }
+                }
+            }
             cx.notify();
         })
         .detach();
+    }
+
+    /// Adds `text` after what the console holds (or as all of it, when empty).
+    fn append_to_console(&mut self, ix: usize, text: &str, cx: &mut Context<Self>) {
+        let editor = self.consoles[ix].editor.clone();
+        let (empty, end) = {
+            let input = editor.read(cx);
+            (input.content.trim().is_empty(), input.content.len())
+        };
+        let (at, text) = if empty {
+            (0, text.trim_end().to_owned())
+        } else {
+            (end, format!("\n\n{}", text.trim_end()))
+        };
+        editor.update(cx, |input, cx| {
+            input.replace_bytes(at..at, &text, text.len(), cx)
+        });
+    }
+
+    /// The reference to a tree row as SQL would write it.
+    fn reference(&self, row: &TreeRow) -> Option<String> {
+        use monocode_core::db::introspect::quote;
+        Some(match row {
+            TreeRow::Source(id) => self.source(id)?.name.clone(),
+            TreeRow::Schema(_, schema) => quote(schema),
+            TreeRow::Table(source, schema, ix) => {
+                let table = self
+                    .schema_node(source, schema)?
+                    .tables
+                    .as_ref()?
+                    .get(*ix)?;
+                format!("{}.{}", quote(schema), quote(&table.info.name))
+            }
+            TreeRow::Routine(source, schema, ix) => {
+                let r = self
+                    .schema_node(source, schema)?
+                    .objects
+                    .routines
+                    .get(*ix)?;
+                format!("{}.{}", quote(schema), quote(&r.name))
+            }
+            TreeRow::Sequence(source, schema, ix) => {
+                let q = self
+                    .schema_node(source, schema)?
+                    .objects
+                    .sequences
+                    .get(*ix)?;
+                format!("{}.{}", quote(schema), quote(&q.name))
+            }
+            TreeRow::Column(_, column) => quote(&column.name),
+            TreeRow::Leaf { label, .. } => label.clone(),
+            _ => return None,
+        })
+    }
+
+    /// The context menu of a tree row.
+    fn open_menu(
+        &mut self,
+        row: TreeRow,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut items: Vec<MenuItem> = Vec::new();
+        let copy = || MenuAction::new("copy-name", "Copy name").into();
+        match &row {
+            TreeRow::Source(id) => {
+                let live = self.is_connected(id);
+                items.push(
+                    MenuAction::new(
+                        if live { "disconnect" } else { "connect" },
+                        if live { "Disconnect" } else { "Connect" },
+                    )
+                    .into(),
+                );
+                items.push(MenuAction::new("refresh", "Refresh").into());
+                items.push(MenuItem::Separator);
+                items.push(MenuAction::new("console", "New console").into());
+                items.push(MenuItem::Separator);
+                items.push(MenuAction::new("edit", "Edit…").into());
+                items.push(MenuAction::new("duplicate", "Duplicate").into());
+                items.push(MenuAction::new("remove", "Remove…").danger().into());
+            }
+            TreeRow::Schema(..) => {
+                items.push(MenuAction::new("refresh", "Refresh").into());
+                items.push(MenuAction::new("console", "New console").into());
+                items.push(MenuItem::Separator);
+                items.push(copy());
+            }
+            TreeRow::Table(..) => {
+                items.push(MenuAction::new("data", "Open data").into());
+                items.push(MenuAction::new("refresh", "Refresh").into());
+                items.push(MenuItem::Separator);
+                items.push(MenuAction::new("ddl", "Show DDL").into());
+                items.push(MenuAction::new("ddl-copy", "Copy DDL").into());
+                items.push(MenuAction::new("ddl-console", "DDL to console").into());
+                items.push(MenuItem::Separator);
+                items.push(MenuAction::new("select-console", "Select * in console").into());
+                items.push(copy());
+            }
+            TreeRow::Routine(..) | TreeRow::Sequence(..) => {
+                items.push(MenuAction::new("ddl", "Show DDL").into());
+                items.push(MenuAction::new("ddl-copy", "Copy DDL").into());
+                items.push(MenuAction::new("ddl-console", "DDL to console").into());
+                items.push(MenuItem::Separator);
+                items.push(copy());
+            }
+            TreeRow::Column(..) | TreeRow::Leaf { .. } => items.push(copy()),
+            TreeRow::Consoles(_) => items.push(MenuAction::new("console", "New console").into()),
+            TreeRow::SavedConsole(..) => {
+                items.push(MenuAction::new("open-console", "Open").into());
+                items.push(MenuAction::new("rename", "Rename…").into());
+                items.push(MenuAction::new("delete-console", "Delete").danger().into());
+            }
+            _ => return,
+        }
+        self.menu = None;
+        let menu = cx.new(|cx| Menu::new("Data source actions", items, window, cx));
+        let events = cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
+            let Some(open) = this.menu.take() else {
+                return;
+            };
+            if let MenuEvent::Picked(id, _) = event {
+                this.run_menu_action(id, &open.row, window, cx);
+            }
+            cx.notify();
+        });
+        self.menu = Some(OpenMenu {
+            row,
+            anchor: at,
+            menu,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn run_menu_action(
+        &mut self,
+        id: &str,
+        row: &TreeRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = match row {
+            TreeRow::Source(s)
+            | TreeRow::Schema(s, _)
+            | TreeRow::Table(s, _, _)
+            | TreeRow::Routine(s, _, _)
+            | TreeRow::Sequence(s, _, _)
+            | TreeRow::Consoles(s)
+            | TreeRow::SavedConsole(s, _, _, _) => Some(s.clone()),
+            _ => None,
+        };
+        match id {
+            "connect" => {
+                if let TreeRow::Source(id) = row {
+                    self.select_source(id, cx);
+                    self.expanded.insert(format!("s:{id}"));
+                    self.expanded.insert(format!("c:{id}"));
+                    self.connect_source(id, cx);
+                }
+            }
+            "disconnect" => {
+                if let TreeRow::Source(id) = row {
+                    self.disconnect_source(id, cx);
+                }
+            }
+            "refresh" => match row {
+                TreeRow::Source(id) => {
+                    self.expanded.insert(format!("s:{id}"));
+                    self.refresh_source(id, cx);
+                }
+                TreeRow::Schema(source, schema) => self.load_tables(source, schema, cx),
+                TreeRow::Table(source, schema, ix) => {
+                    let name = self
+                        .schema_node(source, schema)
+                        .and_then(|s| s.tables.as_ref())
+                        .and_then(|t| t.get(*ix))
+                        .map(|t| t.info.name.clone());
+                    if let Some(name) = name {
+                        self.load_columns(source, schema, &name, cx);
+                    }
+                }
+                _ => {}
+            },
+            "console" => {
+                if let Some(source) = source {
+                    self.select_source(&source, cx);
+                    self.new_console(window, cx);
+                }
+            }
+            "edit" => {
+                if let TreeRow::Source(id) = row {
+                    self.open_dialog(Some(id.clone()), window, cx);
+                }
+            }
+            "duplicate" => {
+                if let TreeRow::Source(id) = row
+                    && let Some(mut copy) = self.source(id).cloned()
+                {
+                    copy.id = uuid_like();
+                    copy.name = format!("{} (copy)", copy.name);
+                    // A saved password is copied to the new entry's own slot.
+                    if copy.save_password
+                        && let Some(password) = source::saved_password(id)
+                    {
+                        let _ = source::save_password(&copy.id, &password);
+                    }
+                    self.save_source(copy, None, cx);
+                }
+            }
+            "remove" => {
+                if let TreeRow::Source(id) = row {
+                    self.confirm_remove = Some(id.clone());
+                }
+            }
+            "data" => {
+                if let TreeRow::Table(source, schema, ix) = row
+                    && let Some(name) = self
+                        .schema_node(source, schema)
+                        .and_then(|s| s.tables.as_ref())
+                        .and_then(|t| t.get(*ix))
+                        .map(|t| t.info.name.clone())
+                {
+                    self.open_table(source, schema, &name, window, cx);
+                }
+            }
+            "select-console" => {
+                if let TreeRow::Table(..) = row
+                    && let Some(name) = self.reference(row)
+                {
+                    self.select_source(source.as_deref().unwrap_or_default(), cx);
+                    if let Some(ix) = self.active_index() {
+                        self.append_to_console(ix, &format!("select * from {name} limit 100;"), cx);
+                    }
+                }
+            }
+            "ddl" | "ddl-copy" | "ddl-console" => {
+                let then = match id {
+                    "ddl" => DdlThen::Preview,
+                    "ddl-copy" => DdlThen::Clipboard,
+                    _ => DdlThen::Console,
+                };
+                let target = match row {
+                    TreeRow::Table(source, schema, ix) => self
+                        .schema_node(source, schema)
+                        .and_then(|s| s.tables.as_ref())
+                        .and_then(|t| t.get(*ix))
+                        .map(|t| DdlTarget::Table {
+                            schema: schema.clone(),
+                            table: t.info.name.clone(),
+                            kind: t.info.kind,
+                        }),
+                    TreeRow::Routine(source, schema, ix) => {
+                        self.routine_target(source, schema, *ix)
+                    }
+                    TreeRow::Sequence(source, schema, ix) => {
+                        self.sequence_target(source, schema, *ix)
+                    }
+                    _ => None,
+                };
+                if let (Some(source), Some(target)) = (source, target) {
+                    if then == DdlThen::Console {
+                        self.select_source(&source, cx);
+                    }
+                    self.fetch_ddl(&source, target, then, cx);
+                }
+            }
+            "copy-name" => {
+                if let Some(name) = self.reference(row) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(name));
+                }
+            }
+            "open-console" => {
+                if let TreeRow::SavedConsole(source, id, ..) = row {
+                    self.open_console(source, *id, window, cx);
+                }
+            }
+            "rename" => {
+                if let TreeRow::SavedConsole(source, id, ..) = row {
+                    self.open_rename(source, *id, window, cx);
+                }
+            }
+            "delete-console" => {
+                if let TreeRow::SavedConsole(source, id, ..) = row {
+                    self.delete_console(source, *id, window, cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// The plan of the statement at the cursor. `analyze` really runs it, so
@@ -1741,7 +2196,11 @@ impl DatabaseView {
                     node.schemas = Some(
                         schemas
                             .into_iter()
-                            .map(|name| SchemaNode { name, tables: None })
+                            .map(|name| SchemaNode {
+                                name,
+                                tables: None,
+                                objects: SchemaObjects::default(),
+                            })
                             .collect(),
                     );
                 }
@@ -1825,12 +2284,17 @@ impl DatabaseView {
         };
         let (key, schema_name) = (source.to_owned(), schema.to_owned());
         let name = schema.to_owned();
-        let work = async move { conn.tables(&name).await };
+        let work = async move {
+            let tables = conn.tables(&name).await?;
+            let objects = conn.schema_objects(&name).await?;
+            Ok::<_, DbError>((tables, objects))
+        };
         self.spawn_db(cx, work, move |this, out, cx| {
-            if let Some(Ok(tables)) = out
+            if let Some(Ok((tables, objects))) = out
                 && let Some(schemas) = this.nodes.get_mut(&key).and_then(|n| n.schemas.as_mut())
                 && let Some(node) = schemas.iter_mut().find(|s| s.name == schema_name)
             {
+                node.objects = objects;
                 node.tables = Some(
                     tables
                         .into_iter()
@@ -1918,35 +2382,99 @@ impl DatabaseView {
                     rows.push(TreeRow::Note(2, "Loading…".into()));
                     continue;
                 };
-                if tables.is_empty() {
-                    rows.push(TreeRow::Note(2, "No tables".into()));
+                let empty = tables.is_empty()
+                    && schema.objects.routines.is_empty()
+                    && schema.objects.sequences.is_empty();
+                if empty {
+                    rows.push(TreeRow::Note(2, "Empty schema".into()));
                 }
-                for (ix, table) in tables.iter().enumerate() {
-                    rows.push(TreeRow::Table(source.id.clone(), schema.name.clone(), ix));
-                    let open = format!("t:{}/{}/{}", source.id, schema.name, table.info.name);
-                    if self.expanded.contains(&open) {
-                        let Some(columns) = &table.columns else {
-                            rows.push(TreeRow::Note(3, "Loading…".into()));
-                            continue;
-                        };
-                        for kind in GroupKind::ALL {
-                            let leaves = group_rows(columns, table.details.as_ref(), kind);
-                            if leaves.is_empty() && kind != GroupKind::Columns {
-                                continue;
-                            }
-                            rows.push(TreeRow::Group(
+                for folder in SchemaFolder::ALL {
+                    let members: Vec<usize> = match folder {
+                        SchemaFolder::Tables
+                        | SchemaFolder::Views
+                        | SchemaFolder::MaterializedViews => tables
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| folder.holds(t.info.kind))
+                            .map(|(i, _)| i)
+                            .collect(),
+                        SchemaFolder::Functions => schema
+                            .objects
+                            .routines
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.kind == RoutineKind::Function)
+                            .map(|(i, _)| i)
+                            .collect(),
+                        SchemaFolder::Procedures => schema
+                            .objects
+                            .routines
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.kind == RoutineKind::Procedure)
+                            .map(|(i, _)| i)
+                            .collect(),
+                        SchemaFolder::Sequences => (0..schema.objects.sequences.len()).collect(),
+                    };
+                    if members.is_empty() {
+                        continue;
+                    }
+                    rows.push(TreeRow::Folder(
+                        source.id.clone(),
+                        schema.name.clone(),
+                        folder,
+                    ));
+                    if !self
+                        .expanded
+                        .contains(&folder_key(&source.id, &schema.name, folder))
+                    {
+                        continue;
+                    }
+                    for ix in members {
+                        match folder {
+                            SchemaFolder::Functions | SchemaFolder::Procedures => rows
+                                .push(TreeRow::Routine(source.id.clone(), schema.name.clone(), ix)),
+                            SchemaFolder::Sequences => rows.push(TreeRow::Sequence(
                                 source.id.clone(),
                                 schema.name.clone(),
-                                table.info.name.clone(),
-                                kind,
-                            ));
-                            if self.expanded.contains(&group_key(
-                                &source.id,
-                                &schema.name,
-                                &table.info.name,
-                                kind,
-                            )) {
-                                rows.extend(leaves);
+                                ix,
+                            )),
+                            _ => {
+                                let table = &tables[ix];
+                                rows.push(TreeRow::Table(
+                                    source.id.clone(),
+                                    schema.name.clone(),
+                                    ix,
+                                ));
+                                let open =
+                                    format!("t:{}/{}/{}", source.id, schema.name, table.info.name);
+                                if !self.expanded.contains(&open) {
+                                    continue;
+                                }
+                                let Some(columns) = &table.columns else {
+                                    rows.push(TreeRow::Note(4, "Loading…".into()));
+                                    continue;
+                                };
+                                for kind in GroupKind::ALL {
+                                    let leaves = group_rows(columns, table.details.as_ref(), kind);
+                                    if leaves.is_empty() && kind != GroupKind::Columns {
+                                        continue;
+                                    }
+                                    rows.push(TreeRow::Group(
+                                        source.id.clone(),
+                                        schema.name.clone(),
+                                        table.info.name.clone(),
+                                        kind,
+                                    ));
+                                    if self.expanded.contains(&group_key(
+                                        &source.id,
+                                        &schema.name,
+                                        &table.info.name,
+                                        kind,
+                                    )) {
+                                        rows.extend(leaves);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1982,7 +2510,27 @@ impl DatabaseView {
             }
             TreeRow::Schema(source, schema) => {
                 if self.toggle(format!("n:{source}/{schema}")) {
+                    for folder in [SchemaFolder::Tables, SchemaFolder::Views] {
+                        self.expanded.insert(folder_key(source, schema, folder));
+                    }
                     self.load_tables(source, schema, cx);
+                }
+            }
+            TreeRow::Folder(source, schema, folder) => {
+                self.toggle(folder_key(source, schema, *folder));
+            }
+            TreeRow::Routine(source, schema, ix) => {
+                if clicks >= 2
+                    && let Some(target) = self.routine_target(source, schema, *ix)
+                {
+                    self.fetch_ddl(source, target, DdlThen::Preview, cx);
+                }
+            }
+            TreeRow::Sequence(source, schema, ix) => {
+                if clicks >= 2
+                    && let Some(target) = self.sequence_target(source, schema, *ix)
+                {
+                    self.fetch_ddl(source, target, DdlThen::Preview, cx);
                 }
             }
             TreeRow::Table(source, schema, ix) => {

@@ -591,6 +591,7 @@ fn an_expanded_table_shows_its_folders_and_hiding_results_survives_a_restart(
             let mut node = SourceNode::new();
             node.link = Link::Ready;
             node.schemas = Some(vec![SchemaNode {
+                objects: Default::default(),
                 name: "public".into(),
                 tables: Some(vec![TableNode {
                     info: TableInfo {
@@ -613,6 +614,7 @@ fn an_expanded_table_shows_its_folders_and_hiding_results_survives_a_restart(
             for key in [
                 format!("s:{source}"),
                 format!("n:{source}/public"),
+                folder_key(&source, "public", SchemaFolder::Tables),
                 format!("t:{source}/public/orders"),
                 group_key(&source, "public", "orders", GroupKind::Indexes),
             ] {
@@ -914,6 +916,168 @@ fn the_export_dialog_names_the_table_and_its_options_shape_the_copy(cx: &mut Tes
                 view.export_table.read(cx).content.as_ref(),
                 "audit.\"Events\""
             );
+        })
+        .unwrap();
+    cx.refresh().unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+}
+
+fn schema_with_objects() -> SchemaNode {
+    use monocode_core::db::{RoutineInfo, SequenceInfo};
+    let table = |name: &str, kind| TableNode {
+        info: TableInfo {
+            name: name.into(),
+            kind,
+            estimated_rows: None,
+            comment: None,
+        },
+        columns: None,
+        details: None,
+    };
+    SchemaNode {
+        name: "public".into(),
+        tables: Some(vec![
+            table("orders", TableKind::Table),
+            table("order_totals", TableKind::View),
+            table("daily", TableKind::MaterializedView),
+        ]),
+        objects: SchemaObjects {
+            routines: vec![
+                RoutineInfo {
+                    oid: "10".into(),
+                    name: "add_one".into(),
+                    arguments: "a integer".into(),
+                    kind: RoutineKind::Function,
+                    result: "integer".into(),
+                },
+                RoutineInfo {
+                    oid: "11".into(),
+                    name: "reset_all".into(),
+                    arguments: String::new(),
+                    kind: RoutineKind::Procedure,
+                    result: String::new(),
+                },
+            ],
+            sequences: vec![SequenceInfo {
+                name: "ticket_seq".into(),
+                data_type: "bigint".into(),
+                start: "1".into(),
+                increment: "5".into(),
+            }],
+        },
+    }
+}
+
+#[gpui::test]
+fn a_schema_groups_tables_views_functions_procedures_and_sequences(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            let mut node = SourceNode::new();
+            node.link = Link::Ready;
+            node.schemas = Some(vec![schema_with_objects()]);
+            view.nodes.insert(source.clone(), node);
+            view.expanded.insert(format!("s:{source}"));
+            view.expanded.insert(format!("n:{source}/public"));
+            let folders = |view: &DatabaseView| -> Vec<SchemaFolder> {
+                view.rows()
+                    .iter()
+                    .filter_map(|r| match r {
+                        TreeRow::Folder(_, _, f) => Some(*f),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                folders(view),
+                [
+                    SchemaFolder::Tables,
+                    SchemaFolder::Views,
+                    SchemaFolder::MaterializedViews,
+                    SchemaFolder::Functions,
+                    SchemaFolder::Procedures,
+                    SchemaFolder::Sequences
+                ]
+            );
+            assert!(
+                !view
+                    .rows()
+                    .iter()
+                    .any(|r| matches!(r, TreeRow::Table(..) | TreeRow::Routine(..))),
+                "folders start closed until opened"
+            );
+            for folder in SchemaFolder::ALL {
+                view.expanded.insert(folder_key(&source, "public", folder));
+            }
+            let rows = view.rows();
+            let count = |f: fn(&TreeRow) -> bool| rows.iter().filter(|r| f(r)).count();
+            assert_eq!(count(|r| matches!(r, TreeRow::Table(..))), 3);
+            assert_eq!(count(|r| matches!(r, TreeRow::Routine(..))), 2);
+            assert_eq!(count(|r| matches!(r, TreeRow::Sequence(..))), 1);
+            // Names as SQL would write them.
+            let routine = rows
+                .iter()
+                .find(|r| matches!(r, TreeRow::Routine(_, _, 0)))
+                .unwrap();
+            assert_eq!(view.reference(routine).as_deref(), Some("public.add_one"));
+            let table = rows
+                .iter()
+                .find(|r| matches!(r, TreeRow::Table(_, _, 1)))
+                .unwrap();
+            assert_eq!(
+                view.reference(table).as_deref(),
+                Some("public.order_totals")
+            );
+            let Some(DdlTarget::Routine { oid, label }) = view.routine_target(&source, "public", 1)
+            else {
+                panic!("a routine target");
+            };
+            assert_eq!((oid.as_str(), label.as_str()), ("11", "public.reset_all()"));
+            assert!(view.routine_target(&source, "public", 9).is_none());
+            assert!(view.sequence_target(&source, "public", 0).is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_right_click_menu_offers_what_fits_the_row_and_copies_names(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, window, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            let mut node = SourceNode::new();
+            node.link = Link::Ready;
+            node.schemas = Some(vec![schema_with_objects()]);
+            view.nodes.insert(source.clone(), node);
+            let table = TreeRow::Table(source.clone(), "public".into(), 0);
+            view.open_menu(table.clone(), gpui::point(px(40.), px(40.)), window, cx);
+            assert!(view.menu.is_some());
+            view.run_menu_action("copy-name", &table, window, cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                Some("public.orders")
+            );
+            // Select-in-console puts the statement in the active console.
+            view.run_menu_action("select-console", &table, window, cx);
+            let text = view.consoles[0].editor.read(cx).content.to_string();
+            assert_eq!(text, "select * from public.orders limit 100;");
+            // A new console from the source row.
+            view.run_menu_action("console", &TreeRow::Source(source.clone()), window, cx);
+            assert_eq!(view.consoles.len(), 2);
+            // Removing asks first.
+            view.run_menu_action("remove", &TreeRow::Source(source.clone()), window, cx);
+            assert_eq!(view.confirm_remove.as_deref(), Some(source.as_str()));
+            // Duplicating makes a second data source with its own id.
+            view.run_menu_action("duplicate", &TreeRow::Source(source.clone()), window, cx);
+            assert_eq!(view.sources.len(), 2);
+            assert_ne!(view.sources[0].id, view.sources[1].id);
+            assert!(view.sources[1].name.ends_with("(copy)"));
         })
         .unwrap();
     cx.refresh().unwrap();

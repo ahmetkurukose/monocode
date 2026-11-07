@@ -20,7 +20,7 @@ pub use consoles::ConsoleStore;
 pub use export::{format_rows, ExportFormat, ExportOptions};
 pub use history::{HistoryEntry, HistoryStore};
 pub use introspect::{
-    CatalogEntry, ColumnInfo, ConstraintInfo, IndexInfo, TableDetails, TableInfo, TableKind,
-    TriggerInfo,
+    CatalogEntry, ColumnInfo, ConstraintInfo, IndexInfo, RoutineInfo, RoutineKind, SchemaObjects,
+    SequenceInfo, TableDetails, TableInfo, TableKind, TriggerInfo,
 };
 pub use source::{DataSource, DataSourceStore, DbColor};
