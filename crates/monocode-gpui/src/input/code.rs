@@ -2061,6 +2061,34 @@ impl Element for CodeElement {
                         }
                     }
                     let _ = line.paint(point(x, y), lh, TextAlign::Left, None, w, cx);
+                    for hint in code
+                        .analysis
+                        .hints
+                        .iter()
+                        .filter(|h| code.row(h.pos) == *row && code.fold_at(*row).is_none())
+                    {
+                        let at = code.display_offset(*row, hint.pos).min(line.len());
+                        let end = line.position_for_index(at, lh).unwrap_or_default();
+                        let note = plain_line(
+                            &hint.text,
+                            None,
+                            11.,
+                            w,
+                            if hint.ok {
+                                Hsla::from(rgb(0x4ade80)).opacity(0.75)
+                            } else {
+                                Hsla::from(rgb(0xf87171)).opacity(0.9)
+                            },
+                        );
+                        let _ = note.paint(
+                            point(x + end.x + px(14.), y + end.y),
+                            lh,
+                            TextAlign::Left,
+                            None,
+                            w,
+                            cx,
+                        );
+                    }
                     if focused
                         && selected.is_empty()
                         && cursor >= start
@@ -2222,6 +2250,7 @@ mod tests {
                         }],
                         folds: Vec::new(),
                         tokens: Vec::new(),
+                        hints: Vec::new(),
                     },
                     cx,
                 );

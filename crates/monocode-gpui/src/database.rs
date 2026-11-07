@@ -23,8 +23,8 @@ use gpui::{
 };
 use monocode_core::db::{
     ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError,
-    HistoryEntry, HistoryStore, QueryResult, TableDetails, TableInfo, TableKind, runtime::runtime,
-    source, split,
+    HistoryEntry, HistoryStore, QueryResult, TableDetails, TableInfo, TableKind, analysis, format,
+    params, runtime::runtime, source, split,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -260,6 +260,55 @@ struct Console {
     _subscriptions: Vec<Subscription>,
 }
 
+/// A statement to run and where it sits in the editor (to mark its outcome).
+#[derive(Clone)]
+struct Stmt {
+    text: String,
+    /// Byte range in the editor.
+    start: usize,
+    end: usize,
+    /// Whether the editor shows its outcome (a table page is not in the text).
+    mark: bool,
+}
+
+/// What happened to one statement.
+struct Outcome {
+    stmt: Stmt,
+    /// The editor's text of the statement, to tell whether parameters were bound into it.
+    original: String,
+    rows: Option<u64>,
+    elapsed_ms: f64,
+    error: Option<DbError>,
+}
+
+#[derive(Default)]
+struct Finished {
+    conn: Option<Arc<Connection>>,
+    results: Vec<QueryResult>,
+    outcomes: Vec<Outcome>,
+    /// The error, and the statement it came from.
+    failure: Option<(DbError, String)>,
+}
+
+/// A run waiting on the user.
+enum Pending {
+    Params {
+        source: String,
+        id: u32,
+        statements: Vec<Stmt>,
+        paging: Option<Paging>,
+    },
+    Confirm {
+        source: String,
+        id: u32,
+        statements: Vec<Stmt>,
+        paging: Option<Paging>,
+        reason: String,
+        /// The sweeping statement.
+        at: usize,
+    },
+}
+
 /// A console showing a table page by page, optionally sorted.
 #[derive(Clone, PartialEq, Debug)]
 struct Paging {
@@ -360,6 +409,11 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    pending: Option<Pending>,
+    param_inputs: Vec<(String, Entity<Input>)>,
+    param_subscriptions: Vec<Subscription>,
+    focus_params: bool,
+    param_values: HashMap<String, String>,
     rename: Option<(String, u32)>,
     rename_input: Entity<Input>,
     results_hidden: bool,
@@ -470,6 +524,11 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            pending: None,
+            param_inputs: Vec::new(),
+            param_subscriptions: Vec::new(),
+            focus_params: false,
+            param_values: HashMap::new(),
             rename: None,
             rename_input,
             results_hidden: saved.results_hidden,
@@ -820,7 +879,12 @@ impl DatabaseView {
         let text = editor.read(cx).content.to_string();
         // Colours follow the text at once; the analysis is a single pass.
         editor.update(cx, |input, cx| {
-            input.set_editor_analysis(sql::analyse(&text), cx)
+            // The edit already moved the notes with the text; the colours are redone,
+            // and an error underline is stale once the text changes.
+            let mut analysis = input.editor_analysis().clone();
+            analysis.tokens = sql::analyse(&text).tokens;
+            analysis.diagnostics.clear();
+            input.set_editor_analysis(analysis, cx);
         });
         let store = self.console_store.clone();
         let key = (source.to_owned(), id);
@@ -869,28 +933,215 @@ impl DatabaseView {
         let editor = self.consoles[ix].editor.read(cx);
         let text = editor.content.to_string();
         let selection = editor.selection_range();
-        let statements: Vec<String> = if !selection.is_empty() {
+        let stmt = |offset: usize, s: split::Statement| Stmt {
+            text: s.text,
+            start: offset + s.from,
+            end: offset + s.to,
+            mark: true,
+        };
+        let statements: Vec<Stmt> = if !selection.is_empty() {
+            let offset = selection.start;
             split::split(&text[selection])
                 .into_iter()
-                .map(|s| s.text)
+                .map(|s| stmt(offset, s))
                 .collect()
         } else if all {
-            split::split(&text).into_iter().map(|s| s.text).collect()
+            split::split(&text)
+                .into_iter()
+                .map(|s| stmt(0, s))
+                .collect()
         } else {
             split::at_cursor(&text, selection.start)
-                .map(|s| vec![s.text])
+                .map(|s| vec![stmt(0, s)])
                 .unwrap_or_default()
         };
-        self.execute(source, id, statements, None, cx);
+        self.start(source, id, statements, None, cx);
+    }
+
+    /// Asks for parameter values if the statements have any, then vets them.
+    fn start(
+        &mut self,
+        source: &str,
+        id: u32,
+        statements: Vec<Stmt>,
+        paging: Option<Paging>,
+        cx: &mut Context<Self>,
+    ) {
+        if statements.is_empty() || self.console_index(source, id).is_none() {
+            return;
+        }
+        let texts: Vec<String> = statements.iter().map(|s| s.text.clone()).collect();
+        let names = params::names(&texts);
+        if names.is_empty() {
+            self.vet(source, id, statements, paging, cx);
+            return;
+        }
+        self.param_inputs = names
+            .iter()
+            .map(|name| {
+                let value = self.param_values.get(name).cloned().unwrap_or_default();
+                let input = cx.new(|cx| {
+                    let mut input = Input::field(
+                        name.clone(),
+                        "value (SQL, e.g. 'text' or 42)",
+                        content(0.35),
+                        cx,
+                    );
+                    input.set_font_size(13.);
+                    input
+                });
+                input.update(cx, |input, cx| input.set_text(value, cx));
+                (name.clone(), input)
+            })
+            .collect();
+        self.param_subscriptions = self
+            .param_inputs
+            .iter()
+            .map(|(_, input)| {
+                cx.subscribe(input, |this, _, _: &input::Submitted, cx| {
+                    this.submit_params(cx)
+                })
+            })
+            .collect();
+        self.focus_params = true;
+        self.pending = Some(Pending::Params {
+            source: source.to_owned(),
+            id,
+            statements,
+            paging,
+        });
+        cx.notify();
+    }
+
+    /// The parameter dialog's OK: values are kept for next time and bound into the text.
+    fn submit_params(&mut self, cx: &mut Context<Self>) {
+        let Some(Pending::Params {
+            source,
+            id,
+            statements,
+            paging,
+        }) = self.pending.take()
+        else {
+            return;
+        };
+        let values: HashMap<String, String> = self
+            .param_inputs
+            .iter()
+            .map(|(name, input)| (name.clone(), input.read(cx).content.to_string()))
+            .collect();
+        self.param_values.extend(values.clone());
+        self.param_inputs.clear();
+        self.param_subscriptions.clear();
+        let bound = statements
+            .into_iter()
+            .map(|s| Stmt {
+                text: params::bind(&s.text, &|name| {
+                    values.get(name).cloned().unwrap_or_default()
+                }),
+                ..s
+            })
+            .collect();
+        self.vet(&source, id, bound, paging, cx);
+    }
+
+    /// Refuses writes on a read-only source without asking the server, and
+    /// asks before a statement that sweeps a whole table.
+    fn vet(
+        &mut self,
+        source: &str,
+        id: u32,
+        statements: Vec<Stmt>,
+        paging: Option<Paging>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.console_index(source, id) else {
+            return;
+        };
+        let read_only = self.source(source).is_some_and(|s| s.read_only);
+        let impacts: Vec<analysis::Impact> = statements
+            .iter()
+            .map(|s| analysis::classify(&s.text))
+            .collect();
+        if read_only && let Some(at) = impacts.iter().position(|i| i.writes) {
+            let blocked = &statements[at];
+            self.results_hidden = false;
+            let message = format!(
+                "{} is read-only, and this statement would change data. Turn off Read-only in the data source's settings to run it.",
+                self.source(source)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            );
+            self.consoles[ix].error = Some((
+                DbError {
+                    message: message.clone(),
+                    ..DbError::default()
+                },
+                blocked.text.clone(),
+            ));
+            self.mark_outcomes(
+                ix,
+                &[Outcome {
+                    stmt: blocked.clone(),
+                    original: blocked.text.clone(),
+                    rows: None,
+                    elapsed_ms: 0.,
+                    error: Some(DbError {
+                        message: "Read-only data source".into(),
+                        ..DbError::default()
+                    }),
+                }],
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        if let Some(at) = impacts.iter().position(|i| i.sweeping) {
+            let first = statements[at]
+                .text
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_uppercase();
+            let reason = match first.as_str() {
+                "UPDATE" => "UPDATE without WHERE changes every row of the table.",
+                "DELETE" => "DELETE without WHERE removes every row of the table.",
+                "TRUNCATE" => "TRUNCATE empties the table at once.",
+                _ => "DROP removes the object for good.",
+            };
+            self.pending = Some(Pending::Confirm {
+                source: source.to_owned(),
+                id,
+                statements,
+                paging,
+                reason: reason.to_owned(),
+                at,
+            });
+            cx.notify();
+            return;
+        }
+        self.execute(source, id, statements, paging, cx);
+    }
+
+    fn confirm_run(&mut self, cx: &mut Context<Self>) {
+        if let Some(Pending::Confirm {
+            source,
+            id,
+            statements,
+            paging,
+            ..
+        }) = self.pending.take()
+        {
+            self.execute(&source, id, statements, paging, cx);
+        }
     }
 
     /// Runs `statements` in order on the console's connection (opening it if
-    /// needed), keeping the last result. `paging` marks a table view.
+    /// needed). `paging` marks a table view.
     fn execute(
         &mut self,
         source: &str,
         id: u32,
-        statements: Vec<String>,
+        statements: Vec<Stmt>,
         paging: Option<Paging>,
         cx: &mut Context<Self>,
     ) {
@@ -909,21 +1160,37 @@ impl DatabaseView {
         self.consoles[ix].running = true;
         self.consoles[ix].error = None;
         self.results_hidden = false;
+        // What the editor holds, to tell later whether a statement was bound.
+        let originals: Vec<String> = statements
+            .iter()
+            .map(|s| {
+                let text = self.consoles[ix].editor.read(cx).content.clone();
+                text.get(s.start..s.end).unwrap_or("").to_owned()
+            })
+            .collect();
         let key = (source.to_owned(), id);
         let history = self.history.clone();
         let history_key = source.to_owned();
         let work = async move {
+            let mut done = Finished::default();
             let conn = match existing {
                 Some(conn) => conn,
-                None => Arc::new(
-                    Connection::connect(&data_source, password.as_deref())
-                        .await
-                        .map_err(|e| (None, e, String::new()))?,
-                ),
+                None => match Connection::connect(&data_source, password.as_deref()).await {
+                    Ok(conn) => Arc::new(conn),
+                    Err(error) => {
+                        done.failure = Some((
+                            error,
+                            statements
+                                .first()
+                                .map(|s| s.text.clone())
+                                .unwrap_or_default(),
+                        ));
+                        return done;
+                    }
+                },
             };
-            let mut all = Vec::new();
-            for statement in statements {
-                let outcome = conn.execute(&statement, limit).await;
+            for (stmt, original) in statements.into_iter().zip(originals) {
+                let outcome = conn.execute(&stmt.text, limit).await;
                 let (rows, error, elapsed_ms) = match &outcome {
                     Ok(r) => (
                         Some(if r.columns.is_empty() {
@@ -940,59 +1207,82 @@ impl DatabaseView {
                     &history_key,
                     &HistoryEntry {
                         at: HistoryEntry::now(),
-                        statement: statement.clone(),
+                        statement: stmt.text.clone(),
                         elapsed_ms,
                         rows,
                         error,
                     },
                 );
                 match outcome {
-                    Ok(result) => all.push(result),
-                    Err(error) => return Err((Some(conn), error, statement)),
+                    Ok(result) => {
+                        done.outcomes.push(Outcome {
+                            stmt,
+                            original,
+                            rows,
+                            elapsed_ms,
+                            error: None,
+                        });
+                        done.results.push(result);
+                    }
+                    Err(error) => {
+                        done.failure = Some((error.clone(), stmt.text.clone()));
+                        done.outcomes.push(Outcome {
+                            stmt,
+                            original,
+                            rows: None,
+                            elapsed_ms: 0.,
+                            error: Some(error),
+                        });
+                        break;
+                    }
                 }
             }
-            Ok((conn, all))
+            done.conn = Some(conn);
+            done
         };
         let task = self.spawn_db(cx, work, move |this, out, cx| {
             let Some(ix) = this.console_index(&key.0, key.1) else {
                 return;
             };
+            let Some(done) = out else {
+                this.consoles[ix].running = false;
+                this.consoles[ix].task = None;
+                this.consoles[ix].error = Some((DbError::default(), String::new()));
+                cx.notify();
+                return;
+            };
+            this.mark_outcomes(ix, &done.outcomes, cx);
             let console = &mut this.consoles[ix];
             console.running = false;
             console.task = None;
-            match out {
-                Some(Ok((conn, results))) => {
-                    console.conn = Some(conn.clone());
-                    if !results.is_empty() {
-                        // Statements that return rows get a tab each; when none
-                        // does, the last one (its status) is what is shown.
-                        let mut shown: Vec<Arc<QueryResult>> = results
-                            .iter()
-                            .filter(|r| !r.columns.is_empty())
-                            .cloned()
-                            .map(Arc::new)
-                            .collect();
-                        if shown.is_empty() {
-                            shown.extend(results.last().cloned().map(Arc::new));
-                        }
-                        let last = shown.len() - 1;
-                        console.all = shown;
-                        console.select_result(last);
-                        console.note = None;
-                        console.export_sql = paging.as_ref().map(table_sql);
-                        console.paging = paging;
-                    }
-                    this.load_catalog(&key.0, conn, cx);
+            if let Some(conn) = done.conn.clone() {
+                console.conn = Some(conn);
+            }
+            if !done.results.is_empty() {
+                // Statements that return rows get a tab each; when none does,
+                // the last one (its status) is what is shown.
+                let mut shown: Vec<Arc<QueryResult>> = done
+                    .results
+                    .iter()
+                    .filter(|r| !r.columns.is_empty())
+                    .cloned()
+                    .map(Arc::new)
+                    .collect();
+                if shown.is_empty() {
+                    shown.extend(done.results.last().cloned().map(Arc::new));
                 }
-                Some(Err((conn, error, statement))) => {
-                    if conn.is_some() {
-                        console.conn = conn;
-                    }
-                    console.error = Some((error, statement));
-                }
-                None => {
-                    console.error = Some((DbError::default(), String::new()));
-                }
+                let last = shown.len() - 1;
+                console.all = shown;
+                console.select_result(last);
+                console.note = None;
+                console.export_sql = paging.as_ref().map(table_sql);
+                console.paging = paging;
+            }
+            if let Some(failure) = done.failure {
+                console.error = Some(failure);
+            }
+            if let Some(conn) = done.conn {
+                this.load_catalog(&key.0, conn, cx);
             }
             cx.notify();
         });
@@ -1000,11 +1290,108 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// Writes each statement's outcome into the editor: a note after it
+    /// (✓ time and rows, or ✗ the error) and, for an error, an underline at
+    /// the position the server reported.
+    fn mark_outcomes(&mut self, ix: usize, outcomes: &[Outcome], cx: &mut Context<Self>) {
+        let editor = self.consoles[ix].editor.clone();
+        editor.update(cx, |input, cx| {
+            let mut analysis = input.editor_analysis().clone();
+            analysis.diagnostics.clear();
+            for o in outcomes.iter().filter(|o| o.stmt.mark) {
+                analysis.hints.retain(|h| h.pos != o.stmt.end);
+                let text = match (&o.error, o.rows) {
+                    (Some(e), _) => format!(
+                        "✗ {}",
+                        e.message
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(70)
+                            .collect::<String>()
+                    ),
+                    (None, Some(rows)) => format!("✓ {:.0} ms · {rows} rows", o.elapsed_ms),
+                    _ => format!("✓ {:.0} ms", o.elapsed_ms),
+                };
+                analysis.hints.push(crate::editor_analysis::Hint {
+                    pos: o.stmt.end,
+                    ok: o.error.is_none(),
+                    text,
+                });
+                if let Some(error) = &o.error {
+                    // The server's position is into what it ran; when parameters
+                    // were bound that is not the editor's text, so underline all of it.
+                    let content = input.content.clone();
+                    let (from, to) = match error.position {
+                        Some(at) if o.original == o.stmt.text => {
+                            let from = (o.stmt.start + at).min(content.len());
+                            let to = content[from..]
+                                .char_indices()
+                                .find(|(i, c)| *i > 0 && !(c.is_alphanumeric() || *c == '_'))
+                                .map_or(content.len(), |(i, _)| from + i)
+                                .min(o.stmt.end.max(from + 1).min(content.len()));
+                            (from, to.max((from + 1).min(content.len())))
+                        }
+                        _ => (o.stmt.start, o.stmt.end),
+                    };
+                    analysis
+                        .diagnostics
+                        .push(crate::editor_analysis::Diagnostic {
+                            from,
+                            to,
+                            severity: "error".into(),
+                            message: error.message.clone(),
+                        });
+                }
+            }
+            input.set_editor_analysis(analysis, cx);
+        });
+    }
+
+    /// Reformats the selection, or all of the console.
+    fn format_console(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let editor = self.consoles[ix].editor.clone();
+        let (text, selection) = {
+            let input = editor.read(cx);
+            (input.content.to_string(), input.selection_range())
+        };
+        let range = (!selection.is_empty()).then_some((selection.start, selection.end));
+        let edits = format::format_sql(&text, range);
+        let (Some(first), Some(last)) = (edits.first(), edits.last()) else {
+            return;
+        };
+        let (from, to) = (first.from, last.to);
+        let mut formatted = String::new();
+        let mut at = from;
+        for e in &edits {
+            formatted.push_str(&text[at..e.from]);
+            formatted.push_str(&e.insert);
+            at = e.to;
+        }
+        if formatted == text[from..to] {
+            return;
+        }
+        let cursor = formatted.len();
+        editor.update(cx, |input, cx| {
+            input.replace_bytes(from..to, &formatted, cursor, cx)
+        });
+    }
+
     /// Reads the page `paging` describes into console `ix`.
     fn show_page(&mut self, ix: usize, paging: Paging, cx: &mut Context<Self>) {
         let (source, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
         let sql = page_sql(&paging, self.limit);
-        self.execute(&source, id, vec![sql], Some(paging), cx);
+        let stmt = Stmt {
+            text: sql,
+            start: 0,
+            end: 0,
+            mark: false,
+        };
+        self.execute(&source, id, vec![stmt], Some(paging), cx);
     }
 
     fn change_page(&mut self, delta: isize, cx: &mut Context<Self>) {

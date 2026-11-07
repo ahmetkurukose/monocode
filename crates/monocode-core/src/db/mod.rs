@@ -2,11 +2,15 @@
 //! statement execution and catalog introspection. UI-independent; all work
 //! runs on the shared tokio runtime ([`runtime`]).
 
+pub mod analysis;
 pub mod conn;
 pub mod consoles;
 pub mod export;
+pub mod format;
 pub mod history;
 pub mod introspect;
+pub mod lexer;
+pub mod params;
 pub mod runtime;
 pub mod source;
 pub mod split;

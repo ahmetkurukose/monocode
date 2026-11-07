@@ -901,6 +901,7 @@ impl Session {
             changes,
             folds: folds(&tree, text),
             tokens: self.tokens.clone(),
+            hints: Vec::new(),
         }
     }
 }

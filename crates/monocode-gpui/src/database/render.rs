@@ -593,6 +593,11 @@ impl DatabaseView {
             })
             .child(div().flex_1())
             .child(
+                icon_button("database-format", "Format SQL (⌘⌥L)", "db-format")
+                    .size(px(26.))
+                    .on_click(cx.listener(|this, _, _, cx| this.format_console(cx))),
+            )
+            .child(
                 icon_button(
                     "database-save-file",
                     "Save console to a .sql file",
@@ -1517,6 +1522,141 @@ impl DatabaseView {
         )
     }
 
+    fn pending_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        match self.pending.as_ref()? {
+            Pending::Params { .. } => {
+                let card = modal::card().w(px(460.)).child(
+                    modal::card_body()
+                        .gap(px(10.))
+                        .child(modal::title("Parameters"))
+                        .child(modal::body(
+                            "Each value is put into the statement as written: type quotes around text, leave empty for NULL.",
+                        ))
+                        .children(self.param_inputs.iter().map(|(name, input)| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .w(px(110.))
+                                        .flex_shrink_0()
+                                        .truncate()
+                                        .font_family("monospace")
+                                        .text_size(px(12.))
+                                        .text_color(content(0.7))
+                                        .child(name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .rounded(px(6.))
+                                        .border_1()
+                                        .border_color(content(0.12))
+                                        .bg(content(0.04))
+                                        .px_2()
+                                        .py(px(6.))
+                                        .child(input.clone()),
+                                )
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(
+                                    crate::project_settings::button("database-params-cancel", "Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pending = None;
+                                            this.param_inputs.clear();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    modal::primary_button("database-params-run", "Run")
+                                        .on_click(cx.listener(|this, _, _, cx| this.submit_params(cx))),
+                                ),
+                        ),
+                );
+                Some(
+                    modal::overlay("database-params", card, {
+                        let weak = cx.weak_entity();
+                        move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.pending = None;
+                                this.param_inputs.clear();
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element(),
+                )
+            }
+            Pending::Confirm {
+                statements,
+                reason,
+                at,
+                ..
+            } => {
+                let excerpt: String = statements[*at].text.chars().take(400).collect();
+                let card = modal::card().w(px(520.)).child(
+                    modal::card_body()
+                        .gap(px(10.))
+                        .child(modal::title("Run this statement?"))
+                        .child(modal::body(reason.clone()))
+                        .child(
+                            div()
+                                .max_h(px(160.))
+                                .overflow_hidden()
+                                .rounded(px(6.))
+                                .bg(content(0.05))
+                                .p(px(10.))
+                                .font_family("monospace")
+                                .text_size(px(12.))
+                                .text_color(content(0.9))
+                                .child(SharedString::from(excerpt)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(
+                                    crate::project_settings::button(
+                                        "database-confirm-cancel",
+                                        "Cancel",
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.pending = None;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    modal::danger_button("database-confirm-run", "Run anyway")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.confirm_run(cx)),
+                                        ),
+                                ),
+                        ),
+                );
+                Some(
+                    modal::overlay("database-confirm", card, {
+                        let weak = cx.weak_entity();
+                        move |_, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.pending = None;
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element(),
+                )
+            }
+        }
+    }
+
     fn remove_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.confirm_remove.clone()?;
         let name = self.source(&id)?.name.clone();
@@ -1677,7 +1817,12 @@ impl DatabaseView {
 }
 
 impl Render for DatabaseView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.focus_params)
+            && let Some((_, input)) = self.param_inputs.first()
+        {
+            window.focus(&input.focus_handle(cx), cx);
+        }
         let tree = self.tree_panel(cx);
         let main = self.main_panel(cx);
         div()
@@ -1695,6 +1840,11 @@ impl Render for DatabaseView {
                 let command = modifiers.platform || modifiers.control;
                 match event.keystroke.key.as_str() {
                     "j" if command => this.toggle_results(cx),
+                    "escape" if this.pending.is_some() => {
+                        this.pending = None;
+                        this.param_inputs.clear();
+                    }
+                    "l" if command && event.keystroke.modifiers.alt => this.format_console(cx),
                     "escape" if this.rename.is_some() => this.rename = None,
                     "escape" if this.history_open || this.export_menu => {
                         this.history_open = false;
@@ -1798,6 +1948,7 @@ impl Render for DatabaseView {
             .children(self.remove_overlay(cx))
             .children(self.history_overlay(cx))
             .children(self.rename_overlay(cx))
+            .children(self.pending_overlay(cx))
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
     }
 }

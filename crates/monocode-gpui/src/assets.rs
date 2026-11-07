@@ -76,6 +76,7 @@ impl AssetSource for Assets {
    "db-column"=>include_bytes!("../assets/db-column.svg"),
    "db-disconnect"=>include_bytes!("../assets/db-disconnect.svg"),
    "db-export"=>include_bytes!("../assets/db-export.svg"),
+   "db-format"=>include_bytes!("../assets/db-format.svg"),
    "db-view"=>include_bytes!("../assets/db-view.svg"),
    "db-console"=>include_bytes!("../assets/db-console.svg"),
    "square-plus"=>include_bytes!("../assets/square-plus.svg"),

@@ -15,6 +15,16 @@ pub(crate) struct Analysis {
     pub changes: Vec<Change>,
     pub folds: Vec<Fold>,
     pub tokens: Vec<Token>,
+    /// Short notes painted after the end of a line (a statement's outcome).
+    #[serde(default)]
+    pub hints: Vec<Hint>,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct Hint {
+    /// Byte offset the note follows.
+    pub pos: usize,
+    pub ok: bool,
+    pub text: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Token {
@@ -329,11 +339,20 @@ impl Analysis {
                 Some(Fold { from, to })
             })
             .collect();
+        let hints = self
+            .hints
+            .iter()
+            .filter_map(|h| {
+                let (pos, _) = edit.map(h.pos, h.pos)?;
+                Some(Hint { pos, ..h.clone() })
+            })
+            .collect();
         Self {
             diagnostics,
             changes,
             folds,
             tokens,
+            hints,
         }
     }
 }

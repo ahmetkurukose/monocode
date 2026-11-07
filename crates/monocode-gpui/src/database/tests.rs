@@ -739,3 +739,134 @@ fn a_console_can_be_renamed_and_the_name_sticks(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+fn read_only_source(name: &str) -> DataSource {
+    let mut source = local_source(name);
+    source.read_only = true;
+    source
+}
+
+fn type_text(view: &mut DatabaseView, text: &str, cx: &mut Context<DatabaseView>) {
+    let len = text.len();
+    view.consoles[0]
+        .editor
+        .update(cx, |i, cx| i.replace_bytes(0..0, text, len, cx));
+}
+
+#[gpui::test]
+fn a_write_on_a_read_only_source_is_refused_before_it_reaches_the_server(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(read_only_source("ro"), None, cx);
+            type_text(view, "delete from orders where id = 1", cx);
+        })
+        .unwrap();
+    // The editor's change event lands after the update that typed.
+    window
+        .update(cx, |view, _, cx| {
+            let source = view.selected.clone().unwrap();
+            view.run(&source, 1, true, cx);
+            assert!(!view.consoles[0].running, "nothing was sent");
+            let (error, statement) = view.consoles[0].error.clone().unwrap();
+            assert!(error.message.contains("read-only"), "{}", error.message);
+            assert!(statement.starts_with("delete"));
+            assert!(view.pending.is_none());
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            let analysis = view.consoles[0].editor.read(cx).editor_analysis().clone();
+            assert_eq!(analysis.diagnostics.len(), 1, "the statement is underlined");
+            assert!(analysis.hints[0].text.starts_with('✗') && !analysis.hints[0].ok);
+        })
+        .unwrap();
+    // Painting the note and the underline must not panic.
+    cx.refresh().unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+}
+
+#[gpui::test]
+fn a_sweeping_write_asks_first_and_parameters_are_asked_for_and_bound(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            let mut writable = local_source("rw");
+            writable.read_only = false;
+            view.save_source(writable, None, cx);
+            type_text(view, "update orders set total = 0", cx);
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            let source = view.selected.clone().unwrap();
+            view.run(&source, 1, true, cx);
+            assert!(matches!(&view.pending, Some(Pending::Confirm { reason, .. }) if reason.contains("every row")));
+            assert!(!view.consoles[0].running, "it waits for an answer");
+            view.pending = None;
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            let source = view.selected.clone().unwrap();
+            // With parameters the dialog comes first; on a read-only source the bound
+            // write is then refused without touching the network.
+            view.save_source(read_only_source("ro"), None, cx);
+            let ro = view.selected.clone().unwrap();
+            assert_ne!(ro, source);
+            let console = view.consoles.iter().position(|c| c.source == ro).unwrap();
+            view.consoles[console].editor.update(cx, |i, cx| {
+                i.replace_bytes(0..0, "update t set a = :v where id = $1", 33, cx)
+            });
+            let id = view.consoles[console].id;
+            view.run(&ro, id, true, cx);
+            let Some(Pending::Params { .. }) = &view.pending else {
+                panic!("the parameter dialog should be open");
+            };
+            let names: Vec<&str> = view.param_inputs.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, [":v", "$1"]);
+            view.param_inputs[0]
+                .1
+                .update(cx, |i, cx| i.set_text("'x'".into(), cx));
+            view.param_inputs[1]
+                .1
+                .update(cx, |i, cx| i.set_text("7".into(), cx));
+            view.submit_params(cx);
+            assert!(view.pending.is_none());
+            assert_eq!(
+                view.param_values[":v"], "'x'",
+                "values are remembered for the next run"
+            );
+            let (error, bound) = view.consoles[console].error.clone().unwrap();
+            assert!(error.message.contains("read-only"));
+            assert_eq!(
+                bound, "update t set a = 'x' where id = 7",
+                "the statement was bound before it was vetted"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn format_rewrites_the_console_in_one_undoable_step(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            type_text(view, "select a,b from t where x=1 and y=2", cx);
+            view.format_console(cx);
+            let text = view.consoles[0].editor.read(cx).content.to_string();
+            assert_eq!(
+                text,
+                "select a,\n       b\nfrom t\nwhere x = 1\n  and y = 2"
+            );
+            view.format_console(cx);
+            let again = view.consoles[0].editor.read(cx).content.to_string();
+            assert_eq!(again, text, "formatting is idempotent");
+        })
+        .unwrap();
+}
