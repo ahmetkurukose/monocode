@@ -39,6 +39,8 @@ minisign-verify = "0.2.5"
 tempfile = "3"
 flate2 = "1"
 tar = "0.4"
+tokio-postgres = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }

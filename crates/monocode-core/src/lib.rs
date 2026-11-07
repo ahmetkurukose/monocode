@@ -7,6 +7,7 @@ pub mod automations;
 pub mod catalog;
 pub mod checkpoint;
 pub mod context;
+pub mod db;
 pub mod desktop_preferences;
 pub mod diff;
 pub mod external_editor;
