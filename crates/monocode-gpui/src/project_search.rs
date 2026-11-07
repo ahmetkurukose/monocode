@@ -26,6 +26,17 @@ fn accent(alpha: f32) -> gpui::Hsla {
     color
 }
 
+/// The search as the Explorer shows it. Its hosts (the right panel's cached
+/// Explorer) give it a size but are not flex containers themselves, so it
+/// takes all of that size rather than asking to flex: with `flex_1` the
+/// results scroller was given no height and the list never showed.
+pub(crate) fn pane(search: &Entity<ProjectSearch>) -> AnyElement {
+    search
+        .clone()
+        .cached(gpui::StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
 pub(crate) enum SearchEvent {
     Open {
         cwd: String,
@@ -653,13 +664,85 @@ mod tests {
             .collect()
     }
 
+    /// What the right panel does with the Explorer: a cached view that
+    /// flexes inside a column, holding the search pane.
+    struct Host(Entity<ProjectSearch>);
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            pane(&self.0)
+        }
+    }
+    struct Column(Entity<Host>);
+    impl Render for Column {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().h(px(40.)).flex_shrink_0())
+                .child(
+                    self.0
+                        .clone()
+                        .cached(gpui::StyleRefinement::default().flex_1().min_h_0().w_full()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn the_results_list_has_height_inside_the_panels_cached_hosts(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let search = std::cell::RefCell::new(None);
+        let window = cx.update(|cx| {
+            let bounds = gpui::Bounds::new(point(px(0.), px(0.)), gpui::size(px(280.), px(900.)));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    let s = cx.new(|cx| ProjectSearch::new("/p".into(), true, cx));
+                    *search.borrow_mut() = Some(s.clone());
+                    let host = cx.new(|_| Host(s));
+                    cx.new(|_| Column(host))
+                },
+            )
+            .unwrap()
+        });
+        let search = search.borrow().clone().unwrap();
+        cx.update(|cx| {
+            search.update(cx, |search, cx| {
+                search.groups = results(24, 3);
+                search.count = 72;
+                cx.notify();
+            })
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let list = visual
+            .debug_bounds("project-search-results")
+            .expect("results list");
+        let row = visual
+            .debug_bounds("project-search-match-0-0")
+            .expect("first match");
+        assert!(
+            list.size.height > px(300.),
+            "the scroller must get the room the pane has: {list:?}"
+        );
+        assert!(row.size.height >= px(20.), "{row:?}");
+    }
+
     #[gpui::test]
     fn results_fill_the_panel_and_stay_inside_it(cx: &mut TestAppContext) {
         cx.update(input::bind);
         let window = cx.update(|cx| {
-            cx.open_window(Default::default(), |_, cx| {
-                cx.new(|cx| ProjectSearch::new("/p".into(), true, cx))
-            })
+            let bounds = gpui::Bounds::new(point(px(0.), px(0.)), gpui::size(px(280.), px(900.)));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| ProjectSearch::new("/p".into(), true, cx)),
+            )
             .unwrap()
         });
         window

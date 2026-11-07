@@ -14,8 +14,8 @@ use crate::{
 use gpui::{
     AnyElement, App, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, KeyDownEvent, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, Point, PromptLevel, Role, SharedString, StyleRefinement,
-    Subscription, Window, actions, div, list, prelude::*, px, rgb,
+    MouseButton, MouseDownEvent, Point, PromptLevel, Role, SharedString, Subscription, Window,
+    actions, div, list, prelude::*, px, rgb,
 };
 use monocode_core::files::{self, DirEntry, NameIssueKind, Severity};
 use std::{
@@ -1482,10 +1482,7 @@ impl Focusable for Explorer {
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(search) = &self.search {
-            return search
-                .clone()
-                .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
-                .into_any_element();
+            return crate::project_search::pane(search);
         }
         if !self.available() {
             return div()
