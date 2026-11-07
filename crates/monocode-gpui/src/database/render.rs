@@ -14,6 +14,18 @@ fn color_of(color: Option<DbColor>) -> Option<u32> {
     })
 }
 
+/// "3m ago", "2h ago", "5d ago".
+fn history_time(at: u64) -> String {
+    let now = HistoryEntry::now();
+    let seconds = now.saturating_sub(at) / 1000;
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
 fn pill(label: &'static str, hex: u32) -> AnyElement {
     div()
         .px(px(6.))
@@ -467,6 +479,11 @@ impl DatabaseView {
             })
             .child(div().flex_1())
             .child(
+                icon_button("database-history", "Query history", "rotate-ccw")
+                    .size(px(26.))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_history(cx))),
+            )
+            .child(
                 crate::project_settings::button("database-limit", format!("limit {limit}"))
                     .h(px(26.))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -718,6 +735,8 @@ impl DatabaseView {
         };
         let visible = grid::visible_rows(sy, body, rows);
         let viewport = self.grid_viewport.clone();
+        let sortable = console.paging.is_some();
+        let sort = console.paging.as_ref().and_then(|p| p.sort.clone());
         let _ = vw;
         let rows_el: Vec<AnyElement> = visible.map(|row| self.grid_row(ix, row, cx)).collect();
         let vbar = self.scrollbar(true, ix, cx);
@@ -779,21 +798,45 @@ impl DatabaseView {
                             .w(px(total))
                             .h_full()
                             .flex()
-                            .children(result.columns.iter().zip(widths).map(|(column, width)| {
-                                div()
-                                    .w(px(width))
-                                    .h_full()
-                                    .flex_shrink_0()
-                                    .px(px(8.))
-                                    .flex()
-                                    .items_center()
-                                    .border_r_1()
-                                    .border_color(content(0.07))
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(content(0.6))
-                                    .child(div().truncate().child(column.name.clone()))
-                            })),
+                            .children(result.columns.iter().zip(widths).enumerate().map(
+                                |(col, (column, width))| {
+                                    let arrow = sort.as_ref().and_then(|(name, desc)| {
+                                        (name == &column.name).then_some(if *desc {
+                                            " ▼"
+                                        } else {
+                                            " ▲"
+                                        })
+                                    });
+                                    div()
+                                        .id(("database-header", col))
+                                        .when(sortable, |d| {
+                                            d.cursor_pointer()
+                                                .hover(|s| s.bg(content(0.06)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.sort_by(col, cx)
+                                                    }),
+                                                )
+                                        })
+                                        .w(px(width))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .px(px(8.))
+                                        .flex()
+                                        .items_center()
+                                        .border_r_1()
+                                        .border_color(content(0.07))
+                                        .text_size(px(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(content(0.6))
+                                        .child(div().truncate().child(format!(
+                                            "{}{}",
+                                            column.name,
+                                            arrow.unwrap_or("")
+                                        )))
+                                },
+                            )),
                     ),
             )
             .child(
@@ -841,12 +884,13 @@ impl DatabaseView {
                 .rounded(px(8.))
                 .border_1()
                 .border_color(content(0.12))
-                .bg(content(0.1))
+                .text_color(content(1.))
                 .occlude()
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.export_menu = false;
                     cx.notify();
                 }))
+                .child(modal::surface(8.))
                 .child(
                     div()
                         .px(px(10.))
@@ -900,6 +944,15 @@ impl DatabaseView {
             .result
             .as_ref()
             .is_some_and(|r| !r.columns.is_empty());
+        let page = console.paging.as_ref().map(|p| {
+            (
+                p.page,
+                console
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| r.rows.len() >= self.limit),
+            )
+        });
         let body: AnyElement = if let Some((error, statement)) = console.error.clone() {
             Self::error_panel(&error, &statement)
         } else if let Some(result) = console.result.clone() {
@@ -951,6 +1004,25 @@ impl DatabaseView {
                         )
                     })
                     .child(div().flex_1())
+                    .when_some(page, |d, (page, has_next)| {
+                        d.child(
+                            icon_button("database-page-prev", "Previous page", "chevron-left")
+                                .size(px(22.))
+                                .opacity(if page > 0 { 1. } else { 0.3 })
+                                .on_click(cx.listener(|this, _, _, cx| this.change_page(-1, cx))),
+                        )
+                        .child(
+                            div()
+                                .text_color(content(0.7))
+                                .child(format!("Page {}", page + 1)),
+                        )
+                        .child(
+                            icon_button("database-page-next", "Next page", "chevron-right")
+                                .size(px(22.))
+                                .opacity(if has_next { 1. } else { 0.3 })
+                                .on_click(cx.listener(|this, _, _, cx| this.change_page(1, cx))),
+                        )
+                    })
                     .when(has_grid, |d| {
                         d.child(
                             icon_button("database-export", "Export", "db-export")
@@ -1023,6 +1095,166 @@ impl DatabaseView {
                 move |_, cx| {
                     let _ = weak.update(cx, |this, cx| {
                         this.preview = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .into_any_element(),
+        )
+    }
+
+    fn history_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.history_open {
+            return None;
+        }
+        let filter = self.history_filter.read(cx).content.to_lowercase();
+        let entries: Vec<(usize, HistoryEntry)> = self
+            .history_entries
+            .iter()
+            .filter(|e| filter.is_empty() || e.statement.to_lowercase().contains(&filter))
+            .take(200)
+            .cloned()
+            .enumerate()
+            .collect();
+        let empty = entries.is_empty();
+        let card = modal::card().w(px(760.)).child(
+            modal::card_body()
+                .gap(px(10.))
+                .child(modal::title("Query history"))
+                .child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(0.12))
+                        .bg(content(0.04))
+                        .px_2()
+                        .py(px(6.))
+                        .child(self.history_filter.clone()),
+                )
+                .child(
+                    div()
+                        .id("database-history-list")
+                        .h(px(360.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .when(empty, |d| {
+                            d.child(
+                                div()
+                                    .p(px(10.))
+                                    .text_size(px(12.5))
+                                    .text_color(content(0.45))
+                                    .child("Nothing here yet."),
+                            )
+                        })
+                        .children(entries.into_iter().map(|(n, entry)| {
+                            let one_line: String = entry
+                                .statement
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(140)
+                                .collect();
+                            let detail = match (&entry.error, entry.rows) {
+                                (Some(_), _) => "failed".to_owned(),
+                                (None, Some(rows)) => {
+                                    format!("{rows} rows · {:.0} ms", entry.elapsed_ms)
+                                }
+                                _ => String::new(),
+                            };
+                            let failed = entry.error.is_some();
+                            let statement = entry.statement.clone();
+                            div()
+                                .id(("database-history-row", n))
+                                .role(Role::ListItem)
+                                .aria_label(one_line.clone())
+                                .px(px(8.))
+                                .py(px(5.))
+                                .rounded(px(5.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(content(0.08)))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family("monospace")
+                                        .text_size(px(12.))
+                                        .text_color(content(0.9))
+                                        .child(one_line),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(10.))
+                                        .text_size(px(10.5))
+                                        .text_color(content(0.4))
+                                        .child(history_time(entry.at))
+                                        .child(
+                                            div()
+                                                .text_color(if failed {
+                                                    rgb(0xf87171).into()
+                                                } else {
+                                                    content(0.4)
+                                                })
+                                                .child(detail),
+                                        ),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                            this.insert_from_history(
+                                                &statement,
+                                                event.click_count >= 2,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    ),
+                                )
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.))
+                                .text_color(content(0.4))
+                                .child("Click to insert, double-click to run"),
+                        )
+                        .child(
+                            crate::project_settings::button("database-history-clear", "Clear")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(source) = this.selected.clone() {
+                                        this.history.clear(&source);
+                                        this.history_entries.clear();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            modal::primary_button("database-history-close", "Close").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.history_open = false;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                ),
+        );
+        Some(
+            modal::overlay("database-history", card, {
+                let weak = cx.weak_entity();
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.history_open = false;
                         cx.notify();
                     });
                 }
@@ -1169,6 +1401,10 @@ impl Render for DatabaseView {
                 let modifiers = event.keystroke.modifiers;
                 let command = modifiers.platform || modifiers.control;
                 match event.keystroke.key.as_str() {
+                    "escape" if this.history_open || this.export_menu => {
+                        this.history_open = false;
+                        this.export_menu = false;
+                    }
                     "escape" => {
                         let Some(ix) = this.active_index() else {
                             return;
@@ -1265,6 +1501,7 @@ impl Render for DatabaseView {
             })
             .children(self.preview_overlay(cx))
             .children(self.remove_overlay(cx))
+            .children(self.history_overlay(cx))
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
     }
 }

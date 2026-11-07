@@ -23,7 +23,7 @@ use gpui::{
 };
 use monocode_core::db::{
     ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError,
-    QueryResult, TableInfo, TableKind, runtime::runtime, source, split,
+    HistoryEntry, HistoryStore, QueryResult, TableInfo, TableKind, runtime::runtime, source, split,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -117,9 +117,72 @@ struct Console {
     scroll_x: f32,
     scroll_y: f32,
     note: Option<String>,
+    paging: Option<Paging>,
+    /// What "save all rows" runs when it is not the shown statement.
+    export_sql: Option<String>,
     task: Option<Task<()>>,
     saver: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A console showing a table page by page, optionally sorted.
+#[derive(Clone, PartialEq, Debug)]
+struct Paging {
+    schema: String,
+    table: String,
+    page: usize,
+    /// Column name and whether it is descending.
+    sort: Option<(String, bool)>,
+}
+
+/// The statement for one page of a table.
+fn page_sql(paging: &Paging, limit: usize) -> String {
+    let order = paging
+        .sort
+        .as_ref()
+        .map(|(column, desc)| {
+            format!(
+                " order by {} {}",
+                quote_ident(column),
+                if *desc { "desc" } else { "asc" }
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "select * from {}.{}{order} limit {limit} offset {}",
+        quote_ident(&paging.schema),
+        quote_ident(&paging.table),
+        paging.page * limit
+    )
+}
+
+/// Header click: ascending, descending, then unsorted; another column starts ascending.
+fn next_sort(current: Option<(String, bool)>, clicked: String) -> Option<(String, bool)> {
+    match current {
+        Some((name, false)) if name == clicked => Some((clicked, true)),
+        Some((name, true)) if name == clicked => None,
+        _ => Some((clicked, false)),
+    }
+}
+
+/// The same table read whole, for exporting every row.
+fn table_sql(paging: &Paging) -> String {
+    let order = paging
+        .sort
+        .as_ref()
+        .map(|(column, desc)| {
+            format!(
+                " order by {} {}",
+                quote_ident(column),
+                if *desc { "desc" } else { "asc" }
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "select * from {}.{}{order}",
+        quote_ident(&paging.schema),
+        quote_ident(&paging.table)
+    )
 }
 
 #[derive(Clone)]
@@ -154,6 +217,10 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    history: Arc<HistoryStore>,
+    history_open: bool,
+    history_entries: Vec<HistoryEntry>,
+    history_filter: Entity<Input>,
     consoles: Vec<Console>,
     expanded: HashSet<String>,
     passwords: HashMap<String, String>,
@@ -195,6 +262,13 @@ fn quote_ident(name: &str) -> String {
 impl DatabaseView {
     pub(crate) fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let store = DataSourceStore::new(&dir);
+        let history_filter = cx.new(|cx| {
+            let mut input = Input::field("Filter history", "Filter history", content(0.35), cx);
+            input.set_font_size(13.);
+            input
+        });
+        cx.subscribe(&history_filter, |_, _, _: &input::Changed, cx| cx.notify())
+            .detach();
         let state_path = dir.join("state.json");
         let saved: SavedState = std::fs::read(&state_path)
             .ok()
@@ -218,6 +292,10 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            history: Arc::new(HistoryStore::new(&dir)),
+            history_open: false,
+            history_entries: Vec::new(),
+            history_filter,
             consoles: Vec::new(),
             expanded: saved.expanded.into_iter().collect(),
             passwords: HashMap::new(),
@@ -412,6 +490,8 @@ impl DatabaseView {
             scroll_x: 0.,
             scroll_y: 0.,
             note: None,
+            paging: None,
+            export_sql: None,
             task: None,
             saver: None,
             _subscriptions: subscriptions,
@@ -602,7 +682,23 @@ impl DatabaseView {
                 .map(|s| vec![s.text])
                 .unwrap_or_default()
         };
-        if statements.is_empty() {
+        self.execute(source, id, statements, None, cx);
+    }
+
+    /// Runs `statements` in order on the console's connection (opening it if
+    /// needed), keeping the last result. `paging` marks a table view.
+    fn execute(
+        &mut self,
+        source: &str,
+        id: u32,
+        statements: Vec<String>,
+        paging: Option<Paging>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.console_index(source, id) else {
+            return;
+        };
+        if self.consoles[ix].running || statements.is_empty() {
             return;
         }
         let Some(data_source) = self.source(source).cloned() else {
@@ -614,6 +710,8 @@ impl DatabaseView {
         self.consoles[ix].running = true;
         self.consoles[ix].error = None;
         let key = (source.to_owned(), id);
+        let history = self.history.clone();
+        let history_key = source.to_owned();
         let work = async move {
             let conn = match existing {
                 Some(conn) => conn,
@@ -625,7 +723,30 @@ impl DatabaseView {
             };
             let mut last = None;
             for statement in statements {
-                match conn.execute(&statement, limit).await {
+                let outcome = conn.execute(&statement, limit).await;
+                let (rows, error, elapsed_ms) = match &outcome {
+                    Ok(r) => (
+                        Some(if r.columns.is_empty() {
+                            r.affected.unwrap_or(0)
+                        } else {
+                            r.rows.len() as u64
+                        }),
+                        None,
+                        r.elapsed_ms,
+                    ),
+                    Err(e) => (None, Some(e.message.clone()), 0.),
+                };
+                history.record(
+                    &history_key,
+                    &HistoryEntry {
+                        at: HistoryEntry::now(),
+                        statement: statement.clone(),
+                        elapsed_ms,
+                        rows,
+                        error,
+                    },
+                );
+                match outcome {
                     Ok(result) => last = Some(result),
                     Err(error) => return Err((Some(conn), error, statement)),
                 }
@@ -650,6 +771,8 @@ impl DatabaseView {
                         console.scroll_x = 0.;
                         console.scroll_y = 0.;
                         console.note = None;
+                        console.export_sql = paging.as_ref().map(table_sql);
+                        console.paging = paging;
                     }
                     this.load_catalog(&key.0, conn, cx);
                 }
@@ -666,6 +789,99 @@ impl DatabaseView {
             cx.notify();
         });
         self.consoles[ix].task = Some(task);
+        cx.notify();
+    }
+
+    /// Reads the page `paging` describes into console `ix`.
+    fn show_page(&mut self, ix: usize, paging: Paging, cx: &mut Context<Self>) {
+        let (source, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
+        let sql = page_sql(&paging, self.limit);
+        self.execute(&source, id, vec![sql], Some(paging), cx);
+    }
+
+    fn change_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let Some(mut paging) = self.consoles[ix].paging.clone() else {
+            return;
+        };
+        let next = paging.page as isize + delta;
+        if next < 0 {
+            return;
+        }
+        paging.page = next as usize;
+        self.show_page(ix, paging, cx);
+    }
+
+    /// Header click in a table view: ascending, descending, then unsorted.
+    fn sort_by(&mut self, column: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let Some(mut paging) = self.consoles[ix].paging.clone() else {
+            return;
+        };
+        let Some(name) = self.consoles[ix]
+            .result
+            .as_ref()
+            .and_then(|r| r.columns.get(column))
+            .map(|c| c.name.clone())
+        else {
+            return;
+        };
+        paging.sort = next_sort(paging.sort.take(), name);
+        paging.page = 0;
+        self.show_page(ix, paging, cx);
+    }
+
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.clone() else {
+            return;
+        };
+        self.history_entries = self.history.list(&source);
+        self.history_filter
+            .update(cx, |input, cx| input.set_text(String::new(), cx));
+        self.history_open = true;
+        cx.notify();
+    }
+
+    /// Puts a history statement into the active console at the cursor.
+    fn insert_from_history(
+        &mut self,
+        statement: &str,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_open = false;
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let (source, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
+        let editor = self.consoles[ix].editor.clone();
+        let (at, empty) = {
+            let input = editor.read(cx);
+            (input.selection_range().end, input.content.trim().is_empty())
+        };
+        let text = if empty {
+            statement.to_owned()
+        } else {
+            format!("\n\n{statement}")
+        };
+        let end = editor.read(cx).content.len();
+        let at = if empty { 0 } else { end.max(at) };
+        editor.update(cx, |input, cx| {
+            input.replace_bytes(at..at, &text, text.len(), cx);
+            if empty {
+                let length = input.content.len();
+                input.select_range(0..length, cx);
+            }
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        if run {
+            self.run(&source, id, false, cx);
+        }
         cx.notify();
     }
 
@@ -991,11 +1207,16 @@ impl DatabaseView {
         let Some(ix) = self.active_index() else {
             return;
         };
-        let (source, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
         self.consoles[ix]
             .editor
             .update(cx, |input, cx| input.set_text(sql, cx));
-        self.run(&source, id, false, cx);
+        let paging = Paging {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+            page: 0,
+            sort: None,
+        };
+        self.show_page(ix, paging, cx);
         window.focus(&self.consoles[ix].editor.focus_handle(cx), cx);
     }
 
@@ -1242,6 +1463,7 @@ impl DatabaseView {
             return;
         };
         let (source, id) = (console.source.clone(), console.id);
+        let export_sql = console.export_sql.clone();
         let directory = std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join("Downloads"))
             .filter(|p| p.is_dir())
@@ -1252,7 +1474,7 @@ impl DatabaseView {
             let Ok(Ok(Some(path))) = picker.await else {
                 return;
             };
-            let statement = result.statement.clone();
+            let statement = export_sql.unwrap_or_else(|| result.statement.clone());
             let target = path.clone();
             let handle =
                 runtime().spawn(async move { conn.export(&statement, &target, format).await });

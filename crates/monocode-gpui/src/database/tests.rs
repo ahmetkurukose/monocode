@@ -444,3 +444,52 @@ fn typing_offers_tables_and_columns_from_the_catalog(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[test]
+fn table_pages_and_sorting_build_the_expected_sql() {
+    let mut paging = Paging {
+        schema: "public".into(),
+        table: "Order Items".into(),
+        page: 2,
+        sort: None,
+    };
+    assert_eq!(
+        page_sql(&paging, 500),
+        "select * from \"public\".\"Order Items\" limit 500 offset 1000"
+    );
+    paging.sort = Some(("total\"x".into(), true));
+    assert_eq!(
+        page_sql(&paging, 100),
+        "select * from \"public\".\"Order Items\" order by \"total\"\"x\" desc limit 100 offset 200"
+    );
+    assert_eq!(
+        table_sql(&paging),
+        "select * from \"public\".\"Order Items\" order by \"total\"\"x\" desc",
+        "exporting a table ignores the page"
+    );
+    let a = next_sort(None, "a".into());
+    assert_eq!(a, Some(("a".into(), false)));
+    let a = next_sort(a, "a".into());
+    assert_eq!(a, Some(("a".into(), true)));
+    assert_eq!(next_sort(a.clone(), "a".into()), None);
+    assert_eq!(next_sort(a, "b".into()), Some(("b".into(), false)));
+}
+
+#[gpui::test]
+fn history_statements_go_into_the_console_without_losing_what_is_there(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, window, cx| {
+            view.save_source(local_source("a"), None, cx);
+            view.history_open = true;
+            view.insert_from_history("select 1", false, window, cx);
+            assert!(!view.history_open);
+            let text = view.consoles[0].editor.read(cx).content.to_string();
+            assert_eq!(text, "select 1", "an empty console takes it as is");
+            view.insert_from_history("select 2", false, window, cx);
+            let text = view.consoles[0].editor.read(cx).content.to_string();
+            assert_eq!(text, "select 1\n\nselect 2", "otherwise it is appended");
+        })
+        .unwrap();
+}
