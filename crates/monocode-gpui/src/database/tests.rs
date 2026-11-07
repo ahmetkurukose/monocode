@@ -686,3 +686,56 @@ fn a_script_with_several_queries_gets_a_tab_per_result(cx: &mut TestAppContext) 
         .unwrap();
     cx.refresh().unwrap();
 }
+
+#[gpui::test]
+fn a_console_can_be_renamed_and_the_name_sticks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    let source = window
+        .update(cx, |view, window, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            view.consoles[0].editor.update(cx, |i, cx| {
+                i.set_text("-- from the comment\nselect 1".into(), cx)
+            });
+            // Typing saves the text after a short pause; do that now.
+            let _ = view
+                .console_store
+                .save(&source, 1, "-- from the comment\nselect 1");
+            assert_eq!(view.tab_title(&view.consoles[0], cx), "from the comment");
+            view.open_rename(&source, 1, window, cx);
+            assert!(view.rename.is_some());
+            view.rename_input
+                .update(cx, |i, cx| i.set_text("  Orders report ".into(), cx));
+            view.commit_rename(cx);
+            assert!(view.rename.is_none());
+            assert_eq!(view.tab_title(&view.consoles[0], cx), "Orders report");
+            assert!(
+                view.saved[&source]
+                    .iter()
+                    .any(|(id, t)| *id == 1 && t == "Orders report")
+            );
+            source
+        })
+        .unwrap();
+    drop(window);
+    let again = open(cx, dir.path());
+    again
+        .update(cx, |view, window, cx| {
+            assert_eq!(
+                view.tab_title(&view.consoles[0], cx),
+                "Orders report",
+                "the name survives a restart"
+            );
+            view.open_rename(&source, 1, window, cx);
+            view.rename_input
+                .update(cx, |i, cx| i.set_text(String::new(), cx));
+            view.commit_rename(cx);
+            assert_eq!(
+                view.tab_title(&view.consoles[0], cx),
+                "from the comment",
+                "an empty name goes back to the automatic one"
+            );
+        })
+        .unwrap();
+}

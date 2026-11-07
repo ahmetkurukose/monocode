@@ -197,6 +197,7 @@ impl DatabaseView {
             TreeRow::SavedConsole(source, id, ..) => Some((source.clone(), *id)),
             _ => None,
         };
+        let rename = forget.clone();
         let row = row.clone();
         div()
             .id(("database-tree-row", ix))
@@ -270,6 +271,30 @@ impl DatabaseView {
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 this.show_ddl(&source, &schema, &table, kind, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            })
+            .when_some(rename, |d, (source, id)| {
+                d.child(
+                    div()
+                        .id(("database-console-rename", ix))
+                        .role(Role::Button)
+                        .aria_label("Rename console")
+                        .size(px(18.))
+                        .flex_shrink_0()
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(content(0.3))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .child(icon("pencil-edit", 11.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.open_rename(&source, id, window, cx);
                                 cx.stop_propagation();
                             }),
                         ),
@@ -508,7 +533,12 @@ impl DatabaseView {
                             })),
                     )
                     .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate(&src, id, window, cx)),
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            this.activate(&src, id, window, cx);
+                            if event.click_count() >= 2 {
+                                this.open_rename(&src, id, window, cx);
+                            }
+                        }),
                     )
             }))
             .child(
@@ -562,6 +592,15 @@ impl DatabaseView {
                 ))
             })
             .child(div().flex_1())
+            .child(
+                icon_button(
+                    "database-save-file",
+                    "Save console to a .sql file",
+                    "file-add",
+                )
+                .size(px(26.))
+                .on_click(cx.listener(|this, _, _, cx| this.save_console_file(cx))),
+            )
             .child(
                 crate::project_settings::button("database-explain", "Explain")
                     .h(px(26.))
@@ -1427,6 +1466,57 @@ impl DatabaseView {
         )
     }
 
+    fn rename_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.rename.as_ref()?;
+        let card = modal::card().child(
+            modal::card_body()
+                .gap(px(10.))
+                .child(modal::title("Rename console"))
+                .child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(0.12))
+                        .bg(content(0.04))
+                        .px_2()
+                        .py(px(6.))
+                        .child(self.rename_input.clone()),
+                )
+                .child(modal::body(
+                    "Leave it empty to name it after its first -- comment again.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            crate::project_settings::button("database-rename-cancel", "Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rename = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            modal::primary_button("database-rename-save", "Rename")
+                                .on_click(cx.listener(|this, _, _, cx| this.commit_rename(cx))),
+                        ),
+                ),
+        );
+        Some(
+            modal::overlay("database-rename", card, {
+                let weak = cx.weak_entity();
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.rename = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .into_any_element(),
+        )
+    }
+
     fn remove_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.confirm_remove.clone()?;
         let name = self.source(&id)?.name.clone();
@@ -1605,6 +1695,7 @@ impl Render for DatabaseView {
                 let command = modifiers.platform || modifiers.control;
                 match event.keystroke.key.as_str() {
                     "j" if command => this.toggle_results(cx),
+                    "escape" if this.rename.is_some() => this.rename = None,
                     "escape" if this.history_open || this.export_menu => {
                         this.history_open = false;
                         this.export_menu = false;
@@ -1706,6 +1797,7 @@ impl Render for DatabaseView {
             .children(self.preview_overlay(cx))
             .children(self.remove_overlay(cx))
             .children(self.history_overlay(cx))
+            .children(self.rename_overlay(cx))
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
     }
 }

@@ -236,6 +236,8 @@ impl SourceNode {
 struct Console {
     id: u32,
     source: String,
+    /// The name the user gave it; otherwise the first `-- comment`, else the number.
+    name: Option<String>,
     editor: Entity<Input>,
     conn: Option<Arc<Connection>>,
     result: Option<Arc<QueryResult>>,
@@ -358,6 +360,8 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    rename: Option<(String, u32)>,
+    rename_input: Entity<Input>,
     results_hidden: bool,
     history: Arc<HistoryStore>,
     history_open: bool,
@@ -389,7 +393,10 @@ impl Focusable for DatabaseView {
 }
 
 /// A console's name: its first line when that is a `-- comment`, else its number.
-fn title_of(text: &str, id: u32) -> String {
+fn title_of(name: Option<&str>, text: &str, id: u32) -> String {
+    if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+        return name.to_owned();
+    }
     let first = text.lines().next().unwrap_or("").trim();
     match first.strip_prefix("--").map(str::trim) {
         Some(title) if !title.is_empty() => title.chars().take(24).collect(),
@@ -424,6 +431,15 @@ fn quote_ident(name: &str) -> String {
 impl DatabaseView {
     pub(crate) fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let store = DataSourceStore::new(&dir);
+        let rename_input = cx.new(|cx| {
+            let mut input = Input::field("Console name", "Console name", content(0.35), cx);
+            input.set_font_size(13.);
+            input
+        });
+        cx.subscribe(&rename_input, |this, _, _: &input::Submitted, cx| {
+            this.commit_rename(cx)
+        })
+        .detach();
         let history_filter = cx.new(|cx| {
             let mut input = Input::field("Filter history", "Filter history", content(0.35), cx);
             input.set_font_size(13.);
@@ -454,6 +470,8 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            rename: None,
+            rename_input,
             results_hidden: saved.results_hidden,
             history: Arc::new(HistoryStore::new(&dir)),
             history_open: false,
@@ -563,7 +581,10 @@ impl DatabaseView {
             .into_iter()
             .map(|id| {
                 let text = self.console_store.load(source, id);
-                (id, title_of(&text, id))
+                (
+                    id,
+                    title_of(self.console_store.name(source, id).as_deref(), &text, id),
+                )
             })
             .collect();
         self.saved.insert(source.to_owned(), list);
@@ -573,6 +594,9 @@ impl DatabaseView {
         if !self.consoles.iter().any(|c| c.source == source) {
             let mut ids = self.console_store.list(source);
             if ids.is_empty() {
+                // A console that exists is a console that is saved, so it
+                // is listed (and can be renamed) from the start.
+                let _ = self.console_store.save(source, 1, "");
                 ids.push(1);
             }
             let wanted = self.open.get(source).cloned();
@@ -640,9 +664,11 @@ impl DatabaseView {
                 move |this, _, _: &input::Submitted, cx| this.run(&key.0, key.1, false, cx)
             }),
         ];
+        let name = self.console_store.name(source, id);
         self.consoles.push(Console {
             id,
             source: source.to_owned(),
+            name,
             editor,
             conn: None,
             result: None,
@@ -805,14 +831,17 @@ impl DatabaseView {
             let _ = this.update(cx, |this, cx| {
                 let text = editor.read(cx).content.to_string();
                 let _ = store.save(&key.0, key.1, &text);
-                if let Some(entry) = this
+                let name = this
+                    .console_index(&key.0, key.1)
+                    .and_then(|ix| this.consoles[ix].name.clone());
+                let title = title_of(name.as_deref(), &text, key.1);
+                match this
                     .saved
                     .get_mut(&key.0)
                     .and_then(|list| list.iter_mut().find(|(i, _)| *i == key.1))
                 {
-                    entry.1 = title_of(&text, key.1);
-                } else {
-                    this.refresh_saved(&key.0);
+                    Some(entry) => entry.1 = title,
+                    None => this.refresh_saved(&key.0),
                 }
                 cx.notify();
             });
@@ -821,7 +850,11 @@ impl DatabaseView {
     }
 
     fn tab_title(&self, console: &Console, cx: &Context<Self>) -> String {
-        title_of(&console.editor.read(cx).content, console.id)
+        title_of(
+            console.name.as_deref(),
+            &console.editor.read(cx).content,
+            console.id,
+        )
     }
 
     // ---- running statements ----
@@ -1008,6 +1041,78 @@ impl DatabaseView {
         paging.sort = next_sort(paging.sort.take(), name);
         paging.page = 0;
         self.show_page(ix, paging, cx);
+    }
+
+    fn open_rename(&mut self, source: &str, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .saved
+            .get(source)
+            .and_then(|l| l.iter().find(|(i, _)| *i == id))
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| format!("Console {id}"));
+        let text = self.console_store.name(source, id).unwrap_or(current);
+        self.rename_input
+            .update(cx, |input, cx| input.set_text(text, cx));
+        self.rename = Some((source.to_owned(), id));
+        window.focus(&self.rename_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Applies the name in the rename box; blank goes back to the automatic title.
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((source, id)) = self.rename.take() else {
+            return;
+        };
+        let name = self.rename_input.read(cx).content.trim().to_owned();
+        self.console_store
+            .set_name(&source, id, (!name.is_empty()).then_some(name.as_str()));
+        if let Some(ix) = self.console_index(&source, id) {
+            self.consoles[ix].name = (!name.is_empty()).then_some(name);
+        }
+        self.refresh_saved(&source);
+        cx.notify();
+    }
+
+    /// Writes the active console to a `.sql` file of the user's choosing.
+    fn save_console_file(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let console = &self.consoles[ix];
+        let text = console.editor.read(cx).content.to_string();
+        let (source, id) = (console.source.clone(), console.id);
+        let stem: String = self
+            .tab_title(console, cx)
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let directory = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Documents"))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let picker = cx.prompt_for_new_path(&directory, Some(&format!("{stem}.sql")));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = picker.await else {
+                return;
+            };
+            let outcome = std::fs::write(&path, text);
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ix) = this.console_index(&source, id) {
+                    this.consoles[ix].note = Some(match outcome {
+                        Ok(()) => format!("Saved to {}", path.display()),
+                        Err(error) => format!("Could not save: {error}"),
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn toggle_results(&mut self, cx: &mut Context<Self>) {

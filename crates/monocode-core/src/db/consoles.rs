@@ -69,6 +69,42 @@ impl ConsoleStore {
 
     pub fn delete(&self, source: &str, id: u32) {
         let _ = std::fs::remove_file(self.file(source, id));
+        self.set_name(source, id, None);
+    }
+
+    fn names_file(&self, source: &str) -> PathBuf {
+        self.folder(source).join("names.json")
+    }
+
+    fn names(&self, source: &str) -> std::collections::BTreeMap<u32, String> {
+        std::fs::read(self.names_file(source))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// The name the user gave console `id`, if any.
+    pub fn name(&self, source: &str, id: u32) -> Option<String> {
+        self.names(source).remove(&id)
+    }
+
+    /// Names console `id`; `None` (or blank) goes back to the automatic title.
+    pub fn set_name(&self, source: &str, id: u32, name: Option<&str>) {
+        let mut names = self.names(source);
+        match name.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) => {
+                names.insert(id, name.to_owned());
+            }
+            None => {
+                if names.remove(&id).is_none() {
+                    return;
+                }
+            }
+        }
+        if let Ok(json) = serde_json::to_vec(&names) {
+            let _ = std::fs::create_dir_all(self.folder(source));
+            let _ = std::fs::write(self.names_file(source), json);
+        }
     }
 
     /// Removes every console of a deleted data source.
@@ -96,6 +132,29 @@ mod tests {
         store.delete_source("src");
         assert!(store.list("src").is_empty());
         assert_eq!(store.list("other"), [1]);
+    }
+
+    #[test]
+    fn names_are_kept_per_console_and_go_with_the_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConsoleStore::new(dir.path());
+        store.save("s", 1, "x").unwrap();
+        assert_eq!(store.name("s", 1), None);
+        store.set_name("s", 1, Some("  Orders report "));
+        store.set_name("s", 2, Some("Other"));
+        assert_eq!(store.name("s", 1).as_deref(), Some("Orders report"));
+        assert_eq!(store.name("t", 1), None, "names are per data source");
+        store.set_name("s", 1, Some("   "));
+        assert_eq!(store.name("s", 1), None, "blank goes back to automatic");
+        store.set_name("s", 1, Some("Again"));
+        store.delete("s", 1);
+        assert_eq!(store.name("s", 1), None);
+        assert_eq!(store.name("s", 2).as_deref(), Some("Other"));
+        assert_eq!(
+            store.list("s"),
+            Vec::<u32>::new(),
+            "names.json is not a console"
+        );
     }
 
     #[test]
