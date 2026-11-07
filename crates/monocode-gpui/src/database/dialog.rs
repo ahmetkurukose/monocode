@@ -151,13 +151,13 @@ impl SourceDialog {
                 return;
             }
         };
-        let password = self.typed_password(cx).or_else(|| {
-            self.has_saved_password
-                .then(|| monocode_core::db::source::saved_password(&source.id))
-                .flatten()
-        });
+        // The saved password is fetched with the connection, off the UI thread.
+        let typed = self.typed_password(cx);
+        let saved_id = self.has_saved_password.then(|| source.id.clone());
         self.test = Test::Running;
         let work = runtime().spawn(async move {
+            let password = typed
+                .or_else(|| saved_id.and_then(|id| monocode_core::db::source::saved_password(&id)));
             let conn = Connection::connect(&source, password.as_deref())
                 .await
                 .map_err(|e| e.message)?;

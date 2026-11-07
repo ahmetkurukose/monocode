@@ -112,24 +112,107 @@ impl DataSourceStore {
     }
 }
 
-fn entry(id: &str) -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, id).ok()
+/// Where secrets live. The OS credential store in the app; a map in tests.
+trait Backend {
+    fn get(&self, account: &str) -> Option<String>;
+    fn set(&self, account: &str, value: &str) -> Result<(), String>;
+}
+
+struct Keyring;
+
+impl Backend for Keyring {
+    fn get(&self, account: &str) -> Option<String> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+            .ok()?
+            .get_password()
+            .ok()
+    }
+
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+            .map_err(|e| e.to_string())?
+            .set_password(value)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The account holding every password as one JSON map.
+const VAULT_ACCOUNT: &str = "passwords";
+
+/// Data source passwords, kept as one credential store item and read at
+/// most once per run. macOS asks for permission once per item it did not
+/// create (and again for each rebuilt, differently signed app); one item
+/// and one read means one question, not one per data source per connect.
+/// Older versions kept an item per data source: those are read when a
+/// source is first used, and move into the single item.
+struct Vault<B: Backend> {
+    backend: B,
+    map: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl<B: Backend> Vault<B> {
+    fn new(backend: B) -> Self {
+        Self { backend, map: None }
+    }
+
+    fn map(&mut self) -> &mut std::collections::BTreeMap<String, String> {
+        let backend = &self.backend;
+        self.map.get_or_insert_with(|| {
+            backend
+                .get(VAULT_ACCOUNT)
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default()
+        })
+    }
+
+    fn persist(&mut self) -> Result<(), String> {
+        let json = serde_json::to_string(self.map()).map_err(|e| e.to_string())?;
+        self.backend.set(VAULT_ACCOUNT, &json)
+    }
+
+    fn get(&mut self, id: &str) -> Option<String> {
+        if let Some(found) = self.map().get(id) {
+            return Some(found.clone());
+        }
+        // A password saved by an older version, in its own item.
+        let legacy = self.backend.get(id)?;
+        self.map().insert(id.to_owned(), legacy.clone());
+        let _ = self.persist();
+        Some(legacy)
+    }
+
+    fn save(&mut self, id: &str, password: &str) -> Result<(), String> {
+        self.map().insert(id.to_owned(), password.to_owned());
+        self.persist()
+    }
+
+    fn forget(&mut self, id: &str) {
+        if self.map().remove(id).is_some() {
+            let _ = self.persist();
+        }
+    }
+}
+
+fn vault() -> &'static std::sync::Mutex<Vault<Keyring>> {
+    static VAULT: std::sync::OnceLock<std::sync::Mutex<Vault<Keyring>>> =
+        std::sync::OnceLock::new();
+    VAULT.get_or_init(|| std::sync::Mutex::new(Vault::new(Keyring)))
 }
 
 pub fn saved_password(id: &str) -> Option<String> {
-    entry(id)?.get_password().ok()
+    vault().lock().ok()?.get(id)
 }
 
 pub fn save_password(id: &str, password: &str) -> Result<(), String> {
-    entry(id)
-        .ok_or("The credential store is unavailable.")?
-        .set_password(password)
-        .map_err(|e| e.to_string())
+    vault()
+        .lock()
+        .map_err(|_| "The credential store is busy.".to_owned())?
+        .save(id, password)
 }
 
 pub fn forget_password(id: &str) {
-    if let Some(entry) = entry(id) {
-        let _ = entry.delete_credential();
+    if let Ok(mut vault) = vault().lock() {
+        vault.forget(id);
     }
 }
 
@@ -149,6 +232,81 @@ mod tests {
         assert_eq!(store.load(), vec![a]);
         let text = std::fs::read_to_string(dir.path().join("datasources.json")).unwrap();
         assert!(!text.to_lowercase().contains("\"password\""));
+    }
+
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    /// A credential store in memory that counts how often it is read.
+    #[derive(Clone, Default)]
+    struct Fake {
+        items: Rc<RefCell<HashMap<String, String>>>,
+        reads: Rc<RefCell<usize>>,
+    }
+
+    impl Backend for Fake {
+        fn get(&self, account: &str) -> Option<String> {
+            *self.reads.borrow_mut() += 1;
+            self.items.borrow().get(account).cloned()
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), String> {
+            self.items.borrow_mut().insert(account.into(), value.into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn passwords_share_one_item_and_it_is_read_once() {
+        let fake = Fake::default();
+        let mut vault = Vault::new(fake.clone());
+        vault.save("a", "pw-a").unwrap();
+        vault.save("b", "pw-b").unwrap();
+        *fake.reads.borrow_mut() = 0;
+        // A new run: nothing cached yet.
+        let mut vault = Vault::new(fake.clone());
+        for _ in 0..5 {
+            assert_eq!(vault.get("a").as_deref(), Some("pw-a"));
+            assert_eq!(vault.get("b").as_deref(), Some("pw-b"));
+        }
+        assert_eq!(
+            *fake.reads.borrow(),
+            1,
+            "ten lookups, one read of the store"
+        );
+        assert_eq!(
+            fake.items.borrow().len(),
+            1,
+            "every password is in the one item"
+        );
+    }
+
+    #[test]
+    fn a_password_forgotten_is_gone_for_good() {
+        let fake = Fake::default();
+        let mut vault = Vault::new(fake.clone());
+        vault.save("a", "pw").unwrap();
+        vault.forget("a");
+        assert_eq!(Vault::new(fake).get("a"), None);
+    }
+
+    #[test]
+    fn a_password_from_an_older_version_moves_into_the_single_item() {
+        let fake = Fake::default();
+        fake.items
+            .borrow_mut()
+            .insert("old-id".into(), "legacy-pw".into());
+        let mut vault = Vault::new(fake.clone());
+        assert_eq!(vault.get("old-id").as_deref(), Some("legacy-pw"));
+        *fake.reads.borrow_mut() = 0;
+        let mut vault = Vault::new(fake.clone());
+        assert_eq!(vault.get("old-id").as_deref(), Some("legacy-pw"));
+        assert_eq!(
+            *fake.reads.borrow(),
+            1,
+            "next run it comes from the single item"
+        );
+        assert_eq!(vault.get("never-saved"), None);
     }
 
     #[test]

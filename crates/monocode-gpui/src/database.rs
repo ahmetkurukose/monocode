@@ -570,6 +570,24 @@ impl Console {
     }
 }
 
+/// A password to look up where it is safe to wait.
+struct PasswordLookup {
+    /// Typed this run, not saved.
+    session: Option<String>,
+    id: String,
+    saved: bool,
+}
+
+impl PasswordLookup {
+    fn resolve(self) -> Option<String> {
+        self.session.or_else(|| {
+            self.saved
+                .then(|| source::saved_password(&self.id))
+                .flatten()
+        })
+    }
+}
+
 fn uuid_like() -> String {
     // A fresh id for a duplicated data source.
     DataSource::new("").id
@@ -691,13 +709,14 @@ impl DatabaseView {
         self.sources.iter().find(|s| s.id == id)
     }
 
-    fn password_for(&self, source: &DataSource) -> Option<String> {
-        self.passwords.get(&source.id).cloned().or_else(|| {
-            source
-                .save_password
-                .then(|| source::saved_password(&source.id))
-                .flatten()
-        })
+    /// How to get a source's password, resolved off the UI thread: the
+    /// credential store may stop to ask the user, and the window must not.
+    fn password_for(&self, source: &DataSource) -> PasswordLookup {
+        PasswordLookup {
+            session: self.passwords.get(&source.id).cloned(),
+            id: source.id.clone(),
+            saved: source.save_password,
+        }
     }
 
     /// Runs `work` on the database runtime and applies its result here.
@@ -1282,19 +1301,21 @@ impl DatabaseView {
             let mut done = Finished::default();
             let conn = match existing {
                 Some(conn) => conn,
-                None => match Connection::connect(&data_source, password.as_deref()).await {
-                    Ok(conn) => Arc::new(conn),
-                    Err(error) => {
-                        done.failure = Some((
-                            error,
-                            statements
-                                .first()
-                                .map(|s| s.text.clone())
-                                .unwrap_or_default(),
-                        ));
-                        return done;
+                None => {
+                    match Connection::connect(&data_source, password.resolve().as_deref()).await {
+                        Ok(conn) => Arc::new(conn),
+                        Err(error) => {
+                            done.failure = Some((
+                                error,
+                                statements
+                                    .first()
+                                    .map(|s| s.text.clone())
+                                    .unwrap_or_default(),
+                            ));
+                            return done;
+                        }
                     }
-                },
+                }
             };
             for (stmt, original) in statements.into_iter().zip(originals) {
                 let outcome = conn.execute(&stmt.text, limit).await;
@@ -2053,7 +2074,7 @@ impl DatabaseView {
             let conn = match existing {
                 Some(conn) => conn,
                 None => Arc::new(
-                    Connection::connect(&data_source, password.as_deref())
+                    Connection::connect(&data_source, password.resolve().as_deref())
                         .await
                         .map_err(|e| (None, e))?,
                 ),
@@ -2175,7 +2196,7 @@ impl DatabaseView {
         let password = self.password_for(&data_source);
         let key = id.to_owned();
         let work = async move {
-            let conn = Connection::connect(&data_source, password.as_deref()).await?;
+            let conn = Connection::connect(&data_source, password.resolve().as_deref()).await?;
             let schemas = conn.schemas(false).await?;
             let catalog = conn.catalog().await.unwrap_or_default();
             Ok::<_, DbError>((Arc::new(conn), schemas, catalog))
@@ -2616,9 +2637,7 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         let existing = editing.as_deref().and_then(|id| self.source(id)).cloned();
-        let has_saved = existing
-            .as_ref()
-            .is_some_and(|s| s.save_password && source::saved_password(&s.id).is_some());
+        let has_saved = existing.as_ref().is_some_and(|s| s.save_password);
         let is_edit = existing.is_some();
         let data_source = existing.unwrap_or_else(|| DataSource::new(""));
         let dialog = cx.new(|cx| SourceDialog::new(data_source, is_edit, has_saved, cx));
