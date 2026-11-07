@@ -23,7 +23,8 @@ use gpui::{
 };
 use monocode_core::db::{
     ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError,
-    HistoryEntry, HistoryStore, QueryResult, TableInfo, TableKind, runtime::runtime, source, split,
+    HistoryEntry, HistoryStore, QueryResult, TableDetails, TableInfo, TableKind, runtime::runtime,
+    source, split,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -54,6 +55,7 @@ struct SavedState {
     /// The consoles open as tabs per data source; the rest are only saved.
     open: HashMap<String, Vec<u32>>,
     expanded: Vec<String>,
+    results_hidden: bool,
 }
 
 impl Default for SavedState {
@@ -66,6 +68,7 @@ impl Default for SavedState {
             active: HashMap::new(),
             open: HashMap::new(),
             expanded: Vec::new(),
+            results_hidden: false,
         }
     }
 }
@@ -80,6 +83,133 @@ enum Link {
 struct TableNode {
     info: TableInfo,
     columns: Option<Vec<ColumnInfo>>,
+    details: Option<TableDetails>,
+}
+
+/// The folders under an expanded table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupKind {
+    Columns,
+    Indexes,
+    ForeignKeys,
+    Constraints,
+    ReferencedBy,
+    Triggers,
+}
+
+impl GroupKind {
+    const ALL: [Self; 6] = [
+        Self::Columns,
+        Self::Indexes,
+        Self::ForeignKeys,
+        Self::Constraints,
+        Self::ReferencedBy,
+        Self::Triggers,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Columns => "Columns",
+            Self::Indexes => "Indexes",
+            Self::ForeignKeys => "Foreign keys",
+            Self::Constraints => "Constraints",
+            Self::ReferencedBy => "Referenced by",
+            Self::Triggers => "Triggers",
+        }
+    }
+}
+
+/// The rows of one group of a table (depth 4, under the group's folder).
+fn group_rows(
+    columns: &[ColumnInfo],
+    details: Option<&TableDetails>,
+    kind: GroupKind,
+) -> Vec<TreeRow> {
+    let leaf = |glyph: &'static str, label: &str, detail: String, full: String| TreeRow::Leaf {
+        glyph,
+        label: label.to_owned(),
+        detail,
+        full,
+    };
+    let Some(details) = details else {
+        return match kind {
+            GroupKind::Columns => columns
+                .iter()
+                .map(|c| TreeRow::Column(4, c.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+    };
+    match kind {
+        GroupKind::Columns => columns
+            .iter()
+            .map(|c| TreeRow::Column(4, c.clone()))
+            .collect(),
+        GroupKind::Indexes => details
+            .indexes
+            .iter()
+            .map(|i| {
+                let using = i
+                    .definition
+                    .split_once(" USING ")
+                    .map_or(i.definition.as_str(), |(_, rest)| rest);
+                let flags = match (i.primary, i.unique) {
+                    (true, _) => "primary · ",
+                    (_, true) => "unique · ",
+                    _ => "",
+                };
+                leaf(
+                    "db-key",
+                    &i.name,
+                    format!("{flags}{using}"),
+                    i.definition.clone(),
+                )
+            })
+            .collect(),
+        GroupKind::ForeignKeys => details
+            .constraints
+            .iter()
+            .filter(|c| c.kind == 'f')
+            .map(|c| {
+                leaf(
+                    "db-column",
+                    &c.name,
+                    c.definition.replacen("FOREIGN KEY ", "", 1),
+                    format!("{}\n{}", c.name, c.definition),
+                )
+            })
+            .collect(),
+        GroupKind::Constraints => details
+            .constraints
+            .iter()
+            .filter(|c| c.kind != 'f')
+            .map(|c| {
+                leaf(
+                    "db-column",
+                    &c.name,
+                    c.definition.clone(),
+                    format!("{}\n{}", c.name, c.definition),
+                )
+            })
+            .collect(),
+        GroupKind::ReferencedBy => details
+            .referenced_by
+            .iter()
+            .map(|(table, definition)| {
+                leaf(
+                    "db-table",
+                    table,
+                    definition.clone(),
+                    format!("{table}\n{definition}"),
+                )
+            })
+            .collect(),
+        GroupKind::Triggers => details
+            .triggers
+            .iter()
+            .map(|t| leaf("db-column", &t.name, String::new(), t.definition.clone()))
+            .collect(),
+    }
 }
 
 struct SchemaNode {
@@ -193,7 +323,15 @@ enum TreeRow {
     SavedConsole(String, u32, String, bool),
     Schema(String, String),
     Table(String, String, usize),
+    /// A folder under a table: source, schema, table, kind.
+    Group(String, String, String, GroupKind),
     Column(usize, ColumnInfo),
+    Leaf {
+        glyph: &'static str,
+        label: String,
+        detail: String,
+        full: String,
+    },
 }
 
 enum Resize {
@@ -217,6 +355,7 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    results_hidden: bool,
     history: Arc<HistoryStore>,
     history_open: bool,
     history_entries: Vec<HistoryEntry>,
@@ -253,6 +392,10 @@ fn title_of(text: &str, id: u32) -> String {
         Some(title) if !title.is_empty() => title.chars().take(24).collect(),
         _ => format!("Console {id}"),
     }
+}
+
+fn group_key(source: &str, schema: &str, table: &str, kind: GroupKind) -> String {
+    format!("g:{source}/{schema}/{table}/{}", kind.label())
 }
 
 fn quote_ident(name: &str) -> String {
@@ -292,6 +435,7 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            results_hidden: saved.results_hidden,
             history: Arc::new(HistoryStore::new(&dir)),
             history_open: false,
             history_entries: Vec::new(),
@@ -330,6 +474,7 @@ impl DatabaseView {
             active: self.active.clone(),
             open: self.open.clone(),
             expanded: self.expanded.iter().cloned().collect(),
+            results_hidden: self.results_hidden,
         };
         if let Ok(json) = serde_json::to_vec_pretty(&state) {
             if let Some(parent) = self.state_path.parent() {
@@ -709,6 +854,7 @@ impl DatabaseView {
         let existing = self.consoles[ix].conn.clone().filter(|c| !c.is_closed());
         self.consoles[ix].running = true;
         self.consoles[ix].error = None;
+        self.results_hidden = false;
         let key = (source.to_owned(), id);
         let history = self.history.clone();
         let history_key = source.to_owned();
@@ -833,6 +979,133 @@ impl DatabaseView {
         paging.sort = next_sort(paging.sort.take(), name);
         paging.page = 0;
         self.show_page(ix, paging, cx);
+    }
+
+    fn toggle_results(&mut self, cx: &mut Context<Self>) {
+        self.results_hidden = !self.results_hidden;
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The table's `CREATE` script, in the preview.
+    fn show_ddl(
+        &mut self,
+        source: &str,
+        schema: &str,
+        table: &str,
+        kind: TableKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.nodes.get(source).and_then(|n| n.conn.clone()) else {
+            self.notice = Some("Connect first".into());
+            cx.notify();
+            return;
+        };
+        let (s, t) = (schema.to_owned(), table.to_owned());
+        let title = format!("{schema}.{table}");
+        let work = async move { conn.ddl(&s, &t, kind).await };
+        self.spawn_db(cx, work, move |this, out, cx| {
+            this.preview = Some(match out {
+                Some(Ok(text)) => (title, text),
+                Some(Err(error)) => (title, format!("-- {}", error.message)),
+                None => (title, "-- The request stopped".into()),
+            });
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// The plan of the statement at the cursor. `analyze` really runs it, so
+    /// it only takes statements that read.
+    fn explain(&mut self, source: &str, id: u32, analyze: bool, cx: &mut Context<Self>) {
+        let Some(ix) = self.console_index(source, id) else {
+            return;
+        };
+        if self.consoles[ix].running {
+            return;
+        }
+        let editor = self.consoles[ix].editor.read(cx);
+        let text = editor.content.to_string();
+        let selection = editor.selection_range();
+        let Some(statement) = (if selection.is_empty() {
+            split::at_cursor(&text, selection.start).map(|s| s.text)
+        } else {
+            split::split(&text[selection])
+                .into_iter()
+                .next()
+                .map(|s| s.text)
+        }) else {
+            return;
+        };
+        let first = statement
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        if analyze && !matches!(first.as_str(), "select" | "with" | "values" | "table") {
+            self.notice =
+                Some("Analyze runs the statement; it only accepts queries that read".into());
+            cx.notify();
+            return;
+        }
+        let Some(data_source) = self.source(source).cloned() else {
+            return;
+        };
+        let password = self.password_for(&data_source);
+        let existing = self.consoles[ix].conn.clone().filter(|c| !c.is_closed());
+        self.consoles[ix].running = true;
+        self.consoles[ix].error = None;
+        let key = (source.to_owned(), id);
+        let sql = format!(
+            "explain ({}) {statement}",
+            if analyze { "analyze, buffers" } else { "costs" }
+        );
+        let work = async move {
+            let conn = match existing {
+                Some(conn) => conn,
+                None => Arc::new(
+                    Connection::connect(&data_source, password.as_deref())
+                        .await
+                        .map_err(|e| (None, e))?,
+                ),
+            };
+            match conn.execute(&sql, 10_000).await {
+                Ok(result) => Ok((conn, result)),
+                Err(error) => Err((Some(conn), error)),
+            }
+        };
+        let task = self.spawn_db(cx, work, move |this, out, cx| {
+            let Some(ix) = this.console_index(&key.0, key.1) else {
+                return;
+            };
+            this.consoles[ix].running = false;
+            this.consoles[ix].task = None;
+            match out {
+                Some(Ok((conn, result))) => {
+                    this.consoles[ix].conn = Some(conn);
+                    let plan: Vec<String> = result
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.first().cloned().flatten())
+                        .collect();
+                    this.preview = Some((
+                        if analyze { "Plan (analyzed)" } else { "Plan" }.to_owned(),
+                        plan.join("\n"),
+                    ));
+                }
+                Some(Err((conn, error))) => {
+                    if conn.is_some() {
+                        this.consoles[ix].conn = conn;
+                    }
+                    this.results_hidden = false;
+                    this.consoles[ix].error = Some((error, String::new()));
+                }
+                None => {}
+            }
+            cx.notify();
+        });
+        self.consoles[ix].task = Some(task);
+        cx.notify();
     }
 
     fn open_history(&mut self, cx: &mut Context<Self>) {
@@ -1030,6 +1303,7 @@ impl DatabaseView {
                         .map(|info| TableNode {
                             info,
                             columns: None,
+                            details: None,
                         })
                         .collect(),
                 );
@@ -1046,15 +1320,20 @@ impl DatabaseView {
         let (key, schema_name, table_name) =
             (source.to_owned(), schema.to_owned(), table.to_owned());
         let (s, t) = (schema.to_owned(), table.to_owned());
-        let work = async move { conn.columns(&s, &t).await };
+        let work = async move {
+            let columns = conn.columns(&s, &t).await?;
+            let details = conn.table_details(&s, &t).await?;
+            Ok::<_, DbError>((columns, details))
+        };
         self.spawn_db(cx, work, move |this, out, cx| {
-            if let Some(Ok(columns)) = out
+            if let Some(Ok((columns, details))) = out
                 && let Some(schemas) = this.nodes.get_mut(&key).and_then(|n| n.schemas.as_mut())
                 && let Some(node) = schemas.iter_mut().find(|s| s.name == schema_name)
                 && let Some(tables) = node.tables.as_mut()
                 && let Some(table) = tables.iter_mut().find(|t| t.info.name == table_name)
             {
                 table.columns = Some(columns);
+                table.details = Some(details);
             }
             cx.notify();
         })
@@ -1112,10 +1391,28 @@ impl DatabaseView {
                     rows.push(TreeRow::Table(source.id.clone(), schema.name.clone(), ix));
                     let open = format!("t:{}/{}/{}", source.id, schema.name, table.info.name);
                     if self.expanded.contains(&open) {
-                        match &table.columns {
-                            None => rows.push(TreeRow::Note(3, "Loading…".into())),
-                            Some(columns) => {
-                                rows.extend(columns.iter().map(|c| TreeRow::Column(3, c.clone())))
+                        let Some(columns) = &table.columns else {
+                            rows.push(TreeRow::Note(3, "Loading…".into()));
+                            continue;
+                        };
+                        for kind in GroupKind::ALL {
+                            let leaves = group_rows(columns, table.details.as_ref(), kind);
+                            if leaves.is_empty() && kind != GroupKind::Columns {
+                                continue;
+                            }
+                            rows.push(TreeRow::Group(
+                                source.id.clone(),
+                                schema.name.clone(),
+                                table.info.name.clone(),
+                                kind,
+                            ));
+                            if self.expanded.contains(&group_key(
+                                &source.id,
+                                &schema.name,
+                                &table.info.name,
+                                kind,
+                            )) {
+                                rows.extend(leaves);
                             }
                         }
                     }
@@ -1169,8 +1466,16 @@ impl DatabaseView {
                 if clicks >= 2 {
                     self.open_table(source, schema, &name, window, cx);
                 } else if self.toggle(format!("t:{source}/{schema}/{name}")) {
+                    self.expanded
+                        .insert(group_key(source, schema, &name, GroupKind::Columns));
                     self.load_columns(source, schema, &name, cx);
                 }
+            }
+            TreeRow::Group(source, schema, table, kind) => {
+                self.toggle(group_key(source, schema, table, *kind));
+            }
+            TreeRow::Leaf { label, full, .. } => {
+                self.preview = Some((label.clone(), full.clone()));
             }
             TreeRow::Consoles(source) => {
                 self.toggle(format!("c:{source}"));

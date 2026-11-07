@@ -111,6 +111,47 @@ impl DatabaseView {
                 Some(column.type_name.clone()),
                 false,
             ),
+            TreeRow::Group(source, schema, table, kind) => {
+                let count = self
+                    .nodes
+                    .get(source)
+                    .and_then(|n| n.schemas.as_ref())
+                    .and_then(|s| s.iter().find(|s| &s.name == schema))
+                    .and_then(|s| s.tables.as_ref())
+                    .and_then(|t| t.iter().find(|t| &t.info.name == table))
+                    .map(|t| {
+                        group_rows(
+                            t.columns.as_deref().unwrap_or(&[]),
+                            t.details.as_ref(),
+                            *kind,
+                        )
+                        .len()
+                    });
+                (
+                    3,
+                    Some(
+                        self.expanded
+                            .contains(&group_key(source, schema, table, *kind)),
+                    ),
+                    "",
+                    kind.label().to_owned(),
+                    count.map(|n| n.to_string()),
+                    false,
+                )
+            }
+            TreeRow::Leaf {
+                glyph,
+                label,
+                detail,
+                ..
+            } => (
+                4,
+                None,
+                glyph,
+                label.clone(),
+                (!detail.is_empty()).then(|| detail.clone()),
+                false,
+            ),
             TreeRow::Consoles(source) => (
                 1,
                 Some(self.expanded.contains(&format!("c:{source}"))),
@@ -132,6 +173,24 @@ impl DatabaseView {
         let is_note = matches!(row, TreeRow::Note(..));
         let tint = match row {
             TreeRow::Source(id) => color_of(self.source(id).and_then(|s| s.color)),
+            _ => None,
+        };
+        let ddl = match row {
+            TreeRow::Table(source, schema, ix) => self
+                .nodes
+                .get(source)
+                .and_then(|n| n.schemas.as_ref())
+                .and_then(|s| s.iter().find(|s| &s.name == schema))
+                .and_then(|s| s.tables.as_ref())
+                .and_then(|t| t.get(*ix))
+                .map(|t| {
+                    (
+                        source.clone(),
+                        schema.clone(),
+                        t.info.name.clone(),
+                        t.info.kind,
+                    )
+                }),
             _ => None,
         };
         let forget = match row {
@@ -185,11 +244,35 @@ impl DatabaseView {
                 d.child(
                     div()
                         .flex_shrink_0()
-                        .max_w(px(110.))
+                        .max_w(px(170.))
                         .truncate()
                         .text_size(px(11.))
                         .text_color(content(0.35))
                         .child(text),
+                )
+            })
+            .when_some(ddl, |d, (source, schema, table, kind)| {
+                d.child(
+                    div()
+                        .id(("database-table-ddl", ix))
+                        .role(Role::Button)
+                        .aria_label("Show DDL")
+                        .size(px(18.))
+                        .flex_shrink_0()
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(content(0.3))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .child(icon("file-script", 12.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.show_ddl(&source, &schema, &table, kind, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
                 )
             })
             .when_some(forget, |d, (source, id)| {
@@ -441,6 +524,7 @@ impl DatabaseView {
         let (src, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
         let (src_stop, src_run) = (src.clone(), src.clone());
         let limit = self.limit;
+        let hidden = self.results_hidden;
         div()
             .h(px(36.))
             .flex_shrink_0()
@@ -478,6 +562,36 @@ impl DatabaseView {
                 ))
             })
             .child(div().flex_1())
+            .child(
+                crate::project_settings::button("database-explain", "Explain")
+                    .h(px(26.))
+                    .on_click(cx.listener({
+                        let src = src.clone();
+                        move |this, _, _, cx| this.explain(&src, id, false, cx)
+                    })),
+            )
+            .child(
+                crate::project_settings::button("database-analyze", "Analyze")
+                    .h(px(26.))
+                    .on_click(cx.listener({
+                        let src = src.clone();
+                        move |this, _, _, cx| this.explain(&src, id, true, cx)
+                    })),
+            )
+            .child(
+                icon_button(
+                    "database-toggle-results",
+                    if hidden {
+                        "Show results (⌘J)"
+                    } else {
+                        "Hide results (⌘J)"
+                    },
+                    "panel-bottom",
+                )
+                .size(px(26.))
+                .when(hidden, |d| d.bg(content(0.1)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_results(cx))),
+            )
             .child(
                 icon_button("database-history", "Query history", "rotate-ccw")
                     .size(px(26.))
@@ -1306,6 +1420,38 @@ impl DatabaseView {
         )
     }
 
+    /// The strip left when the results are hidden: what the last run produced,
+    /// and a way to bring the grid back.
+    fn collapsed_results(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let console = &self.consoles[ix];
+        let summary = if let Some((error, _)) = &console.error {
+            format!("Error: {}", error.message)
+        } else {
+            self.status_line(ix)
+        };
+        let failed = console.error.is_some();
+        div()
+            .h(px(28.))
+            .flex_shrink_0()
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .text_size(px(11.))
+            .text_color(if failed {
+                rgb(0xf87171).into()
+            } else {
+                content(0.5)
+            })
+            .child(div().min_w_0().flex_1().truncate().child(summary))
+            .child(
+                crate::project_settings::button("database-show-results", "Show results")
+                    .h(px(22.))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_results(cx))),
+            )
+            .into_any_element()
+    }
+
     fn main_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(source) = self
             .selected
@@ -1339,7 +1485,12 @@ impl DatabaseView {
         let tabs = self.tabs(&source.id, cx);
         let toolbar = self.toolbar(&source, ix, cx);
         let editor = self.consoles[ix].editor.clone();
-        let results = self.results(ix, cx);
+        let hidden = self.results_hidden;
+        let results = if hidden {
+            self.collapsed_results(ix, cx)
+        } else {
+            self.results(ix, cx)
+        };
         div()
             .flex_1()
             .min_w_0()
@@ -1350,32 +1501,34 @@ impl DatabaseView {
             .child(toolbar)
             .child(
                 div()
-                    .h(px(self.editor_height))
-                    .flex_shrink_0()
+                    .when(!hidden, |d| d.h(px(self.editor_height)).flex_shrink_0())
+                    .when(hidden, |d| d.flex_1().min_h_0())
                     .relative()
                     .child(div().size_full().overflow_hidden().child(editor))
-                    .child(
-                        div()
-                            .id("database-split")
-                            .role(Role::Splitter)
-                            .aria_label("Resize editor")
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom(px(-3.))
-                            .h(px(6.))
-                            .cursor(CursorStyle::ResizeUpDown)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                                    this.resize = Some(Resize::Editor(
-                                        f32::from(event.position.y),
-                                        this.editor_height,
-                                    ));
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    ),
+                    .when(!hidden, |d| {
+                        d.child(
+                            div()
+                                .id("database-split")
+                                .role(Role::Splitter)
+                                .aria_label("Resize editor")
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(px(-3.))
+                                .h(px(6.))
+                                .cursor(CursorStyle::ResizeUpDown)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                        this.resize = Some(Resize::Editor(
+                                            f32::from(event.position.y),
+                                            this.editor_height,
+                                        ));
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                    }),
             )
             .child(div().h(px(1.)).flex_shrink_0().bg(content(0.08)))
             .child(results)
@@ -1401,6 +1554,7 @@ impl Render for DatabaseView {
                 let modifiers = event.keystroke.modifiers;
                 let command = modifiers.platform || modifiers.control;
                 match event.keystroke.key.as_str() {
+                    "j" if command => this.toggle_results(cx),
                     "escape" if this.history_open || this.export_menu => {
                         this.history_open = false;
                         this.export_menu = false;

@@ -493,3 +493,166 @@ fn history_statements_go_into_the_console_without_losing_what_is_there(cx: &mut 
         })
         .unwrap();
 }
+
+fn details() -> TableDetails {
+    use monocode_core::db::{ConstraintInfo, IndexInfo, TriggerInfo};
+    TableDetails {
+        indexes: vec![
+            IndexInfo {
+                name: "orders_pkey".into(),
+                definition: "CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"
+                    .into(),
+                unique: true,
+                primary: true,
+            },
+            IndexInfo {
+                name: "orders_customer_idx".into(),
+                definition:
+                    "CREATE INDEX orders_customer_idx ON public.orders USING btree (customer_id)"
+                        .into(),
+                unique: false,
+                primary: false,
+            },
+        ],
+        constraints: vec![
+            ConstraintInfo {
+                name: "orders_pkey".into(),
+                kind: 'p',
+                definition: "PRIMARY KEY (id)".into(),
+            },
+            ConstraintInfo {
+                name: "orders_customer_fk".into(),
+                kind: 'f',
+                definition: "FOREIGN KEY (customer_id) REFERENCES customers(id)".into(),
+            },
+        ],
+        referenced_by: vec![(
+            "order_items".into(),
+            "item_order_fk FOREIGN KEY (order_id) REFERENCES orders(id)".into(),
+        )],
+        triggers: Vec::new(),
+    }
+}
+
+#[test]
+fn a_tables_groups_list_indexes_foreign_keys_and_what_references_it() {
+    let columns = vec![ColumnInfo {
+        name: "id".into(),
+        type_name: "integer".into(),
+        nullable: false,
+        default: None,
+        primary_key: true,
+    }];
+    let details = details();
+    let leaf = |kind| group_rows(&columns, Some(&details), kind);
+    let TreeRow::Leaf {
+        label,
+        detail,
+        full,
+        ..
+    } = &leaf(GroupKind::Indexes)[0]
+    else {
+        panic!("an index row");
+    };
+    assert_eq!(label, "orders_pkey");
+    assert_eq!(detail, "primary · btree (id)");
+    assert!(full.starts_with("CREATE UNIQUE INDEX"));
+    let TreeRow::Leaf { detail, .. } = &leaf(GroupKind::Indexes)[1] else {
+        panic!();
+    };
+    assert_eq!(detail, "btree (customer_id)");
+    let fks = leaf(GroupKind::ForeignKeys);
+    assert_eq!(fks.len(), 1);
+    let TreeRow::Leaf { detail, .. } = &fks[0] else {
+        panic!()
+    };
+    assert_eq!(detail, "(customer_id) REFERENCES customers(id)");
+    assert_eq!(
+        leaf(GroupKind::Constraints).len(),
+        1,
+        "the foreign key is not repeated"
+    );
+    assert_eq!(leaf(GroupKind::ReferencedBy).len(), 1);
+    assert!(leaf(GroupKind::Triggers).is_empty());
+    assert_eq!(leaf(GroupKind::Columns).len(), 1);
+    assert_eq!(group_rows(&columns, None, GroupKind::Indexes).len(), 0);
+}
+
+#[gpui::test]
+fn an_expanded_table_shows_its_folders_and_hiding_results_survives_a_restart(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            let mut node = SourceNode::new();
+            node.link = Link::Ready;
+            node.schemas = Some(vec![SchemaNode {
+                name: "public".into(),
+                tables: Some(vec![TableNode {
+                    info: TableInfo {
+                        name: "orders".into(),
+                        kind: TableKind::Table,
+                        estimated_rows: None,
+                        comment: None,
+                    },
+                    columns: Some(vec![ColumnInfo {
+                        name: "id".into(),
+                        type_name: "integer".into(),
+                        nullable: false,
+                        default: None,
+                        primary_key: true,
+                    }]),
+                    details: Some(details()),
+                }]),
+            }]);
+            view.nodes.insert(source.clone(), node);
+            for key in [
+                format!("s:{source}"),
+                format!("n:{source}/public"),
+                format!("t:{source}/public/orders"),
+                group_key(&source, "public", "orders", GroupKind::Indexes),
+            ] {
+                view.expanded.insert(key);
+            }
+            let rows = view.rows();
+            let groups: Vec<GroupKind> = rows
+                .iter()
+                .filter_map(|r| match r {
+                    TreeRow::Group(_, _, _, kind) => Some(*kind),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                groups,
+                [
+                    GroupKind::Columns,
+                    GroupKind::Indexes,
+                    GroupKind::ForeignKeys,
+                    GroupKind::Constraints,
+                    GroupKind::ReferencedBy
+                ],
+                "empty folders (triggers) are left out"
+            );
+            let leaves = rows
+                .iter()
+                .filter(|r| matches!(r, TreeRow::Leaf { .. }))
+                .count();
+            assert_eq!(leaves, 2, "only the expanded folder lists its entries");
+            assert!(
+                !rows.iter().any(|r| matches!(r, TreeRow::Column(..))),
+                "columns folder is collapsed"
+            );
+            view.toggle_results(cx);
+            assert!(view.results_hidden);
+        })
+        .unwrap();
+    drop(window);
+    let again = open(cx, dir.path());
+    again
+        .update(cx, |view, _, _| assert!(view.results_hidden))
+        .unwrap();
+}

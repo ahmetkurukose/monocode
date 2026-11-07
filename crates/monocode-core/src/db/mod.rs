@@ -15,5 +15,8 @@ pub use conn::{Connection, DbError, QueryResult, ResultColumn};
 pub use consoles::ConsoleStore;
 pub use export::{format_rows, ExportFormat};
 pub use history::{HistoryEntry, HistoryStore};
-pub use introspect::{CatalogEntry, ColumnInfo, TableInfo, TableKind};
+pub use introspect::{
+    CatalogEntry, ColumnInfo, ConstraintInfo, IndexInfo, TableDetails, TableInfo, TableKind,
+    TriggerInfo,
+};
 pub use source::{DataSource, DataSourceStore, DbColor};
