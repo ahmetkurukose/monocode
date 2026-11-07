@@ -4,11 +4,35 @@ use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, Role, Subscription, Window, div,
     prelude::*, px,
 };
-use monocode_core::{composer, files::ProjectFile};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use monocode_core::{
+    composer,
+    files::ProjectFile,
+    search::project::{self, SearchOptions},
 };
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+/// What typing searches: file names, or what is inside the files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Mode {
+    #[default]
+    Files,
+    Content,
+}
+
+impl Mode {
+    fn other(self) -> Self {
+        match self {
+            Self::Files => Self::Content,
+            Self::Content => Self::Files,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Command {
@@ -43,8 +67,13 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Operator, "Toggle Operator", ""),
     (Command::Orchestrator, "Toggle Orchestrator", ""),
 ];
+/// Most content matches listed.
+const CONTENT_ROWS: usize = 80;
+
 pub(crate) enum Picked {
     File(String),
+    /// A match inside a file: its path, line and column.
+    Match(String, u32, u32),
     Command(Command),
     Dismiss,
 }
@@ -53,6 +82,10 @@ struct Row {
     label: String,
     detail: String,
     path: Option<String>,
+    /// Where a content match is (line, column); `None` opens the file at its top.
+    at: Option<(u32, u32)>,
+    /// The file whose icon the row shows.
+    file_name: String,
     command: Option<Command>,
 }
 pub(crate) struct QuickOpen {
@@ -64,6 +97,13 @@ pub(crate) struct QuickOpen {
     loading: bool,
     error: Option<String>,
     cancel: Arc<AtomicBool>,
+    mode: Mode,
+    /// Rows of the last content search, shown on the Content tab.
+    content_rows: Vec<Row>,
+    cwd: String,
+    searching: bool,
+    content_task: Option<gpui::Task<()>>,
+    content_cancel: Arc<AtomicBool>,
     _changed: Subscription,
 }
 impl EventEmitter<Picked> for QuickOpen {}
@@ -75,6 +115,7 @@ impl Focusable for QuickOpen {
 impl Drop for QuickOpen {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.content_cancel.store(true, Ordering::Relaxed);
     }
 }
 impl QuickOpen {
@@ -93,8 +134,10 @@ impl QuickOpen {
         let changed = cx.subscribe(&search, |this, _, _: &input::Changed, cx| {
             this.active = 0;
             this.rank(cx);
+            this.search_content(cx);
             cx.notify();
         });
+        let cwd_for_search = cwd.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let include_ignored = crate::settings::show_excluded_files(cx);
@@ -123,6 +166,12 @@ impl QuickOpen {
             loading: true,
             error: None,
             cancel,
+            mode: Mode::Files,
+            content_rows: Vec::new(),
+            cwd: cwd_for_search,
+            searching: false,
+            content_task: None,
+            content_cancel: Arc::new(AtomicBool::new(false)),
             _changed: changed,
         };
         this.rank(cx);
@@ -145,6 +194,8 @@ impl QuickOpen {
                                     hint.replace('⌘', "Ctrl+").replace('⇧', "Shift+")
                                 },
                                 path: None,
+                                at: None,
+                                file_name: String::new(),
                                 command: Some(*command),
                             },
                         )
@@ -153,6 +204,8 @@ impl QuickOpen {
                 .collect();
             commands.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             commands.into_iter().map(|(_, row)| row).collect()
+        } else if self.mode == Mode::Content {
+            self.content_rows.clone()
         } else {
             composer::rank_files(&self.files, query, 80)
                 .into_iter()
@@ -160,12 +213,104 @@ impl QuickOpen {
                     label: file.name.clone(),
                     detail: file.relative.clone(),
                     path: Some(file.path.clone()),
+                    at: None,
+                    file_name: file.name.clone(),
                     command: None,
                 })
                 .collect()
         };
         self.active = self.active.min(self.rows.len().saturating_sub(1));
         self.scroll.scroll_to_item(self.active);
+    }
+    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.active = 0;
+            self.content_rows.clear();
+            self.rank(cx);
+            self.search_content(cx);
+            cx.notify();
+        }
+    }
+
+    /// On the Content tab, searches inside the files after a short pause.
+    fn search_content(&mut self, cx: &mut Context<Self>) {
+        self.content_cancel.store(true, Ordering::Relaxed);
+        self.content_task = None;
+        self.searching = false;
+        let query = self.search.read(cx).content.trim().to_owned();
+        if self.mode != Mode::Content || query.is_empty() || query.starts_with('>') {
+            if !self.content_rows.is_empty() {
+                self.content_rows.clear();
+                self.rank(cx);
+            }
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.content_cancel = cancel.clone();
+        self.searching = true;
+        let options = SearchOptions {
+            cwd: self.cwd.clone(),
+            query,
+            case_sensitive: false,
+            whole_word: false,
+            regex: false,
+            include: None,
+            exclude: None,
+            search_id: String::new(),
+            include_ignored: crate::settings::show_excluded_files(cx),
+        };
+        let root = self.cwd.clone();
+        self.content_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let flag = cancel.clone();
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    project::search_project(std::path::Path::new(&root), &options, &flag)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                this.searching = false;
+                match found {
+                    Ok(result) => {
+                        this.error = None;
+                        this.content_rows = result
+                            .matches
+                            .into_iter()
+                            .take(CONTENT_ROWS)
+                            .map(|m| Row {
+                                label: m.preview.trim().to_owned(),
+                                detail: format!("{}:{}", m.relative, m.line),
+                                file_name: m
+                                    .relative
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&m.relative)
+                                    .to_owned(),
+                                path: Some(m.path),
+                                at: Some((m.line, m.column)),
+                                command: None,
+                            })
+                            .collect();
+                    }
+                    Err(error) => {
+                        this.content_rows.clear();
+                        this.error = Some(error);
+                    }
+                }
+                this.rank(cx);
+                cx.notify();
+            });
+        }));
     }
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         if !self.rows.is_empty() {
@@ -181,7 +326,10 @@ impl QuickOpen {
         }
         if let Some(row) = self.rows.get(ix) {
             if let Some(path) = &row.path {
-                cx.emit(Picked::File(path.clone()));
+                match row.at {
+                    Some((line, column)) => cx.emit(Picked::Match(path.clone(), line, column)),
+                    None => cx.emit(Picked::File(path.clone())),
+                }
             } else if let Some(command) = row.command {
                 cx.emit(Picked::Command(command));
             }
@@ -212,7 +360,7 @@ impl Render for QuickOpen {
                     })
                     .hover(|s| s.bg(content(0.07)))
                     .child(if row.path.is_some() {
-                        crate::file_icons::file_type_icon(&row.label, false, false, 18.)
+                        crate::file_icons::file_type_icon(&row.file_name, false, false, 18.)
                     } else {
                         icon("sparkles", 16.).into_any_element()
                     })
@@ -257,6 +405,15 @@ impl Render for QuickOpen {
                 cx.emit(Picked::Dismiss);
                 cx.stop_propagation();
             }))
+            // Tab is the shell's focus-next action; here it flips the tab.
+            .on_action(cx.listener(|this, _: &crate::shell::FocusNext, _, cx| {
+                this.set_mode(this.mode.other(), cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &crate::shell::FocusPrevious, _, cx| {
+                this.set_mode(this.mode.other(), cx);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .px_4()
@@ -268,6 +425,45 @@ impl Render for QuickOpen {
                     .gap_2p5()
                     .child(icon("search", 16.).text_color(content(0.5)))
                     .child(div().flex_1().min_w_0().child(self.search.clone())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(content(0.06))
+                    .children(
+                        [
+                            ("quick-open-tab-files", "Files", Mode::Files),
+                            ("quick-open-tab-content", "Content", Mode::Content),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, target)| {
+                            let on = self.mode == target;
+                            div()
+                                .id(id)
+                                .debug_selector(move || id.to_owned())
+                                .role(Role::Tab)
+                                .aria_label(label)
+                                .aria_selected(on)
+                                .h(px(26.))
+                                .px(px(12.))
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .text_color(content(if on { 1. } else { 0.5 }))
+                                .when(on, |d| d.bg(content(0.1)))
+                                .hover(|s| s.bg(content(0.07)))
+                                .child(label)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.set_mode(target, cx)),
+                                )
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -286,10 +482,20 @@ impl Render for QuickOpen {
                                 .py_6()
                                 .text_size(px(13.))
                                 .text_color(content(0.45))
-                                .child(if self.loading {
+                                .child(if let Some(error) = self.error.clone() {
+                                    error
+                                } else if self.mode == Mode::Content {
+                                    if self.searching {
+                                        "Searching…".to_owned()
+                                    } else if self.search.read(cx).content.trim().is_empty() {
+                                        "Type to search inside the files".to_owned()
+                                    } else {
+                                        "No results".to_owned()
+                                    }
+                                } else if self.loading {
                                     "Loading project files…".to_owned()
                                 } else {
-                                    self.error.clone().unwrap_or_else(|| "No results".into())
+                                    "No results".to_owned()
                                 }),
                         )
                     }),
@@ -302,7 +508,92 @@ impl Render for QuickOpen {
                     .border_color(content(0.07))
                     .text_size(px(10.))
                     .text_color(content(0.35))
-                    .child("↑ ↓ navigate    ↵ open    Esc close    > commands"),
+                    .child(
+                        "↑ ↓ navigate    ↵ open    ⇥ files / content    Esc close    > commands",
+                    ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(
+            dir.path().join("alpha.txt"),
+            "first line\nthe needle is here\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("needle_notes.md"), "nothing\n").unwrap();
+        git(&["add", "."]);
+        dir
+    }
+
+    #[gpui::test]
+    fn files_is_the_first_tab_and_content_is_the_second(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let dir = repo();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| QuickOpen::new(cwd, false, cx))
+            })
+            .unwrap()
+        });
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        window
+            .update(cx, |open, _, cx| {
+                assert_eq!(open.mode, Mode::Files, "file names are searched first");
+                open.search
+                    .update(cx, |input, cx| input.set_text("needle".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |open, _, _| {
+                let names: Vec<&str> = open.rows.iter().map(|r| r.label.as_str()).collect();
+                assert_eq!(
+                    names,
+                    ["needle_notes.md"],
+                    "the Files tab matches names, not contents"
+                );
+                assert!(open.rows[0].at.is_none());
+            })
+            .unwrap();
+        window
+            .update(cx, |open, _, cx| open.set_mode(Mode::Content, cx))
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        window
+            .update(cx, |open, _, cx| {
+                assert_eq!(open.mode, Mode::Content);
+                let found: Vec<(&str, Option<(u32, u32)>)> = open
+                    .rows
+                    .iter()
+                    .map(|r| (r.detail.as_str(), r.at))
+                    .collect();
+                assert_eq!(found, [("alpha.txt:2", Some((2, 5)))], "{found:?}");
+                assert_eq!(open.rows[0].label, "the needle is here");
+                // Back to Files: names again, no stale content rows.
+                open.set_mode(Mode::Files, cx);
+                assert_eq!(open.rows[0].label, "needle_notes.md");
+            })
+            .unwrap();
     }
 }

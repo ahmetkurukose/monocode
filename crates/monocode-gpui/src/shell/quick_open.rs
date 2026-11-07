@@ -44,6 +44,21 @@ impl Shell {
                         cx,
                     );
                 }
+                Picked::Match(path, line, column) => {
+                    let cwd = this.working_copy().to_owned();
+                    this.open_review(
+                        crate::review::ReviewTab::File {
+                            cwd,
+                            path: path.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                    if let Some(pane) = this.active_review(cx) {
+                        let (line, column) = (*line as usize, *column as usize);
+                        pane.update(cx, |pane, cx| pane.navigate_file(line, column, cx));
+                    }
+                }
                 Picked::Command(command) => match command {
                     Command::New => window.dispatch_action(Box::new(NewCodex), cx),
                     Command::Project => window.dispatch_action(Box::new(OpenProject), cx),
