@@ -9,7 +9,11 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Role,
     ScrollHandle, StyledText, Subscription, Task, Window, div, point, prelude::*, px, rgb,
 };
-use monocode_core::search::project::{self, SearchMatch, SearchOptions};
+use monocode_core::{
+    composer,
+    files::ProjectFile,
+    search::project::{self, SearchMatch, SearchOptions},
+};
 use std::{
     collections::HashMap,
     ops::Range,
@@ -30,6 +34,9 @@ fn accent(alpha: f32) -> gpui::Hsla {
 /// Explorer) give it a size but are not flex containers themselves, so it
 /// takes all of that size rather than asking to flex: with `flex_1` the
 /// results scroller was given no height and the list never showed.
+/// Most files listed by name.
+const NAME_HITS: usize = 40;
+
 pub(crate) fn pane(search: &Entity<ProjectSearch>) -> AnyElement {
     search
         .clone()
@@ -60,6 +67,12 @@ struct Group {
 pub(crate) struct ProjectSearch {
     cwd: String,
     active: bool,
+    /// The project's files, listed once per folder, for matching names.
+    files: Arc<Vec<ProjectFile>>,
+    files_key: Option<(String, bool)>,
+    files_task: Option<Task<()>>,
+    /// Files whose name or path matches the query, best first.
+    name_hits: Vec<ProjectFile>,
     query: Entity<Input>,
     include: Entity<Input>,
     exclude: Entity<Input>,
@@ -115,6 +128,10 @@ impl ProjectSearch {
         Self {
             cwd,
             active,
+            files: Arc::new(Vec::new()),
+            files_key: None,
+            files_task: None,
+            name_hits: Vec::new(),
             query,
             include,
             exclude,
@@ -159,6 +176,9 @@ impl ProjectSearch {
             self.cwd = cwd;
             self.groups.clear();
             self.count = 0;
+            self.files = Arc::new(Vec::new());
+            self.files_key = None;
+            self.name_hits.clear();
             self.refresh(cx);
         }
     }
@@ -192,10 +212,15 @@ impl ProjectSearch {
         if options.query.is_empty() || self.cwd.is_empty() || self.cwd == "~" {
             self.groups.clear();
             self.count = 0;
+            self.name_hits.clear();
             self.scroll.set_offset(point(px(0.), px(0.)));
             cx.notify();
             return;
         }
+        if self.active {
+            self.load_files(cx);
+        }
+        self.rank_names(cx);
         if self.active {
             let check = self.cancel.clone();
             self.debounce = Some(cx.spawn(async move |this, cx| {
@@ -208,6 +233,62 @@ impl ProjectSearch {
             }));
         }
         cx.notify();
+    }
+
+    /// Lists the project's files once (again if the excluded-files setting changes).
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        let key = (self.cwd.clone(), crate::settings::show_excluded_files(cx));
+        if self.files_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.files_key = Some(key.clone());
+        let (cwd, include_ignored) = key.clone();
+        let work = cx.background_executor().spawn(async move {
+            monocode_core::files::list_project_files_with(&cwd, None, include_ignored)
+        });
+        self.files_task = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.files_key.as_ref() != Some(&key) {
+                    return;
+                }
+                match result {
+                    Ok(files) => this.files = Arc::new(files),
+                    Err(_) => this.files_key = None,
+                }
+                this.rank_names(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The files whose name or path matches what is typed, the way Quick Open ranks them.
+    fn rank_names(&mut self, cx: &Context<Self>) {
+        let query = self.query.read(cx).content.trim().to_owned();
+        self.name_hits = if query.is_empty() {
+            Vec::new()
+        } else {
+            composer::rank_files(&self.files, &query, NAME_HITS)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+    }
+
+    fn pick_file(&self, index: usize, pin: bool, cx: &mut Context<Self>) {
+        if let Some(file) = self.name_hits.get(index) {
+            cx.emit(SearchEvent::Open {
+                cwd: self.cwd.clone(),
+                matched: SearchMatch {
+                    path: file.path.clone(),
+                    relative: file.relative.clone(),
+                    line: 1,
+                    column: 1,
+                    preview: String::new(),
+                },
+                pin,
+            });
+        }
     }
 
     fn start(&mut self, options: SearchOptions, cx: &mut Context<Self>) {
@@ -338,17 +419,105 @@ impl Render for ProjectSearch {
             error.clone()
         } else if self.query.read(cx).content.trim().is_empty() {
             "Type to search across the project".to_owned()
-        } else if self.count == 0 {
+        } else if self.count == 0 && self.name_hits.is_empty() {
             "No results".to_owned()
         } else {
-            format!(
-                "{} result{} in {} file{}{}",
-                self.count,
-                if self.count == 1 { "" } else { "s" },
-                self.groups.len(),
-                if self.groups.len() == 1 { "" } else { "s" },
-                if self.truncated { " (limited)" } else { "" }
+            let files = (!self.name_hits.is_empty()).then(|| {
+                format!(
+                    "{}{} file name{}",
+                    self.name_hits.len(),
+                    if self.name_hits.len() >= NAME_HITS {
+                        "+"
+                    } else {
+                        ""
+                    },
+                    if self.name_hits.len() == 1 { "" } else { "s" }
+                )
+            });
+            let text = (self.count > 0).then(|| {
+                format!(
+                    "{} result{} in {} file{}{}",
+                    self.count,
+                    if self.count == 1 { "" } else { "s" },
+                    self.groups.len(),
+                    if self.groups.len() == 1 { "" } else { "s" },
+                    if self.truncated { " (limited)" } else { "" }
+                )
+            });
+            [files, text]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        let name_rows: Vec<AnyElement> = if self.name_hits.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(
+                div()
+                    .px_2()
+                    .pt(px(8.))
+                    .pb(px(4.))
+                    .text_size(px(10.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(content(0.4))
+                    .child("FILE NAMES")
+                    .into_any_element(),
             )
+            .chain(self.name_hits.iter().enumerate().map(|(index, file)| {
+                let dir = file
+                    .relative
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir.to_owned())
+                    .unwrap_or_default();
+                div()
+                    .id(("project-search-file", index))
+                    .debug_selector(move || format!("project-search-file-{index}"))
+                    .role(Role::Button)
+                    .aria_label(file.relative.clone())
+                    .w_full()
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(content(0.05)))
+                    .child(file_type_icon(&file.name, false, false, 16.))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(180.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .child(file.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(content(0.4))
+                            .child(dir),
+                    )
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        this.pick_file(index, event.click_count() >= 2, cx);
+                    }))
+                    .into_any_element()
+            }))
+            .chain(std::iter::once(
+                div()
+                    .h(px(1.))
+                    .mt(px(4.))
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(stroke())
+                    .into_any_element(),
+            ))
+            .collect()
         };
         let groups = self
             .groups
@@ -475,7 +644,11 @@ impl Render for ProjectSearch {
                 if !this.query.read(cx).is_composing()
                     && this.query.focus_handle(cx).is_focused(window)
                 {
-                    this.pick(0, 0, false, cx);
+                    if this.name_hits.is_empty() {
+                        this.pick(0, 0, false, cx);
+                    } else {
+                        this.pick_file(0, false, cx);
+                    }
                     cx.stop_propagation();
                 } else {
                     cx.propagate();
@@ -630,6 +803,7 @@ impl Render for ProjectSearch {
                     .track_scroll(&self.scroll)
                     .flex()
                     .flex_col()
+                    .children(name_rows)
                     .children(groups),
             )
             .into_any_element()
@@ -729,6 +903,97 @@ mod tests {
             "the scroller must get the room the pane has: {list:?}"
         );
         assert!(row.size.height >= px(20.), "{row:?}");
+    }
+
+    fn project_file(relative: &str) -> ProjectFile {
+        ProjectFile {
+            name: relative.rsplit('/').next().unwrap().to_owned(),
+            path: format!("/p/{relative}"),
+            relative: relative.to_owned(),
+        }
+    }
+
+    #[gpui::test]
+    fn file_names_match_the_query_are_listed_first_and_open_the_file(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let search = std::cell::RefCell::new(None);
+        let window = cx.update(|cx| {
+            let bounds = gpui::Bounds::new(point(px(0.), px(0.)), gpui::size(px(280.), px(900.)));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    let s = cx.new(|cx| ProjectSearch::new("/p".into(), true, cx));
+                    *search.borrow_mut() = Some(s.clone());
+                    let host = cx.new(|_| Host(s));
+                    cx.new(|_| Column(host))
+                },
+            )
+            .unwrap()
+        });
+        let search = search.borrow().clone().unwrap();
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(String, u32, bool)>::new()));
+        cx.update(|cx| {
+            let opened = opened.clone();
+            cx.subscribe(&search, move |_, event: &SearchEvent, _| {
+                if let SearchEvent::Open { matched, pin, .. } = event {
+                    opened
+                        .borrow_mut()
+                        .push((matched.relative.clone(), matched.line, *pin));
+                }
+            })
+            .detach();
+            search.update(cx, |search, cx| {
+                search.files = Arc::new(vec![
+                    project_file("src/inbox.rs"),
+                    project_file("docs/notes.md"),
+                    project_file("crates/app/src/project_search.rs"),
+                    project_file("README.md"),
+                ]);
+                search
+                    .query
+                    .update(cx, |q, cx| q.set_text("projsearch".into(), cx));
+                search.rank_names(cx);
+                cx.notify();
+            })
+        });
+        let names: Vec<String> = cx.update(|cx| {
+            search
+                .read(cx)
+                .name_hits
+                .iter()
+                .map(|f| f.name.clone())
+                .collect()
+        });
+        assert_eq!(
+            names,
+            ["project_search.rs"],
+            "a fuzzy name match finds the file"
+        );
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let row = visual
+            .debug_bounds("project-search-file-0")
+            .expect("a file row");
+        assert!(
+            row.size.height >= px(20.) && row.size.width > px(100.),
+            "{row:?}"
+        );
+        cx.update(|cx| search.update(cx, |s, cx| s.pick_file(0, true, cx)));
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [("crates/app/src/project_search.rs".to_owned(), 1, true)]
+        );
+        // Nothing typed, nothing listed.
+        cx.update(|cx| {
+            search.update(cx, |s, cx| {
+                s.query.update(cx, |q, cx| q.set_text(String::new(), cx));
+                s.rank_names(cx);
+                assert!(s.name_hits.is_empty());
+            })
+        });
     }
 
     #[gpui::test]
