@@ -1012,85 +1012,184 @@ impl DatabaseView {
             .into_any_element()
     }
 
-    fn export_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use monocode_core::db::ExportFormat::{Csv, Json, Tsv};
+    fn export_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_core::db::ExportFormat;
         if !self.export_menu {
             return None;
         }
-        let entry = |id: &'static str, label: &'static str| {
+        let console = self.active_console()?;
+        let result = console.result.clone()?;
+        let format = self.export_format;
+        let loaded = result.rows.len();
+        let more = result.has_more;
+        let chip = |f: ExportFormat| {
+            let on = f == format;
             div()
-                .id(id)
-                .role(Role::MenuItem)
-                .aria_label(label)
-                .h(px(26.))
+                .id(("database-export-format", f as usize))
+                .role(Role::RadioButton)
+                .aria_label(f.label())
+                .aria_selected(on)
+                .h(px(28.))
                 .px(px(10.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(content(if on { 0.5 } else { 0.12 }))
+                .when(on, |d| d.bg(content(0.1)))
                 .flex()
                 .items_center()
-                .rounded(px(4.))
                 .cursor_pointer()
                 .text_size(px(12.))
-                .hover(|s| s.bg(content(0.1)))
-                .child(label)
-        };
-        Some(
-            div()
-                .absolute()
-                .right(px(8.))
-                .bottom(px(28.))
-                .w(px(220.))
-                .p(px(4.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(content(0.12))
-                .text_color(content(1.))
-                .occlude()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.export_menu = false;
+                .text_color(content(if on { 1. } else { 0.7 }))
+                .hover(|s| s.bg(content(0.08)))
+                .child(f.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.export_format = f;
                     cx.notify();
                 }))
-                .child(modal::surface(8.))
+        };
+        let switch = |id: &'static str, label: &'static str, on: bool, enabled: bool| {
+            div()
+                .id(id)
+                .role(Role::Switch)
+                .aria_label(label)
+                .aria_selected(on)
+                .when(enabled, |d| d.cursor_pointer())
+                .when(!enabled, |d| d.opacity(0.35))
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(content(0.8))
                 .child(
                     div()
-                        .px(px(10.))
-                        .py(px(3.))
-                        .text_size(px(10.))
-                        .text_color(content(0.45))
-                        .child("COPY LOADED ROWS"),
+                        .size(px(16.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(content(if on { 0.7 } else { 0.25 }))
+                        .bg(content(if on { 0.9 } else { 0.0 }))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(on, |d| {
+                            let mut ink = modal::scrim_color();
+                            ink.a = 1.;
+                            d.child(icon("check", 12.).text_color(ink))
+                        }),
                 )
-                .child(
-                    entry("database-copy-csv", "As CSV")
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Csv, cx))),
-                )
-                .child(
-                    entry("database-copy-tsv", "As TSV")
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Tsv, cx))),
-                )
-                .child(
-                    entry("database-copy-json", "As JSON")
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Json, cx))),
-                )
-                .child(div().h(px(1.)).my(px(3.)).bg(content(0.1)))
+                .child(label)
+        };
+        let tabular = format.is_tabular();
+        let card = modal::card().w(px(540.)).child(
+            modal::card_body()
+                .gap(px(12.))
+                .child(modal::title("Export"))
                 .child(
                     div()
-                        .px(px(10.))
-                        .py(px(3.))
-                        .text_size(px(10.))
-                        .text_color(content(0.45))
-                        .child("SAVE ALL ROWS TO A FILE"),
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .children(ExportFormat::ALL.into_iter().map(chip)),
                 )
                 .child(
-                    entry("database-save-csv", "CSV…")
-                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Csv, cx))),
+                    div()
+                        .flex()
+                        .gap(px(20.))
+                        .child(
+                            switch("database-export-header", "Header row", self.export_header, tabular)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.export_format.is_tabular() {
+                                        this.export_header = !this.export_header;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            switch(
+                                "database-export-transpose",
+                                "Transpose (a line per column)",
+                                self.export_transpose,
+                                tabular,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.export_format.is_tabular() {
+                                    this.export_transpose = !this.export_transpose;
+                                    cx.notify();
+                                }
+                            })),
+                        ),
                 )
+                .when(format == ExportFormat::SqlInserts, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .w(px(110.))
+                                    .text_size(px(12.))
+                                    .text_color(content(0.7))
+                                    .child("Insert into"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(content(0.12))
+                                    .bg(content(0.04))
+                                    .px_2()
+                                    .py(px(6.))
+                                    .child(self.export_table.clone()),
+                            ),
+                    )
+                })
+                .child(modal::body(if more {
+                    format!(
+                        "{loaded} rows are loaded and more exist. \"Copy\" takes the loaded rows; \"Save all rows\" runs the statement again without the limit."
+                    )
+                } else {
+                    format!("{loaded} rows. \"Save all rows\" runs the statement again and writes the file.")
+                }))
                 .child(
-                    entry("database-save-tsv", "TSV…")
-                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Tsv, cx))),
-                )
-                .child(
-                    entry("database-save-json", "JSON…")
-                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Json, cx))),
-                )
-                .into_any_element(),
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            crate::project_settings::button("database-export-close", "Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_menu = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            crate::project_settings::button("database-export-copy", "Copy loaded rows")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let format = this.export_format;
+                                    this.copy_result(format, cx)
+                                })),
+                        )
+                        .child(
+                            modal::primary_button("database-export-save", "Save all rows…")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let format = this.export_format;
+                                    this.export_all(format, cx)
+                                })),
+                        ),
+                ),
+        );
+        Some(
+            modal::overlay("database-export", card, {
+                let weak = cx.weak_entity();
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.export_menu = false;
+                        cx.notify();
+                    });
+                }
+            })
+            .into_any_element(),
         )
     }
 
@@ -1235,14 +1334,10 @@ impl DatabaseView {
                         d.child(
                             icon_button("database-export", "Export", "db-export")
                                 .size(px(22.))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_menu = !this.export_menu;
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_export(cx))),
                         )
                     }),
             )
-            .children(self.export_menu(cx))
             .into_any_element()
     }
 
@@ -1948,6 +2043,7 @@ impl Render for DatabaseView {
             .children(self.remove_overlay(cx))
             .children(self.history_overlay(cx))
             .children(self.rename_overlay(cx))
+            .children(self.export_overlay(cx))
             .children(self.pending_overlay(cx))
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
     }

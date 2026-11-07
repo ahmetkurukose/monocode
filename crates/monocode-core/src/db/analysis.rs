@@ -74,6 +74,32 @@ pub fn classify(statement: &str) -> Impact {
     Impact { writes, sweeping }
 }
 
+/// The table a query reads (`from schema.name`), as written, for naming
+/// where exported rows would be inserted.
+pub fn table_of(statement: &str) -> Option<String> {
+    let tokens = lex(statement).tokens;
+    let from = tokens
+        .iter()
+        .position(|t| t.kind == Kind::Word && t.upper == "FROM")?;
+    let mut name = String::new();
+    let mut expect_part = true;
+    for t in &tokens[from + 1..] {
+        if expect_part && matches!(t.kind, Kind::Word | Kind::Quoted) {
+            if name.is_empty() && t.kind == Kind::Word && t.upper == "SELECT" {
+                return None;
+            }
+            name.push_str(&t.text);
+            expect_part = false;
+        } else if !expect_part && t.kind == Kind::Punct && t.text == "." {
+            name.push('.');
+            expect_part = true;
+        } else {
+            break;
+        }
+    }
+    (!name.is_empty() && !name.ends_with('.')).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +170,24 @@ mod tests {
         assert!(!classify("update t set a = 1 where b = 2").sweeping);
         assert!(!classify("insert into t values (1)").sweeping);
         assert!(!classify("select * from t").sweeping);
+    }
+
+    #[test]
+    fn table_of_finds_the_relation_a_query_reads() {
+        assert_eq!(
+            table_of("select * from orders where id = 1").as_deref(),
+            Some("orders")
+        );
+        assert_eq!(
+            table_of("SELECT a FROM public.orders o JOIN x").as_deref(),
+            Some("public.orders")
+        );
+        assert_eq!(
+            table_of("select 1 from \"My Schema\".\"Order Items\"").as_deref(),
+            Some("\"My Schema\".\"Order Items\"")
+        );
+        assert_eq!(table_of("select 1"), None);
+        assert_eq!(table_of("select * from (select 1) s"), None);
     }
 
     #[test]

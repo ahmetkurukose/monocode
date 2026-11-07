@@ -870,3 +870,53 @@ fn format_rewrites_the_console_in_one_undoable_step(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn the_export_dialog_names_the_table_and_its_options_shape_the_copy(cx: &mut TestAppContext) {
+    use monocode_core::db::ExportFormat;
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let mut result = sample();
+            result.statement = "select * from public.orders where id > 0".into();
+            load(view, result);
+            view.open_export(cx);
+            assert!(view.export_menu);
+            assert_eq!(view.export_table.read(cx).content.as_ref(), "public.orders");
+            view.copy_result(ExportFormat::SqlInserts, cx);
+            let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+            assert!(
+                text.starts_with(
+                    "INSERT INTO public.orders (id, payload) VALUES (1, '{\"a\":[1,2]}');"
+                ),
+                "{text}"
+            );
+            view.export_header = false;
+            view.copy_result(ExportFormat::Markdown, cx);
+            let md = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+            assert!(md.starts_with("|   |   |\n| --- | --- |\n| 1 |"), "{md}");
+            view.export_transpose = true;
+            view.export_header = true;
+            view.copy_result(ExportFormat::Csv, cx);
+            let csv = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+            assert_eq!(csv, "id,1,2\npayload,\"{\"\"a\"\":[1,2]}\",\n");
+            // A table view names its own table.
+            view.consoles[0].paging = Some(Paging {
+                schema: "audit".into(),
+                table: "Events".into(),
+                page: 0,
+                sort: None,
+            });
+            view.open_export(cx);
+            assert_eq!(
+                view.export_table.read(cx).content.as_ref(),
+                "audit.\"Events\""
+            );
+        })
+        .unwrap();
+    cx.refresh().unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+}

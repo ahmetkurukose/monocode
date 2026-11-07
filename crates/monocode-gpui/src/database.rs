@@ -409,6 +409,10 @@ pub(crate) struct DatabaseView {
     catalog_started: HashSet<String>,
     grid_viewport: Rc<Cell<(f32, f32)>>,
     export_menu: bool,
+    export_format: monocode_core::db::ExportFormat,
+    export_header: bool,
+    export_transpose: bool,
+    export_table: Entity<Input>,
     pending: Option<Pending>,
     param_inputs: Vec<(String, Entity<Input>)>,
     param_subscriptions: Vec<Subscription>,
@@ -494,6 +498,11 @@ impl DatabaseView {
             this.commit_rename(cx)
         })
         .detach();
+        let export_table = cx.new(|cx| {
+            let mut input = Input::field("Table name", "table_name", content(0.35), cx);
+            input.set_font_size(13.);
+            input
+        });
         let history_filter = cx.new(|cx| {
             let mut input = Input::field("Filter history", "Filter history", content(0.35), cx);
             input.set_font_size(13.);
@@ -524,6 +533,10 @@ impl DatabaseView {
             catalog_started: HashSet::new(),
             grid_viewport: Rc::new(Cell::new((0., 0.))),
             export_menu: false,
+            export_format: monocode_core::db::ExportFormat::Csv,
+            export_header: true,
+            export_transpose: false,
+            export_table,
             pending: None,
             param_inputs: Vec::new(),
             param_subscriptions: Vec::new(),
@@ -2259,12 +2272,53 @@ impl DatabaseView {
 
     // ---- export ----
 
+    fn export_options(&self, cx: &Context<Self>) -> monocode_core::db::ExportOptions {
+        let table = self.export_table.read(cx).content.trim().to_owned();
+        monocode_core::db::ExportOptions {
+            header: self.export_header,
+            transpose: self.export_transpose,
+            table: if table.is_empty() {
+                "table_name".into()
+            } else {
+                table
+            },
+        }
+    }
+
+    /// Opens the export dialog, naming the table SQL inserts would target.
+    fn open_export(&mut self, cx: &mut Context<Self>) {
+        let table = self.active_console().and_then(|console| {
+            console
+                .paging
+                .as_ref()
+                .map(|p| {
+                    format!(
+                        "{}.{}",
+                        monocode_core::db::introspect::quote(&p.schema),
+                        monocode_core::db::introspect::quote(&p.table)
+                    )
+                })
+                .or_else(|| {
+                    console
+                        .result
+                        .as_ref()
+                        .and_then(|r| analysis::table_of(&r.statement))
+                })
+        });
+        self.export_table.update(cx, |input, cx| {
+            input.set_text(table.unwrap_or_else(|| "table_name".into()), cx)
+        });
+        self.export_menu = true;
+        cx.notify();
+    }
+
     fn copy_result(&mut self, format: monocode_core::db::ExportFormat, cx: &mut Context<Self>) {
         let Some(result) = self.active_console().and_then(|c| c.result.clone()) else {
             return;
         };
+        let options = self.export_options(cx);
         let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
-        let text = monocode_core::db::format_rows(format, &columns, &result.rows);
+        let text = monocode_core::db::format_rows(format, &columns, &result.rows, &options);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         if let Some(ix) = self.active_index() {
             self.consoles[ix].note = Some(format!(
@@ -2290,6 +2344,7 @@ impl DatabaseView {
         };
         let (source, id) = (console.source.clone(), console.id);
         let export_sql = console.export_sql.clone();
+        let options = self.export_options(cx);
         let directory = std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join("Downloads"))
             .filter(|p| p.is_dir())
@@ -2302,8 +2357,8 @@ impl DatabaseView {
             };
             let statement = export_sql.unwrap_or_else(|| result.statement.clone());
             let target = path.clone();
-            let handle =
-                runtime().spawn(async move { conn.export(&statement, &target, format).await });
+            let handle = runtime()
+                .spawn(async move { conn.export(&statement, &target, format, options).await });
             let _ = this.update(cx, |this, cx| {
                 if let Some(ix) = this.console_index(&source, id) {
                     this.consoles[ix].note = Some("Exporting…".into());

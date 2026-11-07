@@ -250,6 +250,7 @@ impl Connection {
         statement: &str,
         path: &std::path::Path,
         format: super::export::ExportFormat,
+        options: super::export::ExportOptions,
     ) -> Result<u64, DbError> {
         use super::export::RowWriter;
         self.cancelling.store(false, Ordering::Release);
@@ -272,8 +273,10 @@ impl Connection {
                 SimpleQueryMessage::Row(row) => {
                     if writer.is_none() {
                         let out = file.take().expect("opened once");
-                        writer =
-                            Some(RowWriter::new(out, format, columns.clone()).map_err(io_error)?);
+                        writer = Some(
+                            RowWriter::new(out, format, columns.clone(), options.clone())
+                                .map_err(io_error)?,
+                        );
                     }
                     let cells: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
                     writer
@@ -287,7 +290,7 @@ impl Connection {
         }
         let writer = match writer {
             Some(writer) => writer,
-            None => RowWriter::new(file.take().expect("never opened"), format, columns)
+            None => RowWriter::new(file.take().expect("never opened"), format, columns, options)
                 .map_err(io_error)?,
         };
         writer.finish().map_err(io_error)
@@ -395,7 +398,7 @@ pub(crate) mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let file = dir.join("out.csv");
             let n = conn
-                .export("select g, 'a,b' as t from generate_series(1, 1500) g", &file, crate::db::ExportFormat::Csv)
+                .export("select g, 'a,b' as t from generate_series(1, 1500) g", &file, crate::db::ExportFormat::Csv, Default::default())
                 .await
                 .unwrap();
             assert_eq!(n, 1500, "export ignores the row limit");
@@ -403,7 +406,7 @@ pub(crate) mod tests {
             assert!(text.starts_with("g,t\n1,\"a,b\"\n"), "{}", &text[..30]);
             assert_eq!(text.lines().count(), 1501);
             let empty = dir.join("empty.json");
-            assert_eq!(conn.export("select 1 where false", &empty, crate::db::ExportFormat::Json).await.unwrap(), 0);
+            assert_eq!(conn.export("select 1 where false", &empty, crate::db::ExportFormat::Json, Default::default()).await.unwrap(), 0);
             assert_eq!(std::fs::read_to_string(&empty).unwrap().trim(), "[]");
             let _ = std::fs::remove_dir_all(&dir);
 
