@@ -243,6 +243,56 @@ impl Connection {
         DbError::from_pg(error, statement, self.cancelling.load(Ordering::Acquire))
     }
 
+    /// Runs `statement` and streams every row to `path`, without the row
+    /// limit and without holding the result in memory.
+    pub async fn export(
+        &self,
+        statement: &str,
+        path: &std::path::Path,
+        format: super::export::ExportFormat,
+    ) -> Result<u64, DbError> {
+        use super::export::RowWriter;
+        self.cancelling.store(false, Ordering::Release);
+        let io_error = |e: std::io::Error| DbError::plain(format!("Could not write the file: {e}"));
+        let file = std::fs::File::create(path).map_err(io_error)?;
+        let stream = self
+            .client
+            .simple_query_raw(statement)
+            .await
+            .map_err(|e| self.error(&e, statement))?;
+        let mut stream = std::pin::pin!(stream);
+        let mut writer: Option<RowWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut file = Some(std::io::BufWriter::new(file));
+        let mut columns: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| self.error(&e, statement))? {
+                SimpleQueryMessage::RowDescription(described) => {
+                    columns = described.iter().map(|c| c.name().to_owned()).collect();
+                }
+                SimpleQueryMessage::Row(row) => {
+                    if writer.is_none() {
+                        let out = file.take().expect("opened once");
+                        writer =
+                            Some(RowWriter::new(out, format, columns.clone()).map_err(io_error)?);
+                    }
+                    let cells: Vec<Option<&str>> = (0..row.len()).map(|i| row.get(i)).collect();
+                    writer
+                        .as_mut()
+                        .expect("created above")
+                        .row(&cells)
+                        .map_err(io_error)?;
+                }
+                _ => {}
+            }
+        }
+        let writer = match writer {
+            Some(writer) => writer,
+            None => RowWriter::new(file.take().expect("never opened"), format, columns)
+                .map_err(io_error)?,
+        };
+        writer.finish().map_err(io_error)
+    }
+
     /// Catalog queries: every row, no limit.
     pub(super) async fn rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
         let mut out = Vec::new();
@@ -340,6 +390,22 @@ pub(crate) mod tests {
             let e = conn.execute("select 1 from nope", 5).await.unwrap_err();
             assert_eq!(e.code.as_deref(), Some("42P01"));
             assert_eq!(e.position, Some("select 1 from ".len()));
+
+            let dir = std::env::temp_dir().join(format!("monocode-export-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("out.csv");
+            let n = conn
+                .export("select g, 'a,b' as t from generate_series(1, 1500) g", &file, crate::db::ExportFormat::Csv)
+                .await
+                .unwrap();
+            assert_eq!(n, 1500, "export ignores the row limit");
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(text.starts_with("g,t\n1,\"a,b\"\n"), "{}", &text[..30]);
+            assert_eq!(text.lines().count(), 1501);
+            let empty = dir.join("empty.json");
+            assert_eq!(conn.export("select 1 where false", &empty, crate::db::ExportFormat::Json).await.unwrap(), 0);
+            assert_eq!(std::fs::read_to_string(&empty).unwrap().trim(), "[]");
+            let _ = std::fs::remove_dir_all(&dir);
 
             let conn = std::sync::Arc::new(conn);
             let running = {

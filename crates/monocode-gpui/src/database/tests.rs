@@ -182,3 +182,265 @@ fn key(name: &str, shift: bool) -> gpui::KeyDownEvent {
         prefer_character_input: false,
     }
 }
+
+fn long_result() -> QueryResult {
+    let mut result = sample();
+    result.columns = (0..30)
+        .map(|i| ResultColumn {
+            name: format!("column_{i}"),
+        })
+        .collect();
+    result.rows = (0..500)
+        .map(|r| {
+            (0..30)
+                .map(|c| Some(format!("value {r} {c} with some text")))
+                .collect()
+        })
+        .collect();
+    result
+}
+
+fn load(view: &mut DatabaseView, result: QueryResult) {
+    let console = &mut view.consoles[0];
+    console.widths = grid::column_widths(&result);
+    console.numeric = grid::numeric_columns(&result);
+    console.result = Some(Arc::new(result));
+}
+
+fn wheel(
+    visual: &mut gpui::VisualTestContext,
+    at: gpui::Point<gpui::Pixels>,
+    dx: f32,
+    dy: f32,
+    shift: bool,
+) {
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(dx), px(dy))),
+        modifiers: gpui::Modifiers {
+            shift,
+            ..Default::default()
+        },
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+}
+
+#[gpui::test]
+fn the_grid_scrolls_both_ways_and_stops_at_its_edges(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            load(view, long_result());
+        })
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let grid = visual.debug_bounds("database-grid").expect("grid");
+    let at = grid.center();
+    let state = |visual: &mut gpui::VisualTestContext| {
+        window
+            .read_with(visual, |v, _| {
+                (v.consoles[0].scroll_x, v.consoles[0].scroll_y)
+            })
+            .unwrap()
+    };
+    assert_eq!(state(visual), (0., 0.));
+    // GPUI wheel deltas are negative when content moves up/left.
+    wheel(visual, at, 0., -100., false);
+    assert_eq!(state(visual), (0., 100.));
+    wheel(visual, at, -150., 0., false);
+    assert_eq!(state(visual), (150., 100.));
+    wheel(visual, at, 0., -40., true);
+    assert_eq!(
+        state(visual),
+        (190., 100.),
+        "shift turns the wheel sideways"
+    );
+    wheel(visual, at, 9999., 9999., false);
+    assert_eq!(state(visual), (0., 0.), "never past the start");
+    wheel(visual, at, -99999., -999999., false);
+    let (x, y) = state(visual);
+    let (max_x, max_y) = window
+        .read_with(visual, |v, _| v.grid_max_scroll(0))
+        .unwrap();
+    assert_eq!((x, y), (max_x, max_y));
+    assert!(max_x > 1000. && max_y > 5000.);
+    // The last row exists and the first does not once scrolled to the end.
+    let rows = window
+        .read_with(visual, |v, _| {
+            let body = v.grid_viewport.get().1 - grid::HEADER_HEIGHT - grid::BAR;
+            grid::visible_rows(v.consoles[0].scroll_y, body, 500)
+        })
+        .unwrap();
+    assert_eq!(rows.end, 500);
+    assert!(rows.start > 400);
+}
+
+#[gpui::test]
+fn a_closed_console_can_be_opened_again_from_the_tree(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, window, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            view.consoles[0].editor.update(cx, |input, cx| {
+                input.set_text("-- orders\nselect 1".into(), cx)
+            });
+            view.new_console(window, cx);
+            view.close_console(&source, 1, window, cx);
+            assert!(view.console_index(&source, 1).is_none(), "the tab is gone");
+            assert!(
+                view.saved[&source]
+                    .iter()
+                    .any(|(id, title)| *id == 1 && title == "orders"),
+                "but the console is still listed"
+            );
+            view.expanded.insert(format!("s:{source}"));
+            view.expanded.insert(format!("c:{source}"));
+            let rows = view.rows();
+            assert!(
+                rows.iter()
+                    .any(|r| matches!(r, TreeRow::SavedConsole(_, 1, t, false) if t == "orders"))
+            );
+            view.open_console(&source, 1, window, cx);
+            assert_eq!(view.active.get(&source), Some(&1));
+            let text = view
+                .active_console()
+                .unwrap()
+                .editor
+                .read(cx)
+                .content
+                .to_string();
+            assert_eq!(text, "-- orders\nselect 1");
+            view.delete_console(&source, 1, window, cx);
+            assert!(!view.saved[&source].iter().any(|(id, _)| *id == 1));
+            assert!(view.console_store.list(&source).iter().all(|id| *id != 1));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn open_tabs_come_back_after_a_restart_and_closed_ones_stay_closed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    let source = window
+        .update(cx, |view, window, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            view.consoles[0]
+                .editor
+                .update(cx, |i, cx| i.set_text("select 1".into(), cx));
+            view.new_console(window, cx);
+            view.consoles[1]
+                .editor
+                .update(cx, |i, cx| i.set_text("select 2".into(), cx));
+            view.close_console(&source, 1, window, cx);
+            view.save_state();
+            source
+        })
+        .unwrap();
+    drop(window);
+    let again = open(cx, dir.path());
+    again
+        .update(cx, |view, _, _| {
+            let open: Vec<u32> = view.consoles.iter().map(|c| c.id).collect();
+            assert_eq!(open, [2]);
+            assert_eq!(view.saved[&source].len(), 2, "console 1 is still saved");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_editor_is_coloured_as_sql_and_disconnect_forgets_the_tree(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            view.consoles[0].editor.update(cx, |i, cx| {
+                i.replace_bytes(0..0, "select 'x' from t", 17, cx)
+            });
+            view.expanded.insert(format!("s:{source}"));
+            view.nodes.insert(source.clone(), SourceNode::new());
+            view.disconnect_source(&source, cx);
+            assert!(!view.nodes.contains_key(&source));
+            assert!(!view.expanded.contains(&format!("s:{source}")));
+        })
+        .unwrap();
+    // The editor's change event is delivered once the update above has ended.
+    window
+        .update(cx, |view, _, cx| {
+            let tokens = view.consoles[0]
+                .editor
+                .read(cx)
+                .editor_analysis()
+                .tokens
+                .len();
+            assert!(
+                tokens >= 3,
+                "keywords and the string are coloured, got {tokens}"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_loaded_rows_copy_as_csv_and_json(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            load(view, sample());
+            view.copy_result(monocode_core::db::ExportFormat::Csv, cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                Some("id,payload\n1,\"{\"\"a\"\":[1,2]}\"\n2,\n")
+            );
+            view.copy_result(monocode_core::db::ExportFormat::Json, cx);
+            let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json[0]["payload"]["a"][1], 2);
+            assert!(json[1]["payload"].is_null());
+            assert_eq!(
+                view.consoles[0].note.as_deref(),
+                Some("Copied 2 rows as JSON")
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn typing_offers_tables_and_columns_from_the_catalog(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            *view.catalog_for(&source).write().unwrap() =
+                sql::Catalog::from_entries(vec![monocode_core::db::CatalogEntry {
+                    schema: "public".into(),
+                    table: "orders".into(),
+                    kind: TableKind::Table,
+                    column: "customer_id".into(),
+                    type_name: "integer".into(),
+                }]);
+            view.consoles[0].editor.update(cx, |i, cx| {
+                i.replace_bytes(0..0, "select * from ord", 17, cx);
+                i.schedule_completion(true, cx);
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            let labels = view.consoles[0].editor.read(cx).completion_labels();
+            assert_eq!(labels, ["orders"]);
+        })
+        .unwrap();
+}

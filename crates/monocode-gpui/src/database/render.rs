@@ -76,8 +76,8 @@ impl DatabaseView {
                             .contains(&format!("t:{source}/{schema}/{name}")),
                     ),
                     match kind {
-                        Some(TableKind::View | TableKind::MaterializedView) => "eye",
-                        _ => "table",
+                        Some(TableKind::View | TableKind::MaterializedView) => "db-view",
+                        _ => "db-table",
                     },
                     name,
                     table
@@ -90,16 +90,40 @@ impl DatabaseView {
             TreeRow::Column(depth, column) => (
                 *depth,
                 None,
-                if column.primary_key { "key" } else { "dot" },
+                if column.primary_key {
+                    "db-key"
+                } else {
+                    "db-column"
+                },
                 column.name.clone(),
                 Some(column.type_name.clone()),
                 false,
+            ),
+            TreeRow::Consoles(source) => (
+                1,
+                Some(self.expanded.contains(&format!("c:{source}"))),
+                "db-console",
+                "Consoles".to_owned(),
+                self.saved.get(source).map(|l| l.len().to_string()),
+                false,
+            ),
+            TreeRow::SavedConsole(source, id, title, open) => (
+                2,
+                None,
+                "db-console",
+                title.clone(),
+                open.then(|| "open".to_owned()),
+                self.active.get(source) == Some(id) && self.selected.as_deref() == Some(source),
             ),
             TreeRow::Note(depth, text) => (*depth, None, "", text.clone(), None, false),
         };
         let is_note = matches!(row, TreeRow::Note(..));
         let tint = match row {
             TreeRow::Source(id) => color_of(self.source(id).and_then(|s| s.color)),
+            _ => None,
+        };
+        let forget = match row {
+            TreeRow::SavedConsole(source, id, ..) => Some((source.clone(), *id)),
             _ => None,
         };
         let row = row.clone();
@@ -154,6 +178,30 @@ impl DatabaseView {
                         .text_size(px(11.))
                         .text_color(content(0.35))
                         .child(text),
+                )
+            })
+            .when_some(forget, |d, (source, id)| {
+                d.child(
+                    div()
+                        .id(("database-console-forget", ix))
+                        .role(Role::Button)
+                        .aria_label("Delete console")
+                        .size(px(18.))
+                        .flex_shrink_0()
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(content(0.3))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .child(icon("trash", 11.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.delete_console(&source, id, window, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
                 )
             })
             .when(!is_note, |d| {
@@ -231,6 +279,19 @@ impl DatabaseView {
                             if let Some(id) = this.selected.clone() {
                                 this.expanded.insert(format!("s:{id}"));
                                 this.refresh_source(&id, cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        header_button(
+                            "database-disconnect",
+                            "Disconnect",
+                            "db-disconnect",
+                            selected.as_deref().is_some_and(|id| self.is_connected(id)),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(id) = this.selected.clone() {
+                                this.disconnect_source(&id, cx);
                             }
                         })),
                     )
@@ -513,12 +574,15 @@ impl DatabaseView {
         let Some(result) = console.result.clone() else {
             return div().into_any_element();
         };
-        let selected = console.selected;
+        let (selected, sx, sy) = (console.selected, console.scroll_x, console.scroll_y);
         let total: f32 = console.widths.iter().sum();
         let widths = console.widths.clone();
         let numeric = console.numeric.clone();
         let data = &result.rows[row];
         div()
+            .absolute()
+            .left(px(-sx))
+            .top(px(row as f32 * grid::ROW_HEIGHT - sy))
             .w(px(total))
             .h(px(grid::ROW_HEIGHT))
             .flex()
@@ -578,9 +642,264 @@ impl DatabaseView {
             .into_any_element()
     }
 
+    fn scrollbar(&self, vertical: bool, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (total, rows) = self.grid_size(ix);
+        let (vw, vh) = self.grid_viewport.get();
+        let console = &self.consoles[ix];
+        let (track, content_len, scroll) = if vertical {
+            (
+                (vh - grid::HEADER_HEIGHT - grid::BAR).max(0.),
+                rows as f32 * grid::ROW_HEIGHT,
+                console.scroll_y,
+            )
+        } else {
+            ((vw - grid::BAR).max(0.), total, console.scroll_x)
+        };
+        let (offset, len) = grid::thumb(track, content_len, scroll)?;
+        let thumb = div()
+            .id(if vertical {
+                "database-bar-y"
+            } else {
+                "database-bar-x"
+            })
+            .absolute()
+            .rounded(px(4.))
+            .bg(content(0.25))
+            .hover(|s| s.bg(content(0.4)))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    let Some(ix) = this.active_index() else {
+                        return;
+                    };
+                    let console = &this.consoles[ix];
+                    this.resize = Some(if vertical {
+                        Resize::Bar(true, f32::from(event.position.y), console.scroll_y)
+                    } else {
+                        Resize::Bar(false, f32::from(event.position.x), console.scroll_x)
+                    });
+                    cx.stop_propagation();
+                }),
+            );
+        Some(
+            if vertical {
+                thumb
+                    .top(px(grid::HEADER_HEIGHT + offset))
+                    .right(px(1.))
+                    .w(px(grid::BAR - 2.))
+                    .h(px(len))
+            } else {
+                thumb
+                    .left(px(offset))
+                    .bottom(px(1.))
+                    .h(px(grid::BAR - 2.))
+                    .w(px(len))
+            }
+            .into_any_element(),
+        )
+    }
+
+    fn grid(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let console = &self.consoles[ix];
+        let Some(result) = console.result.clone() else {
+            return div().into_any_element();
+        };
+        let widths = console.widths.clone();
+        let total: f32 = widths.iter().sum();
+        let rows = result.rows.len();
+        let (sx, sy) = (console.scroll_x, console.scroll_y);
+        let (vw, vh) = self.grid_viewport.get();
+        // Before the first paint the viewport is unknown: build a screenful.
+        let body = if vh > 0. {
+            (vh - grid::HEADER_HEIGHT - grid::BAR).max(0.)
+        } else {
+            900.
+        };
+        let visible = grid::visible_rows(sy, body, rows);
+        let viewport = self.grid_viewport.clone();
+        let _ = vw;
+        let rows_el: Vec<AnyElement> = visible.map(|row| self.grid_row(ix, row, cx)).collect();
+        let vbar = self.scrollbar(true, ix, cx);
+        let hbar = self.scrollbar(false, ix, cx);
+        div()
+            .id("database-grid")
+            .debug_selector(|| "database-grid".into())
+            .track_focus(&self.grid_focus)
+            .key_context("DatabaseGrid")
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.grid_key(event, cx)),
+            )
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                let Some(ix) = this.active_index() else {
+                    return;
+                };
+                let delta = event.delta.pixel_delta(px(grid::ROW_HEIGHT));
+                let (mut dx, mut dy) = (f32::from(delta.x), f32::from(delta.y));
+                if event.modifiers.shift && dx == 0. {
+                    (dx, dy) = (dy, 0.);
+                }
+                let console = &this.consoles[ix];
+                let (x, y) = (console.scroll_x - dx, console.scroll_y - dy);
+                this.scroll_grid_to(ix, x, y);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        viewport.set((f32::from(bounds.size.width), f32::from(bounds.size.height)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right(px(grid::BAR))
+                    .h(px(grid::HEADER_HEIGHT))
+                    .overflow_hidden()
+                    .border_b_1()
+                    .border_color(content(0.1))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(-sx))
+                            .top_0()
+                            .w(px(total))
+                            .h_full()
+                            .flex()
+                            .children(result.columns.iter().zip(widths).map(|(column, width)| {
+                                div()
+                                    .w(px(width))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .px(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .border_r_1()
+                                    .border_color(content(0.07))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(content(0.6))
+                                    .child(div().truncate().child(column.name.clone()))
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(grid::HEADER_HEIGHT))
+                    .left_0()
+                    .right(px(grid::BAR))
+                    .bottom(px(grid::BAR))
+                    .overflow_hidden()
+                    .children(rows_el),
+            )
+            .children(vbar)
+            .children(hbar)
+            .into_any_element()
+    }
+
+    fn export_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_core::db::ExportFormat::{Csv, Json, Tsv};
+        if !self.export_menu {
+            return None;
+        }
+        let entry = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .role(Role::MenuItem)
+                .aria_label(label)
+                .h(px(26.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .hover(|s| s.bg(content(0.1)))
+                .child(label)
+        };
+        Some(
+            div()
+                .absolute()
+                .right(px(8.))
+                .bottom(px(28.))
+                .w(px(220.))
+                .p(px(4.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(content(0.12))
+                .bg(content(0.1))
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.export_menu = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(3.))
+                        .text_size(px(10.))
+                        .text_color(content(0.45))
+                        .child("COPY LOADED ROWS"),
+                )
+                .child(
+                    entry("database-copy-csv", "As CSV")
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Csv, cx))),
+                )
+                .child(
+                    entry("database-copy-tsv", "As TSV")
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Tsv, cx))),
+                )
+                .child(
+                    entry("database-copy-json", "As JSON")
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_result(Json, cx))),
+                )
+                .child(div().h(px(1.)).my(px(3.)).bg(content(0.1)))
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(3.))
+                        .text_size(px(10.))
+                        .text_color(content(0.45))
+                        .child("SAVE ALL ROWS TO A FILE"),
+                )
+                .child(
+                    entry("database-save-csv", "CSV…")
+                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Csv, cx))),
+                )
+                .child(
+                    entry("database-save-tsv", "TSV…")
+                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Tsv, cx))),
+                )
+                .child(
+                    entry("database-save-json", "JSON…")
+                        .on_click(cx.listener(|this, _, _, cx| this.export_all(Json, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn results(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let status = self.status_line(ix);
         let console = &self.consoles[ix];
+        let note = console.note.clone();
+        let has_grid = console
+            .result
+            .as_ref()
+            .is_some_and(|r| !r.columns.is_empty());
         let body: AnyElement = if let Some((error, statement)) = console.error.clone() {
             Self::error_panel(&error, &statement)
         } else if let Some(result) = console.result.clone() {
@@ -592,66 +911,7 @@ impl DatabaseView {
                     .child(result.statement.lines().next().unwrap_or("").to_owned())
                     .into_any_element()
             } else {
-                let widths = console.widths.clone();
-                let total: f32 = widths.iter().sum();
-                let rows = result.rows.len();
-                let entity = cx.entity();
-                div()
-                    .id("database-grid")
-                    .track_focus(&self.grid_focus)
-                    .key_context("DatabaseGrid")
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                        this.grid_key(event, cx)
-                    }))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_x_scroll()
-                    .child(
-                        div()
-                            .w(px(total.max(1.)))
-                            .min_w_full()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .w(px(total))
-                                    .h(px(grid::HEADER_HEIGHT))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .border_b_1()
-                                    .border_color(content(0.1))
-                                    .children(result.columns.iter().zip(widths).map(
-                                        |(column, width)| {
-                                            div()
-                                                .w(px(width))
-                                                .h_full()
-                                                .flex_shrink_0()
-                                                .px(px(8.))
-                                                .flex()
-                                                .items_center()
-                                                .border_r_1()
-                                                .border_color(content(0.07))
-                                                .text_size(px(11.5))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(content(0.6))
-                                                .child(div().truncate().child(column.name.clone()))
-                                        },
-                                    )),
-                            )
-                            .child(
-                                uniform_list("database-grid-rows", rows, move |range, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        range
-                                            .map(|row| this.grid_row(ix, row, cx))
-                                            .collect::<Vec<_>>()
-                                    })
-                                })
-                                .flex_1()
-                                .min_h_0(),
-                            ),
-                    )
-                    .into_any_element()
+                self.grid(ix, cx)
             }
         } else {
             div()
@@ -662,6 +922,7 @@ impl DatabaseView {
                 .into_any_element()
         };
         div()
+            .relative()
             .flex_1()
             .min_h_0()
             .flex()
@@ -674,12 +935,34 @@ impl DatabaseView {
                     .px(px(10.))
                     .flex()
                     .items_center()
+                    .gap(px(10.))
                     .border_t_1()
                     .border_color(content(0.07))
                     .text_size(px(11.))
                     .text_color(content(0.45))
-                    .child(status),
+                    .child(div().min_w_0().truncate().child(status))
+                    .when_some(note, |d, text| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(content(0.7))
+                                .child(text),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .when(has_grid, |d| {
+                        d.child(
+                            icon_button("database-export", "Export", "db-export")
+                                .size(px(22.))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_menu = !this.export_menu;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
+            .children(self.export_menu(cx))
             .into_any_element()
     }
 
@@ -928,6 +1211,27 @@ impl Render for DatabaseView {
                             let max = (f32::from(window.viewport_size().height) - 260.).max(120.);
                             this.editor_height =
                                 (height + f32::from(event.position.y) - start).clamp(80., max);
+                        }
+                        Some(Resize::Bar(vertical, start, from)) => {
+                            let Some(ix) = this.active_index() else {
+                                return;
+                            };
+                            let (total, rows) = this.grid_size(ix);
+                            let (vw, vh) = this.grid_viewport.get();
+                            let (max_x, max_y) = grid::max_scroll(total, rows, vw, vh);
+                            let (x, y) = (this.consoles[ix].scroll_x, this.consoles[ix].scroll_y);
+                            if vertical {
+                                let track = (vh - grid::HEADER_HEIGHT - grid::BAR).max(1.);
+                                let content = rows as f32 * grid::ROW_HEIGHT;
+                                let ratio = (content - track).max(1.) / (track - 28.).max(1.);
+                                let delta = (f32::from(event.position.y) - start) * ratio;
+                                this.scroll_grid_to(ix, x, (from + delta).clamp(0., max_y));
+                            } else {
+                                let track = (vw - grid::BAR).max(1.);
+                                let ratio = (total - track).max(1.) / (track - 28.).max(1.);
+                                let delta = (f32::from(event.position.x) - start) * ratio;
+                                this.scroll_grid_to(ix, (from + delta).clamp(0., max_x), y);
+                            }
                         }
                         None => return,
                     }

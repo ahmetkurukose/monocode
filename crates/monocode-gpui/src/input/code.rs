@@ -19,6 +19,10 @@ struct MarkerHit {
     message: String,
 }
 
+pub(crate) type Completer = std::sync::Arc<
+    dyn Fn(&str, usize, bool) -> Vec<crate::editor_analysis::Completion> + Send + Sync,
+>;
+
 pub(super) struct Code {
     hovered_change: Option<usize>,
     can_stage: bool,
@@ -30,6 +34,8 @@ pub(super) struct Code {
     completion_index: usize,
     completion_task: Option<Task<()>>,
     completion_source: Option<(SharedString, usize)>,
+    /// Replaces the QuickJS completion (SQL consoles know their catalog).
+    completer: Option<Completer>,
     folded: Vec<crate::editor_analysis::Fold>,
     search_matches: Vec<Range<usize>>,
     offsets: Vec<usize>,
@@ -64,6 +70,7 @@ impl Code {
             completion_index: 0,
             completion_task: None,
             completion_source: None,
+            completer: None,
             folded: Vec::new(),
             search_matches: Vec::new(),
             offsets: vec![0],
@@ -180,6 +187,18 @@ impl Input {
             code.layout_width = None;
         }
     }
+    #[cfg(test)]
+    pub(crate) fn completion_labels(&self) -> Vec<String> {
+        self.code
+            .as_ref()
+            .map(|c| c.completions.iter().map(|o| o.label.clone()).collect())
+            .unwrap_or_default()
+    }
+    pub(crate) fn set_editor_completer(&mut self, completer: Completer) {
+        if let Some(code) = &mut self.code {
+            code.completer = Some(completer);
+        }
+    }
     pub(crate) fn set_editor_path(&mut self, path: String) {
         if let Some(code) = &mut self.code {
             code.path = path;
@@ -260,6 +279,7 @@ impl Input {
         }
         let source = self.content.clone();
         let path = code.path.clone();
+        let completer = code.completer.clone();
         code.completion_source = Some((source.clone(), at));
         code.completion_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -272,7 +292,12 @@ impl Input {
             let text = source.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::editor_analysis::complete(&path, &text, at, explicit) })
+                .spawn(async move {
+                    match completer {
+                        Some(complete) => Ok(complete(&text, at, explicit)),
+                        None => crate::editor_analysis::complete(&path, &text, at, explicit),
+                    }
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.content == source
@@ -465,6 +490,9 @@ impl Input {
                                         "function" => "ƒ",
                                         "keyword" => "k",
                                         "variable" => "v",
+                                        "table" => "T",
+                                        "column" => "c",
+                                        "schema" => "S",
                                         _ => "·",
                                     },
                                 ))

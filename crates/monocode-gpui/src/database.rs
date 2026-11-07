@@ -6,6 +6,7 @@
 mod dialog;
 mod grid;
 mod render;
+mod sql;
 #[cfg(test)]
 mod tests;
 
@@ -26,10 +27,12 @@ use monocode_core::db::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     future::Future,
     path::PathBuf,
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -48,6 +51,8 @@ struct SavedState {
     limit: usize,
     selected: Option<String>,
     active: HashMap<String, u32>,
+    /// The consoles open as tabs per data source; the rest are only saved.
+    open: HashMap<String, Vec<u32>>,
     expanded: Vec<String>,
 }
 
@@ -59,6 +64,7 @@ impl Default for SavedState {
             limit: 500,
             selected: None,
             active: HashMap::new(),
+            open: HashMap::new(),
             expanded: Vec::new(),
         }
     }
@@ -108,6 +114,9 @@ struct Console {
     error: Option<(DbError, String)>,
     running: bool,
     selected: Option<(usize, usize)>,
+    scroll_x: f32,
+    scroll_y: f32,
+    note: Option<String>,
     task: Option<Task<()>>,
     saver: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -117,6 +126,8 @@ struct Console {
 enum TreeRow {
     Source(String),
     Note(usize, String),
+    Consoles(String),
+    SavedConsole(String, u32, String, bool),
     Schema(String, String),
     Table(String, String, usize),
     Column(usize, ColumnInfo),
@@ -125,6 +136,8 @@ enum TreeRow {
 enum Resize {
     Tree(f32, f32),
     Editor(f32, f32),
+    /// Dragging a grid scrollbar: (vertical, mouse start, scroll start).
+    Bar(bool, f32, f32),
 }
 
 pub(crate) struct DatabaseView {
@@ -135,6 +148,12 @@ pub(crate) struct DatabaseView {
     nodes: HashMap<String, SourceNode>,
     selected: Option<String>,
     active: HashMap<String, u32>,
+    open: HashMap<String, Vec<u32>>,
+    saved: HashMap<String, Vec<(u32, String)>>,
+    catalogs: HashMap<String, Arc<RwLock<sql::Catalog>>>,
+    catalog_started: HashSet<String>,
+    grid_viewport: Rc<Cell<(f32, f32)>>,
+    export_menu: bool,
     consoles: Vec<Console>,
     expanded: HashSet<String>,
     passwords: HashMap<String, String>,
@@ -157,6 +176,15 @@ impl Focusable for DatabaseView {
         self.active_console()
             .map(|c| c.editor.focus_handle(cx))
             .unwrap_or_else(|| self.focus.clone())
+    }
+}
+
+/// A console's name: its first line when that is a `-- comment`, else its number.
+fn title_of(text: &str, id: u32) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    match first.strip_prefix("--").map(str::trim) {
+        Some(title) if !title.is_empty() => title.chars().take(24).collect(),
+        _ => format!("Console {id}"),
     }
 }
 
@@ -184,6 +212,12 @@ impl DatabaseView {
             nodes: HashMap::new(),
             selected,
             active: saved.active,
+            open: saved.open,
+            saved: HashMap::new(),
+            catalogs: HashMap::new(),
+            catalog_started: HashSet::new(),
+            grid_viewport: Rc::new(Cell::new((0., 0.))),
+            export_menu: false,
             consoles: Vec::new(),
             expanded: saved.expanded.into_iter().collect(),
             passwords: HashMap::new(),
@@ -216,6 +250,7 @@ impl DatabaseView {
             limit: self.limit,
             selected: self.selected.clone(),
             active: self.active.clone(),
+            open: self.open.clone(),
             expanded: self.expanded.iter().cloned().collect(),
         };
         if let Ok(json) = serde_json::to_vec_pretty(&state) {
@@ -274,16 +309,44 @@ impl DatabaseView {
         self.console_index(source, *self.active.get(source)?)
     }
 
+    fn catalog_for(&mut self, source: &str) -> Arc<RwLock<sql::Catalog>> {
+        self.catalogs.entry(source.to_owned()).or_default().clone()
+    }
+
+    /// Re-reads which consoles are saved for `source` and their titles.
+    fn refresh_saved(&mut self, source: &str) {
+        let list = self
+            .console_store
+            .list(source)
+            .into_iter()
+            .map(|id| {
+                let text = self.console_store.load(source, id);
+                (id, title_of(&text, id))
+            })
+            .collect();
+        self.saved.insert(source.to_owned(), list);
+    }
+
     fn ensure_consoles(&mut self, source: &str, cx: &mut Context<Self>) {
         if !self.consoles.iter().any(|c| c.source == source) {
             let mut ids = self.console_store.list(source);
             if ids.is_empty() {
                 ids.push(1);
             }
-            for id in ids {
+            let wanted = self.open.get(source).cloned();
+            let mut opened: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|id| wanted.as_ref().is_none_or(|open| open.contains(id)))
+                .collect();
+            if opened.is_empty() {
+                opened.push(ids[0]);
+            }
+            for id in opened {
                 let text = self.console_store.load(source, id);
                 self.add_console(source, id, text, cx);
             }
+            self.refresh_saved(source);
         }
         let first = self
             .consoles
@@ -297,15 +360,32 @@ impl DatabaseView {
         if !valid && let Some(first) = first {
             self.active.insert(source.to_owned(), first);
         }
+        self.remember_open(source);
+    }
+
+    fn remember_open(&mut self, source: &str) {
+        let ids = self
+            .consoles
+            .iter()
+            .filter(|c| c.source == source)
+            .map(|c| c.id)
+            .collect();
+        self.open.insert(source.to_owned(), ids);
     }
 
     fn add_console(&mut self, source: &str, id: u32, text: String, cx: &mut Context<Self>) {
+        let catalog = self.catalog_for(source);
         let editor = cx.new(Input::editor);
         editor.update(cx, |input, cx| {
             input.set_editor_path("console.sql".into());
+            input.set_editor_completer(Arc::new(move |text, at, explicit| match catalog.read() {
+                Ok(catalog) => sql::complete(&catalog, text, at, explicit),
+                Err(_) => Vec::new(),
+            }));
             if !text.is_empty() {
-                input.set_text(text, cx);
+                input.set_text(text.clone(), cx);
             }
+            input.set_editor_analysis(sql::analyse(&text), cx);
         });
         let key = (source.to_owned(), id);
         let subscriptions = vec![
@@ -329,6 +409,9 @@ impl DatabaseView {
             error: None,
             running: false,
             selected: None,
+            scroll_x: 0.,
+            scroll_y: 0.,
+            note: None,
             task: None,
             saver: None,
             _subscriptions: subscriptions,
@@ -340,16 +423,34 @@ impl DatabaseView {
             return;
         };
         let id = self
-            .consoles
-            .iter()
-            .filter(|c| c.source == source)
-            .map(|c| c.id)
+            .console_store
+            .list(&source)
+            .into_iter()
+            .chain(
+                self.consoles
+                    .iter()
+                    .filter(|c| c.source == source)
+                    .map(|c| c.id),
+            )
             .max()
             .unwrap_or(0)
             + 1;
         self.add_console(&source, id, String::new(), cx);
         let _ = self.console_store.save(&source, id, "");
+        self.refresh_saved(&source);
+        self.remember_open(&source);
         self.activate(&source, id, window, cx);
+    }
+
+    /// Brings a saved console back as a tab (or just switches to it).
+    fn open_console(&mut self, source: &str, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_source(source, cx);
+        if self.console_index(source, id).is_none() {
+            let text = self.console_store.load(source, id);
+            self.add_console(source, id, text, cx);
+            self.remember_open(source);
+        }
+        self.activate(source, id, window, cx);
     }
 
     fn activate(&mut self, source: &str, id: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -361,6 +462,8 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// Closes the tab. The text stays saved and is listed under Consoles in
+    /// the tree; an empty console is not worth keeping.
     fn close_console(
         &mut self,
         source: &str,
@@ -377,14 +480,60 @@ impl DatabaseView {
         {
             conn.cancel();
         }
-        self.console_store.delete(source, id);
+        let text = console.editor.read(cx).content.to_string();
+        if text.trim().is_empty() {
+            self.console_store.delete(source, id);
+        } else {
+            let _ = self.console_store.save(source, id, &text);
+        }
+        self.refresh_saved(source);
         if self.active.get(source) == Some(&id) {
             self.active.remove(source);
         }
         if !self.consoles.iter().any(|c| c.source == source) {
+            let next = self
+                .console_store
+                .list(source)
+                .first()
+                .copied()
+                .unwrap_or(1);
+            let text = self.console_store.load(source, next);
+            self.add_console(source, next, text, cx);
+        }
+        self.ensure_consoles(source, cx);
+        if let Some(next) = self.active.get(source).copied() {
+            self.activate(source, next, window, cx);
+        }
+        self.refresh_saved(source);
+        cx.notify();
+    }
+
+    /// Forgets a console for good.
+    fn delete_console(
+        &mut self,
+        source: &str,
+        id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.console_index(source, id) {
+            // Close without saving the text back.
+            let console = self.consoles.remove(ix);
+            if let Some(conn) = &console.conn
+                && console.running
+            {
+                conn.cancel();
+            }
+            if self.active.get(source) == Some(&id) {
+                self.active.remove(source);
+            }
+        }
+        self.console_store.delete(source, id);
+        if !self.consoles.iter().any(|c| c.source == source) {
             self.add_console(source, 1, String::new(), cx);
         }
         self.ensure_consoles(source, cx);
+        self.refresh_saved(source);
         if let Some(next) = self.active.get(source).copied() {
             self.activate(source, next, window, cx);
         }
@@ -395,28 +544,38 @@ impl DatabaseView {
         let Some(ix) = self.console_index(source, id) else {
             return;
         };
-        let store = self.console_store.clone();
         let editor = self.consoles[ix].editor.clone();
+        let text = editor.read(cx).content.to_string();
+        // Colours follow the text at once; the analysis is a single pass.
+        editor.update(cx, |input, cx| {
+            input.set_editor_analysis(sql::analyse(&text), cx)
+        });
+        let store = self.console_store.clone();
         let key = (source.to_owned(), id);
         self.consoles[ix].saver = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            let _ = this.update(cx, |_, cx| {
+            let _ = this.update(cx, |this, cx| {
                 let text = editor.read(cx).content.to_string();
                 let _ = store.save(&key.0, key.1, &text);
+                if let Some(entry) = this
+                    .saved
+                    .get_mut(&key.0)
+                    .and_then(|list| list.iter_mut().find(|(i, _)| *i == key.1))
+                {
+                    entry.1 = title_of(&text, key.1);
+                } else {
+                    this.refresh_saved(&key.0);
+                }
+                cx.notify();
             });
         }));
         cx.notify();
     }
 
     fn tab_title(&self, console: &Console, cx: &Context<Self>) -> String {
-        let text = console.editor.read(cx).content.clone();
-        let first = text.lines().next().unwrap_or("").trim();
-        match first.strip_prefix("--").map(str::trim) {
-            Some(title) if !title.is_empty() => title.chars().take(24).collect(),
-            _ => format!("Console {}", console.id),
-        }
+        title_of(&console.editor.read(cx).content, console.id)
     }
 
     // ---- running statements ----
@@ -482,13 +641,17 @@ impl DatabaseView {
             console.task = None;
             match out {
                 Some(Ok((conn, result))) => {
-                    console.conn = Some(conn);
+                    console.conn = Some(conn.clone());
                     if let Some(result) = result {
                         console.widths = grid::column_widths(&result);
                         console.numeric = grid::numeric_columns(&result);
                         console.result = Some(Arc::new(result));
                         console.selected = None;
+                        console.scroll_x = 0.;
+                        console.scroll_y = 0.;
+                        console.note = None;
                     }
+                    this.load_catalog(&key.0, conn, cx);
                 }
                 Some(Err((conn, error, statement))) => {
                     if conn.is_some() {
@@ -536,15 +699,20 @@ impl DatabaseView {
         let work = async move {
             let conn = Connection::connect(&data_source, password.as_deref()).await?;
             let schemas = conn.schemas(false).await?;
-            Ok::<_, DbError>((Arc::new(conn), schemas))
+            let catalog = conn.catalog().await.unwrap_or_default();
+            Ok::<_, DbError>((Arc::new(conn), schemas, catalog))
         };
         self.spawn_db(cx, work, move |this, out, cx| {
-            let node = this
-                .nodes
-                .entry(key.clone())
-                .or_insert_with(SourceNode::new);
             match out {
-                Some(Ok((conn, schemas))) => {
+                Some(Ok((conn, schemas, catalog))) => {
+                    if let Ok(mut shared) = this.catalog_for(&key).write() {
+                        *shared = sql::Catalog::from_entries(catalog);
+                    }
+                    this.catalog_started.insert(key.clone());
+                    let node = this
+                        .nodes
+                        .entry(key.clone())
+                        .or_insert_with(SourceNode::new);
                     node.conn = Some(conn);
                     node.link = Link::Ready;
                     node.schemas = Some(
@@ -554,13 +722,59 @@ impl DatabaseView {
                             .collect(),
                     );
                 }
-                Some(Err(error)) => node.link = Link::Failed(error.message),
-                None => node.link = Link::Failed("The connection task stopped".into()),
+                Some(Err(error)) => {
+                    let node = this
+                        .nodes
+                        .entry(key.clone())
+                        .or_insert_with(SourceNode::new);
+                    node.link = Link::Failed(error.message);
+                }
+                None => {
+                    let node = this
+                        .nodes
+                        .entry(key.clone())
+                        .or_insert_with(SourceNode::new);
+                    node.link = Link::Failed("The connection task stopped".into());
+                }
             }
             cx.notify();
         })
         .detach();
         cx.notify();
+    }
+
+    /// Loads the completion catalog once per connection, over a connection
+    /// that is already open (a console's).
+    fn load_catalog(&mut self, source: &str, conn: Arc<Connection>, cx: &mut Context<Self>) {
+        if !self.catalog_started.insert(source.to_owned()) {
+            return;
+        }
+        let key = source.to_owned();
+        let work = async move { conn.catalog().await };
+        self.spawn_db(cx, work, move |this, out, cx| {
+            match out {
+                Some(Ok(entries)) => {
+                    if let Ok(mut shared) = this.catalog_for(&key).write() {
+                        *shared = sql::Catalog::from_entries(entries);
+                    }
+                }
+                _ => {
+                    this.catalog_started.remove(&key);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    fn is_connected(&self, id: &str) -> bool {
+        self.nodes
+            .get(id)
+            .is_some_and(|n| n.conn.as_ref().is_some_and(|c| !c.is_closed()))
+            || self
+                .consoles
+                .iter()
+                .any(|c| c.source == id && c.conn.as_ref().is_some_and(|c| !c.is_closed()))
     }
 
     fn disconnect_source(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -571,8 +785,14 @@ impl DatabaseView {
                 && !k.starts_with(&format!("t:{id}/"))
         });
         for console in self.consoles.iter_mut().filter(|c| c.source == id) {
+            if console.running
+                && let Some(conn) = &console.conn
+            {
+                conn.cancel();
+            }
             console.conn = None;
         }
+        self.catalog_started.remove(id);
         cx.notify();
     }
 
@@ -637,6 +857,18 @@ impl DatabaseView {
             if !self.expanded.contains(&format!("s:{}", source.id)) {
                 continue;
             }
+            rows.push(TreeRow::Consoles(source.id.clone()));
+            if self.expanded.contains(&format!("c:{}", source.id)) {
+                for (id, title) in self.saved.get(&source.id).into_iter().flatten() {
+                    let open = self.console_index(&source.id, *id).is_some();
+                    rows.push(TreeRow::SavedConsole(
+                        source.id.clone(),
+                        *id,
+                        title.clone(),
+                        open,
+                    ));
+                }
+            }
             let Some(node) = self.nodes.get(&source.id) else {
                 continue;
             };
@@ -697,6 +929,7 @@ impl DatabaseView {
             TreeRow::Source(id) => {
                 self.select_source(id, cx);
                 if self.toggle(format!("s:{id}")) {
+                    self.expanded.insert(format!("c:{id}"));
                     self.connect_source(id, cx);
                 }
             }
@@ -723,6 +956,10 @@ impl DatabaseView {
                     self.load_columns(source, schema, &name, cx);
                 }
             }
+            TreeRow::Consoles(source) => {
+                self.toggle(format!("c:{source}"));
+            }
+            TreeRow::SavedConsole(source, id, ..) => self.open_console(source, *id, window, cx),
             TreeRow::Column(..) | TreeRow::Note(..) => {}
         }
         self.save_state();
@@ -895,10 +1132,22 @@ impl DatabaseView {
                 };
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
-            "up" => self.consoles[ix].selected = Some((row.saturating_sub(1), col)),
-            "down" => self.consoles[ix].selected = Some(((row + 1).min(rows - 1), col)),
-            "left" => self.consoles[ix].selected = Some((row, col.saturating_sub(1))),
-            "right" => self.consoles[ix].selected = Some((row, (col + 1).min(cols - 1))),
+            "up" | "down" | "left" | "right" | "pageup" | "pagedown" | "home" | "end" => {
+                let page = ((self.grid_viewport.get().1 - grid::HEADER_HEIGHT) / grid::ROW_HEIGHT)
+                    .max(1.) as usize;
+                let next = match key {
+                    "up" => (row.saturating_sub(1), col),
+                    "down" => ((row + 1).min(rows - 1), col),
+                    "left" => (row, col.saturating_sub(1)),
+                    "right" => (row, (col + 1).min(cols - 1)),
+                    "pageup" => (row.saturating_sub(page), col),
+                    "pagedown" => ((row + page).min(rows - 1), col),
+                    "home" => (0, col),
+                    _ => (rows - 1, col),
+                };
+                self.consoles[ix].selected = Some(next);
+                self.reveal_cell(ix, next);
+            }
             "space" | "enter" => self.open_preview(ix, row, col),
             "escape" => cx.emit(Event::Close),
             _ => return,
@@ -921,5 +1170,111 @@ impl DatabaseView {
             None => "NULL".to_owned(),
         };
         self.preview = Some((title, text));
+    }
+
+    /// Total content width and row count of console `ix`'s grid.
+    fn grid_size(&self, ix: usize) -> (f32, usize) {
+        let console = &self.consoles[ix];
+        (
+            console.widths.iter().sum(),
+            console.result.as_ref().map_or(0, |r| r.rows.len()),
+        )
+    }
+
+    fn grid_max_scroll(&self, ix: usize) -> (f32, f32) {
+        let (total, rows) = self.grid_size(ix);
+        let (vw, vh) = self.grid_viewport.get();
+        grid::max_scroll(total, rows, vw, vh)
+    }
+
+    fn scroll_grid_to(&mut self, ix: usize, x: f32, y: f32) {
+        let (max_x, max_y) = self.grid_max_scroll(ix);
+        let console = &mut self.consoles[ix];
+        console.scroll_x = grid::clamp(x, max_x);
+        console.scroll_y = grid::clamp(y, max_y);
+    }
+
+    fn reveal_cell(&mut self, ix: usize, (row, col): (usize, usize)) {
+        let (vw, vh) = self.grid_viewport.get();
+        let console = &self.consoles[ix];
+        let left: f32 = console.widths.iter().take(col).sum();
+        let width = console.widths.get(col).copied().unwrap_or(0.);
+        let x = grid::reveal(console.scroll_x, left, width, (vw - grid::BAR).max(0.));
+        let body = (vh - grid::HEADER_HEIGHT - grid::BAR).max(0.);
+        let y = grid::reveal(
+            console.scroll_y,
+            row as f32 * grid::ROW_HEIGHT,
+            grid::ROW_HEIGHT,
+            body,
+        );
+        self.scroll_grid_to(ix, x, y);
+    }
+
+    // ---- export ----
+
+    fn copy_result(&mut self, format: monocode_core::db::ExportFormat, cx: &mut Context<Self>) {
+        let Some(result) = self.active_console().and_then(|c| c.result.clone()) else {
+            return;
+        };
+        let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+        let text = monocode_core::db::format_rows(format, &columns, &result.rows);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(ix) = self.active_index() {
+            self.consoles[ix].note = Some(format!(
+                "Copied {} rows as {}",
+                result.rows.len(),
+                format.label()
+            ));
+        }
+        self.export_menu = false;
+        cx.notify();
+    }
+
+    /// Asks for a file, then runs the console's last statement again and
+    /// streams every row of it there, past the row limit.
+    fn export_all(&mut self, format: monocode_core::db::ExportFormat, cx: &mut Context<Self>) {
+        self.export_menu = false;
+        let Some(ix) = self.active_index() else {
+            return;
+        };
+        let console = &self.consoles[ix];
+        let (Some(result), Some(conn)) = (console.result.clone(), console.conn.clone()) else {
+            return;
+        };
+        let (source, id) = (console.source.clone(), console.id);
+        let directory = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let name = format!("result.{}", format.extension());
+        let picker = cx.prompt_for_new_path(&directory, Some(&name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = picker.await else {
+                return;
+            };
+            let statement = result.statement.clone();
+            let target = path.clone();
+            let handle =
+                runtime().spawn(async move { conn.export(&statement, &target, format).await });
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ix) = this.console_index(&source, id) {
+                    this.consoles[ix].note = Some("Exporting…".into());
+                }
+                cx.notify();
+            });
+            let outcome = handle.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ix) = this.console_index(&source, id) {
+                    this.consoles[ix].note = Some(match outcome {
+                        Ok(Ok(rows)) => format!("Exported {rows} rows to {}", path.display()),
+                        Ok(Err(error)) => format!("Export failed: {}", error.message),
+                        Err(_) => "Export stopped".into(),
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }

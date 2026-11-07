@@ -33,7 +33,52 @@ pub fn literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// One column of one relation, for completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub schema: String,
+    pub table: String,
+    pub kind: TableKind,
+    pub column: String,
+    pub type_name: String,
+}
+
 impl Connection {
+    /// Every user column of every relation (capped), so completion knows
+    /// schemas, tables and columns without a round trip per keystroke.
+    pub async fn catalog(&self) -> Result<Vec<CatalogEntry>, DbError> {
+        let rows = self
+            .rows(
+                "select n.nspname, c.relname, c.relkind::text, a.attname, \
+                        format_type(a.atttypid, a.atttypmod) \
+                 from pg_attribute a \
+                 join pg_class c on c.oid = a.attrelid \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 where a.attnum > 0 and not a.attisdropped \
+                   and c.relkind in ('r', 'p', 'v', 'm', 'f') \
+                   and n.nspname not in ('pg_catalog', 'information_schema') \
+                   and n.nspname not like 'pg\\_toast%' and n.nspname not like 'pg\\_temp%' \
+                 order by n.nspname, c.relname, a.attnum \
+                 limit 60000",
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CatalogEntry {
+                schema: r[0].clone().unwrap_or_default(),
+                table: r[1].clone().unwrap_or_default(),
+                kind: match r[2].as_deref() {
+                    Some("v") => TableKind::View,
+                    Some("m") => TableKind::MaterializedView,
+                    Some("f") => TableKind::Foreign,
+                    _ => TableKind::Table,
+                },
+                column: r[3].clone().unwrap_or_default(),
+                type_name: r[4].clone().unwrap_or_default(),
+            })
+            .collect())
+    }
+
     pub async fn schemas(&self, system: bool) -> Result<Vec<String>, DbError> {
         let filter = if system {
             ""
@@ -155,6 +200,10 @@ mod tests {
             assert_eq!(columns[1].type_name, "jsonb");
             assert!(columns[1].default.as_deref().unwrap().contains("'{}'"));
             assert!(columns[2].nullable && !columns[2].primary_key);
+            let catalog = conn.catalog().await.unwrap();
+            let mine: Vec<_> = catalog.iter().filter(|e| e.schema == "mc_probe" && e.table == "t").collect();
+            assert_eq!(mine.iter().map(|e| e.column.as_str()).collect::<Vec<_>>(), ["id", "body", "note"]);
+            assert!(catalog.iter().any(|e| e.schema == "mc_probe" && e.table == "v" && e.kind == TableKind::View));
             conn.execute("drop schema mc_probe cascade", 1).await.unwrap();
         });
     }
