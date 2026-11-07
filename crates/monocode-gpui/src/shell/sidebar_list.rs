@@ -580,6 +580,10 @@ impl Shell {
                 .icon("inbox")
                 .toggle(self.workspace.sidebar_inbox_visible)
                 .into(),
+            MenuAction::new("sidebar-database", "Database")
+                .icon("database")
+                .toggle(self.workspace.sidebar_database_visible)
+                .into(),
             MenuAction::new("sidebar-monos", "Monos")
                 .icon("ghost")
                 .toggle(self.workspace.preferences.monos)
@@ -603,6 +607,7 @@ impl Shell {
             "sidebar-notes" => &mut self.workspace.sidebar_notes_visible,
             "sidebar-automations" => &mut self.workspace.sidebar_automations_visible,
             "sidebar-inbox" => &mut self.workspace.sidebar_inbox_visible,
+            "sidebar-database" => &mut self.workspace.sidebar_database_visible,
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
@@ -715,6 +720,7 @@ impl Shell {
                     ("Inbox", "inbox"),
                     ("Notes", "note"),
                     ("Automations", "zap"),
+                    ("Database", "database"),
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
@@ -725,6 +731,7 @@ impl Shell {
                     }
                     "Automations" => self.workspace.sidebar_automations_visible,
                     "Inbox" => self.workspace.sidebar_inbox_visible,
+                    "Database" => self.workspace.sidebar_database_visible,
                     _ => true,
                 })
                 .map(|(label, glyph)| {
@@ -816,6 +823,7 @@ impl Shell {
                             "Inbox" => this.open_inbox(window, cx),
                             "Notes" => this.open_notes(window, cx),
                             "Automations" => this.open_automations(window, cx),
+                            "Database" => this.open_database(window, cx),
                             _ => (),
                         }))
                         .on_hover(cx.listener(move |this, hovered, _, cx| {

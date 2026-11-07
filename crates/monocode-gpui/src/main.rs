@@ -19,6 +19,7 @@ mod composer_motion;
 mod composer_runner;
 mod context_meter;
 mod conversation;
+mod database;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;

@@ -14,6 +14,7 @@ impl Shell {
             AppView::Inbox => "Inbox",
             AppView::Notes => "Notes",
             AppView::Automations => "Automations",
+            AppView::Database => "Database",
         })
     }
 
@@ -220,6 +221,7 @@ impl Shell {
             AppView::Notes => self.notes.clone().map(IntoElement::into_any_element),
             AppView::Inbox => self.inbox.clone().map(IntoElement::into_any_element),
             AppView::Automations => self.automations.clone().map(IntoElement::into_any_element),
+            AppView::Database => self.database.clone().map(IntoElement::into_any_element),
         }
     }
 
@@ -230,6 +232,7 @@ impl Shell {
             Some(AppView::Automations) => {
                 self.automations.as_ref().map(|view| view.focus_handle(cx))
             }
+            Some(AppView::Database) => self.database.as_ref().map(|view| view.focus_handle(cx)),
             None => return false,
         };
         if let Some(focus) = focus {
@@ -384,6 +387,23 @@ impl Shell {
             });
         }
         self.show_app_view(AppView::Automations, window, cx);
+    }
+
+    pub(super) fn open_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_app_view(window, cx);
+        if self.database.is_none() {
+            let view =
+                cx.new(|cx| crate::database::DatabaseView::new(crate::data_dir().join("db"), cx));
+            self.app_view_events.push(cx.subscribe_in(
+                &view,
+                window,
+                |this, _, event: &crate::database::Event, window, cx| match event {
+                    crate::database::Event::Close => this.close_app_view(window, cx),
+                },
+            ));
+            self.database = Some(view);
+        }
+        self.show_app_view(AppView::Database, window, cx);
     }
 
     fn note_to_chat(
