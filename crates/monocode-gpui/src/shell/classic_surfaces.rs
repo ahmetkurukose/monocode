@@ -11,7 +11,8 @@ impl Shell {
     }
 
     pub(super) fn session_sidebar_available(&self, cx: &App) -> bool {
-        !self.classic_surface_open(cx)
+        // The tree lists sessions under their projects, so its column goes.
+        !self.classic_surface_open(cx) && !self.project_rail_tree_on()
     }
 
     pub(super) fn classic_app_surface_header(&self, cx: &App) -> AnyElement {

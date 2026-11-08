@@ -321,6 +321,29 @@ impl SettingsView {
                 )],
             ),
         ];
+        if !inset {
+            layout.insert(
+                1,
+                self.row(
+                    Some("project-rail-view"),
+                    false,
+                    "Project list",
+                    Some("Tree lists each project's sessions and open terminals under it.".into()),
+                    vec![self.segmented(
+                        "project-rail-view",
+                        "Project list",
+                        if p.project_rail_tree() {
+                            "tree"
+                        } else {
+                            "list"
+                        },
+                        &[("list", "List"), ("tree", "Tree")],
+                        cx,
+                        |this, value, cx| this.update(cx, |p| p.project_rail_view = value.into()),
+                    )],
+                ),
+            );
+        }
         if inset {
             layout.insert(
                 1,

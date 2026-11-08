@@ -11,13 +11,38 @@ use monocode_core::scm::DiffStats;
 const ICON_RAIL_WIDTH: f32 = 48.;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ProjectRailRow {
+pub(super) enum ProjectRailRow {
     Monos,
     Heading(&'static str),
     Group(String),
-    Project { path: String, grouped: bool },
+    Project {
+        path: String,
+        grouped: bool,
+    },
+    // Tree view only; see project_rail_tree.rs. `last` marks a project's final
+    // child, which carries the gap before the next project.
+    Session {
+        project: String,
+        id: i64,
+        last: bool,
+    },
+    Terminal {
+        project: String,
+        source: RailTerminal,
+        last: bool,
+    },
+    More {
+        project: String,
+        hidden: usize,
+        last: bool,
+    },
     Gap,
     Empty,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RailTerminal {
+    Dock(usize),
+    Pane(i64),
 }
 pub(super) struct ProjectRailList {
     state: ListState,
@@ -25,6 +50,8 @@ pub(super) struct ProjectRailList {
     compact: bool,
     bounds: HashMap<String, AnchorSlot>,
     group_bounds: HashMap<String, AnchorSlot>,
+    /// Each expanded project's last child, to measure its whole block.
+    pub(super) child_bounds: HashMap<String, AnchorSlot>,
     shifts: HashMap<String, TabShift>,
     settling: Option<String>,
     skip_click: bool,
@@ -40,6 +67,7 @@ impl ProjectRailList {
                     .bounds
                     .values()
                     .chain(this.project_rail_list.group_bounds.values())
+                    .chain(this.project_rail_list.child_bounds.values())
                 {
                     bounds.set(None);
                 }
@@ -52,6 +80,7 @@ impl ProjectRailList {
             compact: false,
             bounds: HashMap::new(),
             group_bounds: HashMap::new(),
+            child_bounds: HashMap::new(),
             shifts: HashMap::new(),
             settling: None,
             skip_click: false,
@@ -298,7 +327,7 @@ impl Shell {
                 )
                 .into_any();
         }
-        self.prepare_project_rail(compact);
+        self.prepare_project_rail(compact, cx);
         let owner = cx.weak_entity();
         let rows = list(self.project_rail_list.state.clone(), move |ix, _, cx| {
             owner
@@ -330,7 +359,7 @@ impl Shell {
             .child(self.project_rail_footer(compact, cx))
             .into_any_element()
     }
-    fn prepare_project_rail(&mut self, compact: bool) {
+    fn prepare_project_rail(&mut self, compact: bool, cx: &App) {
         let mut rows = Vec::new();
         if self.workspace.preferences.monos {
             rows.push(ProjectRailRow::Monos);
@@ -401,6 +430,22 @@ impl Shell {
             rows.push(ProjectRailRow::Empty);
         }
         rows.push(ProjectRailRow::Gap);
+        if !compact && self.project_rail_tree_on() {
+            let mut tree = Vec::with_capacity(rows.len());
+            for row in rows {
+                let open = match &row {
+                    ProjectRailRow::Project { path, .. } if self.project_rail_expanded(path) => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                tree.push(row);
+                if let Some(path) = open {
+                    tree.extend(self.project_rail_children(&path, cx));
+                }
+            }
+            rows = tree;
+        }
         self.project_rail_list.update(rows, compact);
     }
     fn project_rail_list_row(
@@ -427,6 +472,9 @@ impl Shell {
                 self.project_rail_row(ix, path, compact, grouped, row_gap, cx)
             }
             ProjectRailRow::Group(id) => self.project_rail_group_header(id, cx),
+            row @ (ProjectRailRow::Session { .. }
+            | ProjectRailRow::Terminal { .. }
+            | ProjectRailRow::More { .. }) => self.project_rail_child_row(row, cx),
             ProjectRailRow::Gap => div().h(px(8.)).into_any(),
             ProjectRailRow::Empty => div()
                 .px_4()
@@ -482,6 +530,9 @@ impl Shell {
                             );
                         })),
                 )
+            })
+            .when(label == "Projects" && self.project_rail_tree_on(), |d| {
+                d.child(self.sidebar_filter_button(cx))
             })
             .when(label == "Projects", |d| {
                 let anchor = AnchorSlot::default();
@@ -1174,6 +1225,9 @@ impl Shell {
         let pin_path = path.clone();
         let drag_path = path.clone();
         let pinned = self.workspace.project_rail_pinned.contains(&path);
+        let tree = !compact && self.project_rail_tree_on();
+        let expanded = self.project_rail_expanded(&path);
+        let chevron_path = path.clone();
         let offset = self.project_rail_project_offset(&path);
         let raised = self.project_rail_project_raised(&path);
         let reordering = self.project_rail_reordering();
@@ -1202,7 +1256,9 @@ impl Shell {
         let row = div()
             .id(("rail-project", ix))
             .debug_selector(move || format!("rail-project-{ix}"))
-            .h(px(if row_gap { 33. } else { 32. }))
+            .h(px(
+                if tree { 36. } else { 32. } + if row_gap { 1. } else { 0. }
+            ))
             .pl(px(6.))
             .pr_2()
             .when(row_gap, |d| d.pb_px())
@@ -1231,6 +1287,44 @@ impl Shell {
                     .opacity(if selected { 1. } else { 0.65 })
                     .when(selected, |d| d.bg(content(0.1)))
                     .hover(|s| s.bg(content(0.08)).opacity(1.))
+                    .when(tree, |d| {
+                        d.child(
+                            div()
+                                .id(("rail-project-chevron", ix))
+                                .debug_selector(move || format!("rail-project-chevron-{ix}"))
+                                .role(Role::Button)
+                                .aria_label(if expanded {
+                                    "Collapse project"
+                                } else {
+                                    "Expand project"
+                                })
+                                .aria_expanded(expanded)
+                                .size(px(14.))
+                                .ml(px(-4.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .hover(|s| s.bg(content(0.1)))
+                                .child(
+                                    icon(
+                                        if expanded {
+                                            "chevron-down"
+                                        } else {
+                                            "chevron-right"
+                                        },
+                                        12.,
+                                    )
+                                    .text_color(content(0.55)),
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_project_rail_expanded(&chevron_path, cx);
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .size(px(16.))
@@ -1291,7 +1385,7 @@ impl Shell {
                         d.child(
                             div()
                                 .absolute()
-                                .left_2()
+                                .left(px(if tree { 22. } else { 8. }))
                                 .top(px(8.))
                                 .invisible()
                                 .group_hover("project-rail-row", |s| s.visible())
@@ -1356,7 +1450,10 @@ impl Shell {
                         if std::mem::take(&mut this.project_rail_list.skip_click) {
                             return;
                         }
-                        this.select_project(path.clone(), window, cx)
+                        this.select_project(path.clone(), window, cx);
+                        if tree && !this.workspace.project_rail_expanded.contains(&path) {
+                            this.toggle_project_rail_expanded(&path, cx);
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1458,7 +1555,7 @@ impl Shell {
             .get(&rail_shift_key(id, group))
             .map_or(0., |shift| shift.at(std::time::Instant::now()).0)
     }
-    fn project_rail_project_offset(&self, path: &str) -> f32 {
+    pub(super) fn project_rail_project_offset(&self, path: &str) -> f32 {
         let project = self.project_rail_item_offset(path, false);
         if self.workspace.project_rail_pinned.contains(path) {
             return project;
@@ -1482,7 +1579,7 @@ impl Shell {
                     .get(&key)
                     .is_some_and(|shift| !shift.at(std::time::Instant::now()).1)
     }
-    fn project_rail_project_raised(&self, path: &str) -> bool {
+    pub(super) fn project_rail_project_raised(&self, path: &str) -> bool {
         self.project_rail_item_raised(path, false)
             || !self.workspace.project_rail_pinned.contains(path)
                 && self
@@ -1555,6 +1652,14 @@ impl Shell {
                 .filter(|path| self.workspace.project_rail_peers(path, &id))
                 .filter_map(|path| {
                     let mut bounds = self.project_rail_list.bounds.get(path)?.get()?;
+                    if let Some(child) = self
+                        .project_rail_list
+                        .child_bounds
+                        .get(path)
+                        .and_then(AnchorSlot::get)
+                    {
+                        bounds.size.height = bounds.size.height.max(child.bottom() - bounds.top());
+                    }
                     bounds.origin.y -= px(self.project_rail_project_offset(path));
                     Some((path.clone(), bounds))
                 })

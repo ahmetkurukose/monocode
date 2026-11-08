@@ -57,6 +57,8 @@ pub(crate) struct Preferences {
     pub chat_background_empty: u32,
     pub chat_background_session: u32,
     pub collapsed_project_rail: String,
+    /// Classic layout's project list: "list" (one row per project) or "tree".
+    pub project_rail_view: String,
     pub ui_scale: u32,
     pub show_excluded_files: bool,
     // Chat
@@ -154,6 +156,7 @@ impl Default for Preferences {
             chat_background_empty: 24,
             chat_background_session: 24,
             collapsed_project_rail: "compact".into(),
+            project_rail_view: "list".into(),
             ui_scale: 100,
             show_excluded_files: false,
             transcript_layout: "chat".into(),
@@ -197,6 +200,11 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    /// Unknown values fall back to the plain list.
+    pub(crate) fn project_rail_tree(&self) -> bool {
+        self.project_rail_view == "tree"
+    }
+
     /// "bottom", "panel" or "title".
     pub(crate) fn terminal_placement(&self) -> &str {
         match self.terminal_placement.as_str() {
@@ -261,6 +269,7 @@ impl Preferences {
         self.chat_background = d.chat_background;
         self.ui_scale = d.ui_scale;
         self.collapsed_project_rail = d.collapsed_project_rail;
+        self.project_rail_view = d.project_rail_view;
     }
 }
 

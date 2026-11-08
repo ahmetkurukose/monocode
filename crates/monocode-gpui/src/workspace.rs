@@ -141,6 +141,8 @@ pub(crate) struct Workspace {
     pub project_rail_monos_pinned: bool,
     pub project_rail_width: f32,
     pub project_rail_pinned: HashSet<String>,
+    /// Projects opened in the rail's tree view.
+    pub project_rail_expanded: HashSet<String>,
     pub project_rail_groups: Vec<ProjectRailGroup>,
     pub project_rail_assignments: HashMap<String, String>,
     pub classic_sidebar_tabs: HashMap<String, String>,
@@ -357,6 +359,7 @@ impl Default for Workspace {
             project_rail_monos_pinned: false,
             project_rail_width: 220.,
             project_rail_pinned: HashSet::new(),
+            project_rail_expanded: HashSet::new(),
             project_rail_groups: Vec::new(),
             project_rail_assignments: HashMap::new(),
             classic_sidebar_tabs: HashMap::new(),

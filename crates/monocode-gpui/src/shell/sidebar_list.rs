@@ -855,7 +855,7 @@ impl Shell {
             self.sidebar_frame.update(cx, |_, cx| cx.notify());
         }
     }
-    pub(super) fn sidebar_filter_button(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn sidebar_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self
             .workspace
             .session_filters

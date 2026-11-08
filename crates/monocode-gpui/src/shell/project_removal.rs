@@ -171,6 +171,7 @@ impl Shell {
         }
         self.workspace.projects.retain(|p| p != path);
         self.workspace.project_rail_pinned.remove(path);
+        self.workspace.project_rail_expanded.remove(path);
         if self.workspace.project == path {
             let next = self
                 .workspace

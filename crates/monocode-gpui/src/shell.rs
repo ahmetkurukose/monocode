@@ -25,6 +25,7 @@ mod orchestration;
 mod picker_preferences;
 mod pinned_tabs;
 mod project_rail;
+mod project_rail_tree;
 mod project_removal;
 mod project_settings;
 mod quick_composer;
@@ -1703,7 +1704,9 @@ impl Shell {
     /// project, and not covered by an app view.
     fn right_panel_shown(&self, cx: &App) -> bool {
         (self.workspace.right_panel_open || self.right_slide.is_some())
-            && (!self.workspace.classic_layout || self.mono_active(cx))
+            && (!self.workspace.classic_layout
+                || self.project_rail_tree_on()
+                || self.mono_active(cx))
             && !self.app_view_open()
             && self.settings.is_none()
             && !self.search_page()
@@ -1712,7 +1715,7 @@ impl Shell {
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
         let shown = !self.mono_active(cx)
-            && !self.workspace.classic_layout
+            && (!self.workspace.classic_layout || self.project_rail_tree_on())
             && self.workspace.right_panel_open
             && !self.app_view_open()
             && self.settings.is_none()
@@ -5161,7 +5164,7 @@ impl Shell {
     /// TitleBar.tsx's right panel toggle, `pl-1.5 pr-3` clear of the edge.
     fn panel_toggle(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = self.mono_active(cx);
-        if self.workspace.classic_layout && !mono {
+        if self.workspace.classic_layout && !mono && !self.project_rail_tree_on() {
             return div().into_any_element();
         }
         if self.workspace.boxy_layout() && !mono {

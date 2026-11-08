@@ -384,7 +384,8 @@ impl Shell {
         };
         let show_navigation = !spans_window;
         let navigation = show_navigation.then(|| self.navigation(cx));
-        let corner = (self.settings.is_none() && !original).then(|| self.panel_toggle(window, cx));
+        let corner = (self.settings.is_none() && (!original || self.project_rail_tree_on()))
+            .then(|| self.panel_toggle(window, cx));
         let body = div()
             .flex_1()
             .min_h_0()
@@ -511,7 +512,7 @@ impl Shell {
     pub(super) fn corner_room(&self, cx: &gpui::App) -> f32 {
         // Client-drawn window controls hold the corner's right end.
         let controls = self.window_controls;
-        if self.workspace.classic_layout && !self.mono_active(cx) {
+        if self.workspace.classic_layout && !self.mono_active(cx) && !self.project_rail_tree_on() {
             return controls;
         }
         if self.mono_active(cx) {

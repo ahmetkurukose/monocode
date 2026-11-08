@@ -69,6 +69,36 @@ fn workspace_style_is_only_offered_under_the_new_layout(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn the_project_list_choice_is_only_offered_in_classic_and_defaults_to_the_list(
+    cx: &mut TestAppContext,
+) {
+    assert!(!Preferences::default().project_rail_tree());
+    assert!(
+        !serde_json::from_str::<Preferences>("{}")
+            .unwrap()
+            .project_rail_tree()
+    );
+    let window = window(Section::Appearance, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    for classic in [true, false, true] {
+        window
+            .update(visual, |view, _, cx| {
+                view.ctx.classic = classic;
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        for option in ["list", "tree"] {
+            let id = match option {
+                "list" => "settings-project-rail-view-list",
+                _ => "settings-project-rail-view-tree",
+            };
+            assert_eq!(visual.debug_bounds(id).is_some(), classic, "{id}");
+        }
+    }
+}
+
+#[gpui::test]
 fn skills_document_has_its_own_full_height_pane_and_compact_actions(cx: &mut TestAppContext) {
     let window = window(Section::Skills, cx);
     window
