@@ -846,6 +846,8 @@ pub(crate) struct Shell {
     viewport_width: f32,
     viewport_height: f32,
     observations: Vec<Subscription>,
+    /// Terminals whose shell ended, closed on the next frame.
+    exited_terminals: Vec<gpui::EntityId>,
     generation: Arc<AtomicU64>,
     latest_state: Arc<Mutex<String>>,
     pub(crate) render_passes: usize,
@@ -1212,6 +1214,7 @@ impl Shell {
             live_mark: None,
             viewport_width: 1200.,
             viewport_height: 800.,
+            exited_terminals: Vec::new(),
             observations: vec![
                 git_observation,
                 git_changes,
@@ -3221,8 +3224,15 @@ impl Shell {
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::new(cwd, cx));
-        self.observations
-            .push(cx.subscribe(&terminal, |_, _, _: &TerminalEvent, cx| cx.notify()));
+        self.observations.push(cx.subscribe(
+            &terminal,
+            |this, terminal, event: &TerminalEvent, cx| {
+                if matches!(event, TerminalEvent::Exited) {
+                    this.exited_terminals.push(terminal.entity_id());
+                }
+                cx.notify()
+            },
+        ));
         terminal
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
@@ -8658,6 +8668,12 @@ impl Render for Shell {
         self.keep_visible_idle_agents(cx);
         self.sync_git_guard(cx);
         self.sync_ui_scale(window, cx);
+        if !self.exited_terminals.is_empty() {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.close_exited_terminals(window, cx));
+            });
+        }
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {

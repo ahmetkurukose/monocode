@@ -294,6 +294,42 @@ impl Shell {
             )
             .into_any_element()
     }
+    /// A shell that ended (`exit`, `logout`, a crash) takes its tab with it, in
+    /// the dock or on the title strip, instead of leaving a dead prompt.
+    pub(super) fn close_exited_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for id in std::mem::take(&mut self.exited_terminals) {
+            if let Some(pane) = self
+                .terminal_pane_views
+                .iter()
+                .find(|(_, t)| t.entity_id() == id)
+                .map(|(pane, _)| *pane)
+            {
+                self.close_pane(pane, window, cx);
+                continue;
+            }
+            let Some((project, ix)) = self.terminals.iter().find_map(|(project, shells)| {
+                let ix = shells.iter().position(|t| t.entity_id() == id)?;
+                Some((project.clone(), ix))
+            }) else {
+                continue;
+            };
+            if project == self.workspace.project {
+                self.close_terminal(ix, window, cx);
+            } else {
+                // Another project's dock: only its lists change; it is not on screen.
+                if let Some(live) = self.terminals.get_mut(&project) {
+                    live.remove(ix);
+                }
+                if let Some(dock) = self.workspace.docks.get_mut(&project)
+                    && !dock.close(ix)
+                {
+                    dock.open = false;
+                }
+                self.persist(cx);
+                cx.notify();
+            }
+        }
+    }
     /// onToggleRunningTerminal: hide the open dock, else show it on `ix`.
     fn toggle_running_terminal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.dock_open(cx)
@@ -1154,6 +1190,82 @@ const HIDE_TERMINAL_LABEL: &str = if cfg!(target_os = "macos") {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn a_shell_that_exits_leaves_the_dock(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        cx.update(|cx| {
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (project, other_shell) = window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.new_terminal(window, cx);
+                shell.new_terminal(window, cx);
+                let project = shell.workspace.project.clone();
+                assert_eq!(shell.terminals[&project].len(), 2);
+                let keep = shell.terminals[&project][0].clone();
+                let gone = shell.terminals[&project][1].clone();
+                gone.update(cx, |t, cx| t.finish(true, cx));
+                (project, keep)
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(shell.terminals[&project], [other_shell.clone()]);
+                assert_eq!(shell.workspace.docks[&project].terminals.len(), 1);
+                assert!(shell.workspace.docks[&project].open, "one shell is left");
+            })
+            .unwrap();
+        window
+            .update(visual, |shell, _, cx| {
+                other_shell.update(cx, |t, cx| t.finish(true, cx));
+                let _ = shell;
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.terminals[&project].is_empty());
+                assert!(!shell.workspace.docks[&project].open);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_shell_that_failed_stays_open_with_its_output(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        cx.update(|cx| {
+            crate::terminal::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let project = window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.new_terminal(window, cx);
+                let project = shell.workspace.project.clone();
+                let shell_view = shell.terminals[&project][0].clone();
+                shell_view.update(cx, |t, cx| t.finish(false, cx));
+                project
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(
+                    shell.terminals[&project].len(),
+                    1,
+                    "an error leaves the tab"
+                );
+                assert!(shell.workspace.docks[&project].open);
+                assert!(shell.exited_terminals.is_empty());
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn the_new_layout_can_host_the_terminal_as_a_right_panel_tab(cx: &mut gpui::TestAppContext) {

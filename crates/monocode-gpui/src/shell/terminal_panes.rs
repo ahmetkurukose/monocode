@@ -479,6 +479,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_shell_that_exits_closes_its_title_tab_or_split_pane(cx: &mut TestAppContext) {
+        for split in [false, true] {
+            let (window, mut visual, owner, pane) = title_terminal(cx, split);
+            window
+                .update(&mut visual, |shell, _, cx| {
+                    let terminal = shell.terminal_pane_views[&pane].clone();
+                    terminal.update(cx, |terminal, cx| terminal.finish(true, cx));
+                })
+                .unwrap();
+            visual.run_until_parked();
+            assert!(!visual.has_pending_prompt(), "a dead shell asks nothing");
+            window
+                .update(&mut visual, |shell, _, _| {
+                    assert!(!shell.workspace.terminal_panes.contains_key(&pane));
+                    assert!(!shell.terminal_pane_views.contains_key(&pane));
+                    assert!(shell.workspace.tab_of(owner).is_some());
+                    assert!(shell.exited_terminals.is_empty());
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn cmd_w_closes_idle_terminal_tabs_and_split_panes_without_prompting(cx: &mut TestAppContext) {
         for split in [false, true] {
             let (window, mut visual, owner, pane) = title_terminal(cx, split);

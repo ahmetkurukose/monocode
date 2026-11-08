@@ -100,6 +100,9 @@ impl Dimensions for GridSize {
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
+    /// The shell ended cleanly (exit status 0); sent once. A shell that
+    /// failed stays on screen with its output and sends only `Changed`.
+    Exited,
 }
 
 /// Where the grid was painted, for mapping the pointer to cells.
@@ -375,18 +378,21 @@ impl Terminal {
             TermEvent::ChildExit(status) => {
                 let code = status.code().map(|c| format!(" ({c})")).unwrap_or_default();
                 write_note(&self.term, &format!("\r\n[process exited{code}]"));
-                self.finish(cx);
+                self.finish(status.success(), cx);
             }
-            TermEvent::Exit => self.finish(cx),
+            TermEvent::Exit => self.finish(false, cx),
             TermEvent::Title(_) | TermEvent::ResetTitle | TermEvent::Bell => {}
         }
     }
-    fn finish(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn finish(&mut self, clean: bool, cx: &mut Context<Self>) {
         if !self.exited {
             self.exited = true;
             self.sender = None;
             self.set_foreground(None, cx);
             cx.emit(TerminalEvent::Changed);
+            if clean {
+                cx.emit(TerminalEvent::Exited);
+            }
         }
         cx.notify();
     }
