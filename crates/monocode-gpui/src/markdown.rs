@@ -914,6 +914,7 @@ pub(crate) fn code_lines_selected(
         .max()
         .unwrap_or(0);
     div()
+        .debug_selector(|| "code-lines".into())
         .w(px(longest as f32 * 7.3 + 48.))
         .min_w_full()
         .flex()

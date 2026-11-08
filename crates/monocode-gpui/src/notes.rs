@@ -10,11 +10,25 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, MouseButton, Role, Subscription, Task, Window, div,
-    prelude::*, px,
+    FocusHandle, Focusable, FontWeight, MouseButton, Role, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
 };
-use monocode_core::notes::{self, Note};
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use monocode_core::notes::{self, Note, NoteLanguage};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// What the language list is choosing for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Picker {
+    /// The type of a note about to be created.
+    New,
+    /// A new type for the open note.
+    Change,
+}
 
 pub(crate) enum Event {
     Close,
@@ -31,6 +45,13 @@ pub(crate) struct Notes {
     body: Entity<Input>,
     tag: Entity<Input>,
     project_query: Entity<Input>,
+    language_query: Entity<Input>,
+    new_anchor: AnchorSlot,
+    change_anchor: AnchorSlot,
+    picker: Option<Picker>,
+    languages: HashMap<String, String>,
+    syntax: Arc<Mutex<Option<crate::editor_syntax::Session>>>,
+    analysis: Option<Task<()>>,
     project_anchor: AnchorSlot,
     project_open: bool,
     cwd: String,
@@ -84,6 +105,8 @@ impl Notes {
         });
         let project_query =
             cx.new(|cx| Input::field("Find project", "Find project…", content(0.4), cx));
+        let language_query =
+            cx.new(|cx| Input::field("Filter languages", "Filter languages…", content(0.4), cx));
         let subscriptions = vec![
             cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&title, |this, _, _: &input::Changed, cx| this.edited(cx)),
@@ -103,6 +126,7 @@ impl Notes {
             cx.subscribe(&tag, |this, _, _: &input::Submitted, cx| this.add_tag(cx)),
             cx.subscribe(&title, |this, _, _: &input::Submitted, cx| this.flush(cx)),
             cx.subscribe(&project_query, |_, _, _: &input::Changed, cx| cx.notify()),
+            cx.subscribe(&language_query, |_, _, _: &input::Changed, cx| cx.notify()),
         ];
         let mut this = Self {
             store,
@@ -113,6 +137,13 @@ impl Notes {
             body,
             tag,
             project_query,
+            language_query,
+            new_anchor: AnchorSlot::default(),
+            change_anchor: AnchorSlot::default(),
+            picker: None,
+            languages: HashMap::new(),
+            syntax: Default::default(),
+            analysis: None,
             project_anchor: AnchorSlot::default(),
             project_open: false,
             cwd: String::new(),
@@ -154,7 +185,33 @@ impl Notes {
         )
     }
 
-    fn highlight_source(&self, cx: &mut Context<Self>) {
+    /// The language of the open note, Markdown when none is open.
+    fn current_language(&self) -> &'static NoteLanguage {
+        self.selected
+            .as_ref()
+            .and_then(|id| self.languages.get(id))
+            .map_or_else(
+                || notes::language(notes::DEFAULT_LANGUAGE),
+                |id| notes::language(id),
+            )
+    }
+
+    fn language_of(&self, id: &str) -> &'static NoteLanguage {
+        notes::language(self.languages.get(id).map_or("", String::as_str))
+    }
+
+    /// Colours the editor for the note's language: Markdown headings here, any
+    /// other type through the same analysis the file editor uses.
+    fn highlight_source(&mut self, cx: &mut Context<Self>) {
+        let language = self.current_language();
+        let path = format!("note.{}", language.extension);
+        self.body
+            .update(cx, |input, _| input.set_editor_path(path.clone()));
+        if language.id != notes::DEFAULT_LANGUAGE {
+            self.schedule_analysis(path, cx);
+            return;
+        }
+        self.analysis = None;
         let text = self.body.read(cx).content.clone();
         let mut at = 0;
         let mut analysis = crate::editor_analysis::Analysis::default();
@@ -176,6 +233,34 @@ impl Notes {
         }
         self.body
             .update(cx, |input, cx| input.set_editor_analysis(analysis, cx));
+    }
+
+    fn schedule_analysis(&mut self, path: String, cx: &mut Context<Self>) {
+        let text = self.body.read(cx).content.clone();
+        let syntax = crate::editor_syntax::supports(&path).then(|| self.syntax.clone());
+        self.analysis = Some(cx.spawn(async move |this, cx| {
+            if syntax.is_none() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+            }
+            let source = text.clone();
+            let work = cx.background_executor().spawn(async move {
+                match syntax {
+                    Some(syntax) => crate::editor_syntax::analyze(&syntax, &path, &source, None),
+                    None => crate::editor_analysis::analyze(&path, &source, None),
+                }
+            });
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.body.read(cx).content == text
+                    && let Ok(analysis) = result
+                {
+                    this.body
+                        .update(cx, |input, cx| input.set_editor_analysis(analysis, cx));
+                }
+            });
+        }));
     }
 
     pub(crate) fn set_context(
@@ -201,9 +286,10 @@ impl Notes {
         }
         let revision = self.revision;
         let store = self.store.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { locked(&store)?.list_notes() });
+        let work = cx.background_executor().spawn(async move {
+            let store = locked(&store)?;
+            Ok::<_, String>((store.list_notes()?, store.note_languages()?))
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -212,7 +298,8 @@ impl Notes {
                     return;
                 }
                 match result {
-                    Ok(mut notes) => {
+                    Ok((mut notes, languages)) => {
+                        this.languages = languages;
                         // Preserve edits made while the refresh was in flight.
                         if this.dirty
                             && let Some(draft) = this.draft(cx)
@@ -251,6 +338,11 @@ impl Notes {
     }
 
     fn edited(&mut self, cx: &mut Context<Self>) {
+        // With no note open there is nothing to save. Clearing the editors
+        // fires this too, and a dirty flag nothing can clear blocks "New note".
+        if self.selected.is_none() {
+            return;
+        }
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         self.error = None;
@@ -273,6 +365,7 @@ impl Notes {
     fn persist(&mut self, finalize: bool, cx: &mut Context<Self>) {
         self.debounce = None;
         let Some(mut draft) = self.draft(cx) else {
+            self.dirty = false;
             return;
         };
         let saved_title = self
@@ -355,10 +448,13 @@ impl Notes {
         self.tag
             .update(cx, |input, cx| input.set_text(String::new(), cx));
         self.source = note.as_ref().is_some_and(|note| {
-            self.modes
-                .get(&note.id)
-                .copied()
-                .unwrap_or(note.body.trim().is_empty() && note.title == "Untitled")
+            // Only Markdown has a rendered view; code types are always source.
+            self.language_of(&note.id).id != notes::DEFAULT_LANGUAGE
+                || self
+                    .modes
+                    .get(&note.id)
+                    .copied()
+                    .unwrap_or(note.body.trim().is_empty() && note.title == "Untitled")
         });
         self.update_preview(cx);
         cx.notify();
@@ -376,17 +472,25 @@ impl Notes {
         });
     }
 
-    fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn create(&mut self, language: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.flush(cx);
         if self.dirty {
             return;
         }
-        let result =
-            locked(&self.store).and_then(|store| store.create_note(Some(self.cwd.clone())));
+        let language = notes::language(language).id;
+        let result = locked(&self.store).and_then(|store| {
+            let note = store.create_note(Some(self.cwd.clone()))?;
+            store.set_note_language(&note.id, language)?;
+            Ok(note)
+        });
         match result {
             Ok(note) => {
                 self.revision = self.revision.wrapping_add(1);
                 let id = note.id.clone();
+                if language != notes::DEFAULT_LANGUAGE {
+                    self.languages.insert(id.clone(), language.to_owned());
+                }
+                self.picker = None;
                 self.notes.insert(0, note);
                 self.query
                     .update(cx, |input, cx| input.set_text(String::new(), cx));
@@ -581,6 +685,170 @@ impl Notes {
         cx.notify();
     }
 
+    fn open_picker(&mut self, picker: Picker, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker == Some(picker) {
+            self.picker = None;
+        } else {
+            self.picker = Some(picker);
+            self.project_open = false;
+            self.language_query
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            window.focus(&self.language_query.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// What choosing a language does: start a note of that type, or retype the open one.
+    fn pick_language(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.picker {
+            Some(Picker::New) => self.create(id, window, cx),
+            Some(Picker::Change) => self.set_language(id, cx),
+            None => {}
+        }
+    }
+
+    fn set_language(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.picker = None;
+        let Some(note) = self.selected.clone() else {
+            return;
+        };
+        let id = notes::language(id).id;
+        if self.language_of(&note).id == id {
+            cx.notify();
+            return;
+        }
+        match locked(&self.store).and_then(|store| store.set_note_language(&note, id)) {
+            Ok(()) => {
+                if id == notes::DEFAULT_LANGUAGE {
+                    self.languages.remove(&note);
+                } else {
+                    self.languages.insert(note.clone(), id.to_owned());
+                }
+                self.source = id != notes::DEFAULT_LANGUAGE
+                    || self.modes.get(&note).copied().unwrap_or(false);
+                self.body.update(cx, |input, cx| {
+                    input.set_editor_analysis(crate::editor_analysis::Analysis::default(), cx)
+                });
+                self.highlight_source(cx);
+                self.update_preview(cx);
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// The small arrow beside "+": a note of another type than Markdown.
+    fn new_type_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .relative()
+            .child(self.new_anchor.probe())
+            .child(
+                icon_button("create-note-typed", "New note of a type…", "chevron-down")
+                    .debug_selector(|| "create-note-typed".into())
+                    .when(self.picker == Some(Picker::New), |d| d.bg(content(0.08)))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_picker(Picker::New, window, cx)
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The filterable list of note types, as the IDE's "New Scratch File" is.
+    fn language_picker(&self, picker: Picker, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.language_query.read(cx).content.to_string();
+        let current = self.current_language().id;
+        let weak = cx.weak_entity();
+        let anchor = match picker {
+            Picker::New => self.new_anchor.clone(),
+            Picker::Change => self.change_anchor.clone(),
+        };
+        popover("note-language-picker", Anchor::Slot(anchor))
+            .width(260.)
+            .max_height(380.)
+            .on_dismiss(move |_, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.picker = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px_2()
+                            .text_size(px(11.))
+                            .text_color(content(0.45))
+                            .child(if picker == Picker::New {
+                                "New note"
+                            } else {
+                                "Note type"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .child(icon("search", 12.))
+                            .child(div().flex_1().min_w_0().child(self.language_query.clone())),
+                    )
+                    .child(
+                        div()
+                            .id("note-language-results")
+                            .min_h_0()
+                            .max_h(px(300.))
+                            .overflow_y_scroll()
+                            .children(notes::matching_languages(&query).into_iter().map(
+                                |language| {
+                                    let id = language.id;
+                                    let selected = picker == Picker::Change && id == current;
+                                    div()
+                                        .id(SharedString::from(format!("note-language-{id}")))
+                                        .debug_selector(move || format!("note-language-{id}"))
+                                        .role(Role::Button)
+                                        .aria_label(language.label)
+                                        .aria_selected(selected)
+                                        .h(px(30.))
+                                        .px_2()
+                                        .rounded_md()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(13.))
+                                        .cursor_pointer()
+                                        .when(selected, |d| d.bg(content(0.1)))
+                                        .hover(|style| style.bg(content(0.08)))
+                                        .child(crate::activity::file_icon(
+                                            &format!("note.{}", language.extension),
+                                            16.,
+                                        ))
+                                        .child(div().flex_1().child(language.label))
+                                        .when(language.id == notes::DEFAULT_LANGUAGE, |d| {
+                                            d.child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(content(0.4))
+                                                    .child("default"),
+                                            )
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.pick_language(id, window, cx)
+                                        }))
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn project_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let query = self.project_query.read(cx).content.to_lowercase();
         let mut projects = self.projects.clone();
@@ -694,6 +962,7 @@ impl Notes {
             )
             .on_click(cx.listener(|this, _, window, cx| {
                 this.project_open = !this.project_open;
+                this.picker = None;
                 if this.project_open {
                     this.project_query
                         .update(cx, |input, cx| input.set_text(String::new(), cx));
@@ -701,6 +970,36 @@ impl Notes {
                 }
                 cx.notify();
             }));
+        let language = self.current_language();
+        let is_markdown = language.id == notes::DEFAULT_LANGUAGE;
+        let language_chip = div()
+            .relative()
+            .id("note-language-chip")
+            .debug_selector(|| "note-language-chip".into())
+            .role(Role::Button)
+            .aria_label("Change note type")
+            .rounded_md()
+            .px_1p5()
+            .py_1()
+            .cursor_pointer()
+            .hover(|style| style.bg(content(0.08)))
+            .when(self.picker == Some(Picker::Change), |d| d.bg(content(0.08)))
+            .child(self.change_anchor.probe())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(crate::activity::file_icon(
+                        &format!("note.{}", language.extension),
+                        14.,
+                    ))
+                    .child(if is_markdown { "Note" } else { language.label })
+                    .child(icon("chevron-down", 11.)),
+            )
+            .on_click(
+                cx.listener(|this, _, window, cx| this.open_picker(Picker::Change, window, cx)),
+            );
         let tags = div()
             .flex()
             .flex_wrap()
@@ -776,8 +1075,17 @@ impl Notes {
                         if can_add {
                             this.flush(cx);
                             if !this.dirty
-                                && let Some(note) = this.draft(cx)
+                                && let Some(mut note) = this.draft(cx)
                             {
+                                let language = this.current_language();
+                                if language.id != notes::DEFAULT_LANGUAGE {
+                                    // A code note goes in as a code block, not as prose.
+                                    note.body = format!(
+                                        "```{}\n{}\n```",
+                                        language.extension,
+                                        note.body.trim_end()
+                                    );
+                                }
                                 cx.emit(Event::AddToChat(note));
                             }
                         }
@@ -851,12 +1159,14 @@ impl Notes {
             .border_color(content(0.07))
             .children(
                 [(false, "Preview"), (true, "Source")].map(|(source, label)| {
+                    let tab_id = if source {
+                        "note-source"
+                    } else {
+                        "note-preview"
+                    };
                     div()
-                        .id(if source {
-                            "note-source"
-                        } else {
-                            "note-preview"
-                        })
+                        .id(tab_id)
+                        .debug_selector(move || tab_id.into())
                         .role(Role::Tab)
                         .aria_label(label)
                         .aria_selected(self.source == source)
@@ -973,8 +1283,7 @@ impl Notes {
                                     .gap_2()
                                     .text_size(px(12.))
                                     .text_color(content(0.5))
-                                    .child(icon("note", 14.))
-                                    .child("Note")
+                                    .child(language_chip)
                                     .child(div().min_w_0().truncate().child(note.slug.clone()))
                                     .child(project),
                             )
@@ -992,7 +1301,7 @@ impl Notes {
                             .child(tags)
                             .child(actions),
                     )
-                    .child(tabs)
+                    .children(is_markdown.then_some(tabs))
                     .child(editor),
             )
             .into_any_element()
@@ -1027,7 +1336,8 @@ impl gpui::Render for Notes {
         let list = div().relative().w(px(self.list_width)).h_full().flex_shrink_0().min_h_0().flex().flex_col().border_r_1().border_color(content(0.07))
             .child(div().h(px(36.)).flex_shrink_0().px_2().flex().items_center().gap_1().border_b_1().border_color(content(0.07)).child(icon("search", 12.))
                 .child(div().flex_1().min_w_0().child(self.query.clone()))
-                .child(icon_button("create-note", "New note", "plus").on_click(cx.listener(|this, _, window, cx| this.create(window, cx)))))
+                .child(icon_button("create-note", "New note", "plus").debug_selector(|| "create-note".into()).on_click(cx.listener(|this, _, window, cx| this.create(notes::DEFAULT_LANGUAGE, window, cx))))
+                .child(self.new_type_button(cx)))
             .child(div().id("notes-list").role(Role::ListBox).aria_label("Saved notes").flex_1().min_h_0().overflow_y_scroll().p(px(6.))
                 .when(visible.is_empty(), |d| d.child(div().px_1p5().py_2().text_size(px(12.)).text_color(content(0.5)).child(if self.loading { "Loading notes…" } else if !query.trim().is_empty() { "No matching notes" } else { "No notes yet. Save a turn from the transcript, or create one here." })))
                 .children(visible.iter().enumerate().map(|(ix, note)| {
@@ -1038,7 +1348,7 @@ impl gpui::Render for Notes {
                         .child(div().flex().items_center().gap_2().text_size(px(11.)).text_color(content(0.45))
                             .child(div().flex_1().truncate().when_some(note.project_name(), |d, name| d.child(div().flex().items_center().gap_1p5().child(self.project_mark(note.source_cwd.as_deref().unwrap_or(""), 12.)).child(name))))
                             .child(relative_time(note.updated_at)))
-                        .child(div().mt_1().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone()))
+                        .child(div().mt_1().flex().items_center().gap_1p5().child(crate::activity::file_icon(&format!("note.{}", self.language_of(&note.id).extension), 14.)).child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone())))
                         .when(!preview.is_empty(), |d| d.child(div().mt_1().truncate().text_size(px(12.)).text_color(content(0.45)).child(preview)))
                         .when(!note.tags.is_empty(), |d| d.child(div().mt_1p5().flex().items_center().gap_1().overflow_hidden()
                             .children(note.tags.iter().take(3).map(|tag| div().max_w(px(96.)).truncate().rounded_sm().bg(content(0.08)).px_1p5().py(px(2.)).text_size(px(10.)).text_color(content(0.55)).child(format!("#{tag}"))))
@@ -1074,6 +1384,15 @@ impl gpui::Render for Notes {
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 if key == "enter"
+                    && this.picker.is_some()
+                    && this.language_query.focus_handle(cx).is_focused(window)
+                {
+                    let query = this.language_query.read(cx).content.to_string();
+                    if let Some(language) = notes::matching_languages(&query).first() {
+                        this.pick_language(language.id, window, cx);
+                    }
+                    cx.stop_propagation();
+                } else if key == "enter"
                     && this.title.focus_handle(cx).is_focused(window)
                     && !this.title.read(cx).is_composing()
                 {
@@ -1081,7 +1400,9 @@ impl gpui::Render for Notes {
                     window.focus(&this.query.focus_handle(cx), cx);
                     cx.stop_propagation();
                 } else if key == "escape" {
-                    if this.project_open {
+                    if this.picker.is_some() {
+                        this.picker = None;
+                    } else if this.project_open {
                         this.project_open = false;
                     } else {
                         this.flush(cx);
@@ -1099,7 +1420,7 @@ impl gpui::Render for Notes {
                 } else if (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
                     && key == "n"
                 {
-                    this.create(window, cx);
+                    this.create(notes::DEFAULT_LANGUAGE, window, cx);
                     cx.stop_propagation();
                 } else if key == "backspace"
                     && this.tag.focus_handle(cx).is_focused(window)
@@ -1157,6 +1478,9 @@ impl gpui::Render for Notes {
                 )
             })
             .when(self.project_open, |d| d.child(self.project_picker(cx)))
+            .when_some(self.picker, |d, picker| {
+                d.child(self.language_picker(picker, cx))
+            })
     }
 }
 
@@ -1173,5 +1497,153 @@ fn relative_time(at: i64) -> String {
         _ => chrono::DateTime::from_timestamp_millis(at)
             .map(|date| date.format("%b %-d").to_string())
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use monocode_core::store::Store;
+    use std::sync::{Arc, Mutex};
+
+    fn open(cx: &mut TestAppContext) -> gpui::WindowHandle<Notes> {
+        let store: Database = Arc::new(Mutex::new(
+            Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut notes = Notes::new(store, cx);
+                    notes.set_context("/work".into(), vec!["/work".into()], cx);
+                    notes
+                })
+            })
+            .unwrap()
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+    }
+
+    fn filter(window: gpui::WindowHandle<Notes>, visual: &mut VisualTestContext, text: &str) {
+        let text = text.to_owned();
+        window
+            .update(visual, |notes, _, cx| {
+                notes
+                    .language_query
+                    .update(cx, |input, cx| input.set_text(text, cx));
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_plus_button_creates_a_markdown_note_even_in_an_empty_list(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        for expected in 1..=2 {
+            let plus = visual.debug_bounds("create-note").expect("the + button");
+            visual.simulate_click(plus.center(), Default::default());
+            visual.run_until_parked();
+            window
+                .update(visual, |notes, _, _| {
+                    assert_eq!(notes.notes.len(), expected, "error: {:?}", notes.error);
+                    let id = notes.selected.clone().unwrap();
+                    assert_eq!(notes.language_of(&id).id, notes::DEFAULT_LANGUAGE);
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn the_new_note_arrow_offers_types_and_the_note_takes_the_chosen_one(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+        });
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // A plain "+" is a normal Markdown note.
+        window
+            .update(visual, |notes, window, cx| {
+                notes.create(notes::DEFAULT_LANGUAGE, window, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("note-preview").is_some(),
+            "a Markdown note has Preview and Source"
+        );
+        // The arrow lists the types; choosing one starts a note of that type.
+        let arrow = visual.debug_bounds("create-note-typed").unwrap();
+        visual.simulate_click(arrow.center(), Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("note-language-markdown").is_some());
+        // The list scrolls, so narrow it to reach the row, as typing would.
+        filter(window, visual, "pyth");
+        let python = visual
+            .debug_bounds("note-language-python")
+            .expect("the picker lists languages");
+        visual.simulate_click(python.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |notes, _, cx| {
+                assert_eq!(notes.notes.len(), 2, "error: {:?}", notes.error);
+                let id = notes.selected.clone().unwrap();
+                assert_eq!(notes.language_of(&id).id, "python");
+                assert_eq!(notes.picker, None, "the picker closes");
+                assert!(notes.source, "code types are always source");
+                assert_eq!(
+                    locked(&notes.store).unwrap().note_languages().unwrap()[&id],
+                    "python"
+                );
+                let _ = cx;
+            })
+            .unwrap();
+        assert!(
+            visual.debug_bounds("note-preview").is_none(),
+            "no rendered view for a code note"
+        );
+        // The header names the type and retypes the note.
+        let chip = visual.debug_bounds("note-language-chip").unwrap();
+        visual.simulate_click(chip.center(), Default::default());
+        visual.run_until_parked();
+        filter(window, visual, "sql");
+        let sql = visual.debug_bounds("note-language-sql").unwrap();
+        visual.simulate_click(sql.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |notes, _, _| {
+                let id = notes.selected.clone().unwrap();
+                assert_eq!(notes.language_of(&id).id, "sql");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_language_filter_narrows_the_list_and_enter_picks_the_first(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+        });
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let arrow = visual.debug_bounds("create-note-typed").unwrap();
+        visual.simulate_click(arrow.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |notes, _, cx| {
+                notes
+                    .language_query
+                    .update(cx, |input, cx| input.set_text("rus".into(), cx));
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("note-language-rust").is_some());
+        assert!(visual.debug_bounds("note-language-python").is_none());
     }
 }

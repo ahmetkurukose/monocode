@@ -395,6 +395,19 @@ impl TranscriptView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = &self.code_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.code_drag = None;
+            } else {
+                let moved = event.position.x - drag.start;
+                let max = drag.handle.max_offset().x;
+                let x = (drag.offset - moved * drag.ratio).clamp(-max, px(0.));
+                drag.handle
+                    .set_offset(gpui::point(x, drag.handle.offset().y));
+                cx.notify();
+            }
+            return;
+        }
         let mut state = self.selection.0.borrow_mut();
         let Some(drag) = state.drag.as_mut() else {
             return;
@@ -463,6 +476,7 @@ impl TranscriptView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.code_drag = None;
         let mut state = self.selection.0.borrow_mut();
         if state.drag.take().is_none() {
             return;
@@ -783,5 +797,197 @@ mod tests {
             })
             .unwrap();
         assert!(visual.debug_bounds("selection-copy").is_none());
+    }
+
+    #[gpui::test]
+    fn a_code_block_scrolls_back_left_after_scrolling_right(cx: &mut TestAppContext) {
+        use gpui::{
+            Bounds, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestContext, WindowBounds,
+            WindowOptions, point, size,
+        };
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(700.), px(500.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        let long = "x".repeat(300);
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text: format!("Intro\n\n```bash\n{long}\nshort\n```\n\nOutro"),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let start = visual.debug_bounds("code-lines").expect("a code block");
+        let at = point(start.left() + px(100.), start.center().y);
+        let wheel = |visual: &mut VisualTestContext, dx: f32| {
+            visual.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+                ..Default::default()
+            });
+            visual.run_until_parked();
+            visual.debug_bounds("code-lines").unwrap().left()
+        };
+        let right = wheel(visual, -150.);
+        assert!(
+            right < start.left(),
+            "scrolls right: {right:?} vs {:?}",
+            start.left()
+        );
+        let back = wheel(visual, 100.);
+        assert!(
+            back > right,
+            "scrolls back left: {back:?} should be right of {right:?}"
+        );
+        let more = wheel(visual, 100.);
+        assert!(more > back || more == start.left(), "{more:?} {back:?}");
+        // A real trackpad drifts a little vertically and reports gesture phases.
+        let lines = |visual: &mut VisualTestContext, dx: f32| {
+            visual.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Lines(point(dx, 0.)),
+                ..Default::default()
+            });
+            visual.run_until_parked();
+            visual.debug_bounds("code-lines").unwrap().left()
+        };
+        let l_before = visual.debug_bounds("code-lines").unwrap().left();
+        let l_right = lines(visual, -5.);
+        assert!(
+            l_right < l_before,
+            "line wheel right {l_right:?} {l_before:?}"
+        );
+        let l_back = lines(visual, 3.);
+        assert!(l_back > l_right, "line wheel back {l_back:?} {l_right:?}");
+        let swipe = |visual: &mut VisualTestContext, dx: f32, dy: f32| {
+            for phase in [
+                TouchPhase::Started,
+                TouchPhase::Moved,
+                TouchPhase::Moved,
+                TouchPhase::Ended,
+            ] {
+                visual.simulate_event(ScrollWheelEvent {
+                    position: at,
+                    delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+                    touch_phase: phase,
+                    ..Default::default()
+                });
+                visual.run_until_parked();
+            }
+            visual.debug_bounds("code-lines").unwrap().left()
+        };
+        let before = visual.debug_bounds("code-lines").unwrap().left();
+        let swiped_right = swipe(visual, -60., 4.);
+        assert!(
+            swiped_right < before,
+            "swipe right {swiped_right:?} < {before:?}"
+        );
+        let swiped_back = swipe(visual, 60., -4.);
+        assert!(
+            swiped_back > swiped_right,
+            "swipe back {swiped_back:?} > {swiped_right:?}"
+        );
+        let swiped_back_again = swipe(visual, 60., 7.);
+        assert!(
+            swiped_back_again >= swiped_back,
+            "{swiped_back_again:?} >= {swiped_back:?}"
+        );
+    }
+
+    fn code_window(cx: &mut TestAppContext, code: &str) -> gpui::WindowHandle<TranscriptView> {
+        use gpui::{Bounds, WindowBounds, WindowOptions, point, size};
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(700.), px(500.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        let text = format!("Intro\n\n```bash\n{code}\n```\n\nOutro");
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text,
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                );
+            })
+            .unwrap();
+        for _ in 0..3 {
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+        window
+    }
+
+    #[gpui::test]
+    fn a_code_block_shows_a_horizontal_bar_only_when_it_overflows_and_the_bar_drags(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{MouseButton, VisualTestContext, point};
+        let fits = code_window(cx, "echo hi\nls -la");
+        let visual = &mut VisualTestContext::from_window(fits.into(), cx);
+        assert!(
+            visual.debug_bounds("code-scrollbar").is_none(),
+            "a block that fits has no bar"
+        );
+        let wide = code_window(cx, &format!("echo {}\nshort", "x".repeat(300)));
+        let visual = &mut VisualTestContext::from_window(wide.into(), cx);
+        let thumb = visual
+            .debug_bounds("code-scrollbar")
+            .expect("a wide block shows its bar");
+        let before = visual.debug_bounds("code-lines").unwrap().left();
+        let from = thumb.center();
+        visual.simulate_mouse_down(from, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            from + point(px(80.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        let during = visual.debug_bounds("code-lines").unwrap().left();
+        assert!(
+            during < before,
+            "dragging the bar scrolls the code: {during:?} < {before:?}"
+        );
+        let moved = visual.debug_bounds("code-scrollbar").unwrap();
+        assert!(moved.left() > thumb.left(), "and the thumb follows");
+        visual.simulate_mouse_up(
+            from + point(px(80.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
     }
 }

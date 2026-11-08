@@ -38,6 +38,89 @@ pub struct NoteUpsert {
     pub finalize_slug: bool,
 }
 
+/// What a note is written in. A normal note is Markdown; the rest are
+/// scratch-file types, which only choose the editor's colouring and icon.
+pub const DEFAULT_LANGUAGE: &str = "markdown";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NoteLanguage {
+    pub id: &'static str,
+    pub label: &'static str,
+    /// The extension its scratch file would have; drives syntax and icon.
+    pub extension: &'static str,
+}
+
+const fn lang(id: &'static str, label: &'static str, extension: &'static str) -> NoteLanguage {
+    NoteLanguage {
+        id,
+        label,
+        extension,
+    }
+}
+
+/// Markdown and plain text first, then the rest alphabetically.
+pub const LANGUAGES: [NoteLanguage; 37] = [
+    lang("markdown", "Markdown", "md"),
+    lang("plain", "Plain text", "txt"),
+    lang("bash", "Shell script", "sh"),
+    lang("c", "C", "c"),
+    lang("cpp", "C++", "cpp"),
+    lang("csharp", "C#", "cs"),
+    lang("css", "CSS", "css"),
+    lang("dart", "Dart", "dart"),
+    lang("diff", "Diff", "diff"),
+    lang("dockerfile", "Dockerfile", "dockerfile"),
+    lang("env", ".env", "env"),
+    lang("go", "Go", "go"),
+    lang("html", "HTML", "html"),
+    lang("ini", "INI", "ini"),
+    lang("java", "Java", "java"),
+    lang("javascript", "JavaScript", "js"),
+    lang("json", "JSON", "json"),
+    lang("kotlin", "Kotlin", "kt"),
+    lang("less", "Less", "less"),
+    lang("lua", "Lua", "lua"),
+    lang("php", "PHP", "php"),
+    lang("powershell", "PowerShell", "ps1"),
+    lang("python", "Python", "py"),
+    lang("r", "R", "r"),
+    lang("ruby", "Ruby", "rb"),
+    lang("rust", "Rust", "rs"),
+    lang("scala", "Scala", "scala"),
+    lang("scss", "SCSS", "scss"),
+    lang("sql", "SQL", "sql"),
+    lang("swift", "Swift", "swift"),
+    lang("toml", "TOML", "toml"),
+    lang("tsx", "TSX", "tsx"),
+    lang("typescript", "TypeScript", "ts"),
+    lang("vue", "Vue", "vue"),
+    lang("xml", "XML", "xml"),
+    lang("yaml", "YAML", "yaml"),
+    lang("zig", "Zig", "zig"),
+];
+
+/// A saved language id, or Markdown for anything unknown.
+pub fn language(id: &str) -> &'static NoteLanguage {
+    LANGUAGES
+        .iter()
+        .find(|language| language.id == id)
+        .unwrap_or(&LANGUAGES[0])
+}
+
+/// Languages whose label or id contains `query`, in catalogue order.
+pub fn matching_languages(query: &str) -> Vec<&'static NoteLanguage> {
+    let query = query.trim().to_lowercase();
+    LANGUAGES
+        .iter()
+        .filter(|language| {
+            query.is_empty()
+                || language.label.to_lowercase().contains(&query)
+                || language.id.contains(&query)
+                || language.extension == query.trim_start_matches('.')
+        })
+        .collect()
+}
+
 impl Note {
     pub fn upsert(&self, finalize_slug: bool) -> NoteUpsert {
         NoteUpsert {

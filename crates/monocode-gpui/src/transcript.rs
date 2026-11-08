@@ -654,6 +654,15 @@ impl PhaseLayout {
     }
 }
 
+/// A code block's scrollbar thumb being dragged.
+struct CodeDrag {
+    handle: gpui::ScrollHandle,
+    start: Pixels,
+    offset: Pixels,
+    /// Content pixels scrolled per pixel the thumb moves.
+    ratio: f32,
+}
+
 pub(crate) struct TranscriptView {
     selection: selection::Selection,
     selection_focus: Option<gpui::FocusHandle>,
@@ -740,6 +749,9 @@ pub(crate) struct TranscriptView {
     highlight_order: VecDeque<(u64, usize)>,
     highlight_bytes: usize,
     copied: Option<u64>,
+    /// Each code chunk's horizontal scroll, which also sizes its scrollbar.
+    code_scrolls: HashMap<(u64, usize), gpui::ScrollHandle>,
+    code_drag: Option<CodeDrag>,
     copied_response: Option<(usize, Instant)>,
     note_pending: HashSet<usize>,
     note_feedback: HashMap<usize, Result<(), String>>,
@@ -2514,6 +2526,8 @@ impl TranscriptView {
             highlight_order: VecDeque::new(),
             highlight_bytes: 0,
             copied: None,
+            code_scrolls: HashMap::new(),
+            code_drag: None,
             copied_response: None,
             note_pending: HashSet::new(),
             note_feedback: HashMap::new(),
@@ -4473,6 +4487,12 @@ impl TranscriptView {
             let (line, column) = location.unwrap_or((fence.start_line, 1));
             format!("{path}:{line}:{column}")
         });
+        let handle = self
+            .code_scrolls
+            .entry((key, lines.start))
+            .or_default()
+            .clone();
+        let scrollbar = self.code_scrollbar(&handle, cx);
         div()
             .relative()
             .w_full()
@@ -4588,6 +4608,7 @@ impl TranscriptView {
                 div()
                     .id(("code-scroll", ix))
                     .overflow_x_scroll()
+                    .track_scroll(&handle)
                     .w_full()
                     .py(px(10.))
                     .pr_2()
@@ -4610,7 +4631,66 @@ impl TranscriptView {
                         ),
                     )),
             )
+            .children(scrollbar)
             .into_any_element()
+    }
+    /// A thin horizontal bar along the bottom of a code block, only while the
+    /// block is wider than the room it has. It follows the wheel and drags.
+    fn code_scrollbar(
+        &self,
+        handle: &gpui::ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        const MARGIN: f32 = 8.;
+        const MIN_THUMB: f32 = 28.;
+        let viewport = f32::from(handle.bounds().size.width);
+        let max = f32::from(handle.max_offset().x);
+        if viewport <= 0. || max < 1. {
+            return None;
+        }
+        let track = (viewport - 2. * MARGIN).max(0.);
+        let total = viewport + max;
+        let thumb = (track * viewport / total).clamp(MIN_THUMB.min(track), track);
+        let room = (track - thumb).max(0.);
+        let scrolled = (-f32::from(handle.offset().x) / max).clamp(0., 1.);
+        let ratio = if room > 0. { max / room } else { 0. };
+        let drag = handle.clone();
+        Some(
+            div()
+                .id("code-scrollbar")
+                .absolute()
+                .left(px(MARGIN))
+                .right(px(MARGIN))
+                .bottom(px(2.))
+                .h(px(8.))
+                .child(
+                    div()
+                        .id("code-scrollbar-thumb")
+                        .debug_selector(|| "code-scrollbar".into())
+                        .absolute()
+                        .top(px(2.))
+                        .left(px(scrolled * room))
+                        .w(px(thumb))
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(content(0.22))
+                        .hover(|s| s.bg(content(0.4)))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.code_drag = Some(CodeDrag {
+                                    handle: drag.clone(),
+                                    start: event.position.x,
+                                    offset: drag.offset().x,
+                                    ratio,
+                                });
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
     fn row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.rendered += 1;

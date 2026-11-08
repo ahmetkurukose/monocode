@@ -72,6 +72,15 @@ pub fn ensure_notes_table(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn ensure_languages_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS note_languages (
+           note_id TEXT PRIMARY KEY,
+           language TEXT NOT NULL
+         );",
+    )
+}
+
 fn get_content(conn: &Connection, id: &str, kind: &str) -> rusqlite::Result<Option<Note>> {
     conn.query_row(
         "SELECT id, slug, title, body, source_session_id, source_cwd, tags_json,
@@ -441,10 +450,53 @@ impl Store {
         upsert_note(&self.conn, note).map_err(|e| e.to_string())
     }
 
+    /// Each note's language (Markdown notes have no row). Kept in a table of
+    /// its own so the desktop app's notes table stays exactly as it expects.
+    pub fn note_languages(&self) -> Result<std::collections::HashMap<String, String>, String> {
+        if !super::shared::has_table(&self.conn, "note_languages")? {
+            return Ok(Default::default());
+        }
+        let mut query = self
+            .conn
+            .prepare("SELECT note_id, language FROM note_languages")
+            .map_err(|e| e.to_string())?;
+        let rows = query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_note_language(&self, id: &str, language: &str) -> Result<(), String> {
+        valid_id(id)?;
+        if self.shared.is_some() {
+            self.shared_writable()?;
+        }
+        ensure_languages_table(&self.conn).map_err(|e| e.to_string())?;
+        let language = crate::notes::language(language).id;
+        if language == crate::notes::DEFAULT_LANGUAGE {
+            self.conn
+                .execute("DELETE FROM note_languages WHERE note_id = ?1", [id])
+        } else {
+            self.conn.execute(
+                "INSERT INTO note_languages (note_id, language) VALUES (?1, ?2)
+                 ON CONFLICT(note_id) DO UPDATE SET language = excluded.language",
+                params![id, language],
+            )
+        }
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
     pub fn delete_note(&self, id: &str) -> Result<(), String> {
         valid_id(id)?;
         if self.shared.is_some() {
             self.shared_writable()?;
+        }
+        if super::shared::has_table(&self.conn, "note_languages")? {
+            self.conn
+                .execute("DELETE FROM note_languages WHERE note_id = ?1", [id])
+                .map_err(|e| e.to_string())?;
         }
         if super::shared::has_table(&self.conn, "notes")? {
             ensure_notes_table(&self.conn).map_err(|e| e.to_string())?;
@@ -806,5 +858,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(subtype, "document");
+    }
+
+    #[test]
+    fn a_notes_language_lives_beside_the_notes_table_and_goes_with_the_note() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let note = store.create_note(None).unwrap();
+        assert!(store.note_languages().unwrap().is_empty());
+        store.set_note_language(&note.id, "python").unwrap();
+        assert_eq!(store.note_languages().unwrap()[&note.id], "python");
+        // Unknown ids fall back to Markdown, which needs no row.
+        store.set_note_language(&note.id, "nonsense").unwrap();
+        assert!(store.note_languages().unwrap().is_empty());
+        store.set_note_language(&note.id, "sql").unwrap();
+        let columns: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('notes') WHERE name = 'language'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 0, "the shared notes table is not touched");
+        store.delete_note(&note.id).unwrap();
+        assert!(store.note_languages().unwrap().is_empty());
+        assert!(store.set_note_language("bad id!", "sql").is_err());
     }
 }
