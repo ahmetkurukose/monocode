@@ -534,6 +534,7 @@ impl CommitDialog {
             );
         }
         if !untracked.is_empty() {
+            items.push(MenuAction::new("add", "Add to Git").shortcut("⌘⌥A").into());
             items.push(MenuAction::new("delete", "Delete…").danger().into());
         }
         if one_file {
@@ -570,6 +571,7 @@ impl CommitDialog {
         let members = self.members(row);
         match id {
             "rollback" | "delete" => self.ask_rollback(&members, id == "delete", cx),
+            "add" => self.add_to_git(&members, cx),
             "diff" => {
                 if let Some(&ix) = members.first() {
                     self.select(ix, cx);
@@ -589,6 +591,43 @@ impl CommitDialog {
             "check" => self.toggle_files(&members, cx),
             _ => {}
         }
+    }
+
+    /// Puts unversioned files under Git (`git add`); they move to Changes, checked.
+    fn add_to_git(&mut self, members: &[usize], cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let (_, untracked) = plan(&self.files, members);
+        let paths: Vec<String> = untracked
+            .iter()
+            .map(|&ix| self.files[ix].relative.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.busy = Some("rollback");
+        self.error = None;
+        let cwd = PathBuf::from(&self.cwd);
+        let added = paths.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { scm::stage_files(&cwd, &added) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.busy = None;
+                match result {
+                    // What was just added is meant for the commit.
+                    Ok(()) => this.checked.extend(paths),
+                    Err(error) => this.error = Some(error),
+                }
+                this.git.update(cx, |git, cx| git.changed(cx));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Opens the confirmation for rolling back (or deleting) `members`.
@@ -666,6 +705,16 @@ impl CommitDialog {
             self.pending = None;
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if event.keystroke.key == "a"
+            && event.keystroke.modifiers.platform
+            && event.keystroke.modifiers.alt
+            && let Some(file) = self.selected.as_ref()
+            && let Some(ix) = self.files.iter().position(|f| &f.relative == file)
+        {
+            self.add_to_git(&[ix], cx);
+            cx.stop_propagation();
             return;
         }
         if event.keystroke.key == "z"
@@ -1413,6 +1462,60 @@ mod tests {
         std::fs::remove_file(dir.path().join("b.txt")).unwrap();
         std::fs::write(dir.path().join("loose.txt"), "x\n").unwrap();
         dir
+    }
+
+    #[gpui::test]
+    fn add_to_git_moves_an_unversioned_file_to_changes_checked(cx: &mut gpui::TestAppContext) {
+        cx.update(input::bind);
+        let dir = repo();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| CommitDialog::new(git, cwd, String::new(), Kind::Codex, window, cx))
+            })
+            .unwrap()
+        });
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |dialog, window, cx| {
+                let loose = dialog
+                    .files
+                    .iter()
+                    .position(|f| f.relative == "loose.txt")
+                    .unwrap();
+                assert!(!dialog.checked.contains("loose.txt"));
+                let row = dialog
+                    .rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Tree(TreeRow::File { ix, .. }) if *ix == loose))
+                    .unwrap();
+                dialog.open_menu(row, gpui::point(px(10.), px(10.)), window, cx);
+                dialog.run_menu_action("add", row, window, cx);
+                assert_eq!(dialog.busy, Some("rollback"));
+            })
+            .unwrap();
+        for _ in 0..5 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |dialog, _, _| {
+                assert_eq!(dialog.busy, None);
+                let loose = dialog
+                    .files
+                    .iter()
+                    .find(|f| f.relative == "loose.txt")
+                    .unwrap();
+                assert_eq!(loose.status, "added");
+                assert!(dialog.checked.contains("loose.txt"));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

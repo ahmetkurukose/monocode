@@ -169,6 +169,24 @@ pub fn stage_file(cwd: &Path, relative: &str) -> Result<(), String> {
     git_checked(&root, &["--literal-pathspecs", "add", "--", &relative])
 }
 
+/// Stage several files in one go (`git add`), as "Add to Git" does for
+/// unversioned ones. Names are taken literally, never as patterns.
+pub fn stage_files(cwd: &Path, relatives: &[String]) -> Result<(), String> {
+    if relatives.is_empty() {
+        return Ok(());
+    }
+    if remote_workspace::is_remote(cwd) {
+        return relatives.iter().try_for_each(|r| stage_file(cwd, r));
+    }
+    let root = expand_home(cwd);
+    let mut args = vec!["--literal-pathspecs".to_owned(), "add".into(), "--".into()];
+    for relative in relatives {
+        args.push(resolve_repo_path(&root, relative)?);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git_checked(&root, &args)
+}
+
 /// Unstage a file or folder (`git restore --staged`).
 pub fn unstage_file(cwd: &Path, relative: &str) -> Result<(), String> {
     if remote_workspace::is_remote(cwd) {

@@ -1430,3 +1430,24 @@ fn rollback_leaves_unversioned_files_and_odd_names_alone() {
     );
     assert!(rollback_files(dir, &["../outside".into()], false).is_err());
 }
+
+#[test]
+fn stage_files_adds_unversioned_files_in_one_go_and_takes_names_literally() {
+    let dir = tmp();
+    let dir = dir.path();
+    assert!(init_git_commit(dir, &[("a.txt", "alpha\n")]));
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/new.txt"), "n\n").unwrap();
+    std::fs::write(dir.join("b[1].txt"), "b\n").unwrap();
+    std::fs::write(dir.join("b1.txt"), "other\n").unwrap();
+    stage_files(dir, &["sub/new.txt".into(), "b[1].txt".into()]).unwrap();
+    assert_eq!(file(dir, "sub/new.txt").status, "added");
+    assert_eq!(file(dir, "b[1].txt").status, "added");
+    assert_eq!(
+        file(dir, "b1.txt").status,
+        "untracked",
+        "the brackets are a name, not a pattern"
+    );
+    assert!(stage_files(dir, &[]).is_ok());
+    assert!(stage_files(dir, &["../outside".into()]).is_err());
+}
