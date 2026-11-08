@@ -555,6 +555,7 @@ impl TranscriptView {
         let button = |id: &'static str, label: &'static str, glyph: &'static str| {
             div()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .role(Role::Button)
                 .aria_label(label)
                 .flex()
@@ -580,8 +581,11 @@ impl TranscriptView {
             .gap(px(2.))
             .child(
                 button("selection-copy", "Copy", "copy").on_click(cx.listener(
-                    move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                    move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        // Done: close the menu and drop the highlight.
+                        this.selection.clear();
+                        cx.notify();
                     },
                 )),
             )
@@ -700,5 +704,84 @@ mod tests {
         assert_eq!(snap("e\u{301}🙂", 2), 0);
         assert_eq!(snap("e\u{301}🙂", 4), 3);
         assert_eq!(word("hello café", 7), 6..11);
+    }
+
+    #[gpui::test]
+    fn clicking_copy_in_the_selection_menu_copies_the_selected_text(cx: &mut TestAppContext) {
+        use gpui::{Bounds, VisualTestContext, WindowBounds, WindowOptions, point, size};
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text: "Alpha beta gamma.\n\nSecond paragraph here.".into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                let first = view
+                    .rows
+                    .iter()
+                    .find(|row| matches!(&row.body, Body::Markdown(md) if crate::markdown::selection_text(md) == "Alpha beta gamma."))
+                    .unwrap()
+                    .key;
+                {
+                    let mut state = view.selection.0.borrow_mut();
+                    state.response = 0;
+                    state.quote = true;
+                    state.anchor = Some(Position { row: first, byte: 6 });
+                    state.head = Some(Position { row: first, byte: 10 });
+                    state.menu = Some(point(px(300.), px(200.)));
+                }
+                cx.notify();
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let copy = visual
+            .debug_bounds("selection-copy")
+            .expect("the menu is open");
+        visual.simulate_click(copy.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            visual
+                .read_from_clipboard()
+                .and_then(|c| c.text())
+                .as_deref(),
+            Some("beta"),
+            "the click reaches the Copy button"
+        );
+        window
+            .update(visual, |view, _, _| {
+                assert!(
+                    view.selection.0.borrow().menu.is_none(),
+                    "copying closes the menu"
+                );
+                assert!(view.selected_text().is_none(), "and clears the selection");
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("selection-copy").is_none());
     }
 }
