@@ -113,8 +113,8 @@ pub(crate) struct Preferences {
     pub keybindings: HashMap<String, Option<String>>,
 }
 
-pub(crate) const UI_SCALE_PERCENTS: [u32; 16] = [
-    50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200,
+pub(crate) const UI_SCALE_PERCENTS: [u32; 17] = [
+    50, 60, 70, 80, 85, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200,
 ];
 
 impl Default for Preferences {
