@@ -57,7 +57,11 @@ impl Shell {
         }
         let review = self.reviews.remove(&id)?;
         let pane = self.workspace.next_pane_id();
-        self.workspace.review_owners.insert(pane, id);
+        // The owner must be a session. A file opened from a terminal pane
+        // belongs to that terminal's session, not to the terminal itself: a
+        // terminal can close, and it is no chat to open or restore from.
+        let owner = self.workspace.session_for_pane(id);
+        self.workspace.review_owners.insert(pane, owner);
         self.workspace.reviews.remove(&id);
         self.reviews.insert(pane, review.clone());
         self.review_slide = None;

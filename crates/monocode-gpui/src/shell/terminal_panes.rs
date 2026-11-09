@@ -478,6 +478,72 @@ mod tests {
         }
     }
 
+    /// Opens a file from the terminal pane, goes to the Database view and back.
+    fn file_from_a_terminal(cx: &mut TestAppContext, split: bool) {
+        let (window, mut visual, owner, pane) = title_terminal(cx, split);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        window
+            .update(&mut visual, |shell, w, cx| {
+                shell.workspace.preferences.file_tabs = "workspace".into();
+                assert_eq!(shell.workspace.active, Some(pane));
+                let cwd = shell.workspace.project.clone();
+                shell.open_file_at(cwd, path.clone(), None, w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let file_pane = window
+            .update(&mut visual, |shell, _, _| {
+                let active = shell.workspace.active.unwrap();
+                assert_ne!(active, pane);
+                assert!(shell.workspace.tab_of(active).is_some(), "its own tab");
+                assert_eq!(
+                    shell.workspace.review_owners[&active], owner,
+                    "owned by the terminal's session, not by the terminal"
+                );
+                assert_eq!(shell.workspace.session_for_pane(active), owner);
+                active
+            })
+            .unwrap();
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.active_app_view = Some(crate::workspace::AppView::Database);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, w, cx| shell.close_app_view(w, cx))
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(
+                    shell.workspace.tab_of(file_pane).is_some(),
+                    "the file tab stays"
+                );
+                assert!(
+                    shell.workspace.tab_of(pane).is_some(),
+                    "and so does the terminal's"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_file_opened_from_a_terminal_tab_belongs_to_its_session_and_stays(cx: &mut TestAppContext) {
+        file_from_a_terminal(cx, false);
+    }
+
+    #[gpui::test]
+    fn a_file_opened_from_a_split_terminal_pane_belongs_to_its_session_and_stays(
+        cx: &mut TestAppContext,
+    ) {
+        file_from_a_terminal(cx, true);
+    }
+
     #[gpui::test]
     fn a_shell_that_exits_closes_its_title_tab_or_split_pane(cx: &mut TestAppContext) {
         for split in [false, true] {

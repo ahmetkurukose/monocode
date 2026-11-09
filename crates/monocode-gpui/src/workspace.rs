@@ -480,6 +480,7 @@ impl Workspace {
             appearance.normalize();
         }
         let mut known: HashSet<_> = sessions.iter().map(|s| s.0).collect();
+        state.rehome_terminal_owned_files(sessions);
         state.review_owners.retain(|id, owner| {
             *id < 0
                 && known.contains(owner)
@@ -720,6 +721,38 @@ impl Workspace {
             return false;
         };
         self.move_project(path, to)
+    }
+    /// Older versions recorded a file opened from a terminal as owned by that
+    /// terminal pane, which restore cannot resolve to a chat, so the file tab
+    /// vanished. Give each such file to the terminal's session while it is
+    /// known, else to a session of the file's project.
+    fn rehome_terminal_owned_files(&mut self, sessions: &[(i64, String)]) {
+        let owned: Vec<(i64, i64)> = self
+            .review_owners
+            .iter()
+            .filter(|(_, owner)| **owner < 0)
+            .map(|(pane, owner)| (*pane, *owner))
+            .collect();
+        for (pane, owner) in owned {
+            let session = self
+                .terminal_panes
+                .get(&owner)
+                .map(|t| t.owner)
+                .filter(|owner| sessions.iter().any(|(id, _)| id == owner))
+                .or_else(|| {
+                    let cwd = match self.reviews.get(&pane)?.tabs.first()? {
+                        crate::review::ReviewTab::File { cwd, .. } => cwd.clone(),
+                        _ => return None,
+                    };
+                    sessions
+                        .iter()
+                        .find(|(_, session_cwd)| *session_cwd == cwd)
+                        .map(|(id, _)| *id)
+                });
+            if let Some(session) = session {
+                self.review_owners.insert(pane, session);
+            }
+        }
     }
     pub fn session_for_pane(&self, id: i64) -> i64 {
         self.review_owners
@@ -1666,5 +1699,46 @@ mod tests {
         assert_eq!(restored.docks["/work"].terminals, ["/work/sub"]);
         assert!(!restored.docks["/work"].open);
         assert_eq!(restored.desktop_workspace_snapshot.as_ref(), Some(&source));
+    }
+
+    #[test]
+    fn files_recorded_as_owned_by_a_terminal_pane_are_given_to_a_session_on_restore() {
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        state.tabs = vec![1, -2, -3, -5];
+        state.title_order = vec![
+            TitleTab::Session(1),
+            TitleTab::Session(-2),
+            TitleTab::Session(-3),
+            TitleTab::Session(-5),
+        ];
+        state.terminal_panes.insert(
+            -1,
+            TerminalPane {
+                owner: 1,
+                cwd: "/p".into(),
+            },
+        );
+        let file = |path: &str| crate::review::ReviewState {
+            tabs: vec![crate::review::ReviewTab::File {
+                cwd: "/p".into(),
+                path: path.into(),
+            }],
+            chat_hidden: true,
+            ..Default::default()
+        };
+        // -2: its terminal is still there. -3: the terminal is long gone. -5: a session owner.
+        state.review_owners = [(-2, -1), (-3, -9), (-5, 1)].into();
+        state.reviews = [(-2, file("/p/a")), (-3, file("/p/b")), (-5, file("/p/c"))].into();
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        assert_eq!(restored.review_owners.get(&-2), Some(&1));
+        assert_eq!(
+            restored.review_owners.get(&-3),
+            Some(&1),
+            "a gone terminal falls back to a session of the file's project"
+        );
+        assert_eq!(restored.review_owners.get(&-5), Some(&1));
+        assert!(restored.tab_of(-2).is_some() && restored.tab_of(-3).is_some());
     }
 }
