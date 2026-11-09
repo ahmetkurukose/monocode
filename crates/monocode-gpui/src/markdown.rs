@@ -661,12 +661,40 @@ fn rich_inline(
         .children(children)
         .into_any_element()
 }
+/// Inline code that names a file: no spaces, a dot in its last segment, and
+/// either a directory in front or an extension a file could really have.
+/// `Timeout.value`, `.queue()` and `Foo.MINUTES_10` are code, not files.
 fn is_file_chip(text: &str) -> bool {
-    !text.chars().any(char::is_whitespace)
-        && text
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.contains('.'))
+    if text.chars().any(char::is_whitespace) || text.contains(['(', ')', '{', '}', '=', ',']) {
+        return false;
+    }
+    // `name.py:12` and `name.py:12:3` are the file with a position.
+    let mut file = text;
+    for _ in 0..2 {
+        match file.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                file = head
+            }
+            _ => break,
+        }
+    }
+    let Some(name) = file.rsplit('/').next().filter(|name| name.contains('.')) else {
+        return false;
+    };
+    // Config dotfiles the icon table has no entry for.
+    let dotfile = name.starts_with(".env")
+        || matches!(
+            name,
+            ".gitignore"
+                | ".gitattributes"
+                | ".dockerignore"
+                | ".editorconfig"
+                | ".npmrc"
+                | ".bashrc"
+                | ".zshrc"
+                | ".profile"
+        );
+    file.contains('/') || dotfile || crate::file_icons::file_icon_name(name) != "file"
 }
 /// Bind preview links to their document, independent of the focused pane.
 pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
@@ -1100,5 +1128,34 @@ mod fence_highlight_tests {
             }
         }
         assert_eq!(Fence::new("javascript", source).language, "javascript");
+    }
+
+    #[test]
+    fn only_inline_code_that_can_be_a_file_is_a_file_chip() {
+        for yes in [
+            "ApiKeyManagementView.vue",
+            "backfill_company_asm_flags.py",
+            "dfp_advanced_search_bar_builder.py:1321",
+            "cloud_bucket_probe_utils.py:288:5",
+            "docs/asm_refactor_v2_release_review_2026-11-09.md",
+            "src/odd.unknownext",
+            "Cargo.toml",
+            ".env",
+        ] {
+            assert!(super::is_file_chip(yes), "{yes}");
+        }
+        for no in [
+            "Timeout.value",
+            "Timeout.MINUTES_10",
+            ".value",
+            ".queue()",
+            "settings_utils.update_company_passive_port_scan",
+            "company_dns_records",
+            "/app/",
+            "a b.py",
+            "x = y.py",
+        ] {
+            assert!(!super::is_file_chip(no), "{no}");
+        }
     }
 }

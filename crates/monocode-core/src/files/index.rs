@@ -92,6 +92,86 @@ pub fn list_project_files_with(
     Ok(walk_project_files(&root, cancel.into(), include_ignored))
 }
 
+/// The project files a loose reference could mean. Models and people write
+/// `utils.py` or `app/utils.py` without the directories above it, so this
+/// returns every file whose path is the reference or ends with it, as paths
+/// relative to `cwd`, shallowest first. Asks git directly, so a large repo's
+/// listing limit does not hide the file.
+pub fn find_reference(cwd: &str, reference: &str) -> Result<Vec<String>, String> {
+    let reference = reference.trim().replace('\\', "/");
+    let reference = reference.trim_start_matches("./");
+    if reference.is_empty()
+        || reference.starts_with('/')
+        || reference.ends_with('/')
+        || reference.split('/').any(|part| part == "..")
+    {
+        return Ok(Vec::new());
+    }
+    if !super::remote::is_remote(Path::new(cwd)) {
+        let root = expand_home(Path::new(cwd));
+        if root.is_dir() {
+            let escaped: String = reference
+                .chars()
+                .flat_map(|c| {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                        vec!['\\', c]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let glob = format!(":(glob)**/{escaped}");
+            let args = [
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                glob.as_str(),
+            ];
+            if let Some((raw, false)) = git_output_capped(&root, &args, MAX_LS_FILES_BYTES, None) {
+                let mut found: Vec<String> = String::from_utf8_lossy(&raw)
+                    .split('\0')
+                    .filter(|path| !path.is_empty() && !path_has_skipped_dir(path))
+                    .map(str::to_owned)
+                    .collect();
+                rank_references(&mut found);
+                return Ok(found);
+            }
+        }
+    }
+    // Not a git checkout, or a remote one: match against the listing.
+    let files = list_project_files_with(cwd, None, false)?;
+    Ok(match_reference(&files, reference))
+}
+
+/// Listed files whose relative path is `reference` or ends with `/reference`.
+pub fn match_reference(files: &[ProjectFile], reference: &str) -> Vec<String> {
+    let reference = reference.trim().replace('\\', "/");
+    let reference = reference.trim_start_matches("./");
+    if reference.is_empty() {
+        return Vec::new();
+    }
+    let suffix = format!("/{reference}");
+    let mut found: Vec<String> = files
+        .iter()
+        .filter(|file| file.relative == reference || file.relative.ends_with(&suffix))
+        .map(|file| file.relative.clone())
+        .collect();
+    rank_references(&mut found);
+    found
+}
+
+fn rank_references(found: &mut Vec<String>) {
+    found.sort_by(|a, b| {
+        let depth = |p: &String| p.matches('/').count();
+        depth(a).cmp(&depth(b)).then(a.cmp(b))
+    });
+    found.dedup();
+    found.truncate(50);
+}
+
 const MAX_LS_FILES_BYTES: usize = 8 * 1024 * 1024;
 /// Ignored folders listed one by one, and the most one listing may hold.
 const MAX_IGNORED_BYTES: usize = 4 * 1024 * 1024;
@@ -619,5 +699,77 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_loose_reference_finds_files_by_name_or_path_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "--quiet"]);
+        for path in [
+            "top.py",
+            "app/utils.py",
+            "app/deep/more/utils.py",
+            "other/utils.py.bak",
+            "lib/odd[1].txt",
+            "node_modules/pkg/utils.py",
+        ] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "x").unwrap();
+        }
+        git(&["add", "."]);
+        let cwd = root.to_string_lossy();
+        assert_eq!(
+            find_reference(&cwd, "utils.py").unwrap(),
+            ["app/utils.py", "app/deep/more/utils.py"],
+            "shallowest first, dependency folders skipped, no partial names"
+        );
+        assert_eq!(find_reference(&cwd, "top.py").unwrap(), ["top.py"]);
+        assert_eq!(
+            find_reference(&cwd, "deep/more/utils.py").unwrap(),
+            ["app/deep/more/utils.py"]
+        );
+        assert_eq!(
+            find_reference(&cwd, "./app/utils.py").unwrap(),
+            ["app/utils.py"]
+        );
+        assert_eq!(
+            find_reference(&cwd, "odd[1].txt").unwrap(),
+            ["lib/odd[1].txt"],
+            "brackets are part of the name"
+        );
+        assert!(find_reference(&cwd, "missing.py").unwrap().is_empty());
+        assert!(find_reference(&cwd, "../utils.py").unwrap().is_empty());
+        assert!(find_reference(&cwd, "/etc/hosts").unwrap().is_empty());
+    }
+
+    #[test]
+    fn match_reference_works_on_a_plain_listing() {
+        let file = |relative: &str| ProjectFile {
+            name: relative.rsplit('/').next().unwrap().into(),
+            path: format!("/p/{relative}"),
+            relative: relative.into(),
+        };
+        let files = [
+            file("a/x.rs"),
+            file("x.rs"),
+            file("ax.rs"),
+            file("b/c/x.rs"),
+        ];
+        assert_eq!(
+            match_reference(&files, "x.rs"),
+            ["x.rs", "a/x.rs", "b/c/x.rs"]
+        );
+        assert_eq!(match_reference(&files, "c/x.rs"), ["b/c/x.rs"]);
+        assert!(match_reference(&files, "").is_empty());
     }
 }

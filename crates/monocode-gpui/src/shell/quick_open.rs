@@ -16,6 +16,13 @@ impl Shell {
         }
         cx.notify();
     }
+    /// Types into the open Quick Open's search box.
+    pub(super) fn set_quick_open_query(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some(open) = &self.quick_open {
+            let search = open.picker.read(cx).search.clone();
+            search.update(cx, |input, cx| input.set_text(text, cx));
+        }
+    }
     pub(super) fn open_quick_open(
         &mut self,
         palette: bool,
@@ -241,6 +248,102 @@ mod tests {
                         .content,
                     ">"
                 )
+            })
+            .unwrap();
+    }
+
+    fn project_with(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        for file in files {
+            let full = dir.path().join(file);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "x = 1\n").unwrap();
+        }
+        git(&["add", "."]);
+        dir
+    }
+
+    #[gpui::test]
+    fn a_bare_file_name_in_a_reply_opens_the_one_file_that_has_it(cx: &mut gpui::TestAppContext) {
+        let dir = project_with(&["app/utils.py", "app/models.py", "docs/notes.md"]);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_loose_reference("models.py:7".into(), cwd.clone(), w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let opened = shell
+                    .workspace
+                    .recent_files
+                    .get(&cwd)
+                    .and_then(|f| f.first());
+                assert_eq!(
+                    opened.map(String::as_str),
+                    Some(dir.path().join("app/models.py").to_string_lossy().as_ref())
+                );
+                assert!(shell.quick_open.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_name_that_several_files_share_opens_quick_open_on_it(cx: &mut gpui::TestAppContext) {
+        let dir = project_with(&["a/utils.py", "b/utils.py"]);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_loose_reference("utils.py".into(), cwd.clone(), w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let open = shell.quick_open.as_ref().expect("the user picks which");
+                assert_eq!(open.picker.read(cx).search.read(cx).content, "utils.py");
+                assert!(
+                    shell
+                        .workspace
+                        .recent_files
+                        .get(&cwd)
+                        .is_none_or(Vec::is_empty)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_missing_name_still_ends_in_the_usual_not_found_tab(cx: &mut gpui::TestAppContext) {
+        let dir = project_with(&["a/utils.py"]);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, w, cx| {
+                shell.open_loose_reference("nothing.py".into(), cwd.clone(), w, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(
+                    shell.workspace.recent_files[&cwd][0],
+                    dir.path().join("nothing.py").to_string_lossy()
+                );
             })
             .unwrap();
     }

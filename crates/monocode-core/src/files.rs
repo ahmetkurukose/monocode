@@ -3,10 +3,11 @@
 pub mod document;
 mod index;
 pub(crate) use index::skipped_dir_excludes;
-pub(crate) use index::{git_output_capped, is_indexable_root};
 pub use index::{
-    list_project_files, list_project_files_sync_cancellable, list_project_files_with, ProjectFile,
+    find_reference, list_project_files, list_project_files_sync_cancellable,
+    list_project_files_with, match_reference, ProjectFile,
 };
+pub(crate) use index::{git_output_capped, is_indexable_root};
 mod name;
 mod paths;
 pub mod remote;

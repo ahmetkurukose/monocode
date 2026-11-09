@@ -4347,6 +4347,84 @@ impl Shell {
             window.focus(&self.focus, cx);
         }
     }
+    /// Opens `path` (absolute) in a file tab, at `location` when there is one.
+    pub(super) fn open_file_at(
+        &mut self,
+        cwd: String,
+        path: String,
+        location: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
+        // Monos render above the session pane tree. Give its file
+        // an independent visible tab using the normal navigation
+        // path, which retains the Mono tab and live conversation.
+        if self.mono_active(cx)
+            && let Some(owner) = self.workspace.active
+            && let Some(pane) = self.independent_file_pane(owner, cx)
+        {
+            self.open_file_pane(pane, window, cx);
+        }
+        if let Some((line, column)) = location
+            && let Some(pane) = self.active_review(cx)
+        {
+            pane.update(cx, |pane, cx| pane.navigate_file(line, column, cx));
+        }
+    }
+
+    /// A link to a file the project root does not hold at that path, such as a
+    /// bare `utils.py`. One match below the project opens it; several open
+    /// Quick Open on that name to choose; none shows the usual "not found".
+    fn open_loose_reference(
+        &mut self,
+        raw: String,
+        cwd: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (missing, location) = crate::file_editor::file_location(&raw, &cwd);
+        let reference = std::path::Path::new(&missing)
+            .strip_prefix(&cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                std::path::Path::new(&missing)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let work = {
+            let (cwd, reference) = (cwd.clone(), reference.clone());
+            cx.background_executor()
+                .spawn(async move { monocode_core::files::find_reference(&cwd, &reference) })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let found = work.await.unwrap_or_default();
+            let _ = this.update_in(cx, |this, window, cx| match found.as_slice() {
+                [] => this.open_file_at(cwd, missing, location, window, cx),
+                [only] => {
+                    let path = std::path::Path::new(&cwd).join(only);
+                    this.open_file_at(
+                        cwd,
+                        path.to_string_lossy().into_owned(),
+                        location,
+                        window,
+                        cx,
+                    );
+                }
+                _ => {
+                    let name = std::path::Path::new(&reference)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or(reference);
+                    this.open_quick_open(false, window, cx);
+                    this.set_quick_open_query(name, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn open(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
@@ -8968,20 +9046,16 @@ impl Render for Shell {
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
                     let cwd = this.git.read(cx).project().to_owned();
                     let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
-                    this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
-                    // Monos render above the session pane tree. Give its file
-                    // an independent visible tab using the normal navigation
-                    // path, which retains the Mono tab and live conversation.
-                    if this.mono_active(cx)
-                        && let Some(owner) = this.workspace.active
-                        && let Some(pane) = this.independent_file_pane(owner, cx)
-                    {
-                        this.open_file_pane(pane, window, cx);
-                    }
-                    if let Some((line, column)) = location
-                        && let Some(pane) = this.active_review(cx)
-                    {
-                        pane.update(cx, |pane, cx| pane.navigate_file(line, column, cx));
+                    // A reference like `utils.py` names a file somewhere below the
+                    // project, not in its root: look for it before giving up.
+                    let loose = !event.0.starts_with("file://")
+                        && !std::path::Path::new(&event.0).is_absolute()
+                        && !cwd.starts_with("remote://")
+                        && !std::path::Path::new(&path).exists();
+                    if loose {
+                        this.open_loose_reference(event.0.clone(), cwd, window, cx);
+                    } else {
+                        this.open_file_at(cwd, path, location, window, cx);
                     }
                 }),
             )
