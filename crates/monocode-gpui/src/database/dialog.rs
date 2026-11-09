@@ -156,8 +156,19 @@ impl SourceDialog {
         let saved_id = self.has_saved_password.then(|| source.id.clone());
         self.test = Test::Running;
         let work = runtime().spawn(async move {
-            let password = typed
-                .or_else(|| saved_id.and_then(|id| monocode_core::db::source::saved_password(&id)));
+            let password = match typed {
+                Some(password) => Some(password),
+                None => match saved_id {
+                    Some(id) => {
+                        monocode_core::db::source::saved_password_checked(&id).map_err(|error| {
+                            format!(
+                                "The saved password could not be read from the keychain ({error})."
+                            )
+                        })?
+                    }
+                    None => None,
+                },
+            };
             let conn = Connection::connect(&source, password.as_deref())
                 .await
                 .map_err(|e| e.message)?;

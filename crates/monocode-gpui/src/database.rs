@@ -579,11 +579,18 @@ struct PasswordLookup {
 }
 
 impl PasswordLookup {
-    fn resolve(self) -> Option<String> {
-        self.session.or_else(|| {
-            self.saved
-                .then(|| source::saved_password(&self.id))
-                .flatten()
+    /// The password to connect with. An `Err` is a keychain that could not be
+    /// read; it says so rather than letting the server answer "password missing".
+    fn resolve(self) -> Result<Option<String>, DbError> {
+        if self.session.is_some() || !self.saved {
+            return Ok(self.session);
+        }
+        source::saved_password_checked(&self.id).map_err(|error| DbError {
+            message: format!(
+                "The saved password could not be read from the keychain ({error}). \
+                 Allow Monocode access when macOS asks, then connect again."
+            ),
+            ..DbError::default()
         })
     }
 }
@@ -1302,7 +1309,13 @@ impl DatabaseView {
             let conn = match existing {
                 Some(conn) => conn,
                 None => {
-                    match Connection::connect(&data_source, password.resolve().as_deref()).await {
+                    let connected = match password.resolve() {
+                        Ok(password) => {
+                            Connection::connect(&data_source, password.as_deref()).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match connected {
                         Ok(conn) => Arc::new(conn),
                         Err(error) => {
                             done.failure = Some((
@@ -2074,9 +2087,12 @@ impl DatabaseView {
             let conn = match existing {
                 Some(conn) => conn,
                 None => Arc::new(
-                    Connection::connect(&data_source, password.resolve().as_deref())
-                        .await
-                        .map_err(|e| (None, e))?,
+                    Connection::connect(
+                        &data_source,
+                        password.resolve().map_err(|e| (None, e))?.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| (None, e))?,
                 ),
             };
             match conn.execute(&sql, 10_000).await {
@@ -2196,7 +2212,7 @@ impl DatabaseView {
         let password = self.password_for(&data_source);
         let key = id.to_owned();
         let work = async move {
-            let conn = Connection::connect(&data_source, password.resolve().as_deref()).await?;
+            let conn = Connection::connect(&data_source, password.resolve()?.as_deref()).await?;
             let schemas = conn.schemas(false).await?;
             let catalog = conn.catalog().await.unwrap_or_default();
             Ok::<_, DbError>((Arc::new(conn), schemas, catalog))
@@ -2670,6 +2686,9 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         let id = data_source.id.clone();
+        // Only a source that kept a password has one to forget; asking the
+        // keychain about any other would be a read (and a prompt) for nothing.
+        let had_saved = self.source(&id).is_some_and(|s| s.save_password);
         if let Some(password) = password {
             if data_source.save_password {
                 if let Err(error) = source::save_password(&id, &password) {
@@ -2680,7 +2699,7 @@ impl DatabaseView {
                 self.passwords.insert(id.clone(), password);
             }
         }
-        if !data_source.save_password {
+        if !data_source.save_password && had_saved {
             source::forget_password(&id);
         }
         match self.sources.iter_mut().find(|s| s.id == id) {
@@ -2699,12 +2718,15 @@ impl DatabaseView {
     }
 
     fn remove_source(&mut self, id: &str, cx: &mut Context<Self>) {
+        let had_saved = self.source(id).is_some_and(|s| s.save_password);
         self.disconnect_source(id, cx);
         self.sources.retain(|s| s.id != id);
         self.consoles.retain(|c| c.source != id);
         self.console_store.delete_source(id);
         self.active.remove(id);
-        source::forget_password(id);
+        if had_saved {
+            source::forget_password(id);
+        }
         self.passwords.remove(id);
         let _ = self.store.save(&self.sources);
         if self.selected.as_deref() == Some(id) {

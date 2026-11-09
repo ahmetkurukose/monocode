@@ -148,10 +148,16 @@ impl Connection {
     }
 
     pub async fn connect_with(config: Config) -> Result<Self, DbError> {
-        let (client, connection) = config
-            .connect(NoTls)
-            .await
-            .map_err(|e| DbError::from_pg(&e, "", false))?;
+        let (client, connection) = config.connect(NoTls).await.map_err(|e| {
+            let mut error = DbError::from_pg(&e, "", false);
+            // The driver's own wording says nothing of what to do.
+            if error.message.ends_with("password missing") {
+                error.message = "The server asked for a password and none was supplied. \
+                                     Edit the data source and enter it."
+                    .into();
+            }
+            error
+        })?;
         let driver = runtime().spawn(async move {
             let _ = connection.await;
         });

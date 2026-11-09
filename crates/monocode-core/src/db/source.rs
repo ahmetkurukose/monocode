@@ -114,18 +114,22 @@ impl DataSourceStore {
 
 /// Where secrets live. The OS credential store in the app; a map in tests.
 trait Backend {
-    fn get(&self, account: &str) -> Option<String>;
+    /// `Ok(None)` is "nothing stored"; `Err` is "could not look": the store
+    /// was locked, or access was refused. The two must never be confused.
+    fn get(&self, account: &str) -> Result<Option<String>, String>;
     fn set(&self, account: &str, value: &str) -> Result<(), String>;
 }
 
 struct Keyring;
 
 impl Backend for Keyring {
-    fn get(&self, account: &str) -> Option<String> {
-        keyring::Entry::new(KEYRING_SERVICE, account)
-            .ok()?
-            .get_password()
-            .ok()
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+        match entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
@@ -145,6 +149,10 @@ const VAULT_ACCOUNT: &str = "passwords";
 /// and one read means one question, not one per data source per connect.
 /// Older versions kept an item per data source: those are read when a
 /// source is first used, and move into the single item.
+///
+/// A read that fails (access refused, the keychain locked) is not remembered:
+/// the next lookup asks again, and nothing is ever written back from a map
+/// that was never read, which would replace every saved password with one.
 struct Vault<B: Backend> {
     backend: B,
     map: Option<std::collections::BTreeMap<String, String>>,
@@ -155,39 +163,43 @@ impl<B: Backend> Vault<B> {
         Self { backend, map: None }
     }
 
-    fn map(&mut self) -> &mut std::collections::BTreeMap<String, String> {
-        let backend = &self.backend;
-        self.map.get_or_insert_with(|| {
-            backend
-                .get(VAULT_ACCOUNT)
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default()
-        })
+    fn map(&mut self) -> Result<&mut std::collections::BTreeMap<String, String>, String> {
+        if self.map.is_none() {
+            let loaded = match self.backend.get(VAULT_ACCOUNT)? {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|_| "The saved passwords could not be read.".to_owned())?,
+                None => Default::default(),
+            };
+            self.map = Some(loaded);
+        }
+        Ok(self.map.get_or_insert_with(Default::default))
     }
 
     fn persist(&mut self) -> Result<(), String> {
-        let json = serde_json::to_string(self.map()).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(self.map()?).map_err(|e| e.to_string())?;
         self.backend.set(VAULT_ACCOUNT, &json)
     }
 
-    fn get(&mut self, id: &str) -> Option<String> {
-        if let Some(found) = self.map().get(id) {
-            return Some(found.clone());
+    fn get(&mut self, id: &str) -> Result<Option<String>, String> {
+        if let Some(found) = self.map()?.get(id) {
+            return Ok(Some(found.clone()));
         }
         // A password saved by an older version, in its own item.
-        let legacy = self.backend.get(id)?;
-        self.map().insert(id.to_owned(), legacy.clone());
+        let Ok(Some(legacy)) = self.backend.get(id) else {
+            return Ok(None);
+        };
+        self.map()?.insert(id.to_owned(), legacy.clone());
         let _ = self.persist();
-        Some(legacy)
+        Ok(Some(legacy))
     }
 
     fn save(&mut self, id: &str, password: &str) -> Result<(), String> {
-        self.map().insert(id.to_owned(), password.to_owned());
+        self.map()?.insert(id.to_owned(), password.to_owned());
         self.persist()
     }
 
     fn forget(&mut self, id: &str) {
-        if self.map().remove(id).is_some() {
+        if self.map().is_ok_and(|map| map.remove(id).is_some()) {
             let _ = self.persist();
         }
     }
@@ -199,8 +211,17 @@ fn vault() -> &'static std::sync::Mutex<Vault<Keyring>> {
     VAULT.get_or_init(|| std::sync::Mutex::new(Vault::new(Keyring)))
 }
 
+/// The saved password, `None` when none is saved. An `Err` means the store
+/// could not be read (locked, or access refused), not that there is no password.
+pub fn saved_password_checked(id: &str) -> Result<Option<String>, String> {
+    vault()
+        .lock()
+        .map_err(|_| "The credential store is busy.".to_owned())?
+        .get(id)
+}
+
 pub fn saved_password(id: &str) -> Option<String> {
-    vault().lock().ok()?.get(id)
+    saved_password_checked(id).ok().flatten()
 }
 
 pub fn save_password(id: &str, password: &str) -> Result<(), String> {
@@ -243,12 +264,17 @@ mod tests {
     struct Fake {
         items: Rc<RefCell<HashMap<String, String>>>,
         reads: Rc<RefCell<usize>>,
+        /// Reads fail while this is set, like a refused or locked keychain.
+        locked: Rc<RefCell<bool>>,
     }
 
     impl Backend for Fake {
-        fn get(&self, account: &str) -> Option<String> {
+        fn get(&self, account: &str) -> Result<Option<String>, String> {
             *self.reads.borrow_mut() += 1;
-            self.items.borrow().get(account).cloned()
+            if *self.locked.borrow() {
+                return Err("User interaction is not allowed.".into());
+            }
+            Ok(self.items.borrow().get(account).cloned())
         }
         fn set(&self, account: &str, value: &str) -> Result<(), String> {
             self.items.borrow_mut().insert(account.into(), value.into());
@@ -266,8 +292,8 @@ mod tests {
         // A new run: nothing cached yet.
         let mut vault = Vault::new(fake.clone());
         for _ in 0..5 {
-            assert_eq!(vault.get("a").as_deref(), Some("pw-a"));
-            assert_eq!(vault.get("b").as_deref(), Some("pw-b"));
+            assert_eq!(vault.get("a").unwrap().as_deref(), Some("pw-a"));
+            assert_eq!(vault.get("b").unwrap().as_deref(), Some("pw-b"));
         }
         assert_eq!(
             *fake.reads.borrow(),
@@ -287,7 +313,7 @@ mod tests {
         let mut vault = Vault::new(fake.clone());
         vault.save("a", "pw").unwrap();
         vault.forget("a");
-        assert_eq!(Vault::new(fake).get("a"), None);
+        assert_eq!(Vault::new(fake).get("a"), Ok(None));
     }
 
     #[test]
@@ -297,16 +323,66 @@ mod tests {
             .borrow_mut()
             .insert("old-id".into(), "legacy-pw".into());
         let mut vault = Vault::new(fake.clone());
-        assert_eq!(vault.get("old-id").as_deref(), Some("legacy-pw"));
+        assert_eq!(vault.get("old-id").unwrap().as_deref(), Some("legacy-pw"));
         *fake.reads.borrow_mut() = 0;
         let mut vault = Vault::new(fake.clone());
-        assert_eq!(vault.get("old-id").as_deref(), Some("legacy-pw"));
+        assert_eq!(vault.get("old-id").unwrap().as_deref(), Some("legacy-pw"));
         assert_eq!(
             *fake.reads.borrow(),
             1,
             "next run it comes from the single item"
         );
-        assert_eq!(vault.get("never-saved"), None);
+        assert_eq!(vault.get("never-saved"), Ok(None));
+    }
+
+    #[test]
+    fn a_refused_read_is_an_error_not_a_missing_password_and_is_asked_again() {
+        let fake = Fake::default();
+        Vault::new(fake.clone()).save("a", "pw-a").unwrap();
+        *fake.locked.borrow_mut() = true;
+        let mut vault = Vault::new(fake.clone());
+        assert!(vault.get("a").is_err(), "locked is not 'no password'");
+        assert!(vault.get("a").is_err(), "and the failure is not remembered");
+        *fake.locked.borrow_mut() = false;
+        assert_eq!(
+            vault.get("a").unwrap().as_deref(),
+            Some("pw-a"),
+            "once the keychain answers, the password is there"
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_back_from_a_map_that_was_never_read() {
+        let fake = Fake::default();
+        Vault::new(fake.clone()).save("a", "pw-a").unwrap();
+        *fake.locked.borrow_mut() = true;
+        let mut vault = Vault::new(fake.clone());
+        assert!(vault.save("b", "pw-b").is_err());
+        vault.forget("a");
+        *fake.locked.borrow_mut() = false;
+        let mut fresh = Vault::new(fake);
+        assert_eq!(
+            fresh.get("a").unwrap().as_deref(),
+            Some("pw-a"),
+            "the other password survived the failed save and forget"
+        );
+        assert_eq!(fresh.get("b").unwrap(), None);
+    }
+
+    #[test]
+    fn an_unreadable_vault_is_never_replaced() {
+        let fake = Fake::default();
+        fake.items
+            .borrow_mut()
+            .insert(VAULT_ACCOUNT.into(), "{ not json".into());
+        let mut vault = Vault::new(fake.clone());
+        assert!(vault.get("a").is_err());
+        assert!(vault.save("a", "pw").is_err());
+        assert_eq!(
+            fake.items.borrow()[VAULT_ACCOUNT],
+            "{ not json",
+            "left exactly as it was"
+        );
     }
 
     #[test]
