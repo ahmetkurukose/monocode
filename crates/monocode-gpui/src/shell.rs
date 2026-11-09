@@ -2340,6 +2340,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A file opened from the Database, Inbox, Notes or Automations view
+        // belongs to the project: leave the view, or it opens out of sight.
+        if self.app_view_open() {
+            self.close_app_view(window, cx);
+        }
         if let crate::review::ReviewTab::File { cwd, path } = &tab {
             let recent = self.workspace.recent_files.entry(cwd.clone()).or_default();
             recent.retain(|old| old != path);

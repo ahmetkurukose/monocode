@@ -347,4 +347,37 @@ mod tests {
             })
             .unwrap();
     }
+
+    #[gpui::test]
+    fn a_file_picked_from_an_app_view_leaves_the_view_and_shows_the_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::app_views::AppView;
+        let dir = project_with(&["app/utils.py"]);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let path = dir
+            .path()
+            .join("app/utils.py")
+            .to_string_lossy()
+            .to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        for view in [AppView::Database, AppView::Inbox, AppView::Notes] {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.active_app_view = Some(view);
+                    shell.open_file_at(cwd.clone(), path.clone(), None, w, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, _| {
+                    assert!(
+                        !shell.app_view_open(),
+                        "{view:?} must not keep covering the file"
+                    );
+                    assert_eq!(shell.workspace.recent_files[&cwd][0], path);
+                })
+                .unwrap();
+        }
+    }
 }
