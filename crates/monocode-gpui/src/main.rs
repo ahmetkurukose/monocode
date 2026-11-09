@@ -86,6 +86,7 @@ mod session_review;
 mod settings;
 mod shell;
 mod sound;
+mod stash_dialog;
 mod syntax;
 mod tab_label;
 mod tab_motion;

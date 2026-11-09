@@ -2,6 +2,7 @@
 //! src-tauri/src/fs.rs. Synchronous: callers run these on a background executor.
 mod review;
 pub(crate) mod shell;
+mod stash;
 pub(crate) mod text;
 mod update;
 
@@ -20,6 +21,10 @@ pub use review::{
     review_index, stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
 };
 pub(crate) use shell::{expand_home, path_to_js};
+pub use stash::{
+    stash_apply, stash_branch, stash_clear, stash_drop, stash_file_diff, stash_files, stash_list,
+    stash_push, StashEntry, StashOutcome,
+};
 pub use update::{
     abort_update, merge_branch, outgoing, range_file_diff, rebase_branch, update_project,
     IncomingCommit, UpdateMethod, UpdateReport,

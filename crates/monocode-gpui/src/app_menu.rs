@@ -145,6 +145,9 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Push", GitPush),
             MenuItem::separator(),
             MenuItem::action("Branches…", GitBranches),
+            MenuItem::separator(),
+            MenuItem::action("Stash Changes…", GitStash),
+            MenuItem::action("Unstash Changes…", GitUnstash),
         ]),
         // AppKit adds its window list here once the menu is named "Window".
         Menu::new("Window").items([

@@ -1451,3 +1451,153 @@ fn stage_files_adds_unversioned_files_in_one_go_and_takes_names_literally() {
     assert!(stage_files(dir, &[]).is_ok());
     assert!(stage_files(dir, &["../outside".into()]).is_err());
 }
+
+fn repo_with_changes() -> tempfile::TempDir {
+    let dir = tmp();
+    assert!(init_git_commit(
+        dir.path(),
+        &[("a.txt", "one\n"), ("b.txt", "two\n")]
+    ));
+    std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").unwrap();
+    dir
+}
+
+#[test]
+fn stash_push_shelves_changes_and_lists_them_newest_first() {
+    let dir = repo_with_changes();
+    let root = dir.path();
+    stash_push(root, "first idea", false, false).unwrap();
+    assert!(index(root).files.is_empty(), "the tree is clean again");
+    std::fs::write(root.join("b.txt"), "two\nmore\n").unwrap();
+    stash_push(root, "", false, false).unwrap();
+    let list = stash_list(root).unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].index, 0);
+    assert_eq!(list[0].branch, "main");
+    assert!(list[0].message.starts_with("WIP: "), "{:?}", list[0]);
+    assert_eq!(list[1].message, "first idea");
+    assert!(list[0].timestamp > 0 && list[0].sha != list[1].sha);
+    assert_eq!(
+        stash_push(root, "nothing", false, false).unwrap_err(),
+        "There are no changes to stash"
+    );
+}
+
+#[test]
+fn stash_can_take_untracked_files_and_keep_what_is_staged() {
+    let dir = repo_with_changes();
+    let root = dir.path();
+    std::fs::write(root.join("new.txt"), "fresh\n").unwrap();
+    stash_push(root, "with new", true, false).unwrap();
+    assert!(
+        !root.join("new.txt").exists(),
+        "untracked files were shelved"
+    );
+    let entry = &stash_list(root).unwrap()[0];
+    let files = stash_files(root, &entry.sha).unwrap();
+    let names: Vec<_> = files.iter().map(|f| f.relative.as_str()).collect();
+    assert_eq!(names, ["a.txt", "new.txt"]);
+    assert_eq!(files[0].additions, 1);
+    let diff = stash_file_diff(root, &entry.sha, "new.txt").unwrap();
+    assert_eq!(diff.current, "fresh\n");
+    assert_eq!(diff.original, "");
+    let diff = stash_file_diff(root, &entry.sha, "a.txt").unwrap();
+    assert_eq!(
+        (diff.original.as_str(), diff.current.as_str()),
+        ("one\n", "one\nchanged\n")
+    );
+    // Without the flag an untracked file stays where it is.
+    std::fs::write(root.join("a.txt"), "one\nagain\n").unwrap();
+    std::fs::write(root.join("loose.txt"), "x\n").unwrap();
+    stash_push(root, "tracked only", false, false).unwrap();
+    assert!(root.join("loose.txt").exists());
+    // Keeping the index leaves the staged change in the tree.
+    std::fs::write(root.join("a.txt"), "one\nstaged\n").unwrap();
+    assert!(git(root, &["add", "a.txt"]));
+    stash_push(root, "keep", false, true).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "one\nstaged\n"
+    );
+}
+
+#[test]
+fn applying_keeps_the_entry_and_popping_drops_it() {
+    let dir = repo_with_changes();
+    let root = dir.path();
+    stash_push(root, "work", false, false).unwrap();
+    let sha = stash_list(root).unwrap()[0].sha.clone();
+    let outcome = stash_apply(root, &sha, false, false).unwrap();
+    assert_eq!(outcome, StashOutcome::default());
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "one\nchanged\n"
+    );
+    assert_eq!(stash_list(root).unwrap().len(), 1, "apply keeps it");
+    assert!(git(root, &["checkout", "--", "a.txt"]));
+    let outcome = stash_apply(root, &sha, true, false).unwrap();
+    assert!(outcome.dropped && outcome.conflicts.is_empty());
+    assert!(stash_list(root).unwrap().is_empty(), "pop drops it");
+    assert_eq!(
+        stash_apply(root, &sha, false, false).unwrap_err(),
+        "That stash no longer exists"
+    );
+}
+
+#[test]
+fn a_conflicting_pop_reports_the_files_and_keeps_the_entry() {
+    let dir = repo_with_changes();
+    let root = dir.path();
+    stash_push(root, "mine", false, false).unwrap();
+    std::fs::write(root.join("a.txt"), "one\ntheirs\n").unwrap();
+    assert!(git(root, &["commit", "-am", "other change"]));
+    let sha = stash_list(root).unwrap()[0].sha.clone();
+    let outcome = stash_apply(root, &sha, true, false).unwrap();
+    assert_eq!(outcome.conflicts, ["a.txt"]);
+    assert!(!outcome.dropped);
+    assert_eq!(stash_list(root).unwrap().len(), 1, "kept for another try");
+    // Local edits in the way are an error, with git's own words.
+    assert!(git(root, &["checkout", "-f", "HEAD"]));
+    std::fs::write(root.join("a.txt"), "local edit\n").unwrap();
+    let error = stash_apply(root, &sha, false, false).unwrap_err();
+    assert!(
+        error.contains("overwritten") || error.contains("conflict"),
+        "{error}"
+    );
+}
+
+#[test]
+fn dropping_clearing_and_branching_from_entries() {
+    let dir = repo_with_changes();
+    let root = dir.path();
+    stash_push(root, "one", false, false).unwrap();
+    std::fs::write(root.join("b.txt"), "two\nb\n").unwrap();
+    stash_push(root, "two", false, false).unwrap();
+    std::fs::write(root.join("a.txt"), "one\nthree\n").unwrap();
+    stash_push(root, "three", false, false).unwrap();
+    let list = stash_list(root).unwrap();
+    // Entries are found by commit, so dropping the middle one is exact.
+    stash_drop(root, &list[1].sha).unwrap();
+    let left: Vec<_> = stash_list(root)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(left, ["three", "one"]);
+    let newest = stash_list(root).unwrap()[0].sha.clone();
+    assert!(stash_branch(root, &newest, "").is_err());
+    assert!(stash_branch(root, &newest, "-bad").is_err());
+    stash_branch(root, &newest, "from-stash").unwrap();
+    assert_eq!(
+        git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+        Some("from-stash")
+    );
+    assert_eq!(
+        stash_list(root).unwrap().len(),
+        1,
+        "branching drops its entry"
+    );
+    stash_clear(root).unwrap();
+    assert!(stash_list(root).unwrap().is_empty());
+    assert!(stash_apply(root, "zz", false, false).is_err());
+}

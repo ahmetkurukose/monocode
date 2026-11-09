@@ -13,6 +13,7 @@ use crate::{
         menu_popover, popover,
     },
     right_panel::*,
+    stash_dialog::{Intent as StashIntent, StashDialog, StashDialogEvent},
     theme::*,
     update_dialog::{Source, UpdateDialog, UpdateDialogEvent},
 };
@@ -257,6 +258,7 @@ pub(crate) struct Changes {
     commit_anchor: AnchorSlot,
     commit_dialog: Option<(Entity<CommitDialog>, Subscription)>,
     update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
+    stash_dialog: Option<(Entity<StashDialog>, Subscription)>,
     branch_picker: Option<(Entity<BranchPopup>, Subscription)>,
     /// The switcher opened from the menu bar: a centred window, not a popover.
     branch_place: BranchPlace,
@@ -305,6 +307,7 @@ impl Changes {
             commit_anchor: AnchorSlot::default(),
             commit_dialog: None,
             update_dialog: None,
+            stash_dialog: None,
             branch_picker: None,
             branch_place: BranchPlace::Header,
             blocked: None,
@@ -732,6 +735,42 @@ impl Changes {
             cx.notify();
         });
         self.update_dialog = Some((dialog, subscription));
+        cx.emit(ChangesEvent::Overlays);
+        cx.notify();
+    }
+
+    /// Stash Changes… and Unstash Changes…: one window to shelve the working
+    /// tree and to manage what is shelved.
+    pub(crate) fn open_stash_dialog(
+        &mut self,
+        intent: StashIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stash_dialog.is_some() || self.busy.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        if self.refuse_while_agent_works("stash or unstash", window, cx) {
+            return;
+        }
+        let git = self.git.clone();
+        let cwd = self.cwd.clone();
+        let dialog = cx.new(|cx| StashDialog::new(git, cwd, intent, window, cx));
+        let subscription = cx.subscribe(&dialog, |this, _, event: &StashDialogEvent, cx| {
+            match event {
+                StashDialogEvent::Changed(what) => {
+                    this.mutated(cx);
+                    this.set_status(what, cx);
+                }
+                StashDialogEvent::Close => {
+                    this.stash_dialog = None;
+                    this.mutated(cx);
+                    cx.emit(ChangesEvent::Overlays);
+                }
+            }
+            cx.notify();
+        });
+        self.stash_dialog = Some((dialog, subscription));
         cx.emit(ChangesEvent::Overlays);
         cx.notify();
     }
@@ -1172,6 +1211,13 @@ impl Changes {
                         .icon(if pulling { "loader" } else { "refresh-cw" })
                         .disabled(self.busy.is_some() || !can_pull)
                         .into(),
+                    MenuItem::Separator,
+                    MenuAction::new("stash", "Stash Changes…")
+                        .disabled(self.busy.is_some())
+                        .into(),
+                    MenuAction::new("unstash", "Unstash Changes…")
+                        .disabled(self.busy.is_some())
+                        .into(),
                 ]
             }
             MenuKind::Commit => {
@@ -1195,7 +1241,7 @@ impl Changes {
             }
         };
         let (label, width) = match kind {
-            MenuKind::Branch => ("Branch actions", 204.),
+            MenuKind::Branch => ("Branch actions", 214.),
             MenuKind::Commit => ("Commit options", 192.),
         };
         let menu = cx.new(|cx| {
@@ -1220,6 +1266,8 @@ impl Changes {
                             cx,
                         ),
                         "dialog" => this.open_commit_dialog(window, cx),
+                        "stash" => this.open_stash_dialog(StashIntent::Stash, window, cx),
+                        "unstash" => this.open_stash_dialog(StashIntent::Manage, window, cx),
                         "push" => this.commit(true, false, window, cx),
                         "push-pr" => this.commit(true, true, window, cx),
                         "amend" => this.toggle_amend(window, cx),
@@ -2379,6 +2427,9 @@ impl Changes {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
         if let Some((dialog, _)) = &self.update_dialog {
+            out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
+        }
+        if let Some((dialog, _)) = &self.stash_dialog {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
         let Some(picker) = self

@@ -87,7 +87,7 @@ impl Focusable for UpdateDialog {
     }
 }
 
-fn age(timestamp: i64) -> String {
+pub(crate) fn age(timestamp: i64) -> String {
     let now = monocode_core::time::now_ms() as i64 / 1000;
     let seconds = (now - timestamp).max(0);
     match seconds {
@@ -508,7 +508,7 @@ impl UpdateDialog {
 }
 
 /// The diff pane's model for one file.
-fn model(
+pub(crate) fn model(
     id: &SharedString,
     relative: &str,
     loaded: Option<(FileDiff, Option<diff::UnifiedFile>)>,

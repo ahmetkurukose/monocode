@@ -145,6 +145,8 @@ actions!(
         GitPull,
         GitPush,
         GitBranches,
+        GitStash,
+        GitUnstash,
         CheckForUpdates,
         MinimizeWindow,
         ZoomWindow,
@@ -9105,6 +9107,16 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &GitPush, window, cx| {
                 this.git_tool(window, cx, |changes, window, cx| changes.push(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &GitStash, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.open_stash_dialog(crate::stash_dialog::Intent::Stash, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &GitUnstash, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.open_stash_dialog(crate::stash_dialog::Intent::Manage, window, cx)
+                })
             }))
             .on_action(cx.listener(|this, _: &GitBranches, window, cx| {
                 this.git_tool(window, cx, |changes, window, cx| {

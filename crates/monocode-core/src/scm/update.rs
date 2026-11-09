@@ -74,7 +74,7 @@ fn commits_in(root: &Path, revs: &[&str]) -> Vec<IncomingCommit> {
 }
 
 /// Files that differ between two commits, with line counts.
-fn range_files_for(root: &Path, old: &str, new: &str) -> Vec<ChangedFile> {
+pub(super) fn range_files_for(root: &Path, old: &str, new: &str) -> Vec<ChangedFile> {
     let mut files: HashMap<String, FileAcc> = HashMap::new();
     let mut statuses: HashMap<String, &'static str> = HashMap::new();
     let diff = |kind: &str| {
