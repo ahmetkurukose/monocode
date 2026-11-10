@@ -170,6 +170,11 @@ impl Shell {
             self.close_pane(pane, window, cx);
         }
         self.workspace.projects.retain(|p| p != path);
+        let gone =
+            |tab: &TitleTab| matches!(tab, TitleTab::ProjectApp { project, .. } if project == path);
+        self.workspace.title_order.retain(|tab| !gone(tab));
+        self.workspace.scope_focus.retain(|_, tab| !gone(tab));
+        self.workspace.prune_pinned_tabs();
         self.workspace.project_rail_pinned.remove(path);
         self.workspace.project_rail_expanded.remove(path);
         if self.workspace.project == path {

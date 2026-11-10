@@ -8,7 +8,6 @@ use crate::{
     resource_pressure::SessionInfo,
     right_panel::{RightPanel, RightTab},
     theme::*,
-    workspace::TitleTab,
 };
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, Role, StyleRefinement,
@@ -153,7 +152,7 @@ impl Shell {
             && self.workspace.classic_layout
             && !self.workspace.project_rail_open
             && self.settings.is_none()
-            && !self.app_view_open()
+            && !self.classic_app_surface()
             && !self.search_page()
             && !self.mono_active(cx)
     }
@@ -183,10 +182,10 @@ impl Shell {
     }
     pub(super) fn layout_changed(&mut self, cx: &mut Context<Self>) {
         let classic = self.workspace.boxy_layout();
-        if !self.workspace.classic_layout
-            && let Some(view) = self.active_app_view
+        if let Some(view) = self.active_app_view
+            && (!self.workspace.classic_layout || self.project_app_scope(view))
         {
-            self.remember_title_tab(TitleTab::App(view));
+            self.remember_title_tab(self.app_tab(view));
         }
         if !self.workspace.classic_layout
             && let Some(id) = self.monos.as_ref().and_then(|m| m.read(cx).active.clone())
@@ -374,7 +373,7 @@ impl Shell {
             && self.classic_surface_open(cx);
         let tab_bar = if spans_window || (original && self.search_page()) {
             None
-        } else if original && self.app_view_open() {
+        } else if original && self.classic_app_surface() {
             Some(self.titlebar_controls_space(self.classic_app_surface_header(cx), window))
         } else if original && self.mono_active(cx) {
             let bar = self.classic_mono_header(cx);

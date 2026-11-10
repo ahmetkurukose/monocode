@@ -5,7 +5,7 @@ impl Shell {
     pub(super) fn classic_surface_open(&self, cx: &App) -> bool {
         self.workspace.classic_layout
             && (self.settings.is_some()
-                || self.app_view_open()
+                || self.classic_app_surface()
                 || self.search_page()
                 || self.mono_active(cx))
     }

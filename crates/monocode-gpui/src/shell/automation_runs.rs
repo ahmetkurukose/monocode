@@ -102,7 +102,9 @@ impl Shell {
                             && this.settings.is_none()
                         {
                             let saved = this.workspace.scope_focus.get(&this.tab_scope()).cloned();
-                            if let Some(tab @ TitleTab::App(_)) = saved {
+                            if let Some(tab @ (TitleTab::App(_) | TitleTab::ProjectApp { .. })) =
+                                saved
+                            {
                                 this.open_title_tab(&tab, window, cx);
                             }
                         }

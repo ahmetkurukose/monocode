@@ -95,14 +95,14 @@ impl Shell {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.close_title_tabs(&[TitleTab::App(view)], None, window, cx);
+                            this.close_title_tabs(&[this.app_tab(view)], None, window, cx);
                         })),
                 )
             })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event, _, cx| {
-                    this.start_tab_drag(TitleTab::App(view), event, cx)
+                    this.start_tab_drag(this.app_tab(view), event, cx)
                 }),
             )
             .on_mouse_down(
@@ -120,14 +120,14 @@ impl Shell {
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.close_title_tabs(&[TitleTab::App(view)], None, window, cx);
+                    this.close_title_tabs(&[this.app_tab(view)], None, window, cx);
                 }),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 if std::mem::take(&mut this.skip_tab_click) {
                     return;
                 }
-                this.open_title_tab(&TitleTab::App(view), window, cx);
+                this.open_title_tab(&this.app_tab(view), window, cx);
             }))
     }
     /// Reads how many notes the store holds for the sidebar's Notes row.
@@ -204,8 +204,8 @@ impl Shell {
             self.leave_app_views(cx);
         }
         self.active_app_view = Some(view);
-        if !self.workspace.classic_layout {
-            self.remember_title_tab(TitleTab::App(view));
+        if !self.workspace.classic_layout || self.project_app_scope(view) {
+            self.remember_title_tab(self.app_tab(view));
             self.reveal_active_tab(cx);
         }
         self.update_chat_visibility(cx);

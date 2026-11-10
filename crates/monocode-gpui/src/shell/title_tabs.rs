@@ -87,6 +87,11 @@ impl Shell {
                     !self.workspace.classic_layout
                         && (*view != app_views::AppView::Notes || self.workspace.preferences.notes)
                 }
+                TitleTab::ProjectApp { view, project } => {
+                    self.project_rail_tree_on()
+                        && *project == self.workspace.project
+                        && (*view != app_views::AppView::Notes || self.workspace.preferences.notes)
+                }
                 TitleTab::Session(tab) => {
                     self.workspace.tabs.contains(tab) && {
                         let id = self.workspace.scope_pane(*tab);
@@ -121,7 +126,7 @@ impl Shell {
 
     pub(super) fn active_title_tab(&self, cx: &App) -> Option<TitleTab> {
         if let Some(view) = self.active_app_view {
-            return Some(TitleTab::App(view));
+            return Some(self.app_tab(view));
         }
         if self.search_page() {
             return Some(TitleTab::Search);
@@ -193,6 +198,9 @@ impl Shell {
                 app_views::AppView::Automations => self.open_automations(window, cx),
                 app_views::AppView::Database => self.open_database(window, cx),
             },
+            TitleTab::ProjectApp { view, project } => {
+                self.open_project_app(*view, project.clone(), window, cx)
+            }
             TitleTab::Session(id) => {
                 let focus = self.workspace.tab_focus(*id);
                 let review_focused = self.tab_review_focused(*id, cx);
@@ -354,8 +362,8 @@ impl Shell {
         self.cancel_pane_drag(cx);
         let session_active = self.workspace.active;
         for tab in &closing {
-            if let TitleTab::App(view) = tab
-                && self.active_app_view == Some(*view)
+            if matches!(tab, TitleTab::App(_) | TitleTab::ProjectApp { .. })
+                && active.as_ref() == Some(tab)
             {
                 self.leave_app_views(cx);
             }

@@ -922,9 +922,9 @@ impl Shell {
             }
         });
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
-        let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
+        let mut workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
-        let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
+        let latest_state = Arc::new(Mutex::new(workspace.saved_json()));
         let quit_state = latest_state.clone();
         let quit_store = store.clone();
         // This application-level hook survives the last window/entity being released.
@@ -4309,7 +4309,7 @@ impl Shell {
         }
     }
     fn save_state(&mut self, cx: &mut Context<Self>) {
-        let state = serde_json::to_string(&self.workspace).unwrap();
+        let state = self.workspace.saved_json();
         *self.latest_state.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
         let revision = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let generation = self.generation.clone();
@@ -4715,7 +4715,10 @@ impl Shell {
             .workspace
             .scope_focus
             .get(&self.tab_scope())
-            .is_some_and(|tab| matches!(tab, TitleTab::Session(_)));
+            .is_some_and(|tab| {
+                matches!(tab, TitleTab::Session(_))
+                    || matches!(tab, TitleTab::ProjectApp { .. }) && self.project_rail_tree_on()
+            });
         if (!self.workspace.classic_layout || remembered_session)
             && self.restore_scope_tab(window, cx)
         {
@@ -5706,7 +5709,7 @@ impl Shell {
                     MenuTarget::Tab(id) => TitleTab::Session(*id),
                     MenuTarget::MonoTab(id) => self.mono_tab(id.clone()),
                     MenuTarget::SearchTab => TitleTab::Search,
-                    MenuTarget::AppTab(view) => TitleTab::App(*view),
+                    MenuTarget::AppTab(view) => self.app_tab(*view),
                     _ => unreachable!(),
                 };
                 let tabs = self.visible_tabs(cx);
@@ -5798,7 +5801,9 @@ impl Shell {
                         match &tab {
                             TitleTab::Session(id) => title(id),
                             TitleTab::Search => "Search".into(),
-                            TitleTab::App(view) => view.label().into(),
+                            TitleTab::App(view) | TitleTab::ProjectApp { view, .. } => {
+                                view.label().into()
+                            }
                             TitleTab::Mono { id, .. } => self
                                 .monos
                                 .as_ref()
@@ -6171,7 +6176,7 @@ impl Shell {
             }
             MenuTarget::SearchTab => self.run_title_tab_menu(TitleTab::Search, action, window, cx),
             MenuTarget::AppTab(view) => {
-                self.run_title_tab_menu(TitleTab::App(view), action, window, cx)
+                self.run_title_tab_menu(self.app_tab(view), action, window, cx)
             }
             MenuTarget::Session(id) => self.run_session_menu(id, action, window, cx),
             MenuTarget::Folder(folder) => self.run_folder_menu(folder, action, window, cx),
@@ -7990,7 +7995,7 @@ impl Shell {
         let source = match &id {
             TitleTab::Session(tab) => Some(DragSource::Tab(*tab)),
             TitleTab::Mono { .. } => Some(DragSource::MonoTab),
-            TitleTab::Search | TitleTab::App(_) => None,
+            TitleTab::Search | TitleTab::App(_) | TitleTab::ProjectApp { .. } => None,
         };
         let was = self.pane_drag.is_some();
         self.pane_drag = source.filter(|_| armed).map(|source| PaneDrag {
@@ -8541,7 +8546,7 @@ impl Shell {
             .enumerate()
             .filter_map(|(ix, tab)| match tab {
                 TitleTab::Session(id) => session_elements.remove(id),
-                TitleTab::App(view) => {
+                TitleTab::App(view) | TitleTab::ProjectApp { view, .. } => {
                     let element = self
                         .app_title_tab(*view, tab_width(tab), cx)
                         .left(shifts[ix]);
@@ -9253,10 +9258,10 @@ impl Render for Shell {
                     return;
                 }
                 if let Some(view) = this.active_app_view.filter(|_| this.settings.is_none()) {
-                    if this.workspace.classic_layout {
+                    if this.workspace.classic_layout && !this.project_app_scope(view) {
                         this.close_app_view(window, cx);
                     } else {
-                        this.close_title_tabs(&[TitleTab::App(view)], None, window, cx);
+                        this.close_title_tabs(&[this.app_tab(view)], None, window, cx);
                     }
                     return;
                 }

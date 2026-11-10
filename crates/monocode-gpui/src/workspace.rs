@@ -43,14 +43,48 @@ pub(crate) enum TitleTab {
         project: String,
         worktree: String,
     },
+    /// Classic with the tree rail: an app view as one project's tab. Kept
+    /// out of the saved `title_order`, `pinned_tabs` and `scope_focus`: on
+    /// disk these tabs live in `Workspace::project_apps`, because a build
+    /// that does not know this variant would fail to read the whole file.
+    ProjectApp {
+        view: AppView,
+        project: String,
+    },
 }
 
 impl TitleTab {
     pub fn session(&self) -> Option<i64> {
         match self {
             Self::Session(id) => Some(*id),
-            Self::Mono { .. } | Self::Search | Self::App(_) => None,
+            Self::Mono { .. } | Self::Search | Self::App(_) | Self::ProjectApp { .. } => None,
         }
+    }
+}
+
+/// A project app tab where it sat: its `title_order` index, its pin index,
+/// or (for `scope_focus`) the scope it was focused in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProjectAppSlot {
+    pub view: Option<AppView>,
+    pub project: String,
+    pub slot: usize,
+    pub scope: String,
+}
+
+/// `TitleTab::ProjectApp` entries, saved apart so older builds ignore them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProjectApps {
+    pub tabs: Vec<ProjectAppSlot>,
+    pub pinned: Vec<ProjectAppSlot>,
+    pub focus: Vec<ProjectAppSlot>,
+}
+
+impl ProjectApps {
+    fn is_empty(&self) -> bool {
+        self.tabs.is_empty() && self.pinned.is_empty() && self.focus.is_empty()
     }
 }
 
@@ -161,6 +195,9 @@ pub(crate) struct Workspace {
     pub desktop_workspace_snapshot: Option<serde_json::Value>,
     /// Exact source strings retained for preferences with no native equivalent.
     pub desktop_preferences_metadata: Option<serde_json::Value>,
+    /// Only filled while saving: see `TitleTab::ProjectApp`.
+    #[serde(skip_serializing_if = "ProjectApps::is_empty")]
+    pub project_apps: ProjectApps,
 }
 
 /// A saved command the footer runs in a terminal with one click.
@@ -320,6 +357,7 @@ impl Default for Workspace {
             title_order: Vec::new(),
             pinned_tabs: Vec::new(),
             scope_focus: HashMap::new(),
+            project_apps: ProjectApps::default(),
             worktree_focus: HashMap::new(),
             tab_workspaces: HashMap::new(),
             active: None,
@@ -618,7 +656,79 @@ impl Workspace {
                 .insert(project.clone(), state.active.unwrap());
         }
         state.add_project(&state.project.clone());
+        state.restore_project_apps();
         state
+    }
+
+    /// The JSON to save. Project app tabs are moved into `project_apps` for
+    /// the write and put back where they were afterwards.
+    pub fn saved_json(&mut self) -> String {
+        let mut apps = ProjectApps::default();
+        let slot = |tab: &TitleTab, slot: usize, scope: &str| match tab {
+            TitleTab::ProjectApp { view, project } => Some(ProjectAppSlot {
+                view: Some(*view),
+                project: project.clone(),
+                slot,
+                scope: scope.into(),
+            }),
+            _ => None,
+        };
+        apps.tabs = (self.title_order.iter().enumerate())
+            .filter_map(|(ix, tab)| slot(tab, ix, ""))
+            .collect();
+        apps.pinned = (self.pinned_tabs.iter().enumerate())
+            .filter_map(|(ix, tab)| slot(tab, ix, ""))
+            .collect();
+        apps.focus = (self.scope_focus.iter())
+            .filter_map(|(scope, tab)| slot(tab, 0, scope))
+            .collect();
+        let project_app = |tab: &TitleTab| matches!(tab, TitleTab::ProjectApp { .. });
+        self.title_order.retain(|tab| !project_app(tab));
+        self.pinned_tabs.retain(|tab| !project_app(tab));
+        self.scope_focus.retain(|_, tab| !project_app(tab));
+        self.project_apps = apps;
+        let json = serde_json::to_string(self).unwrap();
+        self.restore_project_apps();
+        json
+    }
+
+    /// Puts saved project app tabs back, dropping removed projects' tabs.
+    fn restore_project_apps(&mut self) {
+        let apps = std::mem::take(&mut self.project_apps);
+        let tab = |entry: &ProjectAppSlot| {
+            self.projects
+                .contains(&entry.project)
+                .then_some(TitleTab::ProjectApp {
+                    view: entry.view?,
+                    project: entry.project.clone(),
+                })
+        };
+        let tabs: Vec<_> = (apps.tabs.iter())
+            .filter_map(|entry| Some((entry.slot, tab(entry)?)))
+            .collect();
+        let pinned: Vec<_> = (apps.pinned.iter())
+            .filter_map(|entry| Some((entry.slot, tab(entry)?)))
+            .collect();
+        let focus: Vec<_> = (apps.focus.iter())
+            .filter_map(|entry| Some((entry.scope.clone(), tab(entry)?)))
+            .collect();
+        for (slot, tab) in tabs {
+            if !self.title_order.contains(&tab) {
+                let slot = slot.min(self.title_order.len());
+                self.title_order.insert(slot, tab);
+            }
+        }
+        for (slot, tab) in pinned {
+            if self.title_order.contains(&tab) && !self.pinned_tabs.contains(&tab) {
+                let slot = slot.min(self.pinned_tabs.len());
+                self.pinned_tabs.insert(slot, tab);
+            }
+        }
+        for (scope, tab) in focus {
+            if self.title_order.contains(&tab) {
+                self.scope_focus.entry(scope).or_insert(tab);
+            }
+        }
     }
     pub fn add_project(&mut self, path: &str) {
         self.archived_projects.retain(|p| p != path);
@@ -1575,6 +1685,55 @@ mod tests {
             (dock.terminals.clone(), dock.active),
             (vec!["/c".to_string()], 0)
         );
+    }
+    #[test]
+    fn project_app_tabs_are_saved_apart_and_come_back_in_place() {
+        let sessions = vec![(1, "/a".into()), (2, "/a".into())];
+        let notes = TitleTab::ProjectApp {
+            view: AppView::Notes,
+            project: "/a".into(),
+        };
+        let gone = TitleTab::ProjectApp {
+            view: AppView::Inbox,
+            project: "/removed".into(),
+        };
+        let mut state = Workspace::default();
+        state.open(1);
+        state.open(2);
+        state.projects = vec!["/a".into()];
+        state.project = "/a".into();
+        state.title_order = vec![
+            TitleTab::Session(1),
+            notes.clone(),
+            TitleTab::Session(2),
+            gone.clone(),
+        ];
+        state.pinned_tabs = vec![TitleTab::Session(2), notes.clone()];
+        state.scope_focus.insert("/a\0/a".into(), notes.clone());
+        let json = state.saved_json();
+        // A build without the variant must still read the file.
+        assert!(!json.contains("ProjectApp"), "{json}");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["title_order"].as_array().unwrap().len(), 2);
+        // Saving leaves the live state as it was, removed project included.
+        assert_eq!(state.title_order[1], notes);
+        assert_eq!(state.pinned_tabs, vec![TitleTab::Session(2), notes.clone()]);
+        assert!(state.project_apps.tabs.is_empty());
+        let restored = Workspace::restore(Some(&json), &sessions, "/a");
+        assert_eq!(
+            restored.title_order,
+            vec![TitleTab::Session(1), notes.clone(), TitleTab::Session(2)]
+        );
+        assert_eq!(
+            restored.pinned_tabs,
+            vec![TitleTab::Session(2), notes.clone()]
+        );
+        assert_eq!(restored.scope_focus.get("/a\0/a"), Some(&notes));
+        assert!(restored.project_apps.tabs.is_empty());
+        // A file without app tabs has no `project_apps` at all.
+        let mut plain = Workspace::default();
+        let plain: serde_json::Value = serde_json::from_str(&plain.saved_json()).unwrap();
+        assert!(plain.get("project_apps").is_none());
     }
     #[test]
     fn restore_keeps_project_selection_and_prunes_stale_project_focus() {

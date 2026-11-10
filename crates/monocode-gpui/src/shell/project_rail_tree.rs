@@ -136,6 +136,32 @@ impl Shell {
         rows
     }
 
+    /// In Classic with the tree rail, Inbox, Notes and Database open as tabs
+    /// of the current project. Automations stays one global surface.
+    pub(super) fn project_app_scope(&self, view: AppView) -> bool {
+        self.project_rail_tree_on() && view != AppView::Automations
+    }
+
+    /// The title tab an app view has here: the current project's own tab, or
+    /// the one global tab.
+    pub(super) fn app_tab(&self, view: AppView) -> TitleTab {
+        if self.project_app_scope(view) {
+            TitleTab::ProjectApp {
+                view,
+                project: self.workspace.project.clone(),
+            }
+        } else {
+            TitleTab::App(view)
+        }
+    }
+
+    /// An app view drawn as a Classic surface, with its own header and no
+    /// tab strip, rather than as a project tab.
+    pub(super) fn classic_app_surface(&self) -> bool {
+        self.active_app_view
+            .is_some_and(|view| !self.project_app_scope(view))
+    }
+
     /// Opens one of a project's apps, switching to the project first.
     pub(super) fn open_project_app(
         &mut self,
@@ -1011,5 +1037,124 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    fn click_app(
+        window: WindowHandle<Shell>,
+        visual: &mut VisualTestContext,
+        app: &str,
+        project: &str,
+    ) {
+        let ix = project_ix(window, visual, project);
+        visual.simulate_mouse_move(gpui::point(px(800.), px(500.)), None, Default::default());
+        visual.run_until_parked();
+        let icon = at(visual, format!("rail-app-{app}-{ix}")).unwrap();
+        visual.simulate_click(icon.center(), Default::default());
+        visual.run_until_parked();
+    }
+
+    fn app(view: AppView, project: &str) -> TitleTab {
+        TitleTab::ProjectApp {
+            view,
+            project: project.into(),
+        }
+    }
+
+    #[gpui::test]
+    fn app_tabs_belong_to_their_project_and_come_back_with_it(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let db = tempfile::tempdir().unwrap();
+        let (other, here) = ("/work/another-project", "/work/monocode");
+        window
+            .update(visual, |shell, _, _| {
+                shell.database_dir = db.path().to_owned()
+            })
+            .unwrap();
+        tree(window, visual, &[]);
+        click_app(window, visual, "notes", other);
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.project, other);
+                assert!(shell.visible_tabs(cx).contains(&app(AppView::Notes, other)));
+                assert_eq!(shell.active_title_tab(cx), Some(app(AppView::Notes, other)));
+                assert!(!shell.classic_surface_open(cx));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        assert!(at(visual, "app-title-tab-Notes".into()).is_some());
+        assert!(at(visual, "title-tab-strip".into()).is_some());
+        assert!(at(visual, "classic-app-surface-header".into()).is_none());
+
+        // Another project's strip has its own app tabs, not this one's.
+        click_app(window, visual, "database", here);
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.project, here);
+                assert_eq!(shell.active_app_view, Some(AppView::Database));
+                let tabs = shell.visible_tabs(cx);
+                assert!(tabs.contains(&app(AppView::Database, here)));
+                assert!(!tabs.contains(&app(AppView::Notes, other)));
+                assert!(!tabs.iter().any(|tab| matches!(tab, TitleTab::App(_))));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        assert!(at(visual, "app-title-tab-Database".into()).is_some());
+        assert!(at(visual, "app-title-tab-Notes".into()).is_none());
+
+        // Going back to the project lands on the app tab it had open.
+        window
+            .update(visual, |shell, window, cx| {
+                shell.select_project(other.into(), window, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, window, cx| {
+                assert_eq!(shell.active_app_view, Some(AppView::Notes));
+                // Without the tree the view is a Classic surface again and
+                // the project tabs wait, hidden.
+                shell.workspace.preferences.project_rail_view = "list".into();
+                assert!(shell.classic_app_surface());
+                assert!(shell.visible_tabs(cx).iter().all(|t| t.session().is_some()));
+                shell.workspace.preferences.project_rail_view = "tree".into();
+                // Closing the tab leaves the view and drops the tab.
+                let tab = shell.app_tab(AppView::Notes);
+                shell.close_title_tabs(&[tab.clone()], None, window, cx);
+                assert_eq!(shell.active_app_view, None);
+                assert!(!shell.workspace.title_order.contains(&tab));
+                assert!((shell.workspace.title_order).contains(&app(AppView::Database, here)));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn removing_a_project_drops_its_app_tabs(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let db = tempfile::tempdir().unwrap();
+        let other = "/work/another-project";
+        window
+            .update(visual, |shell, _, _| {
+                shell.database_dir = db.path().to_owned()
+            })
+            .unwrap();
+        tree(window, visual, &[]);
+        click_app(window, visual, "notes", other);
+        window
+            .update(visual, |shell, window, cx| {
+                shell.toggle_pin_tab(app(AppView::Notes, other), cx);
+                assert!((shell.workspace.pinned_tabs).contains(&app(AppView::Notes, other)));
+                shell.archive_project(other, window, cx);
+                let gone = |tab: &TitleTab| *tab == app(AppView::Notes, other);
+                assert!(!shell.workspace.title_order.iter().any(gone));
+                assert!(!shell.workspace.pinned_tabs.iter().any(gone));
+                assert!(!shell.workspace.scope_focus.values().any(gone));
+            })
+            .unwrap();
     }
 }

@@ -108,7 +108,7 @@ impl Shell {
             TitleTab::Session(id) => MenuTarget::Tab(*id),
             TitleTab::Mono { id, .. } => MenuTarget::MonoTab(id.clone()),
             TitleTab::Search => MenuTarget::SearchTab,
-            TitleTab::App(view) => MenuTarget::AppTab(*view),
+            TitleTab::App(view) | TitleTab::ProjectApp { view, .. } => MenuTarget::AppTab(*view),
         }
     }
 
@@ -153,7 +153,9 @@ impl Shell {
                 }
             }
             TitleTab::Search => (Face::Neutral, neutral("search"), "Search".into()),
-            TitleTab::App(view) => (Face::Neutral, neutral(view.icon()), view.label().into()),
+            TitleTab::App(view) | TitleTab::ProjectApp { view, .. } => {
+                (Face::Neutral, neutral(view.icon()), view.label().into())
+            }
         };
         PinCard {
             tab: tab.clone(),
