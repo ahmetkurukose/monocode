@@ -499,14 +499,19 @@ impl DatabaseView {
                         })),
                     ),
             )
-            .child(if self.sources.is_empty() {
+            .child(if self.visible_sources().next().is_none() {
                 div()
                     .flex_1()
                     .px(px(14.))
                     .py(px(10.))
                     .text_size(px(12.))
                     .text_color(content(0.45))
-                    .child("No data sources yet. Add one with +.")
+                    .child(if self.sources.is_empty() {
+                        "No data sources yet. Add one with +."
+                    } else {
+                        "No data sources in this project. Add one with +, \
+                         or give one this project in its settings."
+                    })
                     .into_any_element()
             } else {
                 uniform_list("database-tree-rows", rows.len(), move |range, _, cx| {

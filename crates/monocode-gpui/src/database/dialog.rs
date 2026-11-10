@@ -28,7 +28,9 @@ enum Test {
 }
 
 pub(crate) struct SourceDialog {
-    source: DataSource,
+    pub(super) source: DataSource,
+    /// The workspace's projects, offered in the Projects row.
+    projects: Vec<String>,
     editing: bool,
     has_saved_password: bool,
     name: Entity<Input>,
@@ -70,6 +72,7 @@ impl SourceDialog {
         source: DataSource,
         editing: bool,
         has_saved_password: bool,
+        projects: Vec<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let name = field("Name", cx);
@@ -97,6 +100,7 @@ impl SourceDialog {
             .collect();
         Self {
             source,
+            projects,
             editing,
             has_saved_password,
             name,
@@ -236,17 +240,77 @@ impl SourceDialog {
             .into_any_element()
     }
 
+    /// "All projects", and when that is off one switch per project. The
+    /// last project cannot be switched off: no projects means all of them.
+    fn projects_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.projects.is_empty() {
+            return None;
+        }
+        let all = self.source.projects.is_empty();
+        let first = self.projects[0].clone();
+        let mut row = div().flex().flex_col().gap(px(6.)).child(
+            div()
+                .text_size(px(11.))
+                .text_color(content(0.5))
+                .child("Projects"),
+        );
+        row = row.child(Self::switch(
+            "database-all-projects",
+            "All projects",
+            all,
+            cx,
+            move |s| {
+                if s.projects.is_empty() {
+                    s.projects = vec![first.clone()];
+                } else {
+                    s.projects.clear();
+                }
+            },
+        ));
+        if !all {
+            let list = div()
+                .flex()
+                .flex_wrap()
+                .gap_x(px(16.))
+                .gap_y(px(6.))
+                .pl(px(24.));
+            let list = list.children(self.projects.iter().enumerate().map(|(ix, project)| {
+                let on = self.source.projects.contains(project);
+                let path = project.clone();
+                Self::switch(
+                    SharedString::from(format!("database-project-{ix}")),
+                    crate::workspace::project_name(project),
+                    on,
+                    cx,
+                    move |s| {
+                        if !s.projects.contains(&path) {
+                            s.projects.push(path.clone());
+                        } else if s.projects.len() > 1 {
+                            s.projects.retain(|p| p != &path);
+                        }
+                    },
+                )
+            }));
+            row = row.child(list);
+        }
+        Some(row.into_any_element())
+    }
+
     fn switch(
-        id: &'static str,
-        label: &'static str,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
         on: bool,
         cx: &mut Context<Self>,
         toggle: impl Fn(&mut DataSource) + 'static,
     ) -> AnyElement {
+        let id: SharedString = id.into();
+        let label: SharedString = label.into();
+        let selector = id.clone();
         div()
             .id(id)
+            .debug_selector(move || selector.to_string())
             .role(Role::Switch)
-            .aria_label(label)
+            .aria_label(label.clone())
             .aria_selected(on)
             .cursor_pointer()
             .flex()
@@ -327,6 +391,7 @@ impl gpui::Render for SourceDialog {
                 )
                 .child(Self::labeled("Database", &self.database, None))
                 .child(Self::labeled("Comment", &self.comment, None))
+                .children(self.projects_row(cx))
                 .child(
                     div()
                         .flex()

@@ -1084,3 +1084,116 @@ fn a_right_click_menu_offers_what_fits_the_row_and_copies_names(cx: &mut TestApp
     let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();
 }
+
+fn listed(view: &DatabaseView) -> Vec<String> {
+    view.rows()
+        .into_iter()
+        .filter_map(|row| match row {
+            TreeRow::Source(id) => view.source(&id).map(|s| s.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn each_project_lists_its_sources_and_comes_back_to_the_one_it_showed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ("/work/a", "/work/b");
+    let projects = vec![a.to_string(), b.to_string()];
+    let window = open(cx, dir.path());
+    let (shared, mine) = window
+        .update(cx, |view, _, cx| {
+            let shared = local_source("shared");
+            let mut mine = local_source("mine");
+            mine.projects = vec![a.into()];
+            view.save_source(shared.clone(), None, cx);
+            view.save_source(mine.clone(), None, cx);
+            assert_eq!(listed(view), ["shared", "mine"], "unscoped lists all");
+            view.set_scope(Some(b.into()), projects.clone(), cx);
+            assert_eq!(listed(view), ["shared"]);
+            assert_eq!(view.selected.as_ref(), Some(&shared.id));
+            view.set_scope(Some(a.into()), projects.clone(), cx);
+            assert_eq!(listed(view), ["shared", "mine"]);
+            view.select_source(&mine.id, cx);
+            let ix = view.active_index().unwrap();
+            view.consoles[ix]
+                .editor
+                .update(cx, |input, cx| input.set_text("select 'kept'".into(), cx));
+            // Away and back: the console and its text stay, the selection returns.
+            view.set_scope(Some(b.into()), projects.clone(), cx);
+            assert_eq!(view.selected.as_ref(), Some(&shared.id));
+            assert_eq!(view.console_texts(&mine.id, cx), ["select 'kept'"]);
+            view.set_scope(Some(a.into()), projects.clone(), cx);
+            assert_eq!(view.selected.as_ref(), Some(&mine.id));
+            (shared, mine)
+        })
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let again = open(cx, dir.path());
+    again
+        .update(cx, |view, _, cx| {
+            view.set_scope(Some(b.into()), projects.clone(), cx);
+            assert_eq!(view.selected.as_ref(), Some(&shared.id));
+            view.set_scope(Some(a.into()), projects.clone(), cx);
+            assert_eq!(
+                view.selected.as_ref(),
+                Some(&mine.id),
+                "remembered per project"
+            );
+            // Given to B only, it leaves A's tree and the selection moves on.
+            let mut moved = mine.clone();
+            moved.projects = vec![b.into()];
+            view.save_source(moved, None, cx);
+            assert_eq!(listed(view), ["shared"]);
+            assert_eq!(view.selected.as_ref(), Some(&shared.id));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_new_source_in_a_project_belongs_to_it_and_the_dialog_switches_projects(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ("/work/a", "/work/b");
+    let window = open(cx, dir.path());
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let assigned = |visual: &mut gpui::VisualTestContext| {
+        window
+            .update(visual, |view, _, cx| {
+                let (dialog, _) = view.dialog.as_ref().unwrap();
+                dialog.read(cx).source.projects.clone()
+            })
+            .unwrap()
+    };
+    window
+        .update(visual, |view, window, cx| {
+            view.set_scope(Some(b.into()), vec![a.into(), b.into()], cx);
+            view.open_dialog(None, window, cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(assigned(visual), [b]);
+    let click = |visual: &mut gpui::VisualTestContext, id: &'static str| {
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        let at = visual.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+        visual.simulate_click(at.center(), Default::default());
+        visual.run_until_parked();
+    };
+    click(visual, "database-project-0");
+    assert_eq!(assigned(visual), [b, a]);
+    click(visual, "database-project-1");
+    assert_eq!(assigned(visual), [a]);
+    // The last project stays: none would mean every project.
+    click(visual, "database-project-0");
+    assert_eq!(assigned(visual), [a]);
+    click(visual, "database-all-projects");
+    assert!(assigned(visual).is_empty());
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("database-project-0").is_none());
+    click(visual, "database-all-projects");
+    assert_eq!(assigned(visual), [a]);
+}

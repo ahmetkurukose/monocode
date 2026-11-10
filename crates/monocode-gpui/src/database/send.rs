@@ -17,9 +17,11 @@ pub(crate) struct Target {
 }
 
 /// The saved data sources, the one used last first, read from `dir` so a file
-/// editor can offer them without the Database view being open.
-pub(crate) fn send_targets(dir: &std::path::Path) -> Vec<Target> {
-    let sources = DataSourceStore::new(dir).load();
+/// editor can offer them without the Database view being open. Sources that
+/// belong to other projects than `place`'s are left out.
+pub(crate) fn send_targets(dir: &std::path::Path, place: &str) -> Vec<Target> {
+    let mut sources = DataSourceStore::new(dir).load();
+    sources.retain(|source| source.in_project(place));
     let last: Option<String> = std::fs::read(dir.join("state.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<SavedState>(&bytes).ok())
@@ -275,7 +277,7 @@ mod tests {
         let (b, a) = (source("b"), source("a"));
         store.save(&[b.clone(), a.clone()]).unwrap();
         let names = |dir: &std::path::Path| {
-            send_targets(dir)
+            send_targets(dir, "/work/a")
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
@@ -287,6 +289,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(dir.path()), ["b", "a"]);
-        assert!(send_targets(&dir.path().join("none")).is_empty());
+        assert!(send_targets(&dir.path().join("none"), "/work/a").is_empty());
+        // A source of another project is not offered from this one's files.
+        let mut b = b;
+        b.projects = vec!["/work/b".into()];
+        store.save(&[b, a]).unwrap();
+        assert_eq!(names(dir.path()), ["a"]);
     }
 }

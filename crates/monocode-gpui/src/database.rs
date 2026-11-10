@@ -66,6 +66,8 @@ struct SavedState {
     send_target: Option<String>,
     /// The console made for each file sent to a data source, by `source\0file`.
     sent: HashMap<String, u32>,
+    /// The data source last shown in each project's Database tab.
+    selected_by_scope: HashMap<String, String>,
 }
 
 impl Default for SavedState {
@@ -81,6 +83,7 @@ impl Default for SavedState {
             results_hidden: false,
             send_target: None,
             sent: HashMap::new(),
+            selected_by_scope: HashMap::new(),
         }
     }
 }
@@ -522,6 +525,11 @@ pub(crate) struct DatabaseView {
     results_hidden: bool,
     send_target: Option<String>,
     sent: HashMap<String, u32>,
+    /// With project tabs, the project whose data sources the tree lists.
+    scope: Option<String>,
+    /// The workspace's projects, for the dialog's Projects list.
+    projects: Vec<String>,
+    selected_by_scope: HashMap<String, String>,
     history: Arc<HistoryStore>,
     history_open: bool,
     history_entries: Vec<HistoryEntry>,
@@ -679,6 +687,9 @@ impl DatabaseView {
             results_hidden: saved.results_hidden,
             send_target: saved.send_target,
             sent: saved.sent,
+            scope: None,
+            projects: Vec::new(),
+            selected_by_scope: saved.selected_by_scope,
             history: Arc::new(HistoryStore::new(&dir)),
             history_open: false,
             history_entries: Vec::new(),
@@ -720,6 +731,13 @@ impl DatabaseView {
             results_hidden: self.results_hidden,
             send_target: self.send_target.clone(),
             sent: self.sent.clone(),
+            selected_by_scope: {
+                let mut map = self.selected_by_scope.clone();
+                if let (Some(scope), Some(id)) = (&self.scope, &self.selected) {
+                    map.insert(scope.clone(), id.clone());
+                }
+                map
+            },
         };
         if let Ok(json) = serde_json::to_vec_pretty(&state) {
             if let Some(parent) = self.state_path.parent() {
@@ -731,6 +749,63 @@ impl DatabaseView {
 
     fn source(&self, id: &str) -> Option<&DataSource> {
         self.sources.iter().find(|s| s.id == id)
+    }
+
+    /// Whether the tree lists `source` in the current scope.
+    fn source_shown(&self, source: &DataSource) -> bool {
+        self.scope
+            .as_deref()
+            .is_none_or(|scope| source.in_project(scope))
+    }
+
+    /// The data sources the tree lists.
+    fn visible_sources(&self) -> impl Iterator<Item = &DataSource> {
+        self.sources.iter().filter(|s| self.source_shown(s))
+    }
+
+    fn shown_id(&self, id: &str) -> bool {
+        self.source(id).is_some_and(|s| self.source_shown(s))
+    }
+
+    /// Narrows the tree to one project's data sources, or (`None`) lists
+    /// them all. Each project comes back to the source it showed last.
+    /// Consoles, connections and running queries belong to the source and
+    /// are left alone; only the selection moves.
+    pub(crate) fn set_scope(
+        &mut self,
+        scope: Option<String>,
+        projects: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.projects = projects;
+        if self.scope == scope {
+            return;
+        }
+        if let (Some(old), Some(id)) = (&self.scope, &self.selected) {
+            self.selected_by_scope.insert(old.clone(), id.clone());
+        }
+        self.scope = scope;
+        let remembered = (self.scope.as_ref())
+            .and_then(|scope| self.selected_by_scope.get(scope))
+            .filter(|id| self.shown_id(id))
+            .cloned();
+        if let Some(id) = remembered {
+            self.selected = Some(id);
+        }
+        self.reselect_shown(cx);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// Keeps the selection on a listed source, falling back to the first.
+    fn reselect_shown(&mut self, cx: &mut Context<Self>) {
+        if !self.selected.as_deref().is_some_and(|id| self.shown_id(id)) {
+            let first = self.visible_sources().next().map(|s| s.id.clone());
+            self.selected = first;
+        }
+        if let Some(id) = self.selected.clone() {
+            self.ensure_consoles(&id, cx);
+        }
     }
 
     /// How to get a source's password, resolved off the UI thread: the
@@ -2399,7 +2474,7 @@ impl DatabaseView {
 
     fn rows(&self) -> Vec<TreeRow> {
         let mut rows = Vec::new();
-        for source in &self.sources {
+        for source in self.visible_sources() {
             rows.push(TreeRow::Source(source.id.clone()));
             if !self.expanded.contains(&format!("s:{}", source.id)) {
                 continue;
@@ -2672,8 +2747,14 @@ impl DatabaseView {
         let existing = editing.as_deref().and_then(|id| self.source(id)).cloned();
         let has_saved = existing.as_ref().is_some_and(|s| s.save_password);
         let is_edit = existing.is_some();
-        let data_source = existing.unwrap_or_else(|| DataSource::new(""));
-        let dialog = cx.new(|cx| SourceDialog::new(data_source, is_edit, has_saved, cx));
+        let data_source = existing.unwrap_or_else(|| {
+            // A source made in a project's tab belongs to that project.
+            let mut source = DataSource::new("");
+            source.projects = self.scope.iter().cloned().collect();
+            source
+        });
+        let projects = self.projects.clone();
+        let dialog = cx.new(|cx| SourceDialog::new(data_source, is_edit, has_saved, projects, cx));
         let subscription = cx.subscribe_in(
             &dialog,
             window,
@@ -2729,7 +2810,8 @@ impl DatabaseView {
         // Connection settings may have changed: start clean.
         self.disconnect_source(&id, cx);
         self.selected = Some(id.clone());
-        self.ensure_consoles(&id, cx);
+        // Assigned away from this project, it leaves the tree.
+        self.reselect_shown(cx);
         self.save_state();
         cx.notify();
     }
@@ -2747,10 +2829,8 @@ impl DatabaseView {
         self.passwords.remove(id);
         let _ = self.store.save(&self.sources);
         if self.selected.as_deref() == Some(id) {
-            self.selected = self.sources.first().map(|s| s.id.clone());
-            if let Some(next) = self.selected.clone() {
-                self.ensure_consoles(&next, cx);
-            }
+            self.selected = None;
+            self.reselect_shown(cx);
         }
         self.confirm_remove = None;
         self.save_state();

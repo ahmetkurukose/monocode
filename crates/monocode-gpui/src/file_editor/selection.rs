@@ -179,7 +179,7 @@ impl FileEditor {
             range,
             anchor,
             reference,
-            sources: crate::database::send_targets(&self.database_dir),
+            sources: crate::database::send_targets(&self.database_dir, &self.cwd),
             lines,
         });
         cx.notify();

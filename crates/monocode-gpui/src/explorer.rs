@@ -1054,7 +1054,7 @@ impl Explorer {
         let sources = if target.is_dir {
             Vec::new()
         } else {
-            crate::database::send_targets(&self.database_dir)
+            crate::database::send_targets(&self.database_dir, &self.cwd)
         };
         let mut items: Vec<MenuItem> = vec![
             MenuAction::new("new-file", "New File").into(),

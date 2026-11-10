@@ -5751,7 +5751,12 @@ impl Shell {
                 if let Some(id) = tab.session() {
                     let sources = self
                         .tab_file(id)
-                        .map(|_| crate::database::send_targets(&self.database_dir))
+                        .map(|_| {
+                            crate::database::send_targets(
+                                &self.database_dir,
+                                &self.workspace.project,
+                            )
+                        })
                         .unwrap_or_default();
                     if !sources.is_empty() {
                         items.extend([

@@ -34,6 +34,24 @@ pub struct DataSource {
     pub application_name: String,
     pub statement_timeout_ms: Option<u32>,
     pub search_path: Option<String>,
+    /// The projects this source belongs to; empty means every project.
+    pub projects: Vec<String>,
+}
+
+impl DataSource {
+    /// Whether the source is offered in `place`: a project, or a folder
+    /// inside one. Sources with no projects are offered everywhere.
+    pub fn in_project(&self, place: &str) -> bool {
+        let place = crate::files::path_key(place);
+        self.projects.is_empty()
+            || self.projects.iter().any(|project| {
+                let project = crate::files::path_key(project);
+                place == project
+                    || place
+                        .strip_prefix(project.trim_end_matches('/'))
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
 }
 
 impl Default for DataSource {
@@ -52,6 +70,7 @@ impl Default for DataSource {
             application_name: "Monocode".into(),
             statement_timeout_ms: None,
             search_path: None,
+            projects: Vec::new(),
         }
     }
 }
@@ -240,6 +259,21 @@ pub fn forget_password(id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_belongs_to_its_projects_and_their_folders_or_to_all() {
+        let mut source = DataSource::new("db");
+        assert!(source.in_project("/work/a"));
+        source.projects = vec!["/work/a".into()];
+        assert!(source.in_project("/work/a"));
+        assert!(source.in_project("/work/a/"));
+        assert!(source.in_project("/work/a/src"));
+        assert!(!source.in_project("/work/ab"));
+        assert!(!source.in_project("/work/b"));
+        // Files written before projects existed load with none: everywhere.
+        let old: DataSource = serde_json::from_str(r#"{"id":"x","name":"x"}"#).unwrap();
+        assert!(old.projects.is_empty() && old.in_project("/anywhere"));
+    }
 
     #[test]
     fn sources_round_trip_without_a_password_field() {

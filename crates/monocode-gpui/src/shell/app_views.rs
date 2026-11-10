@@ -415,7 +415,11 @@ impl Shell {
 
     pub(super) fn open_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prepare_app_view(window, cx);
-        self.ensure_database(window, cx);
+        let view = self.ensure_database(window, cx);
+        let scope =
+            (self.project_app_scope(AppView::Database)).then(|| self.workspace.project.clone());
+        let projects = self.workspace.projects.clone();
+        view.update(cx, |view, cx| view.set_scope(scope, projects, cx));
         self.show_app_view(AppView::Database, window, cx);
     }
 
