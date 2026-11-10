@@ -673,6 +673,11 @@ impl Shell {
                     ("Database", "database"),
                 ]
                 .into_iter()
+                // With the tree each project carries these apps on its row.
+                .filter(|(label, _)| {
+                    !(self.project_rail_tree_on()
+                        && (self.workspace.preferences).project_app_shown(&label.to_lowercase()))
+                })
                 .filter(|(label, _)| match *label {
                     "Inbox" => self.workspace.sidebar_inbox_visible,
                     "Notes" => {

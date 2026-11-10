@@ -1157,4 +1157,34 @@ mod tests {
             })
             .unwrap();
     }
+
+    #[gpui::test]
+    fn the_tree_drops_the_rail_rows_of_apps_its_projects_carry(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let rows = |visual: &mut VisualTestContext| {
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+            ["Inbox", "Notes", "Database"]
+                .map(|label| at(visual, format!("sidebar-navigation-{label}")).is_some())
+        };
+        tree(window, visual, &[]);
+        assert_eq!(rows(visual), [false, false, false]);
+        // An app hidden from the project rows keeps its rail row.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.project_apps = vec!["notes".into()];
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        assert_eq!(rows(visual), [true, false, true]);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.project_rail_view = "list".into();
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        assert_eq!(rows(visual), [true, true, true]);
+    }
 }
