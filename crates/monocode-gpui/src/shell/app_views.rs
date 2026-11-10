@@ -268,9 +268,11 @@ impl Shell {
         if let Some(notes) = &self.notes {
             let cwd = self.workspace.project.clone();
             let projects = self.workspace.projects.clone();
+            let scope = self.project_app_scope(AppView::Notes).then(|| cwd.clone());
             notes.update(cx, |notes, cx| {
                 notes.set_appearances(self.workspace.project_appearance.clone(), cx);
                 notes.set_context(cwd, projects, cx);
+                notes.set_scope(scope, cx);
                 notes.refresh(cx);
             });
         }

@@ -55,6 +55,11 @@ pub(crate) struct Notes {
     project_anchor: AnchorSlot,
     project_open: bool,
     cwd: String,
+    /// With project tabs, the project whose notes the list shows; notes
+    /// saved outside any project show in every project.
+    scope: Option<String>,
+    /// Shows every project's notes despite `scope`.
+    all_projects: bool,
     projects: Vec<String>,
     appearances: HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
     source: bool,
@@ -147,6 +152,8 @@ impl Notes {
             project_anchor: AnchorSlot::default(),
             project_open: false,
             cwd: String::new(),
+            scope: None,
+            all_projects: false,
             projects: Vec::new(),
             appearances: HashMap::new(),
             source: false,
@@ -274,6 +281,36 @@ impl Notes {
         cx.notify();
     }
 
+    /// Narrows the list to one project's notes, or (`None`) shows them all.
+    pub(crate) fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.all_projects = false;
+        self.reselect_shown(cx);
+    }
+
+    fn shown(&self, note: &Note) -> bool {
+        self.all_projects || note.in_project(self.scope.as_deref())
+    }
+
+    fn first_shown(&self) -> Option<String> {
+        let note = self.notes.iter().find(|note| self.shown(note))?;
+        Some(note.id.clone())
+    }
+
+    /// Moves the selection to the first listed note when it left the list.
+    fn reselect_shown(&mut self, cx: &mut Context<Self>) {
+        self.flush(cx);
+        let listed = (self.selected.as_ref())
+            .is_some_and(|id| self.notes.iter().any(|n| &n.id == id && self.shown(n)));
+        if !self.dirty && !listed {
+            self.load_selection(self.first_shown(), cx);
+        }
+        cx.notify();
+    }
+
     /// How many notes the list holds, once it has loaded.
     pub(crate) fn count(&self) -> Option<usize> {
         (!self.loading).then_some(self.notes.len())
@@ -311,8 +348,12 @@ impl Notes {
                         let next = this
                             .selected
                             .clone()
-                            .filter(|id| this.notes.iter().any(|note| &note.id == id))
-                            .or_else(|| this.notes.first().map(|note| note.id.clone()));
+                            .filter(|id| {
+                                this.notes
+                                    .iter()
+                                    .any(|note| &note.id == id && this.shown(note))
+                            })
+                            .or_else(|| this.first_shown());
                         if !this.dirty || next != this.selected || this.document.is_none() {
                             this.load_selection(next, cx);
                         }
@@ -514,7 +555,7 @@ impl Notes {
                 self.notes.retain(|note| note.id != id);
                 self.modes.remove(&id);
                 self.dirty = false;
-                self.load_selection(self.notes.first().map(|note| note.id.clone()), cx);
+                self.load_selection(self.first_shown(), cx);
             }
             Err(error) => self.error = Some(error),
         }
@@ -1330,16 +1371,40 @@ impl gpui::Render for Notes {
         let visible: Vec<_> = self
             .notes
             .iter()
-            .filter(|note| note.matches(&query))
+            .filter(|note| note.matches(&query) && self.shown(note))
             .cloned()
             .collect();
+        let scope_toggle = self.scope.is_some().then(|| {
+            let all = self.all_projects;
+            div()
+                .id("notes-all-projects")
+                .debug_selector(|| "notes-all-projects".into())
+                .role(Role::Switch)
+                .aria_label("Show every project's notes")
+                .aria_selected(all)
+                .flex_shrink_0()
+                .px_1p5()
+                .py(px(2.))
+                .rounded_sm()
+                .text_size(px(11.))
+                .text_color(content(if all { 0.9 } else { 0.5 }))
+                .when(all, |d| d.bg(content(0.1)))
+                .hover(|style| style.bg(content(0.08)))
+                .cursor_pointer()
+                .child("All")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.all_projects = !this.all_projects;
+                    this.reselect_shown(cx);
+                }))
+        });
         let list = div().relative().w(px(self.list_width)).h_full().flex_shrink_0().min_h_0().flex().flex_col().border_r_1().border_color(content(0.07))
             .child(div().h(px(36.)).flex_shrink_0().px_2().flex().items_center().gap_1().border_b_1().border_color(content(0.07)).child(icon("search", 12.))
                 .child(div().flex_1().min_w_0().child(self.query.clone()))
+                .children(scope_toggle)
                 .child(icon_button("create-note", "New note", "plus").debug_selector(|| "create-note".into()).on_click(cx.listener(|this, _, window, cx| this.create(notes::DEFAULT_LANGUAGE, window, cx))))
                 .child(self.new_type_button(cx)))
             .child(div().id("notes-list").role(Role::ListBox).aria_label("Saved notes").flex_1().min_h_0().overflow_y_scroll().p(px(6.))
-                .when(visible.is_empty(), |d| d.child(div().px_1p5().py_2().text_size(px(12.)).text_color(content(0.5)).child(if self.loading { "Loading notes…" } else if !query.trim().is_empty() { "No matching notes" } else { "No notes yet. Save a turn from the transcript, or create one here." })))
+                .when(visible.is_empty(), |d| d.child(div().px_1p5().py_2().text_size(px(12.)).text_color(content(0.5)).child(if self.loading { "Loading notes…" } else if !query.trim().is_empty() { "No matching notes" } else if self.scope.is_some() && !self.all_projects && !self.notes.is_empty() { "No notes in this project yet. Create one here, or show every project's notes with All." } else { "No notes yet. Save a turn from the transcript, or create one here." })))
                 .children(visible.iter().enumerate().map(|(ix, note)| {
                     let id = note.id.clone();
                     let active = self.selected.as_ref() == Some(&id);
@@ -1645,5 +1710,76 @@ mod tests {
         visual.run_until_parked();
         assert!(visual.debug_bounds("note-language-rust").is_some());
         assert!(visual.debug_bounds("note-language-python").is_none());
+    }
+
+    #[gpui::test]
+    fn a_project_scope_lists_its_notes_and_unfiled_ones_and_all_shows_every_note(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(input::bind);
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let (a, b) = ("/work/a", "/work/b");
+        let ids = window
+            .update(visual, |notes, _, _| {
+                let store = locked(&notes.store).unwrap();
+                [Some(a), Some(b), None]
+                    .map(|cwd| store.create_note(cwd.map(Into::into)).unwrap().id)
+            })
+            .unwrap();
+        let shown = |visual: &mut VisualTestContext| {
+            window
+                .update(visual, |notes, _, _| {
+                    let mut shown: Vec<_> = (notes.notes.iter())
+                        .filter(|note| notes.shown(note))
+                        .map(|note| note.id.clone())
+                        .collect();
+                    shown.sort();
+                    (shown, notes.selected.clone())
+                })
+                .unwrap()
+        };
+        let sorted = |mut ids: Vec<String>| {
+            ids.sort();
+            ids
+        };
+        window
+            .update(visual, |notes, _, cx| {
+                notes.set_context(b.into(), vec![a.into(), b.into()], cx);
+                notes.set_scope(Some(b.into()), cx);
+                notes.refresh(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let (list, selected) = shown(visual);
+        assert_eq!(list, sorted(vec![ids[1].clone(), ids[2].clone()]));
+        assert!(selected.is_some_and(|id| list.contains(&id)));
+        // A's own note was selected nowhere; moving to A selects one of its.
+        window
+            .update(visual, |notes, _, cx| {
+                notes.load_selection(Some(ids[1].clone()), cx);
+                notes.set_scope(Some(a.into()), cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let (list, selected) = shown(visual);
+        assert_eq!(list, sorted(vec![ids[0].clone(), ids[2].clone()]));
+        assert!(selected.is_some_and(|id| list.contains(&id)));
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        let all = visual
+            .debug_bounds("notes-all-projects")
+            .expect("the All switch");
+        visual.simulate_click(all.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(shown(visual).0, sorted(ids.to_vec()));
+        // Without a scope every note shows and the switch goes away.
+        window
+            .update(visual, |notes, _, cx| notes.set_scope(None, cx))
+            .unwrap();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        assert_eq!(shown(visual).0, sorted(ids.to_vec()));
+        assert!(visual.debug_bounds("notes-all-projects").is_none());
     }
 }
