@@ -124,6 +124,13 @@ pub(crate) enum FileEvent {
     SaveFailed,
     WordWrap(bool),
     AddToChat(String),
+    /// Selected text, for the console of this data source. Lines are 1-based.
+    SendToDatabase {
+        source: String,
+        text: String,
+        first_line: usize,
+        last_line: usize,
+    },
 }
 
 pub(crate) struct FileEditor {
@@ -140,6 +147,8 @@ pub(crate) struct FileEditor {
     focus: FocusHandle,
     pub input: Entity<Input>,
     selection: selection::Selection,
+    /// Where the saved data sources are, to offer them for sending text to.
+    pub(crate) database_dir: PathBuf,
     search: Entity<Input>,
     search_open: bool,
     replacement: Entity<Input>,
@@ -284,6 +293,7 @@ impl FileEditor {
             focus: cx.focus_handle(),
             input,
             selection: selection::Selection::default(),
+            database_dir: crate::data_dir().join("db"),
             search,
             search_open: false,
             replacement,

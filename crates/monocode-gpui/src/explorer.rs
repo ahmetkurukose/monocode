@@ -213,6 +213,8 @@ pub(crate) struct Explorer {
     keyboard: bool,
     typeahead: (String, Option<Instant>),
     next_id: u64,
+    /// Where the saved data sources are, to offer files to.
+    pub(crate) database_dir: PathBuf,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -225,6 +227,12 @@ fn basename(path: &str) -> &str {
 
 pub(crate) struct OpenFile(pub String);
 impl EventEmitter<OpenFile> for Explorer {}
+/// A file chosen from the menu to go to a data source's console.
+pub(crate) struct SendFileToDatabase {
+    pub path: String,
+    pub source: String,
+}
+impl EventEmitter<SendFileToDatabase> for Explorer {}
 /// Shared file-action toast state. Name validation remains local to its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileActionError(pub Option<String>);
@@ -308,6 +316,7 @@ impl Explorer {
             keyboard: false,
             typeahead: (String::new(), None),
             next_id: 0,
+            database_dir: crate::data_dir().join("db"),
             _subscriptions: subscriptions,
         }
     }
@@ -1042,7 +1051,12 @@ impl Explorer {
                 && (paste_parent == c.path || paste_parent.starts_with(&format!("{}/", c.path)))
         });
         let root = target.root;
-        let items: Vec<MenuItem> = vec![
+        let sources = if target.is_dir {
+            Vec::new()
+        } else {
+            crate::database::send_targets(&self.database_dir)
+        };
+        let mut items: Vec<MenuItem> = vec![
             MenuAction::new("new-file", "New File").into(),
             MenuAction::new("new-folder", "New Folder").into(),
             MenuItem::Separator,
@@ -1079,6 +1093,27 @@ impl Explorer {
             MenuItem::Separator,
             MenuAction::new("reveal", REVEAL_LABEL).into(),
         ];
+        if !sources.is_empty() {
+            items.extend([
+                MenuItem::Separator,
+                MenuAction::new("send-database", "Send to Database")
+                    .icon("database")
+                    .submenu(
+                        sources
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, source)| {
+                                MenuAction::new(
+                                    format!("send-db:{}", source.id),
+                                    source.name.clone(),
+                                )
+                                .checked(ix == 0)
+                            })
+                            .collect(),
+                    )
+                    .into(),
+            ]);
+        }
         self.menu = None;
         let menu = cx.new(|cx| Menu::new("File actions", items, window, cx));
         let events = cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
@@ -1125,6 +1160,10 @@ impl Explorer {
             "rename" => self.start_rename(target.path, window, cx),
             "delete" => self.delete(target.path, window, cx),
             "reveal" => self.reveal(target.path, window, cx),
+            id if id.starts_with("send-db:") => cx.emit(SendFileToDatabase {
+                path: target.path,
+                source: id["send-db:".len()..].to_owned(),
+            }),
             _ => {}
         }
     }

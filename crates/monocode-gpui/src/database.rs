@@ -6,6 +6,7 @@
 mod dialog;
 mod grid;
 mod render;
+mod send;
 mod sql;
 #[cfg(test)]
 mod tests;
@@ -42,6 +43,10 @@ pub(crate) enum Event {
     Close,
 }
 
+#[cfg(test)]
+pub(crate) use send::write_sources;
+pub(crate) use send::{MAX_SEND_BYTES, Origin, Target, send_targets};
+
 const LIMITS: [usize; 4] = [100, 500, 1000, 5000];
 const TREE_ROW: f32 = 26.;
 
@@ -57,6 +62,10 @@ struct SavedState {
     open: HashMap<String, Vec<u32>>,
     expanded: Vec<String>,
     results_hidden: bool,
+    /// Where text sent from a file went last.
+    send_target: Option<String>,
+    /// The console made for each file sent to a data source, by `source\0file`.
+    sent: HashMap<String, u32>,
 }
 
 impl Default for SavedState {
@@ -70,6 +79,8 @@ impl Default for SavedState {
             open: HashMap::new(),
             expanded: Vec::new(),
             results_hidden: false,
+            send_target: None,
+            sent: HashMap::new(),
         }
     }
 }
@@ -509,6 +520,8 @@ pub(crate) struct DatabaseView {
     rename: Option<(String, u32)>,
     rename_input: Entity<Input>,
     results_hidden: bool,
+    send_target: Option<String>,
+    sent: HashMap<String, u32>,
     history: Arc<HistoryStore>,
     history_open: bool,
     history_entries: Vec<HistoryEntry>,
@@ -664,6 +677,8 @@ impl DatabaseView {
             rename: None,
             rename_input,
             results_hidden: saved.results_hidden,
+            send_target: saved.send_target,
+            sent: saved.sent,
             history: Arc::new(HistoryStore::new(&dir)),
             history_open: false,
             history_entries: Vec::new(),
@@ -703,6 +718,8 @@ impl DatabaseView {
             open: self.open.clone(),
             expanded: self.expanded.iter().cloned().collect(),
             results_hidden: self.results_hidden,
+            send_target: self.send_target.clone(),
+            sent: self.sent.clone(),
         };
         if let Ok(json) = serde_json::to_vec_pretty(&state) {
             if let Some(parent) = self.state_path.parent() {

@@ -7,6 +7,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod database_send;
 mod file_panes;
 mod github_star;
 mod idle_agents;
@@ -810,6 +811,11 @@ pub(crate) struct Shell {
     /// A session review card's Review, opened beside its pane next frame.
     pending_review: Option<(i64, crate::review::ReviewTab)>,
     pending_composer_focus: Option<i64>,
+    /// Text and files on their way to a data source's console, handled on the
+    /// next frame (which has the window the Database view needs).
+    pending_database_sends: Vec<database_send::DbSend>,
+    /// Where the Database view keeps its data sources and consoles.
+    database_dir: std::path::PathBuf,
     review_focused: bool,
     review_drag: bool,
     split_bounds: HashMap<i64, AnchorSlot>,
@@ -1188,6 +1194,8 @@ impl Shell {
             review_slide: None,
             pending_review: None,
             pending_composer_focus: None,
+            pending_database_sends: Vec::new(),
+            database_dir: crate::data_dir().join("db"),
             review_focused: false,
             review_drag: false,
             split_bounds: HashMap::new(),
@@ -2019,6 +2027,8 @@ impl Shell {
             panel
         });
         let explorer = panel.read(cx).explorer.clone();
+        let database_dir = self.database_dir.clone();
+        explorer.update(cx, |explorer, _| explorer.database_dir = database_dir);
         self.observations.push(cx.subscribe(
             &explorer,
             |this, _, _: &crate::explorer::ToggleExcluded, cx| {
@@ -2051,6 +2061,12 @@ impl Shell {
                     window,
                     cx,
                 );
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &explorer,
+            |this, _, event: &crate::explorer::SendFileToDatabase, cx| {
+                this.send_file_to_database(event.path.clone(), event.source.clone(), cx)
             },
         ));
         self.observations.push(cx.subscribe_in(
@@ -2304,6 +2320,22 @@ impl Shell {
                     ReviewEvent::Comment(text) => {
                         let owner = this.workspace.session_for_pane(id);
                         this.add_to_chat(owner, text, cx);
+                    }
+                    ReviewEvent::SendToDatabase {
+                        path,
+                        source,
+                        text,
+                        first_line,
+                        last_line,
+                    } => {
+                        this.pending_database_sends
+                            .push(database_send::DbSend::Text {
+                                path: path.clone(),
+                                source: source.clone(),
+                                text: text.clone(),
+                                lines: Some((*first_line, *last_line)),
+                            });
+                        cx.notify();
                     }
                     ReviewEvent::Empty => this.close_review(id, cx),
                     ReviewEvent::DragPane(position) => {
@@ -5712,6 +5744,34 @@ impl Shell {
                         .disabled(count < 2 && !closable)
                         .into(),
                 ];
+                // A tab holding a file can send it to a data source's console.
+                if let Some(id) = tab.session() {
+                    let sources = self
+                        .tab_file(id)
+                        .map(|_| crate::database::send_targets(&self.database_dir))
+                        .unwrap_or_default();
+                    if !sources.is_empty() {
+                        items.extend([
+                            MenuItem::Separator,
+                            MenuAction::new("send-database", "Send to Database")
+                                .icon("database")
+                                .submenu(
+                                    sources
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(ix, source)| {
+                                            MenuAction::new(
+                                                format!("send-db:{}", source.id),
+                                                source.name.clone(),
+                                            )
+                                            .checked(ix == 0)
+                                        })
+                                        .collect(),
+                                )
+                                .into(),
+                        ]);
+                    }
+                }
                 // Closing a tab keeps its session; archive also hides it from
                 // the active history while preserving everything on disk.
                 if let Some(id) = tab.session().filter(|id| {
@@ -6076,6 +6136,12 @@ impl Shell {
                 "archive" => return self.toggle_archive(id, cx),
                 "delete" => return self.confirm_delete_session(id, window, cx),
                 _ => {}
+            }
+            if let Some(source) = action.strip_prefix("send-db:") {
+                if let Some(path) = self.tab_file(id) {
+                    self.send_file_to_database(path, source.to_owned(), cx);
+                }
+                return;
             }
         }
         match target {
@@ -8753,6 +8819,12 @@ impl Render for Shell {
         self.keep_visible_idle_agents(cx);
         self.sync_git_guard(cx);
         self.sync_ui_scale(window, cx);
+        if !self.pending_database_sends.is_empty() {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                this.update(cx, |this, cx| this.flush_database_sends(window, cx));
+            });
+        }
         if !self.exited_terminals.is_empty() {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {

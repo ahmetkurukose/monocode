@@ -11,6 +11,7 @@ use crate::notifications::{
     layout_notice::{LayoutNotice, LayoutNoticeEvent},
     linked_activity::{Cleanup, LinkedActivity, LinkedActivityEvent},
     platform, reminders,
+    sent_notice::SentNotice,
     updater::{self, Event as UpdaterEvent, Updater},
 };
 use std::{sync::mpsc::Receiver, time::Duration};
@@ -24,6 +25,7 @@ pub(super) struct State {
     pub installed: Entity<InstalledUpdateNotice>,
     pub updater: Entity<Updater>,
     pub file_error: Entity<FileActionError>,
+    pub database_sent: Entity<SentNotice>,
     pub reminder_error: Option<String>,
     pub github: Entity<GithubActivity>,
     linked: HashMap<i64, Entity<LinkedActivity>>,
@@ -65,6 +67,7 @@ impl State {
             installed: cx.new(|_| InstalledUpdateNotice::new(None)),
             updater: updater::shared(store, cx),
             file_error: cx.new(|_| FileActionError::new()),
+            database_sent: cx.new(|_| SentNotice::default()),
             reminder_error: None,
             github: cx.new(|_| GithubActivity::new(HashMap::new())),
             linked: HashMap::new(),
@@ -982,6 +985,9 @@ impl Shell {
             })
             .when(state.file_error.read(cx).is_visible(), |stack| {
                 stack.child(state.file_error.clone())
+            })
+            .when(state.database_sent.read(cx).is_visible(), |stack| {
+                stack.child(state.database_sent.clone())
             })
             .when(!state.reminders.read(cx).is_empty(), |d| {
                 d.child(

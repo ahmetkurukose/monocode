@@ -139,6 +139,14 @@ pub(crate) struct ReviewState {
 pub(crate) enum ReviewEvent {
     Changed,
     Comment(String),
+    /// Text selected in a file, for a data source's console.
+    SendToDatabase {
+        path: String,
+        source: String,
+        text: String,
+        first_line: usize,
+        last_line: usize,
+    },
     DragPane(Point<Pixels>),
     /// The last tab closed.
     Empty,
@@ -456,6 +464,21 @@ impl ReviewPane {
                 }
                 if let FileEvent::AddToChat(text) = event {
                     cx.emit(ReviewEvent::Comment(text.clone()));
+                }
+                if let FileEvent::SendToDatabase {
+                    source,
+                    text,
+                    first_line,
+                    last_line,
+                } = event
+                {
+                    cx.emit(ReviewEvent::SendToDatabase {
+                        path: editor.read(cx).path.clone(),
+                        source: source.clone(),
+                        text: text.clone(),
+                        first_line: *first_line,
+                        last_line: *last_line,
+                    });
                 }
                 if let FileEvent::WordWrap(wrap) = event {
                     cx.emit(ReviewEvent::WordWrap(*wrap));

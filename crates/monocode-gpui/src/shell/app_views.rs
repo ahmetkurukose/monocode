@@ -389,20 +389,31 @@ impl Shell {
         self.show_app_view(AppView::Automations, window, cx);
     }
 
+    /// The Database view, made if need be, without showing it.
+    pub(super) fn ensure_database(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::database::DatabaseView> {
+        if let Some(view) = &self.database {
+            return view.clone();
+        }
+        let dir = self.database_dir.clone();
+        let view = cx.new(|cx| crate::database::DatabaseView::new(dir, cx));
+        self.app_view_events.push(cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &crate::database::Event, window, cx| match event {
+                crate::database::Event::Close => this.close_app_view(window, cx),
+            },
+        ));
+        self.database = Some(view.clone());
+        view
+    }
+
     pub(super) fn open_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prepare_app_view(window, cx);
-        if self.database.is_none() {
-            let view =
-                cx.new(|cx| crate::database::DatabaseView::new(crate::data_dir().join("db"), cx));
-            self.app_view_events.push(cx.subscribe_in(
-                &view,
-                window,
-                |this, _, event: &crate::database::Event, window, cx| match event {
-                    crate::database::Event::Close => this.close_app_view(window, cx),
-                },
-            ));
-            self.database = Some(view);
-        }
+        self.ensure_database(window, cx);
         self.show_app_view(AppView::Database, window, cx);
     }
 
