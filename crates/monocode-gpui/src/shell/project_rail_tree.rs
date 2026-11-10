@@ -11,6 +11,8 @@ use gpui::Div;
 /// Sessions listed under a project before "N more".
 const MAX_SESSIONS: usize = 8;
 const CHILD_HEIGHT: f32 = 30.;
+/// The space between two projects' cards.
+pub(super) const CARD_GAP: f32 = 6.;
 /// The apps a project's row offers, in order: preference name, view, icon.
 const PROJECT_APPS: [(&str, AppView, &str); 3] = [
     ("inbox", AppView::Inbox, "inbox"),
@@ -106,10 +108,7 @@ impl Shell {
         terminals.extend(panes.into_iter().map(RailTerminal::Pane));
 
         let project = path.to_owned();
-        let apps = !PROJECT_APPS
-            .iter()
-            .all(|(app, _, _)| !self.workspace.preferences.project_app_shown(app));
-        let total = ids.len() + usize::from(hidden > 0) + terminals.len() + usize::from(apps);
+        let total = ids.len() + usize::from(hidden > 0) + terminals.len();
         let mut rows = Vec::with_capacity(total);
         let last = |n: usize| n + 1 == total;
         for id in ids {
@@ -258,6 +257,41 @@ impl Shell {
         })
     }
 
+    /// One row's slice of its project's card: the plate behind a project and
+    /// the rows under it, which sets it apart from its neighbours. The
+    /// current project's card is the stronger one. `top` and `bottom` close
+    /// the card; `inset` is the gap kept above it.
+    pub(super) fn project_rail_card(
+        &self,
+        project: &str,
+        top: bool,
+        bottom: bool,
+        inset: f32,
+    ) -> Option<Div> {
+        if !self.project_rail_tree_on() {
+            return None;
+        }
+        let current = self.workspace.project == project;
+        let offset = self.project_rail_project_offset(project);
+        let ix = self.rail_index(project);
+        let part = if top { "top" } else { "row" };
+        Some(
+            div()
+                .debug_selector(move || format!("rail-card-{part}-{ix}"))
+                .absolute()
+                .left(px(3.))
+                .right(px(5.))
+                .top(px(inset + offset))
+                .bottom(px(-offset))
+                .bg(content(if current { 0.055 } else { 0.025 }))
+                .border_color(content(if current { 0.14 } else { 0.07 }))
+                .border_l_1()
+                .border_r_1()
+                .when(top, |d| d.rounded_t_lg().border_t_1())
+                .when(bottom, |d| d.rounded_b_lg().border_b_1()),
+        )
+    }
+
     /// The frame every child row shares. A list item's root is placed by the
     /// list, so the drag offset goes on the button inside it.
     fn project_rail_child_frame(
@@ -278,6 +312,8 @@ impl Shell {
             .pr_2()
             .w_full()
             .flex()
+            .relative()
+            .children(self.project_rail_card(project, false, last, 0.))
             .when(last, |d| d.pb_px());
         if last {
             let slot = self
@@ -1186,5 +1222,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows(visual), [true, true, true]);
+    }
+
+    #[gpui::test]
+    fn each_project_is_a_card_set_apart_from_the_next(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let other = "/work/another-project";
+        tree(window, visual, &[other]);
+        let order = window
+            .update(visual, |shell, _, _| shell.workspace.projects.clone())
+            .unwrap();
+        let ix = project_ix(window, visual, other);
+        // The open project's card runs from its row to its last child.
+        let top = at(visual, format!("rail-card-top-{ix}")).expect("the card's head");
+        let rows = at(visual, format!("rail-card-row-{ix}")).expect("the card's rows");
+        assert_eq!(rows.left(), top.left());
+        assert_eq!(rows.right(), top.right());
+        let button = at(visual, format!("rail-project-button-{ix}")).unwrap();
+        assert!(top.left() < button.left() && button.right() < top.right());
+        // The next project's card starts a gap below it.
+        if let Some(next) = order.get(ix + 1) {
+            let next_ix = project_ix(window, visual, next);
+            let next = at(visual, format!("rail-card-top-{next_ix}")).unwrap();
+            assert!(next.top() >= rows.bottom() + px(CARD_GAP) - px(0.5));
+        } else {
+            let previous = at(visual, format!("rail-card-top-{}", ix - 1)).unwrap();
+            assert!(top.top() >= previous.bottom() + px(CARD_GAP) - px(0.5));
+        }
+        // The list view has no cards.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.project_rail_view = "list".into();
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        assert!(at(visual, format!("rail-card-top-{ix}")).is_none());
     }
 }

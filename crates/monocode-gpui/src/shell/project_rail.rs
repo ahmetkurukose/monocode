@@ -461,6 +461,23 @@ impl Shell {
             self.project_rail_list.rows.get(ix + 1),
             Some(ProjectRailRow::Project { .. })
         );
+        let child = |row: Option<&ProjectRailRow>| {
+            matches!(
+                row,
+                Some(
+                    ProjectRailRow::Session { .. }
+                        | ProjectRailRow::Terminal { .. }
+                        | ProjectRailRow::More { .. }
+                )
+            )
+        };
+        // In the tree each project is a card; cards that follow one another
+        // stand apart.
+        let previous = ix
+            .checked_sub(1)
+            .and_then(|ix| self.project_rail_list.rows.get(ix));
+        let card_gap = matches!(previous, Some(ProjectRailRow::Project { .. })) || child(previous);
+        let has_children = child(self.project_rail_list.rows.get(ix + 1));
         match row {
             ProjectRailRow::Monos => self
                 .monos
@@ -468,9 +485,14 @@ impl Shell {
                 .map(|m| m.update(cx, |m, cx| m.project_navigation_rail(compact, cx)))
                 .unwrap_or_else(|| div().into_any()),
             ProjectRailRow::Heading(label) => self.project_rail_heading(label, compact, cx),
-            ProjectRailRow::Project { path, grouped } => {
-                self.project_rail_row(ix, path, compact, grouped, row_gap, cx)
-            }
+            ProjectRailRow::Project { path, grouped } => self.project_rail_row(
+                ix,
+                path,
+                compact,
+                grouped,
+                (row_gap, card_gap, has_children),
+                cx,
+            ),
             ProjectRailRow::Group(id) => self.project_rail_group_header(id, cx),
             row @ (ProjectRailRow::Session { .. }
             | ProjectRailRow::Terminal { .. }
@@ -1212,7 +1234,8 @@ impl Shell {
         path: String,
         compact: bool,
         grouped: bool,
-        row_gap: bool,
+        // A project row follows; a card precedes; child rows follow.
+        (row_gap, card_gap, has_children): (bool, bool, bool),
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ix = self
@@ -1239,6 +1262,14 @@ impl Shell {
             self.project_rail_app_icons(&path, cx)
         };
         let offset = self.project_rail_project_offset(&path);
+        let card_top = if tree && card_gap {
+            project_rail_tree::CARD_GAP
+        } else {
+            0.
+        };
+        let card = (!compact)
+            .then(|| self.project_rail_card(&path, true, !has_children, card_top))
+            .flatten();
         let raised = self.project_rail_project_raised(&path);
         let reordering = self.project_rail_reordering();
         let bounds = self
@@ -1266,13 +1297,16 @@ impl Shell {
         let row = div()
             .id(("rail-project", ix))
             .debug_selector(move || format!("rail-project-{ix}"))
-            .h(px(
-                if tree { 36. } else { 32. } + if row_gap { 1. } else { 0. }
-            ))
+            .h(px(if tree { 36. } else { 32. }
+                + if row_gap { 1. } else { 0. }
+                + card_top))
             .pl(px(6.))
             .pr_2()
             .when(row_gap, |d| d.pb_px())
             .when(grouped, |d| d.px_3())
+            .pt(px(card_top))
+            .relative()
+            .children(card)
             .child(
                 div()
                     .id(("rail-project-button", ix))
