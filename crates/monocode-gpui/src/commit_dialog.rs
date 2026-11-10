@@ -4,6 +4,7 @@
 //! other staged entry stays staged.
 use crate::{
     change_tree::{Node, TreeRow, basename},
+    dialog_resize::{self, DialogResize},
     diff_view::{DiffFile, DiffView, diff_counts},
     file_icons::file_type_icon,
     git_status::ProjectGit,
@@ -115,9 +116,18 @@ pub(crate) struct CommitDialog {
     menu: Option<OpenMenu>,
     pending: Option<Pending>,
     focus: FocusHandle,
+    size: DialogResize,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<CommitDialogEvent> for CommitDialog {}
+impl dialog_resize::Resizable for CommitDialog {
+    fn dialog_resize(&mut self) -> &mut DialogResize {
+        &mut self.size
+    }
+}
+
+/// The size the user last dragged the dialog to; the next one opens that big.
+static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
 impl Focusable for CommitDialog {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -176,6 +186,7 @@ impl CommitDialog {
             menu: None,
             pending: None,
             focus: cx.focus_handle(),
+            size: DialogResize::new(&REMEMBERED_SIZE),
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -1093,9 +1104,7 @@ fn model(
 
 impl Render for CommitDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let viewport = window.viewport_size();
-        let width = (viewport.width.as_f32() - 80.).clamp(560., 1040.);
-        let height = (viewport.height.as_f32() - 80.).clamp(420., 720.);
+        let (width, height) = self.size.size(window.viewport_size());
         let entity = cx.entity();
         let count = self.rows.len();
         let checked = self.checked.len();
@@ -1127,6 +1136,7 @@ impl Render for CommitDialog {
             .into_any_element()
         };
         let card = modal::card()
+            .debug_selector(|| "commit-card".into())
             .w(px(width))
             .h(px(height))
             .flex()
@@ -1134,6 +1144,8 @@ impl Render for CommitDialog {
             .overflow_hidden()
             .child(
                 div()
+                    .id("commit-header")
+                    .on_click(cx.listener(dialog_resize::header_click))
                     .relative()
                     .h(px(44.))
                     .flex_shrink_0()
@@ -1149,7 +1161,13 @@ impl Render for CommitDialog {
                             .text_size(px(12.))
                             .text_color(content(0.45))
                             .child(format!("{checked} of {total} selected")),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(dialog_resize::maximize_button(
+                        "commit-maximize",
+                        self.size.maximized(),
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -1338,9 +1356,15 @@ impl Render for CommitDialog {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.commit(true, window, cx))),
                     ),
-            );
+            )
+            .child(dialog_resize::corner_grip(
+                "commit-resize",
+                (width, height),
+                cx,
+            ));
         div()
             .size_full()
+            .child(dialog_resize::drag_listener(cx))
             .track_focus(&self.focus)
             .key_context("CommitDialog")
             .on_key_down(cx.listener(Self::key))
@@ -1611,5 +1635,76 @@ mod tests {
             })
             .unwrap();
         cx.refresh().unwrap();
+    }
+
+    #[gpui::test]
+    fn the_dialog_fills_the_window_on_request_and_grows_by_its_corner(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{MouseButton, VisualTestContext, point};
+        cx.update(input::bind);
+        *REMEMBERED_SIZE.lock().unwrap() = None;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let open = |cx: &mut gpui::TestAppContext| {
+            let cwd = cwd.clone();
+            cx.update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                    cx.new(|cx| CommitDialog::new(git, cwd, String::new(), Kind::Codex, window, cx))
+                })
+                .unwrap()
+            })
+        };
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let card = visual.debug_bounds("commit-card").expect("the dialog");
+        let viewport = visual.update(|window, _| window.viewport_size());
+        let full = viewport - gpui::size(px(24.), px(24.));
+        let toggle = visual.debug_bounds("commit-maximize").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("commit-card").unwrap().size, full);
+        let toggle = visual.debug_bounds("commit-maximize").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("commit-card").unwrap().size, card.size);
+        // A double click on the header fills the window too.
+        let header = visual.debug_bounds("commit-card").unwrap().origin + point(px(200.), px(20.));
+        visual.simulate_click(header, Default::default());
+        visual.simulate_event(gpui::MouseDownEvent {
+            position: header,
+            button: MouseButton::Left,
+            modifiers: Default::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        visual.simulate_event(gpui::MouseUpEvent {
+            position: header,
+            button: MouseButton::Left,
+            modifiers: Default::default(),
+            click_count: 2,
+        });
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("commit-card").unwrap().size, full);
+        let toggle = visual.debug_bounds("commit-maximize").unwrap();
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        // Dragging the corner resizes about the centre, and is remembered.
+        let grip = visual.debug_bounds("commit-resize").unwrap().center();
+        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
+        let to = grip - point(px(40.), px(30.));
+        visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        let smaller = visual.debug_bounds("commit-card").unwrap().size;
+        assert_eq!(smaller.width, card.size.width - px(80.));
+        assert_eq!(smaller.height, card.size.height - px(60.));
+        let again = open(cx);
+        let visual = &mut VisualTestContext::from_window(again.into(), cx);
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("commit-card").unwrap().size, smaller);
+        *REMEMBERED_SIZE.lock().unwrap() = None;
     }
 }

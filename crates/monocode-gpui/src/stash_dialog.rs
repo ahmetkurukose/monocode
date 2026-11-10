@@ -3,6 +3,7 @@
 //! from it. One window for both, as the IDEs' "Stash Changes" and "Unstash".
 use crate::{
     change_tree::{Node, TreeRow, basename},
+    dialog_resize::{self, DialogResize},
     diff_view::{DiffFile, DiffView, diff_counts},
     file_icons::file_type_icon,
     git_status::ProjectGit,
@@ -23,8 +24,8 @@ use monocode_core::{
 use std::{collections::HashSet, path::PathBuf};
 
 const ROW: f32 = 26.;
-const MIN_SIZE: (f32, f32) = (480., 360.);
-const MARGIN: f32 = 12.;
+/// The size the user last dragged the window to; the next one opens that big.
+static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
 
 pub(crate) enum StashDialogEvent {
     Close,
@@ -71,12 +72,17 @@ pub(crate) struct StashDialog {
     armed: Option<Armed>,
     busy: bool,
     error: Option<String>,
-    maximized: bool,
+    size: DialogResize,
     tasks: Vec<Task<()>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<StashDialogEvent> for StashDialog {}
+impl dialog_resize::Resizable for StashDialog {
+    fn dialog_resize(&mut self) -> &mut DialogResize {
+        &mut self.size
+    }
+}
 impl Focusable for StashDialog {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -149,7 +155,7 @@ impl StashDialog {
             armed: None,
             busy: false,
             error: None,
-            maximized: false,
+            size: DialogResize::new(&REMEMBERED_SIZE).with_usual_min_height(440.),
             tasks: vec![],
             focus,
             _subscriptions: subscriptions,
@@ -667,23 +673,7 @@ impl StashDialog {
 
 impl gpui::Render for StashDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let viewport = window.viewport_size();
-        let (room_w, room_h) = (
-            (viewport.width.as_f32() - 2. * MARGIN).max(MIN_SIZE.0.min(viewport.width.as_f32())),
-            (viewport.height.as_f32() - 2. * MARGIN).max(MIN_SIZE.1.min(viewport.height.as_f32())),
-        );
-        let (width, height) = if self.maximized {
-            (room_w, room_h)
-        } else {
-            (
-                (viewport.width.as_f32() - 80.)
-                    .clamp(560., 1040.)
-                    .min(room_w),
-                (viewport.height.as_f32() - 80.)
-                    .clamp(440., 720.)
-                    .min(room_h),
-            )
-        };
+        let (width, height) = self.size.size(window.viewport_size());
         let entity = cx.entity();
         let count = self.rows.len();
         let has_changes = self.has_changes(cx);
@@ -966,12 +956,7 @@ impl gpui::Render for StashDialog {
                     .gap_3()
                     .border_b_1()
                     .border_color(stroke())
-                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                        if event.click_count() == 2 {
-                            this.maximized = !this.maximized;
-                            cx.notify();
-                        }
-                    }))
+                    .on_click(cx.listener(dialog_resize::header_click))
                     .child(modal::title("Stash"))
                     .child(
                         div()
@@ -983,33 +968,23 @@ impl gpui::Render for StashDialog {
                             .text_color(content(0.5))
                             .child(subtitle),
                     )
-                    .child(
-                        icon_button(
-                            "stash-maximize",
-                            if self.maximized {
-                                "Restore size"
-                            } else {
-                                "Fill the window"
-                            },
-                            if self.maximized {
-                                "minimize-2"
-                            } else {
-                                "maximize-2"
-                            },
-                        )
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.maximized = !this.maximized;
-                            cx.notify();
-                        })),
-                    ),
+                    .child(dialog_resize::maximize_button(
+                        "stash-maximize",
+                        self.size.maximized(),
+                        cx,
+                    )),
             )
             .child(form)
             .child(body)
-            .child(footer);
+            .child(footer)
+            .child(dialog_resize::corner_grip(
+                "stash-resize",
+                (width, height),
+                cx,
+            ));
         div()
             .size_full()
+            .child(dialog_resize::drag_listener(cx))
             .track_focus(&self.focus)
             .key_context("StashDialog")
             .on_key_down(cx.listener(Self::key))
@@ -1244,5 +1219,34 @@ mod tests {
                 assert!(!dialog.busy, "nothing to stash, nothing started");
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_window_fills_the_app_on_request_and_grows_by_its_corner(cx: &mut TestAppContext) {
+        use gpui::{MouseButton, point};
+        *REMEMBERED_SIZE.lock().unwrap() = None;
+        let dir = repo();
+        let (window, _) = open(cx, &dir, Intent::Stash);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let card = visual.debug_bounds("stash-card").expect("the window");
+        let viewport = visual.update(|window, _| window.viewport_size());
+        click(visual, "stash-maximize");
+        visual.run_until_parked();
+        let full = viewport - gpui::size(px(24.), px(24.));
+        assert_eq!(visual.debug_bounds("stash-card").unwrap().size, full);
+        click(visual, "stash-maximize");
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("stash-card").unwrap().size, card.size);
+        let grip = visual.debug_bounds("stash-resize").unwrap().center();
+        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
+        let to = grip - point(px(40.), px(30.));
+        visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        let smaller = visual.debug_bounds("stash-card").unwrap().size;
+        assert_eq!(smaller.width, card.size.width - px(80.));
+        assert_eq!(smaller.height, card.size.height - px(60.));
+        *REMEMBERED_SIZE.lock().unwrap() = None;
     }
 }

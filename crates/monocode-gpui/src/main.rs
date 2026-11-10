@@ -22,6 +22,7 @@ mod conversation;
 mod database;
 #[cfg(debug_assertions)]
 mod dev_reload;
+mod dialog_resize;
 mod diff_view;
 mod editor_analysis;
 mod editor_scrollbar;

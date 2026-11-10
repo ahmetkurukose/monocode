@@ -3,6 +3,7 @@
 //! file's diff. A conflict stops the update and offers to abort it.
 use crate::{
     change_tree::{Node, TreeRow, basename},
+    dialog_resize::{self, DialogResize},
     diff_view::{DiffFile, DiffView, diff_counts},
     file_icons::file_type_icon,
     git_status::ProjectGit,
@@ -12,7 +13,7 @@ use crate::{
 };
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    SharedString, Task, Window, canvas, div, prelude::*, px, rgb, uniform_list,
+    SharedString, Task, Window, div, prelude::*, px, rgb, uniform_list,
 };
 use monocode_core::{
     diff,
@@ -21,17 +22,8 @@ use monocode_core::{
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 const ROW: f32 = 26.;
-const MIN_SIZE: (f32, f32) = (480., 360.);
-/// Room kept around a dialog that fills the window.
-const MARGIN: f32 = 12.;
-/// The size the user last dragged a dialog to; the next one opens that big.
-static REMEMBERED_SIZE: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
-
-/// A corner drag in progress: where it started and the size it started from.
-struct Resize {
-    start: gpui::Point<gpui::Pixels>,
-    from: (f32, f32),
-}
+/// The size the user last dragged this dialog to; the next one opens that big.
+static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
 
 pub(crate) enum UpdateDialogEvent {
     Close,
@@ -74,13 +66,14 @@ pub(crate) struct UpdateDialog {
     pushing: bool,
     error: Option<String>,
     focus: FocusHandle,
-    /// Fills the window; toggled from the header or by double-clicking it.
-    maximized: bool,
-    /// A size chosen by dragging the corner.
-    custom: Option<(f32, f32)>,
-    resizing: Option<Resize>,
+    size: DialogResize,
 }
 impl EventEmitter<UpdateDialogEvent> for UpdateDialog {}
+impl dialog_resize::Resizable for UpdateDialog {
+    fn dialog_resize(&mut self) -> &mut DialogResize {
+        &mut self.size
+    }
+}
 impl Focusable for UpdateDialog {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -131,40 +124,10 @@ impl UpdateDialog {
             pushing: false,
             error: None,
             focus,
-            maximized: false,
-            custom: *REMEMBERED_SIZE.lock().unwrap(),
-            resizing: None,
+            size: DialogResize::new(&REMEMBERED_SIZE),
         };
         this.run(cx);
         this
-    }
-
-    fn toggle_maximized(&mut self, cx: &mut Context<Self>) {
-        self.maximized = !self.maximized;
-        cx.notify();
-    }
-
-    fn drag_resize(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(resize) = &self.resizing else {
-            return;
-        };
-        if event.pressed_button != Some(gpui::MouseButton::Left) {
-            self.finish_resize(cx);
-            return;
-        }
-        let moved = event.position - resize.start;
-        self.custom = Some((
-            resize.from.0 + 2. * moved.x.as_f32(),
-            resize.from.1 + 2. * moved.y.as_f32(),
-        ));
-        cx.notify();
-    }
-
-    fn finish_resize(&mut self, cx: &mut Context<Self>) {
-        if self.resizing.take().is_some() {
-            *REMEMBERED_SIZE.lock().unwrap() = self.custom;
-            cx.notify();
-        }
     }
 
     fn run(&mut self, cx: &mut Context<Self>) {
@@ -555,27 +518,7 @@ pub(crate) fn model(
 impl Render for UpdateDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
-        let (room_w, room_h) = (
-            (viewport.width.as_f32() - 2. * MARGIN).max(MIN_SIZE.0.min(viewport.width.as_f32())),
-            (viewport.height.as_f32() - 2. * MARGIN).max(MIN_SIZE.1.min(viewport.height.as_f32())),
-        );
-        let (width, height) = if self.maximized {
-            (room_w, room_h)
-        } else if let Some((w, h)) = self.custom {
-            (
-                w.clamp(MIN_SIZE.0.min(room_w), room_w),
-                h.clamp(MIN_SIZE.1.min(room_h), room_h),
-            )
-        } else {
-            (
-                (viewport.width.as_f32() - 80.)
-                    .clamp(560., 1040.)
-                    .min(room_w),
-                (viewport.height.as_f32() - 80.)
-                    .clamp(420., 720.)
-                    .min(room_h),
-            )
-        };
+        let (width, height) = self.size.size(viewport);
         let running = matches!(self.phase, Phase::Running);
         let entity = cx.entity();
         let count = self.rows.len();
@@ -745,11 +688,7 @@ impl Render for UpdateDialog {
                     .border_b_1()
                     .border_color(stroke())
                     .id("update-header")
-                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                        if event.click_count() == 2 {
-                            this.toggle_maximized(cx);
-                        }
-                    }))
+                    .on_click(cx.listener(dialog_resize::header_click))
                     .child(modal::title(title))
                     .child(
                         div()
@@ -761,27 +700,11 @@ impl Render for UpdateDialog {
                             .text_color(content(0.5))
                             .child(subtitle),
                     )
-                    .child(
-                        icon_button(
-                            "update-maximize",
-                            if self.maximized {
-                                "Restore size"
-                            } else {
-                                "Fill the window"
-                            },
-                            if self.maximized {
-                                "minimize-2"
-                            } else {
-                                "maximize-2"
-                            },
-                        )
-                        .debug_selector(|| "update-maximize".into())
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_maximized(cx)
-                        })),
-                    ),
+                    .child(dialog_resize::maximize_button(
+                        "update-maximize",
+                        self.size.maximized(),
+                        cx,
+                    )),
             )
             .child(body)
             .child(
@@ -855,67 +778,14 @@ impl Render for UpdateDialog {
                         })),
                     ),
             )
-            .child(
-                // The corner grip. The card stays centred, so it grows by twice
-                // the pointer's travel to keep the corner under the pointer.
-                div()
-                    .id("update-resize")
-                    .debug_selector(|| "update-resize".into())
-                    .role(gpui::Role::Splitter)
-                    .aria_label("Resize dialog")
-                    .absolute()
-                    .right_0()
-                    .bottom_0()
-                    .size(px(18.))
-                    .cursor(gpui::CursorStyle::ResizeUpLeftDownRight)
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(4.))
-                            .bottom(px(4.))
-                            .size(px(8.))
-                            .border_r_2()
-                            .border_b_2()
-                            .border_color(content(0.3)),
-                    )
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                            this.resizing = Some(Resize {
-                                start: event.position,
-                                from: (width, height),
-                            });
-                            this.maximized = false;
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            );
+            .child(dialog_resize::corner_grip(
+                "update-resize",
+                (width, height),
+                cx,
+            ));
         div()
             .size_full()
-            .child(
-                // The overlay hides the dialog from hover, so a corner drag
-                // listens at the window instead.
-                canvas(|_, _, _| (), {
-                    let weak = cx.weak_entity();
-                    move |_, _, window, _| {
-                        let moves = weak.clone();
-                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
-                            if phase == gpui::DispatchPhase::Capture {
-                                let _ = moves.update(cx, |this, cx| this.drag_resize(event, cx));
-                            }
-                        });
-                        let ups = weak.clone();
-                        window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _, cx| {
-                            if phase == gpui::DispatchPhase::Capture {
-                                let _ = ups.update(cx, |this, cx| this.finish_resize(cx));
-                            }
-                        });
-                    }
-                })
-                .absolute()
-                .size_0(),
-            )
+            .child(dialog_resize::drag_listener(cx))
             .track_focus(&self.focus)
             .key_context("UpdateDialog")
             .on_key_down(cx.listener(Self::key))
@@ -969,14 +839,20 @@ mod tests {
         visual.run_until_parked();
         let card = visual.debug_bounds("update-card").expect("the dialog");
         let viewport = visual.update(|window, _| window.viewport_size());
-        assert!(card.size.width < viewport.width - px(2. * MARGIN) + px(0.5));
+        assert!(card.size.width < viewport.width - px(2. * dialog_resize::MARGIN) + px(0.5));
         // Fill the window and come back.
         let toggle = visual.debug_bounds("update-maximize").unwrap();
         visual.simulate_click(toggle.center(), Default::default());
         visual.run_until_parked();
         let full = visual.debug_bounds("update-card").unwrap();
-        assert_eq!(full.size.width, viewport.width - px(2. * MARGIN));
-        assert_eq!(full.size.height, viewport.height - px(2. * MARGIN));
+        assert_eq!(
+            full.size.width,
+            viewport.width - px(2. * dialog_resize::MARGIN)
+        );
+        assert_eq!(
+            full.size.height,
+            viewport.height - px(2. * dialog_resize::MARGIN)
+        );
         let toggle = visual.debug_bounds("update-maximize").unwrap();
         visual.simulate_click(toggle.center(), Default::default());
         visual.run_until_parked();
