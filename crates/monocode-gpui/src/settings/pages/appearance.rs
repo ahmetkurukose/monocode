@@ -343,6 +343,46 @@ impl SettingsView {
                     )],
                 ),
             );
+            if p.project_rail_tree() {
+                let apps = [
+                    ("project-app-inbox", "inbox", "Inbox"),
+                    ("project-app-notes", "notes", "Notes"),
+                    ("project-app-database", "database", "Database"),
+                ];
+                let controls = apps
+                    .into_iter()
+                    .map(|(id, app, label)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(px(12.))
+                            .text_color(content(0.7))
+                            .child(label)
+                            .child(self.toggle(
+                                id,
+                                label,
+                                p.project_app_shown(app),
+                                false,
+                                cx,
+                                move |this, on, cx| {
+                                    this.update(cx, |p| p.set_project_app_shown(app, on))
+                                },
+                            ))
+                            .into_any_element()
+                    })
+                    .collect();
+                layout.insert(
+                    2,
+                    self.row(
+                        Some("project-apps"),
+                        false,
+                        "Project apps",
+                        Some("Shown under each project in the tree; each opens as that project's tab.".into()),
+                        controls,
+                    ),
+                );
+            }
         }
         if inset {
             layout.insert(

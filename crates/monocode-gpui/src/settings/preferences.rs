@@ -59,6 +59,8 @@ pub(crate) struct Preferences {
     pub collapsed_project_rail: String,
     /// Classic layout's project list: "list" (one row per project) or "tree".
     pub project_rail_view: String,
+    /// The apps offered under each project in the tree: "inbox", "notes", "database".
+    pub project_apps: Vec<String>,
     pub ui_scale: u32,
     pub show_excluded_files: bool,
     // Chat
@@ -157,6 +159,7 @@ impl Default for Preferences {
             chat_background_session: 24,
             collapsed_project_rail: "compact".into(),
             project_rail_view: "list".into(),
+            project_apps: vec!["inbox".into(), "notes".into(), "database".into()],
             ui_scale: 100,
             show_excluded_files: false,
             transcript_layout: "chat".into(),
@@ -203,6 +206,21 @@ impl Preferences {
     /// Unknown values fall back to the plain list.
     pub(crate) fn project_rail_tree(&self) -> bool {
         self.project_rail_view == "tree"
+    }
+
+    /// Whether the tree offers this app ("inbox", "notes", "database") under each project.
+    pub(crate) fn project_app_shown(&self, app: &str) -> bool {
+        self.project_apps.iter().any(|a| a == app)
+    }
+
+    pub(crate) fn set_project_app_shown(&mut self, app: &str, on: bool) {
+        self.project_apps.retain(|a| a != app);
+        if on {
+            self.project_apps.push(app.to_owned());
+        }
+        // Keep one order on disk whatever order they were switched in.
+        let rank = |a: &String| ["inbox", "notes", "database"].iter().position(|x| x == a);
+        self.project_apps.sort_by_key(rank);
     }
 
     /// "bottom", "panel" or "title".
@@ -270,6 +288,7 @@ impl Preferences {
         self.ui_scale = d.ui_scale;
         self.collapsed_project_rail = d.collapsed_project_rail;
         self.project_rail_view = d.project_rail_view;
+        self.project_apps = d.project_apps;
     }
 }
 

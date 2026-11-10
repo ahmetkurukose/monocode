@@ -2,6 +2,7 @@
 //! the terminals it holds, one compact row each. Everything here reads state
 //! that already exists (summaries, the dock's terminal list); it loads no chat
 //! and spawns no shell until a row is clicked.
+use super::app_views::AppView;
 use super::project_rail::{ProjectRailRow, RailTerminal};
 use super::*;
 use crate::workspace;
@@ -10,6 +11,29 @@ use gpui::Div;
 /// Sessions listed under a project before "N more".
 const MAX_SESSIONS: usize = 8;
 const CHILD_HEIGHT: f32 = 30.;
+/// The apps a project's row offers, in order: preference name, view, icon.
+const PROJECT_APPS: [(&str, AppView, &str); 3] = [
+    ("inbox", AppView::Inbox, "inbox"),
+    ("notes", AppView::Notes, "note"),
+    ("database", AppView::Database, "database"),
+];
+
+/// A plain tooltip for the rail's app icons.
+struct RailTip(SharedString);
+impl Render for RailTip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(pane_fill())
+            .border_1()
+            .border_color(content(0.15))
+            .text_size(px(12.))
+            .text_color(content(1.))
+            .child(self.0.clone())
+    }
+}
 
 impl Shell {
     /// The tree is a Classic-layout option; Focused has no project rail.
@@ -82,7 +106,10 @@ impl Shell {
         terminals.extend(panes.into_iter().map(RailTerminal::Pane));
 
         let project = path.to_owned();
-        let total = ids.len() + usize::from(hidden > 0) + terminals.len();
+        let apps = !PROJECT_APPS
+            .iter()
+            .all(|(app, _, _)| !self.workspace.preferences.project_app_shown(app));
+        let total = ids.len() + usize::from(hidden > 0) + terminals.len() + usize::from(apps);
         let mut rows = Vec::with_capacity(total);
         let last = |n: usize| n + 1 == total;
         for id in ids {
@@ -107,6 +134,102 @@ impl Shell {
             });
         }
         rows
+    }
+
+    /// Opens one of a project's apps, switching to the project first.
+    pub(super) fn open_project_app(
+        &mut self,
+        view: AppView,
+        project: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.project != project {
+            self.select_project(project, window, cx);
+        }
+        match view {
+            AppView::Inbox => self.open_inbox(window, cx),
+            AppView::Notes => self.open_notes(window, cx),
+            AppView::Database => self.open_database(window, cx),
+            AppView::Automations => self.open_automations(window, cx),
+        }
+    }
+
+    /// The project's apps as small icons beside its name, in tree mode.
+    pub(super) fn project_rail_app_icons(
+        &mut self,
+        project: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.project_rail_tree_on() {
+            return None;
+        }
+        let project = project.to_owned();
+        let ix = self.rail_index(&project);
+        let name = workspace::project_name(&project);
+        let here = self.workspace.project == project;
+        let mut icons = Vec::new();
+        for (app, view, glyph) in PROJECT_APPS {
+            if !self.workspace.preferences.project_app_shown(app) {
+                continue;
+            }
+            let selected = here && self.active_app_view == Some(view);
+            let unread = view == AppView::Inbox
+                && self
+                    .inbox
+                    .as_ref()
+                    .is_some_and(|inbox| inbox.read(cx).unread_count_in(&project) > 0);
+            let target = project.clone();
+            icons.push(
+                div()
+                    .id(SharedString::from(format!("rail-app-{app}-{ix}")))
+                    .debug_selector(move || format!("rail-app-{app}-{ix}"))
+                    .role(Role::Button)
+                    .aria_label(format!("{} of {name}", view.label()))
+                    .aria_selected(selected)
+                    .relative()
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.08)))
+                    .child(icon(glyph, 13.).text_color(content(if selected { 0.9 } else { 0.55 })))
+                    .when(unread, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(2.))
+                                .right(px(2.))
+                                .size(px(5.))
+                                .rounded_full()
+                                .bg(accent_color()),
+                        )
+                    })
+                    .tooltip({
+                        let label = view.label();
+                        move |_, cx| cx.new(|_| RailTip(label.into())).into()
+                    })
+                    // Neither a drag of the project nor a click on its row.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_project_app(view, target.clone(), window, cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
+        (!icons.is_empty()).then(|| {
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_px()
+                .children(icons)
+                .into_any_element()
+        })
     }
 
     /// The frame every child row shares. A list item's root is placed by the
@@ -798,5 +921,95 @@ mod tests {
             at(visual, format!("rail-session-{a}")).is_none(),
             "an archived session leaves the tree unless Archived is on"
         );
+    }
+
+    #[gpui::test]
+    fn each_project_shows_its_apps_beside_its_name_and_each_icon_can_be_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let other = "/work/another-project";
+        tree(window, visual, &[]);
+        for path in [other, "/work/monocode"] {
+            let ix = project_ix(window, visual, path);
+            let row = at(visual, format!("rail-project-button-{ix}")).unwrap();
+            for app in ["inbox", "notes", "database"] {
+                let icon = at(visual, format!("rail-app-{app}-{ix}"))
+                    .unwrap_or_else(|| panic!("{app} is offered for {path}"));
+                assert!(
+                    icon.top() >= row.top() && icon.bottom() <= row.bottom(),
+                    "on the project's own row, collapsed or not"
+                );
+            }
+        }
+        let ix = project_ix(window, visual, other);
+        window
+            .update(visual, |shell, _, cx| {
+                shell
+                    .workspace
+                    .preferences
+                    .set_project_app_shown("inbox", false);
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(at(visual, format!("rail-app-inbox-{ix}")).is_none());
+        assert!(at(visual, format!("rail-app-notes-{ix}")).is_some());
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.project_apps.clear();
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            at(visual, format!("rail-app-notes-{ix}")).is_none(),
+            "none left, none shown"
+        );
+        // The plain list never shows them.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.project_apps = vec!["notes".into()];
+                shell.workspace.preferences.project_rail_view = "list".into();
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(at(visual, format!("rail-app-notes-{ix}")).is_none());
+    }
+
+    #[gpui::test]
+    fn an_app_icon_switches_to_its_project_and_opens_the_app(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let db = tempfile::tempdir().unwrap();
+        let other = "/work/another-project";
+        window
+            .update(visual, |shell, _, _| {
+                shell.database_dir = db.path().to_owned()
+            })
+            .unwrap();
+        tree(window, visual, &[other]);
+        let ix = project_ix(window, visual, other);
+        for (app, view) in [("notes", AppView::Notes), ("database", AppView::Database)] {
+            // Away first, so the last icon's tooltip is not in the way.
+            visual.simulate_mouse_move(gpui::point(px(800.), px(500.)), None, Default::default());
+            visual.run_until_parked();
+            let icon = at(visual, format!("rail-app-{app}-{ix}")).unwrap();
+            visual.simulate_click(icon.center(), Default::default());
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, _, _| {
+                    assert_eq!(shell.workspace.project, other);
+                    assert_eq!(shell.active_app_view, Some(view));
+                })
+                .unwrap();
+        }
     }
 }

@@ -99,6 +99,43 @@ fn the_project_list_choice_is_only_offered_in_classic_and_defaults_to_the_list(
 }
 
 #[gpui::test]
+fn project_apps_are_offered_with_the_tree_only_and_switch_one_by_one(cx: &mut TestAppContext) {
+    let mut prefs = Preferences::default();
+    assert!(prefs.project_app_shown("inbox") && prefs.project_app_shown("database"));
+    prefs.set_project_app_shown("notes", false);
+    assert_eq!(prefs.project_apps, ["inbox", "database"]);
+    prefs.set_project_app_shown("notes", true);
+    assert_eq!(
+        prefs.project_apps,
+        ["inbox", "notes", "database"],
+        "one order"
+    );
+    let window = window(Section::Appearance, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    for (classic, tree, shown) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        window
+            .update(visual, |view, _, cx| {
+                view.ctx.classic = classic;
+                view.prefs.project_rail_view = if tree { "tree" } else { "list" }.into();
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert_eq!(
+            visual
+                .debug_bounds("settings-toggle-project-app-notes")
+                .is_some(),
+            shown,
+            "classic {classic}, tree {tree}"
+        );
+    }
+}
+
+#[gpui::test]
 fn skills_document_has_its_own_full_height_pane_and_compact_actions(cx: &mut TestAppContext) {
     let window = window(Section::Skills, cx);
     window

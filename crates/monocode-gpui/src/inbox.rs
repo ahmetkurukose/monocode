@@ -665,6 +665,15 @@ impl Inbox {
         cx.notify();
     }
 
+    /// Unseen items of one project; items with no project count in none.
+    pub(crate) fn unread_count_in(&self, project: &str) -> usize {
+        self.snapshot
+            .items
+            .iter()
+            .filter(|item| item.project_path == project && self.state.seen.unseen(item))
+            .count()
+    }
+
     pub(crate) fn unread_count(&self) -> usize {
         self.snapshot
             .items

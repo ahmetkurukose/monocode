@@ -1228,6 +1228,11 @@ impl Shell {
         let tree = !compact && self.project_rail_tree_on();
         let expanded = self.project_rail_expanded(&path);
         let chevron_path = path.clone();
+        let app_icons = if compact {
+            None
+        } else {
+            self.project_rail_app_icons(&path, cx)
+        };
         let offset = self.project_rail_project_offset(&path);
         let raised = self.project_rail_project_raised(&path);
         let reordering = self.project_rail_reordering();
@@ -1349,6 +1354,7 @@ impl Shell {
                                 .child(label),
                         )
                     })
+                    .when(!compact, |d| d.children(app_icons))
                     .when(!compact, |d| {
                         d.when_some(stats, |d, stats| {
                             d.child(
