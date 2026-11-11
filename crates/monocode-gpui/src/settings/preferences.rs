@@ -33,6 +33,8 @@ pub(crate) struct Preferences {
     pub terminal_placement: String,
     /// The terminal's text size in points.
     pub terminal_font_size: u32,
+    /// Lines of history each new terminal keeps above the screen.
+    pub terminal_scrollback: u32,
     /// Selecting text in a terminal copies it.
     pub terminal_copy_on_select: bool,
     // Appearance
@@ -139,6 +141,7 @@ impl Default for Preferences {
             terminal_in_panel: false,
             terminal_placement: String::new(),
             terminal_font_size: 13,
+            terminal_scrollback: 2000,
             terminal_copy_on_select: false,
             theme: "dark".into(),
             wayland_window_decorations: true,

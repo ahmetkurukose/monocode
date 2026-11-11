@@ -65,8 +65,15 @@ fn font_size(cx: &App) -> f32 {
     cx.try_global::<crate::settings::Preferences>()
         .map_or(FONT_SIZE, |p| p.terminal_font_size.clamp(8, 28) as f32)
 }
-/// TerminalView's `scrollback`, retained for every open terminal.
+/// TerminalView's `scrollback` until Settings > Terminal chooses another.
 const SCROLLBACK: usize = 2000;
+/// The history Settings > Terminal chose, kept to what Alacritty allows.
+fn scrollback(cx: &App) -> usize {
+    cx.try_global::<crate::settings::Preferences>()
+        .map_or(SCROLLBACK, |p| {
+            p.terminal_scrollback.clamp(100, 100_000) as usize
+        })
+}
 const PADDING: f32 = 8.;
 /// The web build's WebLinksAddon URL pattern.
 const URL_PATTERN: &str = r#"(https?|HTTPS?)://[^\s"'!*(){}|\\^<>`]*[^\s"':,.!?{}|\\^~\[\]`()<>]"#;
@@ -163,11 +170,11 @@ struct Spawned {
 }
 /// Start the login shell on a PTY with TerminalView's environment. A failure
 /// is written into the grid, as TerminalView prints it.
-fn spawn(cwd: &str, size: GridSize, id: u64) -> Spawned {
+fn spawn(cwd: &str, size: GridSize, scrollback: usize, id: u64) -> Spawned {
     let (tx, rx) = async_channel::unbounded();
     let listener = Listener(tx);
     let config = Config {
-        scrolling_history: SCROLLBACK,
+        scrolling_history: scrollback,
         default_cursor_style: TermCursorStyle {
             shape: CursorShape::Beam,
             blinking: true,
@@ -271,7 +278,7 @@ impl Terminal {
             // PTY thread; UI tests run the dock without a shell behind it.
             detached(size)
         } else {
-            spawn(&cwd, size, cx.entity_id().as_u64())
+            spawn(&cwd, size, scrollback(cx), cx.entity_id().as_u64())
         };
         let events = cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
@@ -872,7 +879,8 @@ impl Element for Grid {
         let colors = content.colors;
         let offset = content.display_offset;
         let selection = content.selection;
-        let mut rows: Vec<Vec<Painting>> = vec![Vec::new(); lines];
+        let mut rows: Vec<Vec<Painting>> =
+            (0..lines).map(|_| Vec::with_capacity(columns)).collect();
         for indexed in content.display_iter {
             let cell = indexed.cell;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -926,6 +934,15 @@ impl Element for Grid {
         let cursor_shape = content.cursor.shape;
         let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR);
         drop(term);
+        // Blank cells at the end of a row paint nothing; shaping them as
+        // spaces only lengthens the string.
+        for row in &mut rows {
+            while row.last().is_some_and(|(_, c, pen, bg, _)| {
+                *c == ' ' && bg.is_none() && !pen.underline && !pen.strike
+            }) {
+                row.pop();
+            }
+        }
 
         let mut painted = Painted {
             lines: Vec::new(),
@@ -1115,9 +1132,16 @@ fn cell_rect(
 
 /// The HTTP(S) link covering `at`: the OSC 8 hyperlink on its cells, else
 /// a plain URL on its logical line.
+/// Rows searched above and below the pointer for the link under it. A line
+/// wrapped over thousands of rows would otherwise be rescanned in full on
+/// every frame the pointer rests on the grid.
+const LINK_SEARCH_ROWS: i32 = 50;
+
 fn link_at<T>(term: &Term<T>, regex: &mut RegexSearch, at: GridPoint) -> Option<Link> {
-    let start = term.line_search_left(at);
-    let end = term.line_search_right(at);
+    let mut start = term.line_search_left(at);
+    let mut end = term.line_search_right(at);
+    start.line = start.line.max(at.line - LINK_SEARCH_ROWS);
+    end.line = end.line.min(at.line + LINK_SEARCH_ROWS);
     if let Some(hyperlink) = term.grid()[at].hyperlink() {
         let same = |point: GridPoint| term.grid()[point].hyperlink().as_ref() == Some(&hyperlink);
         let mut first = at;
@@ -1574,6 +1598,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_link_is_found_at_the_end_of_a_very_long_wrapped_line(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        view.update(cx, |terminal, _| {
+            let cell = size(px(8.), px(16.));
+            terminal.resize(20, 4, cell);
+            terminal.geometry.set(Some(Geometry {
+                origin: point(px(0.), px(0.)),
+                cell,
+            }));
+            // 200 wrapped rows of filler, longer than the search window,
+            // then a URL on the last row.
+            let filler = "x".repeat(20 * 200);
+            write_note(&terminal.term, &format!("{filler}https://example.com/a"));
+            let at = |line: usize, column: usize| {
+                point(px(column as f32 * 8. + 1.), px(line as f32 * 16. + 1.))
+            };
+            let url = terminal.link_at(at(2, 5)).expect("URL on the last rows");
+            assert_eq!(url.uri, "https://example.com/a");
+            assert_eq!(terminal.link_at(at(0, 5)), None, "filler is not a link");
+        });
+    }
+
+    #[gpui::test]
     fn dragging_at_edges_extends_selection_through_history(cx: &mut gpui::TestAppContext) {
         let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
         view.update(cx, |terminal, cx| {
@@ -1690,6 +1737,27 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn the_scrollback_follows_the_preference(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(scrollback(cx), 2000, "the default without preferences");
+            cx.set_global(crate::settings::Preferences {
+                terminal_scrollback: 25_000,
+                ..Default::default()
+            });
+            assert_eq!(scrollback(cx), 25_000);
+            cx.set_global(crate::settings::Preferences {
+                terminal_scrollback: 9_000_000,
+                ..Default::default()
+            });
+            assert_eq!(
+                scrollback(cx),
+                100_000,
+                "a saved value out of range is clamped"
+            );
+        });
+    }
+
     #[test]
     fn keys_encode_like_xterm_with_the_macos_editing_shortcuts() {
         assert_eq!(bytes("enter"), Some(b"\r".to_vec()));
@@ -1793,7 +1861,7 @@ mod tests {
             columns: 60,
             lines: 10,
         };
-        let spawned = spawn(&dir, size, 1);
+        let spawned = spawn(&dir, size, SCROLLBACK, 1);
         let sender = spawned.sender.expect("the shell started");
         assert!(spawned.shell_pid > 1);
         let _ = sender.send(Msg::Input(Cow::Borrowed(b"printf 'mono%scode\\n' -\r")));

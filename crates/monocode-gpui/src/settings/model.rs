@@ -187,6 +187,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "text zoom smaller larger shell grid",
     ),
     (
+        "terminal-scrollback",
+        Section::Terminal,
+        "Terminal scrollback",
+        "history lines buffer log output memory",
+    ),
+    (
         "terminal-copy-on-select",
         Section::Terminal,
         "Copy on select",
