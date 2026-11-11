@@ -23,7 +23,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 const ROW: f32 = 26.;
 /// The size the user last dragged this dialog to; the next one opens that big.
-static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
+static REMEMBERED_SIZE: dialog_resize::Remembered = dialog_resize::remembered();
 
 pub(crate) enum UpdateDialogEvent {
     Close,
@@ -519,6 +519,8 @@ impl Render for UpdateDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let (width, height) = self.size.size(viewport);
+        let split_room = height - 110.;
+        let top = self.size.top_height(split_room, height * 0.34);
         let running = matches!(self.phase, Phase::Running);
         let entity = cx.entity();
         let count = self.rows.len();
@@ -604,7 +606,7 @@ impl Render for UpdateDialog {
                 .flex_col()
                 .child(
                     div()
-                        .h(px(height * 0.34))
+                        .h(px(top))
                         .flex_shrink_0()
                         .flex()
                         .child(
@@ -645,6 +647,12 @@ impl Render for UpdateDialog {
                                 }),
                         ),
                 )
+                .child(dialog_resize::split_handle(
+                    "update-split",
+                    top,
+                    split_room,
+                    cx,
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -833,7 +841,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::{MouseButton, VisualTestContext, point};
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
         let window = open(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
@@ -875,6 +883,6 @@ mod tests {
             visual.debug_bounds("update-card").unwrap().size,
             smaller.size
         );
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
     }
 }

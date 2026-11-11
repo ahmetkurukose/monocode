@@ -25,7 +25,7 @@ use std::{collections::HashSet, path::PathBuf};
 
 const ROW: f32 = 26.;
 /// The size the user last dragged the window to; the next one opens that big.
-static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
+static REMEMBERED_SIZE: dialog_resize::Remembered = dialog_resize::remembered();
 
 pub(crate) enum StashDialogEvent {
     Close,
@@ -674,6 +674,9 @@ impl StashDialog {
 impl gpui::Render for StashDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (width, height) = self.size.size(window.viewport_size());
+        // The form, header and buttons take about this much of the height.
+        let split_room = height - 200.;
+        let top = self.size.top_height(split_room, height * 0.26);
         let entity = cx.entity();
         let count = self.rows.len();
         let has_changes = self.has_changes(cx);
@@ -783,7 +786,7 @@ impl gpui::Render for StashDialog {
                         .flex_col()
                         .child(
                             div()
-                                .h(px(height * 0.26))
+                                .h(px(top))
                                 .flex_shrink_0()
                                 .border_b_1()
                                 .border_color(stroke())
@@ -810,6 +813,12 @@ impl gpui::Render for StashDialog {
                                     .into_any_element()
                                 }),
                         )
+                        .child(dialog_resize::split_handle(
+                            "stash-split",
+                            top,
+                            split_room,
+                            cx,
+                        ))
                         .child(div().flex_1().min_h_0().child(self.diff_view.clone())),
                 )
                 .into_any_element()
@@ -1224,7 +1233,7 @@ mod tests {
     #[gpui::test]
     fn the_window_fills_the_app_on_request_and_grows_by_its_corner(cx: &mut TestAppContext) {
         use gpui::{MouseButton, point};
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
         let dir = repo();
         let (window, _) = open(cx, &dir, Intent::Stash);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
@@ -1247,6 +1256,6 @@ mod tests {
         let smaller = visual.debug_bounds("stash-card").unwrap().size;
         assert_eq!(smaller.width, card.size.width - px(80.));
         assert_eq!(smaller.height, card.size.height - px(60.));
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
     }
 }

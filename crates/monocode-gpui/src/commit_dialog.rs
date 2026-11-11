@@ -127,7 +127,7 @@ impl dialog_resize::Resizable for CommitDialog {
 }
 
 /// The size the user last dragged the dialog to; the next one opens that big.
-static REMEMBERED_SIZE: dialog_resize::Remembered = std::sync::Mutex::new(None);
+static REMEMBERED_SIZE: dialog_resize::Remembered = dialog_resize::remembered();
 impl Focusable for CommitDialog {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -1105,6 +1105,10 @@ fn model(
 impl Render for CommitDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (width, height) = self.size.size(window.viewport_size());
+        // The list and message above, the diff below: the header and the
+        // buttons take the rest.
+        let split_room = height - 110.;
+        let top = self.size.top_height(split_room, height * 0.38);
         let entity = cx.entity();
         let count = self.rows.len();
         let checked = self.checked.len();
@@ -1172,7 +1176,7 @@ impl Render for CommitDialog {
             .child(
                 div()
                     .relative()
-                    .h(px(height * 0.38))
+                    .h(px(top))
                     .flex_shrink_0()
                     .flex()
                     .child(
@@ -1293,8 +1297,15 @@ impl Render for CommitDialog {
                             ),
                     ),
             )
+            .child(dialog_resize::split_handle(
+                "commit-split",
+                top,
+                split_room,
+                cx,
+            ))
             .child(
                 div()
+                    .debug_selector(|| "commit-diff".into())
                     .flex_1()
                     .min_h_0()
                     .border_t_1()
@@ -1637,13 +1648,17 @@ mod tests {
         cx.refresh().unwrap();
     }
 
+    /// The remembered size is one per process: tests that set it take turns.
+    static SIZE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[gpui::test]
     fn the_dialog_fills_the_window_on_request_and_grows_by_its_corner(
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::{MouseButton, VisualTestContext, point};
         cx.update(input::bind);
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        let _serial = SIZE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
         let open = |cx: &mut gpui::TestAppContext| {
@@ -1705,6 +1720,57 @@ mod tests {
         let visual = &mut VisualTestContext::from_window(again.into(), cx);
         visual.run_until_parked();
         assert_eq!(visual.debug_bounds("commit-card").unwrap().size, smaller);
-        *REMEMBERED_SIZE.lock().unwrap() = None;
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
+    }
+
+    #[gpui::test]
+    fn the_line_above_the_diff_drags_to_give_the_diff_more_or_less_room(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{MouseButton, VisualTestContext, point};
+        cx.update(input::bind);
+        let _serial = SIZE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let open = |cx: &mut gpui::TestAppContext| {
+            let cwd = cwd.clone();
+            cx.update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                    cx.new(|cx| CommitDialog::new(git, cwd, String::new(), Kind::Codex, window, cx))
+                })
+                .unwrap()
+            })
+        };
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let diff = visual.debug_bounds("commit-diff").expect("the diff");
+        let drag = |visual: &mut VisualTestContext, by: f32| {
+            let at = visual.debug_bounds("commit-split").unwrap().center();
+            visual.simulate_mouse_down(at, MouseButton::Left, Default::default());
+            let to = at + point(px(0.), px(by));
+            visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+            visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+            visual.run_until_parked();
+            visual.debug_bounds("commit-diff").unwrap()
+        };
+        // Up: the diff grows by as much, and its bottom stays put.
+        let taller = drag(visual, -60.);
+        assert_eq!(taller.size.height, diff.size.height + px(60.));
+        assert_eq!(taller.bottom(), diff.bottom());
+        // Far down: the diff keeps some room.
+        let least = drag(visual, 2000.);
+        assert!(least.size.height > px(20.) && least.size.height < diff.size.height);
+        // Far up: so does the list.
+        let most = drag(visual, -2000.);
+        assert!(most.top() - visual.debug_bounds("commit-card").unwrap().top() > px(100.));
+        // The next dialog opens with the same split.
+        let again = open(cx);
+        let visual = &mut VisualTestContext::from_window(again.into(), cx);
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("commit-diff").unwrap().size, most.size);
+        *REMEMBERED_SIZE.lock().unwrap() = Default::default();
     }
 }
