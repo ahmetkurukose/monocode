@@ -311,6 +311,7 @@ pub(super) fn key(request: &Request) -> String {
             .as_ref()
             .map(|mono| (&mono.root, &mono.mono.id)),
         request.settings.disable_claude_hooks,
+        request.settings.claude_chrome,
         crate::accounts::claude_entrypoint()
     ])
     .to_string()

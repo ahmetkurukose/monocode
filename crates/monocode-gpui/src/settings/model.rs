@@ -506,6 +506,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "pretooluse settings.json block command notification",
     ),
     (
+        "claude-chrome",
+        Section::Providers,
+        "Claude in Chrome",
+        "browser extension chrome integration web automation",
+    ),
+    (
         "claude-entrypoint",
         Section::Providers,
         "Identify as Monocode to Claude",

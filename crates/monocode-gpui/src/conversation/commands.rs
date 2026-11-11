@@ -127,6 +127,9 @@ impl Conversation {
         settings.disable_claude_hooks = cx
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|preferences| !preferences.claude_hooks);
+        settings.claude_chrome = cx
+            .try_global::<crate::settings::Preferences>()
+            .is_some_and(|preferences| preferences.claude_chrome);
         let cwd = self.execution_cwd().to_owned();
         let provider_id = self.summary.provider_id.clone();
         let model = self.model.clone();

@@ -1503,6 +1503,9 @@ fn run_operation(
             if mode == "bypassPermissions" {
                 command.arg("--allow-dangerously-skip-permissions");
             }
+            if settings.claude_chrome && !settings.text_only {
+                command.arg("--chrome");
+            }
             let mut config = json!({});
             if settings.disable_claude_hooks || settings.text_only {
                 config["disableAllHooks"] = true.into();

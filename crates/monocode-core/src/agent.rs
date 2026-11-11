@@ -105,6 +105,10 @@ pub struct Settings {
     pub turn_model: Option<TurnInfo>,
     #[serde(skip)]
     pub disable_claude_hooks: bool,
+    /// Start Claude Code with its Chrome integration (`--chrome`). A
+    /// headless session does not take it from Claude's own default.
+    #[serde(skip)]
+    pub claude_chrome: bool,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]

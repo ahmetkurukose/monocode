@@ -88,6 +88,8 @@ pub(crate) struct Preferences {
     pub mask_emails: bool,
     pub idle_agents: u32,
     pub claude_hooks: bool,
+    /// Start Claude Code with its Chrome integration.
+    pub claude_chrome: bool,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -182,6 +184,7 @@ impl Default for Preferences {
             mask_emails: true,
             idle_agents: 3,
             claude_hooks: true,
+            claude_chrome: false,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),
