@@ -301,6 +301,56 @@ mod tests {
             .unwrap();
     }
 
+    /// What a click on a reply's file chip does: the chip's link is the
+    /// reference joined to the session's folder, sent as `OpenPath`.
+    #[gpui::test]
+    fn a_chip_naming_a_file_without_its_directory_opens_it_at_the_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = project_with(&[
+            "application/core/utils/user_login_utils.py",
+            "app/models.py",
+        ]);
+        let cwd = dir.path().to_string_lossy().to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        let runs = vec![crate::markdown_model::InlineRun {
+            text: "user_login_utils.py:399".into(),
+            style: crate::markdown_model::InlineStyle {
+                code: true,
+                ..Default::default()
+            },
+        }];
+        let mut row =
+            crate::markdown::rows(&crate::markdown_model::Block::Paragraph { runs }).remove(0);
+        crate::markdown::resolve_file_links(&mut row, &cwd);
+        let crate::markdown::Part::Text { runs, .. } = &row.part else {
+            panic!("a paragraph");
+        };
+        let link = runs.iter().find_map(|run| run.style.link.clone()).unwrap();
+        assert_eq!(link, format!("{cwd}/user_login_utils.py:399:1"));
+        window
+            .update(cx, |shell, w, cx| {
+                let project = cwd.clone();
+                shell.git.update(cx, |git, cx| git.set_project(project, cx));
+                w.focus(&shell.focus, cx);
+                w.dispatch_action(Box::new(crate::file_editor::OpenPath(link.clone())), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let opened = (shell.workspace.recent_files.get(&cwd)).and_then(|f| f.first());
+                let file = dir
+                    .path()
+                    .join("application/core/utils/user_login_utils.py");
+                assert_eq!(
+                    opened.map(String::as_str),
+                    Some(file.to_string_lossy().as_ref())
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn a_name_that_several_files_share_opens_quick_open_on_it(cx: &mut gpui::TestAppContext) {
         let dir = project_with(&["a/utils.py", "b/utils.py"]);

@@ -9137,9 +9137,10 @@ impl Render for Shell {
                     let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
                     // A reference like `utils.py` names a file somewhere below the
                     // project, not in its root: look for it before giving up.
-                    let loose = !event.0.starts_with("file://")
-                        && !std::path::Path::new(&event.0).is_absolute()
-                        && !cwd.starts_with("remote://")
+                    // Chips in a reply arrive already joined to the project
+                    // root, so what counts is a missing path inside it.
+                    let loose = !cwd.starts_with("remote://")
+                        && std::path::Path::new(&path).starts_with(&cwd)
                         && !std::path::Path::new(&path).exists();
                     if loose {
                         this.open_loose_reference(event.0.clone(), cwd, window, cx);
