@@ -187,7 +187,12 @@ impl Inbox {
         };
         let single = files.len() == 1;
         let first = files.first().map(|f| f.id.clone());
+        // The pull request's project on this machine, for "Jump to Source".
+        let root = (self.item())
+            .map(|item| item.project_path)
+            .filter(|path| !path.is_empty());
         self.diff_view.update(cx, |view, cx| {
+            view.source_root = root;
             view.file_count = single.then_some(1);
             view.totals = None;
             view.set_files(files, cx);

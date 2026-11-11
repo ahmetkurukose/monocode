@@ -105,8 +105,22 @@ impl UpdateDialog {
         let diff_view = cx.new(DiffView::new);
         diff_view.update(cx, |view, cx| {
             view.allow_split = true;
+            view.source_root = Some(cwd.clone());
             view.set_split(true, cx);
         });
+        // "Jump to Source" opens the file behind the dialog: step aside.
+        cx.subscribe(
+            &diff_view,
+            |this, _, event: &crate::diff_view::DiffEvent, cx| {
+                if matches!(event, crate::diff_view::DiffEvent::Jumped)
+                    && !matches!(this.phase, Phase::Running)
+                    && !this.pushing
+                {
+                    cx.emit(UpdateDialogEvent::Close);
+                }
+            },
+        )
+        .detach();
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut this = Self {

@@ -104,8 +104,19 @@ impl StashDialog {
         let diff_view = cx.new(DiffView::new);
         diff_view.update(cx, |view, cx| {
             view.allow_split = true;
+            view.source_root = Some(cwd.clone());
             view.set_split(true, cx);
         });
+        // "Jump to Source" opens the file behind the window: step aside.
+        cx.subscribe(
+            &diff_view,
+            |this, _, event: &crate::diff_view::DiffEvent, cx| {
+                if matches!(event, crate::diff_view::DiffEvent::Jumped) && !this.busy {
+                    cx.emit(StashDialogEvent::Close);
+                }
+            },
+        )
+        .detach();
         let message = cx.new(|cx| {
             let mut input = Input::field("Stash message", "Message (optional)", content(0.35), cx);
             input.set_font_size(13.);

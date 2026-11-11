@@ -102,6 +102,9 @@ pub(crate) enum DiffEvent {
     StageHunk(SharedString, usize),
     /// Text for the active chat's composer.
     Comment(String),
+    /// "Jump to Source" opened a file in the workspace; a dialog showing
+    /// the diff gets out of its way.
+    Jumped,
 }
 
 #[derive(Clone, PartialEq)]
@@ -460,6 +463,9 @@ pub(crate) struct DiffView {
     pending: Option<usize>,
     focus_id: Option<SharedString>,
     pub(crate) busy_id: Option<SharedString>,
+    /// The folder the files' paths are relative to. With it, each file's
+    /// header offers "Jump to Source".
+    pub(crate) source_root: Option<String>,
     pub(crate) file_count: Option<usize>,
     pub(crate) totals: Option<(u32, u32)>,
     highlights: HashMap<SharedString, (Arc<Vec<Block>>, Option<Tokens>)>,
@@ -518,6 +524,7 @@ impl DiffView {
             pending: None,
             focus_id: None,
             busy_id: None,
+            source_root: None,
             file_count: None,
             totals: None,
             highlights: HashMap::new(),
@@ -1456,6 +1463,39 @@ impl DiffView {
             )
     }
 
+    /// Where "Jump to Source" goes for a file: its path under the source
+    /// root, at the first line the diff changed.
+    pub(crate) fn source_target(&self, file: usize) -> Option<String> {
+        let root = self.source_root.as_ref()?;
+        let f = self.files.get(file)?;
+        let path = if std::path::Path::new(&f.path).is_absolute() {
+            f.path.clone()
+        } else {
+            format!("{}/{}", root.trim_end_matches('/'), f.path)
+        };
+        let lines = || f.blocks.iter().flat_map(|block| block.lines().iter());
+        let line = lines()
+            .find(|line| line.kind == LineKind::Add)
+            .and_then(|line| line.new_number)
+            // Only deletions: the line that now sits where they were.
+            .or_else(|| {
+                let at = lines().position(|line| line.kind == LineKind::Del)?;
+                lines().skip(at).find_map(|line| line.new_number)
+            });
+        Some(match line {
+            Some(line) => format!("{path}:{line}"),
+            None => path,
+        })
+    }
+
+    fn jump_to_source(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.source_target(file) else {
+            return;
+        };
+        window.dispatch_action(Box::new(crate::file_editor::OpenPath(target)), cx);
+        cx.emit(DiffEvent::Jumped);
+    }
+
     fn file_header(&self, file: usize, sticky: bool, cx: &mut Context<Self>) -> AnyElement {
         let f = &self.files[file];
         let expanded = self.open.contains(&f.id);
@@ -1533,6 +1573,16 @@ impl DiffView {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(file, cx))),
             )
             .child(diff_counts(f.additions, f.deletions))
+            .when(self.source_root.is_some(), |d| {
+                d.child(
+                    tool_button(("jump-file", file), "Jump to Source", "pencil", true)
+                        .debug_selector(move || format!("diff-jump-{file}"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.jump_to_source(file, window, cx);
+                        })),
+                )
+            })
             .when(f.can_discard, |d| {
                 d.child(
                     tool_button(("discard-file", file), "Discard file", "undo", !busy).when(
@@ -2784,5 +2834,67 @@ mod tests {
             RowKind::Notice(t) if t.as_ref() == "Binary file changed")
         );
         assert_eq!(expand_tabs("\tab\tc"), "    ab  c");
+    }
+
+    #[gpui::test]
+    fn jump_to_source_names_the_file_at_its_first_changed_line(cx: &mut gpui::TestAppContext) {
+        let original: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let edited = original.replace("line 20\n", "changed 20\n");
+        let removed = original.replace("line 30\n", "");
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(DiffView::new))
+                .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let jumps = std::rc::Rc::new(Cell::new(0));
+        let seen = jumps.clone();
+        window
+            .update(visual, |view, _, cx| {
+                let mut edit = file("edit.py", &original, &edited);
+                edit.path = "app/edit.py".into();
+                let mut cut = file("cut.py", &original, &removed);
+                cut.path = "app/cut.py".into();
+                // An absolute path is used as it is.
+                let whole = file("whole.py", &original, &edited);
+                view.set_files(vec![edit, cut, whole], cx);
+                // Without a root there is nothing to jump to.
+                assert_eq!(view.source_target(0), None);
+                view.source_root = Some("/work/project/".into());
+                assert_eq!(
+                    view.source_target(0).as_deref(),
+                    Some("/work/project/app/edit.py:20")
+                );
+                // Only a deletion: the line that took its place.
+                assert_eq!(
+                    view.source_target(1).as_deref(),
+                    Some("/work/project/app/cut.py:30")
+                );
+                assert_eq!(view.source_target(2).as_deref(), Some("/r/whole.py:20"));
+                cx.subscribe(&cx.entity(), move |_, _, event: &DiffEvent, _| {
+                    if matches!(event, DiffEvent::Jumped) {
+                        seen.set(seen.get() + 1);
+                    }
+                })
+                .detach();
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let button = visual
+            .debug_bounds("diff-jump-0")
+            .expect("the header's button");
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(jumps.get(), 1);
+        // No root, no button.
+        window
+            .update(visual, |view, _, cx| {
+                view.source_root = None;
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("diff-jump-0").is_none());
     }
 }

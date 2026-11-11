@@ -424,6 +424,13 @@ impl ReviewPane {
         let view = cached
             .as_ref()
             .map_or_else(|| cx.new(DiffView::new), |s| s.view.clone());
+        let root = match &tab {
+            ReviewTab::File { .. } => None,
+            ReviewTab::Changes { cwd, .. }
+            | ReviewTab::Commit { cwd, .. }
+            | ReviewTab::Session { cwd, .. } => Some(cwd.clone()),
+        };
+        view.update(cx, |view, _| view.source_root = root);
         let events = cx.subscribe(&view, |this, view, event: &DiffEvent, cx| {
             let Some(ix) = this.sources.iter().position(|s| s.view == view) else {
                 return;
@@ -1409,6 +1416,7 @@ impl ReviewPane {
                 cx.emit(ReviewEvent::Comment(text.clone()));
                 return;
             }
+            DiffEvent::Jumped => return,
             DiffEvent::StageFile(id) | DiffEvent::DiscardFile(id) => {
                 let Some(relative) = id.strip_prefix("unstaged:").map(str::to_owned) else {
                     return;

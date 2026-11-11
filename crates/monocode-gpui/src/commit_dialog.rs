@@ -153,8 +153,19 @@ impl CommitDialog {
         let diff_view = cx.new(DiffView::new);
         diff_view.update(cx, |view, cx| {
             view.allow_split = true;
+            view.source_root = Some(cwd.clone());
             view.set_split(true, cx);
         });
+        // "Jump to Source" opens the file behind the dialog: step aside.
+        cx.subscribe(
+            &diff_view,
+            |this, _, event: &crate::diff_view::DiffEvent, cx| {
+                if matches!(event, crate::diff_view::DiffEvent::Jumped) && this.busy.is_none() {
+                    cx.emit(CommitDialogEvent::Close);
+                }
+            },
+        )
+        .detach();
         let subscriptions = vec![
             cx.observe(&git, |this, _, cx| this.refresh(cx)),
             cx.subscribe(&input, |_, _, _: &input::Changed, cx| cx.notify()),
@@ -551,6 +562,7 @@ impl CommitDialog {
         if one_file {
             items.push(MenuItem::Separator);
             items.push(MenuAction::new("diff", "Show Diff").into());
+            items.push(MenuAction::new("jump", "Jump to Source").into());
             items.push(MenuAction::new("copy-path", "Copy Path").into());
             items.push(MenuAction::new("copy-relative", "Copy Relative Path").into());
         }
@@ -578,9 +590,28 @@ impl CommitDialog {
         cx.notify();
     }
 
-    fn run_menu_action(&mut self, id: &str, row: usize, _: &mut Window, cx: &mut Context<Self>) {
+    fn run_menu_action(
+        &mut self,
+        id: &str,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let members = self.members(row);
         match id {
+            "jump" => {
+                if let Some(&ix) = members.first() {
+                    let path = format!(
+                        "{}/{}",
+                        self.cwd.trim_end_matches('/'),
+                        self.files[ix].relative
+                    );
+                    window.dispatch_action(Box::new(crate::file_editor::OpenPath(path)), cx);
+                    if self.busy.is_none() {
+                        cx.emit(CommitDialogEvent::Close);
+                    }
+                }
+            }
             "rollback" | "delete" => self.ask_rollback(&members, id == "delete", cx),
             "add" => self.add_to_git(&members, cx),
             "diff" => {
