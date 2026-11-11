@@ -57,6 +57,99 @@ pub fn prepare_prompt(
     crate::composer::prepare_prompt(&text, cwd, attachments)
 }
 
+/// Claude Code's custom commands: `.claude/commands/*.md` in the project and
+/// in the home folder, the project's first. Claude only reports its commands
+/// once a session has started, and then by name alone, so the files are what
+/// a new chat can offer and where the descriptions come from.
+pub fn claude_command_files(cwd: &str) -> Vec<NativeCommand> {
+    let project = crate::scm::expand_home(std::path::Path::new(cwd));
+    let home = crate::scm::shell::dirs_home().map(PathBuf::from);
+    let roots = [
+        Some((project.join(".claude/commands"), "project")),
+        home.map(|home| (home.join(".claude/commands"), "user")),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut commands = Vec::new();
+    for (root, origin) in roots.into_iter().flatten() {
+        let mut files = Vec::new();
+        command_files(&root, 0, &mut files);
+        files.sort();
+        for file in files {
+            let Some(name) = file.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if name.is_empty()
+                || name.chars().any(char::is_whitespace)
+                || !seen.insert(name.to_owned())
+            {
+                continue;
+            }
+            let (description, input_hint) = command_front_matter(&file);
+            commands.push(NativeCommand {
+                name: name.into(),
+                description,
+                invocation: native_invocation(Kind::Claude, name),
+                source: Kind::Claude,
+                origin: Some(origin.into()),
+                aliases: Vec::new(),
+                input_hint,
+                subcommands: Vec::new(),
+            });
+        }
+    }
+    commands
+}
+
+fn command_files(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth < 3 {
+                command_files(&path, depth + 1, out);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "md") && out.len() < 500 {
+            out.push(path);
+        }
+    }
+}
+
+/// A command file's `description` and `argument-hint`, from its front matter.
+fn command_front_matter(file: &std::path::Path) -> (String, Option<String>) {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(file) else {
+        return (String::new(), None);
+    };
+    let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+    if lines.next().as_deref().map(str::trim) != Some("---") {
+        return (String::new(), None);
+    }
+    let value = |line: &str, key: &str| {
+        let rest = line.strip_prefix(key)?.trim_start().strip_prefix(':')?;
+        let rest = rest.trim();
+        let rest = rest
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .or_else(|| rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+            .unwrap_or(rest);
+        (!rest.is_empty()).then(|| rest.to_owned())
+    };
+    let (mut description, mut hint) = (String::new(), None);
+    for line in lines.take(40) {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(text) = value(&line, "description") {
+            description = text;
+        } else if let Some(text) = value(&line, "argument-hint") {
+            hint = Some(text);
+        }
+    }
+    (description, hint)
+}
+
 pub(super) fn parse_commands(kind: Kind, rows: &Value) -> Vec<NativeCommand> {
     let mut seen = std::collections::HashSet::new();
     rows.as_array()
@@ -205,6 +298,45 @@ impl Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_command_files_are_listed_with_their_descriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = dir.path().join(".claude/commands");
+        std::fs::create_dir_all(commands.join("review")).unwrap();
+        std::fs::write(
+            commands.join("backend-review.md"),
+            "---\ndescription: Review the backend.\nargument-hint: <branch>\n---\n\nBody\n",
+        )
+        .unwrap();
+        std::fs::write(commands.join("plain.md"), "No front matter here.\n").unwrap();
+        std::fs::write(
+            commands.join("review/frontend-review.md"),
+            "---\ndescription: \"Quoted: text\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(commands.join("notes.txt"), "not a command").unwrap();
+        let found = claude_command_files(&dir.path().to_string_lossy());
+        let project: Vec<_> = found
+            .iter()
+            .filter(|c| c.origin.as_deref() == Some("project"))
+            .map(|c| {
+                (
+                    c.invocation.as_str(),
+                    c.description.as_str(),
+                    c.input_hint.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            project,
+            [
+                ("backend-review", "Review the backend.", Some("<branch>")),
+                ("plain", "", None),
+                ("frontend-review", "Quoted: text", None),
+            ]
+        );
+        assert!(found.iter().all(|c| c.source == Kind::Claude));
+    }
     #[test]
     fn native_escape_only_rewrites_reserved_leading_commands() {
         assert_eq!(

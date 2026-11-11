@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 mod acp;
 mod commands;
 pub use commands::{
-    compact, discover_commands, native_invocation, native_prompt, prepare_prompt, supports_compact,
-    NativeCommand, NativeSubcommand,
+    claude_command_files, compact, discover_commands, native_invocation, native_prompt,
+    prepare_prompt, supports_compact, NativeCommand, NativeSubcommand,
 };
 mod attachments;
 mod compaction;

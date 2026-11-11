@@ -81,6 +81,10 @@ pub(crate) struct Completion {
     skills: Vec<DiscoveredSkill>,
     provider: monocode_core::provider::Kind,
     native_commands: Vec<monocode_core::provider::NativeCommand>,
+    /// What the provider itself reported, before command files are added.
+    reported_commands: Vec<monocode_core::provider::NativeCommand>,
+    /// Claude's custom command files for this folder (`.claude/commands`).
+    command_files: Vec<monocode_core::provider::NativeCommand>,
     native_loading: bool,
     native_revision: usize,
     mcp: Vec<monocode_core::mcp::McpConnection>,
@@ -148,6 +152,8 @@ impl Completion {
             skills: Vec::new(),
             provider: monocode_core::provider::Kind::Codex,
             native_commands: Vec::new(),
+            reported_commands: Vec::new(),
+            command_files: Vec::new(),
             native_loading: false,
             native_revision: 0,
             mcp: Vec::new(),
@@ -215,6 +221,8 @@ impl Completion {
         self.cwd = cwd.into();
         self.skills.clear();
         self.native_commands.clear();
+        self.reported_commands.clear();
+        self.command_files.clear();
         self.native_loading = false;
         self.native_revision = self.native_revision.wrapping_add(1);
         self.mcp.clear();
@@ -253,7 +261,13 @@ impl Completion {
                 self.known.remove(token);
             }
             self.provider = provider;
-            self.native_commands.clear();
+            self.reported_commands.clear();
+            self.native_commands = self.merged_commands();
+            self.known.extend(
+                self.native_commands
+                    .iter()
+                    .map(|command| format!("/{}", command.invocation)),
+            );
             self.native_loading = false;
             self.native_revision = self.native_revision.wrapping_add(1);
             self.selected_mcp.clear();
@@ -274,10 +288,11 @@ impl Completion {
         for command in &self.native_commands {
             self.known.remove(&format!("/{}", command.invocation));
         }
-        self.native_commands = commands
+        self.reported_commands = commands
             .into_iter()
             .filter(|command| command.source == self.provider)
             .collect();
+        self.native_commands = self.merged_commands();
         self.known.extend(
             self.native_commands
                 .iter()
@@ -286,6 +301,28 @@ impl Completion {
         self.highlight(cx);
         self.rank();
         cx.notify();
+    }
+    /// The provider's commands with Claude's command files: a new chat has
+    /// only the files, and Claude reports names without descriptions.
+    fn merged_commands(&self) -> Vec<monocode_core::provider::NativeCommand> {
+        let mut commands = self.reported_commands.clone();
+        if self.provider != monocode_core::provider::Kind::Claude {
+            return commands;
+        }
+        for file in &self.command_files {
+            match (commands.iter_mut()).find(|c| c.invocation == file.invocation) {
+                Some(reported) => {
+                    if reported.description.is_empty() {
+                        reported.description = file.description.clone();
+                    }
+                    if reported.input_hint.is_none() {
+                        reported.input_hint = file.input_hint.clone();
+                    }
+                }
+                None => commands.push(file.clone()),
+            }
+        }
+        commands
     }
     /// A skill or provider command already named `/{name}`, which wins over
     /// MonoCode's own command of the same name.
@@ -514,11 +551,12 @@ impl Completion {
                 monocode_core::skills::list_skills(cwd.clone(), Some(disabled)).unwrap_or_default();
             let files =
                 monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&cancel));
+            let command_files = monocode_core::provider::claude_command_files(&cwd);
             let mcp = monocode_core::mcp::mcp_discover(cwd).unwrap_or_default();
-            (skills, files, notes, mcp)
+            (skills, files, notes, mcp, command_files)
         });
         cx.spawn(async move |this, cx| {
-            let (skills, files, notes, mcp) = work.await;
+            let (skills, files, notes, mcp, command_files) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
@@ -526,6 +564,8 @@ impl Completion {
                 this.loading = false;
                 this.loaded = Some(Instant::now());
                 this.skills = skills;
+                this.command_files = command_files;
+                this.native_commands = this.merged_commands();
                 this.mcp = mcp;
                 this.notes = notes;
                 match files {
@@ -1167,6 +1207,71 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         window
+    }
+    #[gpui::test]
+    fn a_new_claude_chat_offers_the_projects_command_files(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = dir.path().join(".claude/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("backend-review.md"),
+            "---\ndescription: Review the backend.\n---\nBody\n",
+        )
+        .unwrap();
+        let window = window(cx);
+        let offered = |cx: &mut TestAppContext, text: &str| {
+            let text = text.to_owned();
+            window
+                .update(cx, |view, _, cx| {
+                    view.input.update(cx, |input, cx| input.set_text(text, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |view, _, _| {
+                    // The user's own skills are listed too; only ours matter.
+                    view.choices
+                        .iter()
+                        .filter(|c| c.insertion == "/backend-review")
+                        .map(|c| (c.insertion.clone(), c.detail.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap()
+        };
+        window
+            .update(cx, |view, _, cx| {
+                view.set_provider("claude", cx);
+                view.set_cwd(&dir.path().to_string_lossy(), cx);
+            })
+            .unwrap();
+        // Nothing has been sent, so Claude has reported no commands yet.
+        let review = (
+            "/backend-review".to_owned(),
+            "Review the backend.".to_owned(),
+        );
+        assert_eq!(offered(cx, "/backend"), [review.clone()]);
+        // Once it has, by name alone, the file still gives the description.
+        window
+            .update(cx, |view, _, cx| {
+                let reported = |name: &str| monocode_core::provider::NativeCommand {
+                    name: name.into(),
+                    description: String::new(),
+                    invocation: name.into(),
+                    source: monocode_core::provider::Kind::Claude,
+                    origin: None,
+                    aliases: Vec::new(),
+                    input_hint: None,
+                    subcommands: Vec::new(),
+                };
+                view.set_native_commands(vec![reported("backend-review"), reported("init")], cx);
+            })
+            .unwrap();
+        assert_eq!(offered(cx, "/backend"), [review]);
+        // Another provider does not run Claude's commands.
+        window
+            .update(cx, |view, _, cx| view.set_provider("codex", cx))
+            .unwrap();
+        assert!(offered(cx, "/backend").is_empty());
     }
     #[gpui::test]
     fn bare_slash_prioritizes_local_modes_and_typing_filters_skills(cx: &mut TestAppContext) {
