@@ -2613,7 +2613,8 @@ impl Inbox {
                     .child(self.project_mark(&key, 12.))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         toggle(&mut this.state.filters.hidden_projects, key.clone());
-                        this.filters_changed(false, cx);
+                        // A project shown is a project to fetch.
+                        this.filters_changed(true, cx);
                     }))
                     .into_any_element(),
                 );
@@ -3370,6 +3371,37 @@ mod tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
     }
+    #[gpui::test]
+    fn only_the_projects_the_filter_lists_are_fetched(cx: &mut TestAppContext) {
+        let window = fixture(cx);
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
+                    let (home, other, third) = (
+                        PathBuf::from("/work/home"),
+                        PathBuf::from("/work/other"),
+                        PathBuf::from("/work/third"),
+                    );
+                    inbox.projects = vec![home.clone(), other.clone(), third.clone()];
+                    inbox.service.cwd = home.clone();
+                    // Opened in a project, the others are filtered out: only
+                    // it is asked about, however many the workspace holds.
+                    inbox.state.filters.hidden_projects =
+                        super::super::other_projects(&inbox.projects, &home);
+                    assert_eq!(inbox.fetch_projects(), vec![home.clone()]);
+                    let scoped = inbox.fetch_scope();
+                    // Showing another project in the filter fetches it too,
+                    // and that is a different fetch.
+                    inbox.state.filters.hidden_projects = vec!["/work/third".into()];
+                    assert_eq!(inbox.fetch_projects(), vec![home, other]);
+                    assert_ne!(inbox.fetch_scope(), scoped);
+                    // Off screen it does not refresh unless automations ask.
+                    assert!(!inbox.background);
+                });
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn the_inbox_opens_scoped_to_its_project_and_labels_projects_by_appearance(
         cx: &mut TestAppContext,

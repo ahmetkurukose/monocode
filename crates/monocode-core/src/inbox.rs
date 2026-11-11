@@ -594,6 +594,53 @@ pub struct Service {
 /// Pairs each repository with one checkout to fetch it through. Several
 /// checkouts of the same repository share its rows, so the active checkout
 /// goes first and keeps them when the inbox is scoped to it.
+/// How many provider calls run at once.
+const PARALLEL: usize = 8;
+
+/// Runs `run` on every job, a few at a time, and returns the results in the
+/// jobs' order.
+fn parallel<T: Sync, R: Send>(jobs: &[T], run: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let mut results = Vec::with_capacity(jobs.len());
+    for batch in jobs.chunks(PARALLEL) {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = batch.iter().map(|job| scope.spawn(|| run(job))).collect();
+            for worker in workers {
+                match worker.join() {
+                    Ok(result) => results.push(result),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+    }
+    results
+}
+
+/// A checkout's GitHub repositories. Asking GitHub takes most of a second
+/// and the answer only changes when a remote does, so it is kept a while.
+fn github_repositories(project: &Path) -> Result<Vec<String>, String> {
+    const KEEP: std::time::Duration = std::time::Duration::from_secs(600);
+    type Known = HashMap<PathBuf, (std::time::Instant, Vec<String>)>;
+    static KNOWN: std::sync::Mutex<Option<Known>> = std::sync::Mutex::new(None);
+    let known = |project: &Path| {
+        let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, repos) = known.as_ref()?.get(project)?;
+        (at.elapsed() < KEEP).then(|| repos.clone())
+    };
+    if let Some(repos) = known(project) {
+        return Ok(repos);
+    }
+    let repos = github::git_github_repositories_for(project)?;
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            project.to_path_buf(),
+            (std::time::Instant::now(), repos.clone()),
+        );
+    Ok(repos)
+}
+
 fn repo_checkouts<'a>(
     projects: &'a [PathBuf],
     cwd: &Path,
@@ -759,9 +806,12 @@ impl Service {
                     }
                     return Ok(items);
                 }
-                let checkouts = repo_checkouts(projects, &self.cwd, |project| {
+                // Each project's repository, then each repository's issues and
+                // pull requests, are separate calls to the provider: run them
+                // side by side, or a dozen projects take a dozen times as long.
+                let resolved = parallel(projects, |project| {
                     match provider {
-                        "github" => github::git_github_repositories_for(project),
+                        "github" => github_repositories(project),
                         "gitlab" => gitlab::gitlab_repo(
                             self.data_dir.clone(),
                             project.to_string_lossy().into_owned(),
@@ -775,53 +825,64 @@ impl Service {
                     }
                     .ok()
                 });
+                let checkouts = repo_checkouts(projects, &self.cwd, |project| {
+                    let at = projects.iter().position(|p| p.as_path() == project)?;
+                    resolved[at].clone()
+                });
+                let jobs: Vec<(&PathBuf, &str, &str)> = checkouts
+                    .iter()
+                    .flat_map(|(project, repo)| {
+                        ["issue", "pr"].map(|kind| (*project, repo.as_str(), kind))
+                    })
+                    .collect();
+                let fetched = parallel(
+                    &jobs,
+                    |(project, repo, kind)| -> Result<Vec<Item>, String> {
+                        Ok(match provider {
+                            "github" => convert(github::git_github_work_items_for(
+                                project,
+                                repo,
+                                kind,
+                                state.filters.assigned_to_me,
+                                state.filters.fetch_state(),
+                                "",
+                                limit,
+                            )?)?,
+                            "gitlab" => convert(gitlab::gitlab_list_work_items(
+                                self.data_dir.clone(),
+                                project.to_string_lossy().into_owned(),
+                                (*kind).into(),
+                                false,
+                                state.filters.fetch_state().into(),
+                                Some(limit),
+                            )?)?,
+                            _ => convert(azure_devops::azure_devops_list_work_items(
+                                self.data_dir.clone(),
+                                project.to_string_lossy().into_owned(),
+                                (*kind).into(),
+                                false,
+                                state.filters.fetch_state().into(),
+                                Some(limit),
+                            )?)?,
+                        })
+                    },
+                );
                 let mut first_error: Option<String> = None;
-                for (project, repo) in checkouts {
-                    for kind in ["issue", "pr"] {
-                        let fetched: Result<Vec<Item>, String> = (|| {
-                            Ok(match provider {
-                                "github" => convert(github::git_github_work_items_for(
-                                    project,
-                                    &repo,
-                                    kind,
-                                    state.filters.assigned_to_me,
-                                    state.filters.fetch_state(),
-                                    "",
-                                    limit,
-                                )?)?,
-                                "gitlab" => convert(gitlab::gitlab_list_work_items(
-                                    self.data_dir.clone(),
-                                    project.to_string_lossy().into_owned(),
-                                    kind.into(),
-                                    false,
-                                    state.filters.fetch_state().into(),
-                                    Some(limit),
-                                )?)?,
-                                _ => convert(azure_devops::azure_devops_list_work_items(
-                                    self.data_dir.clone(),
-                                    project.to_string_lossy().into_owned(),
-                                    kind.into(),
-                                    false,
-                                    state.filters.fetch_state().into(),
-                                    Some(limit),
-                                )?)?,
-                            })
-                        })();
-                        // One kind failing (e.g. a repository with issues
-                        // disabled) must not hide the other kind's rows.
-                        let rows = match fetched {
-                            Ok(rows) => rows,
-                            Err(error) => {
-                                first_error.get_or_insert(error);
-                                continue;
-                            }
-                        };
-                        items.extend(rows.into_iter().map(|mut item| {
-                            item.provider = provider.into();
-                            item.project_path = project.to_string_lossy().into_owned();
-                            item
-                        }));
-                    }
+                for ((project, _, _), fetched) in jobs.iter().zip(fetched) {
+                    // One kind failing (e.g. a repository with issues
+                    // disabled) must not hide the other kind's rows.
+                    let rows = match fetched {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    items.extend(rows.into_iter().map(|mut item| {
+                        item.provider = provider.into();
+                        item.project_path = project.to_string_lossy().into_owned();
+                        item
+                    }));
                 }
                 if items.is_empty() {
                     if let Some(error) = first_error {

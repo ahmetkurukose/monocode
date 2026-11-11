@@ -139,6 +139,8 @@ pub(crate) struct Inbox {
     refresh_queued: bool,
     notifications: model::NotificationTracker,
     last_refresh: Instant,
+    /// Refresh while off screen too; see `set_background`.
+    background: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -488,8 +490,13 @@ impl Inbox {
                         .await;
                     if this
                         .update(cx, |this, cx| {
-                            let interval = Duration::from_secs(if this.active { 120 } else { 300 });
-                            if this.last_refresh.elapsed() >= interval {
+                            // On screen it looks every minute. Off screen it
+                            // only keeps looking for automations that wait
+                            // on its items.
+                            let interval = Duration::from_secs(if this.active { 60 } else { 300 });
+                            if (this.active || this.background)
+                                && this.last_refresh.elapsed() >= interval
+                            {
                                 this.refresh(cx);
                             }
                             if this.active
@@ -599,6 +606,7 @@ impl Inbox {
             refresh_queued: false,
             notifications: model::NotificationTracker::default(),
             last_refresh: Instant::now(),
+            background: false,
             _subscriptions: subscriptions,
         }
     }
@@ -629,11 +637,6 @@ impl Inbox {
                     .is_some_and(|key| !visible.iter().any(|item| &item.key() == key))
                 {
                     self.deselect(cx);
-                    if self.active
-                        && let Some(item) = visible.first()
-                    {
-                        self.select(item.key(), cx);
-                    }
                 }
             }
             self.refresh(cx);
@@ -660,11 +663,14 @@ impl Inbox {
         }
         self.active = active;
         if active {
+            // An item's content is fetched when it is picked, not before.
             if let Some(item) = self.item() {
                 self.state.seen.mark(&item);
                 self.save();
-            } else if let Some(item) = self.visible_items(cx).first() {
-                self.select(item.key(), cx);
+            }
+            // Coming on screen is when the list is wanted fresh.
+            if self.last_refresh.elapsed() >= Duration::from_secs(60) {
+                self.refresh(cx);
             }
         }
         cx.notify();
@@ -726,7 +732,11 @@ impl Inbox {
         let generation = self.generation;
         let service = self.service.clone();
         let state = self.state.clone();
-        let projects = self.projects.clone();
+        let projects = self.fetch_projects();
+        let fetched: std::collections::HashSet<String> = projects
+            .iter()
+            .map(|project| project.to_string_lossy().into_owned())
+            .collect();
         let scope = self.fetch_scope();
         let store = self.store.clone();
         let task = cx.background_executor().spawn(async move {
@@ -749,6 +759,19 @@ impl Inbox {
                     return;
                 }
                 let appeared = this.notifications.observe(&snapshot, scope);
+                // Projects that were not asked about keep the rows they had,
+                // so going back to one shows its list at once.
+                let kept: Vec<Item> = (this.snapshot.items.iter())
+                    .filter(|item| {
+                        !item.project_path.is_empty()
+                            && !fetched.contains(&item.project_path)
+                            && (this.projects.iter())
+                                .any(|p| p.to_string_lossy() == item.project_path.as_str())
+                            && !snapshot.errors.contains_key(&item.provider)
+                    })
+                    .cloned()
+                    .collect();
+                snapshot.items.extend(kept);
                 // A temporary outage must not erase the last usable provider list.
                 for provider in snapshot.errors.keys() {
                     snapshot.items.extend(
@@ -793,12 +816,6 @@ impl Inbox {
                 {
                     this.deselect(cx);
                 }
-                if this.active
-                    && this.selected.is_none()
-                    && let Some(item) = this.visible_items(cx).first()
-                {
-                    this.select(item.key(), cx);
-                }
                 if std::mem::take(&mut this.refresh_queued) {
                     this.refresh(cx);
                 }
@@ -809,12 +826,30 @@ impl Inbox {
         cx.notify();
     }
 
+    /// The projects whose items are fetched: those the project filter lists,
+    /// which is the current project unless the user shows more. The others
+    /// sit in the workspace unused, some with hundreds of pull requests.
+    fn fetch_projects(&self) -> Vec<PathBuf> {
+        let hidden = &self.state.filters.hidden_projects;
+        self.projects
+            .iter()
+            .filter(|project| !hidden.contains(&project.to_string_lossy().into_owned()))
+            .cloned()
+            .collect()
+    }
+
+    /// Keeps the list fresh while the Inbox is off screen, for automations
+    /// triggered by its items.
+    pub(crate) fn set_background(&mut self, background: bool) {
+        self.background = background;
+    }
+
     /// Rows are assigned to the active checkout, so a fetch made for another
     /// one is stale even when the project list is the same.
     fn fetch_scope(&self) -> String {
         format!(
             "{}:{}",
-            self.state.fetch_scope(&self.projects),
+            self.state.fetch_scope(&self.fetch_projects()),
             monocode_core::files::path_key(&self.service.cwd.to_string_lossy())
         )
     }
@@ -939,9 +974,17 @@ impl Inbox {
             self.comments.clear();
         }
         let service = self.service.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { (service.details(&item), service.thread(&item)) });
+        let task = cx.background_executor().spawn(async move {
+            // Two calls to the provider: make them at the same time.
+            std::thread::scope(|scope| {
+                let thread = scope.spawn(|| service.thread(&item));
+                let details = service.details(&item);
+                let thread = thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (details, thread)
+            })
+        });
         cx.spawn(async move |this, cx| {
             let (details, thread) = task.await;
             let _ = this.update(cx, |this, cx| {

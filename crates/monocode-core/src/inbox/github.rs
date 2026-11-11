@@ -1045,20 +1045,33 @@ pub(super) fn git_github_pr_diff_for(
     } else {
         "files,additions,deletions"
     };
-    let json = gh_run(
-        root,
-        &["pr", "view", &number, "--repo", &repo, "--json", fields],
-        false,
-    )?;
-    let mut diff = parse_github_pr_diff_meta(&json)?;
-    let (patch, truncated) = if full_context {
-        let (base, head) = parse_github_pr_oids(&json)?;
-        git_diff_full_context(root, &base, &head)?
-    } else {
-        (
-            gh_run(root, &["pr", "diff", &number, "--repo", &repo], true)?,
+    let view = || {
+        gh_run(
+            root,
+            &["pr", "view", &number, "--repo", &repo, "--json", fields],
             false,
         )
+    };
+    // The file list and the patch are two calls: ask for both at once.
+    let (json, patch) = if full_context {
+        (view()?, None)
+    } else {
+        let (json, patch) = std::thread::scope(|scope| {
+            let patch =
+                scope.spawn(|| gh_run(root, &["pr", "diff", &number, "--repo", &repo], true));
+            let json = view();
+            (json, patch.join())
+        });
+        let patch = patch.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (json?, Some(patch?))
+    };
+    let mut diff = parse_github_pr_diff_meta(&json)?;
+    let (patch, truncated) = match patch {
+        Some(patch) => (patch, false),
+        None => {
+            let (base, head) = parse_github_pr_oids(&json)?;
+            git_diff_full_context(root, &base, &head)?
+        }
     };
     if truncated || patch.len() > MAX_PR_DIFF_BYTES {
         diff.truncated = true;

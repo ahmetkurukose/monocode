@@ -163,6 +163,9 @@ impl Shell {
                         }
                         if has_events {
                             this.ensure_background_inbox(window, cx);
+                            if let Some(inbox) = &this.inbox {
+                                inbox.update(cx, |inbox, _| inbox.set_background(true));
+                            }
                         }
                     }
                     Err(error) => {
