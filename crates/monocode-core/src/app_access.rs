@@ -31,6 +31,10 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "notes.write"
             | "worktrees.list"
             | "worktrees.create"
+            | "api.list"
+            | "api.read"
+            | "api.run"
+            | "api.import_curl"
     ) {
         return Err("Unknown Operator action. Run app help for project actions; memory, habits and artifacts require a Mono.".into());
     }

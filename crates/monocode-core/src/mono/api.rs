@@ -17,6 +17,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "memory.add"=>"fact topic until","memory.replace"=>"find fact topic until","memory.remove"=>"find topic",
         "habits.add"=>"name instructions schedule","habits.update"=>"id name instructions schedule enabled","habits.run"|"habits.remove"=>"id",
         "chat.card"=>"type repo number note sessionId options name instructions schedule",
+        "api.list"=>"project","api.read"=>"request collection project",
+        "api.run"=>"request collection environment timeoutSeconds project",
+        "api.import_curl"=>"curl collection folder name project",
         _=>return Err("Unknown app action. Run app help".into()),
     };
     for (key, value) in input.as_object().ok_or("Input must be an object")? {
@@ -28,7 +31,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be true or false"));
         }
-        if ["limit", "offset", "maxChars", "number"].contains(&key.as_str())
+        if ["limit", "offset", "maxChars", "number", "timeoutSeconds"].contains(&key.as_str())
             && value.as_u64().is_none()
         {
             return Err(format!("{key} must be a non-negative integer"));
@@ -53,6 +56,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "offset",
             "maxChars",
             "number",
+            "timeoutSeconds",
+            "request",
             "id",
             "sessionId",
             "besideSessionId",
