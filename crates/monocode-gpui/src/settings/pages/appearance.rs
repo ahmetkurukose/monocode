@@ -348,6 +348,7 @@ impl SettingsView {
                     ("project-app-inbox", "inbox", "Inbox"),
                     ("project-app-notes", "notes", "Notes"),
                     ("project-app-database", "database", "Database"),
+                    ("project-app-api", "api", "API"),
                 ];
                 let controls = apps
                     .into_iter()

@@ -693,6 +693,7 @@ impl Shell {
                     ("Notes", "file"),
                     ("Automations", "zap"),
                     ("Database", "database"),
+                    ("API", "api"),
                 ]
                 .into_iter()
                 // With the tree each project carries these apps on its row.
@@ -707,6 +708,7 @@ impl Shell {
                     }
                     "Automations" => self.workspace.sidebar_automations_visible,
                     "Database" => self.workspace.sidebar_database_visible,
+                    "API" => self.workspace.sidebar_api_visible,
                     _ => true,
                 })
                 .map(|(label, glyph)| {
@@ -748,6 +750,7 @@ impl Shell {
                             "Notes" => this.open_notes(w, cx),
                             "Automations" => this.open_automations(w, cx),
                             "Database" => this.open_database(w, cx),
+                            "API" => this.open_api(w, cx),
                             _ => (),
                         }))
                 }),
@@ -931,6 +934,7 @@ impl Shell {
                         workspace::AppView::Database,
                         self.workspace.sidebar_database_visible,
                     ),
+                    (workspace::AppView::Api, self.workspace.sidebar_api_visible),
                 ]
                 .into_iter()
                 .filter(|(_, v)| *v)
@@ -947,6 +951,7 @@ impl Shell {
                             workspace::AppView::Notes => "rail-notes",
                             workspace::AppView::Automations => "rail-automations",
                             workspace::AppView::Database => "rail-database",
+                            workspace::AppView::Api => "rail-api",
                         },
                         view.label(),
                         glyph,
@@ -974,6 +979,7 @@ impl Shell {
                                 workspace::AppView::Notes => this.open_notes(w, cx),
                                 workspace::AppView::Automations => this.open_automations(w, cx),
                                 workspace::AppView::Database => this.open_database(w, cx),
+                                workspace::AppView::Api => this.open_api(w, cx),
                             }
                         }
                     }))

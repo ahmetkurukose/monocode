@@ -665,3 +665,36 @@ fn app_launch_submission_uses_the_saved_message_identity(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn operator_api_actions_are_gated_like_the_others_and_report_a_missing_collection(
+    cx: &mut TestAppContext,
+) {
+    let (window, _, caller) = setup(cx);
+    assert!(!mutating("api.list") && !mutating("api.read"));
+    assert!(mutating("api.run") && mutating("api.import_curl"));
+    let listed = call(window, caller, "api-list", "api.list", json!({}), cx).unwrap();
+    assert_eq!(listed["collections"], json!([]));
+    assert_eq!(listed["environments"], json!([]));
+    let error = call(
+        window,
+        caller,
+        "api-read",
+        "api.read",
+        json!({"request":"Login"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("no API collections"), "{error}");
+    // Another project's folder is refused, as for every action.
+    let error = call(
+        window,
+        caller,
+        "api-other",
+        "api.list",
+        json!({"project":"/work/another-project"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("this thread's project"), "{error}");
+}

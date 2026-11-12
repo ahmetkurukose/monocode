@@ -15,6 +15,7 @@ impl Shell {
             AppView::Notes => "Notes",
             AppView::Automations => "Automations",
             AppView::Database => "Database",
+            AppView::Api => "API",
         })
     }
 
@@ -222,6 +223,7 @@ impl Shell {
             AppView::Inbox => self.inbox.clone().map(IntoElement::into_any_element),
             AppView::Automations => self.automations.clone().map(IntoElement::into_any_element),
             AppView::Database => self.database.clone().map(IntoElement::into_any_element),
+            AppView::Api => self.api.clone().map(IntoElement::into_any_element),
         }
     }
 
@@ -233,6 +235,7 @@ impl Shell {
                 self.automations.as_ref().map(|view| view.focus_handle(cx))
             }
             Some(AppView::Database) => self.database.as_ref().map(|view| view.focus_handle(cx)),
+            Some(AppView::Api) => self.api.as_ref().map(|view| view.focus_handle(cx)),
             None => return false,
         };
         if let Some(focus) = focus {
@@ -421,6 +424,117 @@ impl Shell {
         let projects = self.workspace.projects.clone();
         view.update(cx, |view, cx| view.set_scope(scope, projects, cx));
         self.show_app_view(AppView::Database, window, cx);
+    }
+
+    /// The API view, made if need be, without showing it.
+    pub(super) fn ensure_api(&mut self, cx: &mut Context<Self>) -> Entity<crate::api::ApiView> {
+        if let Some(view) = &self.api {
+            return view.clone();
+        }
+        let dir = self.api_state_dir.clone();
+        let view = cx.new(|cx| crate::api::ApiView::new(dir, cx));
+        self.app_view_events.push(
+            cx.subscribe(
+                &view,
+                |this, _, event: &crate::api::Event, cx| match event {
+                    crate::api::Event::AskAgent {
+                        project,
+                        title,
+                        prompt,
+                    } => this.start_api_chat(project.clone(), title.clone(), prompt.clone(), cx),
+                },
+            ),
+        );
+        self.api = Some(view.clone());
+        view
+    }
+
+    /// Opens the API view and adds the cURL command to the project's collection.
+    pub(super) fn send_curl_to_api(
+        &mut self,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_api(window, cx);
+        if let Some(view) = self.api.clone() {
+            view.update(cx, |view, cx| {
+                view.import_curl_request(&command, window, cx)
+            });
+        }
+    }
+
+    /// A new chat in `project` with `prompt` in its composer, not yet sent.
+    fn start_api_chat(
+        &mut self,
+        project: String,
+        title: String,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let choice = self.new_chat_choice(&project);
+        let kind = choice.kind;
+        let settings = monocode_core::agent::Settings {
+            model: choice.model,
+            effort: crate::conversation::preferred_effort(kind.id(), cx),
+            access: self
+                .workspace
+                .preferences
+                .default_access
+                .as_deref()
+                .map(monocode_core::agent::AccessMode::from_id)
+                .unwrap_or_default(),
+            account: crate::accounts::get(cx)
+                .map(|accounts| accounts.read(cx).selected(kind, &project))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let store = self.store.clone();
+        self.navigation_revision += 1;
+        let revision = self.navigation_revision;
+        let work = cx.background_executor().spawn(async move {
+            if !std::path::Path::new(&project).is_dir() {
+                return Err("Choose a project folder first".to_owned());
+            }
+            let store = locked(&store)?;
+            let mut summary = store.create(kind.id(), &project)?;
+            store.title(summary.id, &title)?;
+            summary.title = title;
+            store.save_agent_settings(summary.id, &settings)?;
+            Ok::<_, String>((summary, settings, prompt))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok((summary, settings, prompt)) => {
+                    let id = summary.id;
+                    this.draft_sessions.insert(id);
+                    this.add(summary, cx);
+                    this.sessions[&id].update(cx, |view, cx| {
+                        view.install_transfer(settings, Some(prompt), cx)
+                    });
+                    if this.navigation_revision == revision {
+                        this.activate_session(id, window, cx);
+                    }
+                    this.persist(cx);
+                }
+                Err(error) => {
+                    this.error = Some(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn open_api(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_app_view(window, cx);
+        let view = self.ensure_api(cx);
+        let scope = (self.project_app_scope(AppView::Api)).then(|| self.workspace.project.clone());
+        let projects = self.workspace.projects.clone();
+        let current = self.workspace.project.clone();
+        view.update(cx, |view, cx| view.set_scope(scope, projects, current, cx));
+        self.show_app_view(AppView::Api, window, cx);
     }
 
     fn note_to_chat(

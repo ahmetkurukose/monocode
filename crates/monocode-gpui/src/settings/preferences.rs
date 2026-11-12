@@ -63,6 +63,10 @@ pub(crate) struct Preferences {
     pub project_rail_view: String,
     /// The apps offered under each project in the tree: "inbox", "notes", "database".
     pub project_apps: Vec<String>,
+    /// Which apps `project_apps` was last updated for, so an app added later is
+    /// offered once to saved preferences and then left to the user.
+    #[serde(default)]
+    pub project_apps_rev: u32,
     pub ui_scale: u32,
     pub show_excluded_files: bool,
     // Chat
@@ -164,7 +168,13 @@ impl Default for Preferences {
             chat_background_session: 24,
             collapsed_project_rail: "compact".into(),
             project_rail_view: "list".into(),
-            project_apps: vec!["inbox".into(), "notes".into(), "database".into()],
+            project_apps: vec![
+                "inbox".into(),
+                "notes".into(),
+                "database".into(),
+                "api".into(),
+            ],
+            project_apps_rev: PROJECT_APPS_REV,
             ui_scale: 100,
             show_excluded_files: false,
             transcript_layout: "chat".into(),
@@ -208,7 +218,19 @@ impl Default for Preferences {
     }
 }
 
+/// 1: the API app.
+const PROJECT_APPS_REV: u32 = 1;
+
 impl Preferences {
+    /// Offers apps added since these preferences were saved. Runs once per
+    /// revision, so switching one off afterwards sticks.
+    pub(crate) fn migrate(&mut self) {
+        if self.project_apps_rev < 1 {
+            self.set_project_app_shown("api", true);
+        }
+        self.project_apps_rev = PROJECT_APPS_REV;
+    }
+
     /// Unknown values fall back to the plain list.
     pub(crate) fn project_rail_tree(&self) -> bool {
         self.project_rail_view == "tree"
@@ -225,7 +247,11 @@ impl Preferences {
             self.project_apps.push(app.to_owned());
         }
         // Keep one order on disk whatever order they were switched in.
-        let rank = |a: &String| ["inbox", "notes", "database"].iter().position(|x| x == a);
+        let rank = |a: &String| {
+            ["inbox", "notes", "database", "api"]
+                .iter()
+                .position(|x| x == a)
+        };
         self.project_apps.sort_by_key(rank);
     }
 
@@ -365,5 +391,24 @@ mod decoration_tests {
         assert!(!restored.wayland_window_decorations);
         restored.restore_appearance();
         assert!(restored.wayland_window_decorations);
+    }
+
+    #[test]
+    fn saved_preferences_are_offered_the_api_app_once() {
+        let mut saved: Preferences =
+            serde_json::from_str(r#"{"project_apps":["inbox","notes","database"]}"#).unwrap();
+        assert!(!saved.project_app_shown("api"));
+        saved.migrate();
+        assert_eq!(saved.project_apps, ["inbox", "notes", "database", "api"]);
+        // Switching it off afterwards sticks across the next load.
+        saved.set_project_app_shown("api", false);
+        let mut again: Preferences =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        again.migrate();
+        assert!(!again.project_app_shown("api"));
+        // New preferences already have it and are not touched.
+        let mut fresh = Preferences::default();
+        fresh.migrate();
+        assert!(fresh.project_app_shown("api"));
     }
 }

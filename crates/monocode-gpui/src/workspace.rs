@@ -12,6 +12,7 @@ pub(crate) enum AppView {
     Notes,
     Automations,
     Database,
+    Api,
 }
 impl AppView {
     pub fn label(self) -> &'static str {
@@ -20,6 +21,7 @@ impl AppView {
             Self::Notes => "Notes",
             Self::Automations => "Automations",
             Self::Database => "Database",
+            Self::Api => "API",
         }
     }
     pub fn icon(self) -> &'static str {
@@ -28,6 +30,7 @@ impl AppView {
             Self::Notes => "note",
             Self::Automations => "zap",
             Self::Database => "database",
+            Self::Api => "api",
         }
     }
 }
@@ -138,6 +141,7 @@ pub(crate) struct Workspace {
     pub sidebar_automations_visible: bool,
     pub sidebar_inbox_visible: bool,
     pub sidebar_database_visible: bool,
+    pub sidebar_api_visible: bool,
     pub sidebar_activity_visible: bool,
     /// The inset right panel: open state, tab, width and tab order.
     pub right_panel_open: bool,
@@ -375,6 +379,7 @@ impl Default for Workspace {
             sidebar_automations_visible: true,
             sidebar_inbox_visible: true,
             sidebar_database_visible: true,
+            sidebar_api_visible: true,
             sidebar_activity_visible: true,
             right_panel_open: false,
             right_panel_tab: Default::default(),
@@ -656,6 +661,7 @@ impl Workspace {
                 .insert(project.clone(), state.active.unwrap());
         }
         state.add_project(&state.project.clone());
+        state.preferences.migrate();
         state.restore_project_apps();
         state
     }

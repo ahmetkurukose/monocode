@@ -5,6 +5,7 @@
 
 mod accounts;
 mod activity;
+mod api;
 mod app_log;
 mod app_menu;
 mod arcade;

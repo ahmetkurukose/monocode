@@ -726,6 +726,7 @@ pub(crate) struct Shell {
     inbox: Option<Entity<crate::inbox::Inbox>>,
     automations: Option<Entity<crate::automations::Automations>>,
     database: Option<Entity<crate::database::DatabaseView>>,
+    api: Option<Entity<crate::api::ApiView>>,
     active_app_view: Option<app_views::AppView>,
     app_view_events: Vec<Subscription>,
     automation_state: automation_runs::State,
@@ -816,6 +817,8 @@ pub(crate) struct Shell {
     pending_database_sends: Vec<database_send::DbSend>,
     /// Where the Database view keeps its data sources and consoles.
     database_dir: std::path::PathBuf,
+    /// Where the API view keeps its own state; the collections live in the projects.
+    api_state_dir: std::path::PathBuf,
     review_focused: bool,
     review_drag: bool,
     split_bounds: HashMap<i64, AnchorSlot>,
@@ -1126,6 +1129,7 @@ impl Shell {
             inbox: None,
             automations: None,
             database: None,
+            api: None,
             active_app_view: None,
             app_view_events: Vec::new(),
             automation_state: Default::default(),
@@ -1196,6 +1200,7 @@ impl Shell {
             pending_composer_focus: None,
             pending_database_sends: Vec::new(),
             database_dir: crate::data_dir().join("db"),
+            api_state_dir: crate::data_dir().join("api"),
             review_focused: false,
             review_drag: false,
             split_bounds: HashMap::new(),
@@ -9131,6 +9136,11 @@ impl Render for Shell {
                     this.close_preview(cx);
                 }
             }))
+            .on_action(
+                cx.listener(|this, event: &crate::api::SendCurl, window, cx| {
+                    this.send_curl_to_api(event.0.clone(), window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, event: &crate::file_editor::OpenPath, window, cx| {
                     let cwd = this.git.read(cx).project().to_owned();

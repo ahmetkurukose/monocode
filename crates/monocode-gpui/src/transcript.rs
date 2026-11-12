@@ -4571,6 +4571,24 @@ impl TranscriptView {
                                 })
                                 .child(fence.label.clone()),
                         )
+                        .when(
+                            code.trim_start().starts_with("curl ")
+                                && matches!(
+                                    fence.language.as_str(),
+                                    "" | "bash" | "sh" | "shell" | "zsh" | "curl"
+                                ),
+                            |d| {
+                                let command = code.to_string();
+                                d.child(icon_button("send-to-api", "Send to API", "api").on_click(
+                                    move |_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(crate::api::SendCurl(command.clone())),
+                                            cx,
+                                        );
+                                    },
+                                ))
+                            },
+                        )
                         .child(
                             icon_button(
                                 "copy-code",

@@ -102,12 +102,13 @@ fn the_project_list_choice_is_only_offered_in_classic_and_defaults_to_the_list(
 fn project_apps_are_offered_with_the_tree_only_and_switch_one_by_one(cx: &mut TestAppContext) {
     let mut prefs = Preferences::default();
     assert!(prefs.project_app_shown("inbox") && prefs.project_app_shown("database"));
+    assert!(prefs.project_app_shown("api"));
     prefs.set_project_app_shown("notes", false);
-    assert_eq!(prefs.project_apps, ["inbox", "database"]);
+    assert_eq!(prefs.project_apps, ["inbox", "database", "api"]);
     prefs.set_project_app_shown("notes", true);
     assert_eq!(
         prefs.project_apps,
-        ["inbox", "notes", "database"],
+        ["inbox", "notes", "database", "api"],
         "one order"
     );
     let window = window(Section::Appearance, cx);

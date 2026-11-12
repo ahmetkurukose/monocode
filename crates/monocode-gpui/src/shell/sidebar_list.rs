@@ -584,6 +584,10 @@ impl Shell {
                 .icon("database")
                 .toggle(self.workspace.sidebar_database_visible)
                 .into(),
+            MenuAction::new("sidebar-api", "API")
+                .icon("api")
+                .toggle(self.workspace.sidebar_api_visible)
+                .into(),
             MenuAction::new("sidebar-monos", "Monos")
                 .icon("ghost")
                 .toggle(self.workspace.preferences.monos)
@@ -608,6 +612,7 @@ impl Shell {
             "sidebar-automations" => &mut self.workspace.sidebar_automations_visible,
             "sidebar-inbox" => &mut self.workspace.sidebar_inbox_visible,
             "sidebar-database" => &mut self.workspace.sidebar_database_visible,
+            "sidebar-api" => &mut self.workspace.sidebar_api_visible,
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
@@ -721,6 +726,7 @@ impl Shell {
                     ("Notes", "note"),
                     ("Automations", "zap"),
                     ("Database", "database"),
+                    ("API", "api"),
                 ]
                 .into_iter()
                 .filter(|(label, _)| match *label {
@@ -732,6 +738,7 @@ impl Shell {
                     "Automations" => self.workspace.sidebar_automations_visible,
                     "Inbox" => self.workspace.sidebar_inbox_visible,
                     "Database" => self.workspace.sidebar_database_visible,
+                    "API" => self.workspace.sidebar_api_visible,
                     _ => true,
                 })
                 .map(|(label, glyph)| {
@@ -824,6 +831,7 @@ impl Shell {
                             "Notes" => this.open_notes(window, cx),
                             "Automations" => this.open_automations(window, cx),
                             "Database" => this.open_database(window, cx),
+                            "API" => this.open_api(window, cx),
                             _ => (),
                         }))
                         .on_hover(cx.listener(move |this, hovered, _, cx| {
@@ -957,6 +965,82 @@ mod tests {
         window
             .update(visual, |shell, _, _| assert!(shell.app_search.is_some()))
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_curl_command_sent_from_a_reply_opens_the_api_view_with_it(cx: &mut TestAppContext) {
+        use super::app_views::AppView;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = super::super::tests::window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().into_owned();
+        window
+            .update(visual, |shell, w, cx| {
+                shell.api_state_dir = state.path().to_path_buf();
+                shell.workspace.add_project(&root);
+                shell.workspace.project = root.clone();
+                shell.send_curl_to_api("curl -X DELETE https://x.test/items/3".into(), w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.active_app_view, Some(AppView::Api));
+                let names = shell.api.as_ref().unwrap().read(cx).open_request_names();
+                assert_eq!(names, vec!["DELETE 3"]);
+            })
+            .unwrap();
+        assert!(
+            monocode_core::api::api_dir(&root)
+                .join("api.postman_collection.json")
+                .exists()
+        );
+    }
+
+    #[gpui::test]
+    fn every_app_in_the_sidebar_opens_when_clicked(cx: &mut TestAppContext) {
+        use super::app_views::AppView;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = super::super::tests::window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let state = tempfile::tempdir().unwrap();
+        window
+            .update(visual, |shell, _, _| {
+                shell.database_dir = state.path().join("db");
+                shell.api_state_dir = state.path().join("api");
+                shell.workspace.preferences.notes = true;
+            })
+            .unwrap();
+        visual.run_until_parked();
+        for (label, view) in [
+            ("Inbox", AppView::Inbox),
+            ("Notes", AppView::Notes),
+            ("Automations", AppView::Automations),
+            ("Database", AppView::Database),
+            ("API", AppView::Api),
+        ] {
+            window
+                .update(visual, |shell, w, cx| {
+                    shell.close_app_view(w, cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+            let selector: &'static str =
+                Box::leak(format!("sidebar-navigation-{label}").into_boxed_str());
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no {label} entry in the sidebar"));
+            visual.simulate_click(bounds.center(), Default::default());
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, _, _| {
+                    assert_eq!(shell.active_app_view, Some(view), "{label}");
+                    assert!(shell.app_view_body().is_some(), "{label} has a body");
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]

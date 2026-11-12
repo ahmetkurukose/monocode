@@ -58,3 +58,6 @@ Desktop.ini
 
 # Local document preview mockup
 /work/mono-document-preview.html
+
+# API collections and environments the app keeps in a project (may hold credentials)
+.monocode/

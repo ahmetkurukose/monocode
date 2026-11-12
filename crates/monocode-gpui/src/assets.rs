@@ -71,6 +71,7 @@ impl AssetSource for Assets {
    "chevron-right"=>include_bytes!("../assets/chevron-right.svg"),
    "inbox"=>include_bytes!("../assets/inbox.svg"),
    "database"=>include_bytes!("../assets/database.svg"),
+   "api"=>include_bytes!("../assets/api.svg"),
    "db-table"=>include_bytes!("../assets/db-table.svg"),
    "db-key"=>include_bytes!("../assets/db-key.svg"),
    "db-column"=>include_bytes!("../assets/db-column.svg"),

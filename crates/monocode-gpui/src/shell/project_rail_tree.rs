@@ -14,10 +14,11 @@ const CHILD_HEIGHT: f32 = 30.;
 /// The space between two projects' cards.
 pub(super) const CARD_GAP: f32 = 6.;
 /// The apps a project's row offers, in order: preference name, view, icon.
-const PROJECT_APPS: [(&str, AppView, &str); 3] = [
+const PROJECT_APPS: [(&str, AppView, &str); 4] = [
     ("inbox", AppView::Inbox, "inbox"),
     ("notes", AppView::Notes, "note"),
     ("database", AppView::Database, "database"),
+    ("api", AppView::Api, "api"),
 ];
 
 /// A plain tooltip for the rail's app icons.
@@ -176,6 +177,7 @@ impl Shell {
             AppView::Inbox => self.open_inbox(window, cx),
             AppView::Notes => self.open_notes(window, cx),
             AppView::Database => self.open_database(window, cx),
+            AppView::Api => self.open_api(window, cx),
             AppView::Automations => self.open_automations(window, cx),
         }
     }
@@ -1059,7 +1061,11 @@ mod tests {
             .unwrap();
         tree(window, visual, &[other]);
         let ix = project_ix(window, visual, other);
-        for (app, view) in [("notes", AppView::Notes), ("database", AppView::Database)] {
+        for (app, view) in [
+            ("notes", AppView::Notes),
+            ("database", AppView::Database),
+            ("api", AppView::Api),
+        ] {
             // Away first, so the last icon's tooltip is not in the way.
             visual.simulate_mouse_move(gpui::point(px(800.), px(500.)), None, Default::default());
             visual.run_until_parked();

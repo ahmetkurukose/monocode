@@ -197,6 +197,7 @@ impl Shell {
                 app_views::AppView::Notes => self.open_notes(window, cx),
                 app_views::AppView::Automations => self.open_automations(window, cx),
                 app_views::AppView::Database => self.open_database(window, cx),
+                app_views::AppView::Api => self.open_api(window, cx),
             },
             TitleTab::ProjectApp { view, project } => {
                 self.open_project_app(*view, project.clone(), window, cx)

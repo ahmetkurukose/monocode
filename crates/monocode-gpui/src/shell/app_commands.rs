@@ -176,6 +176,8 @@ impl Shell {
                     | "notes.list"
                     | "notes.read"
                     | "worktrees.list"
+                    | "api.list"
+                    | "api.read"
             )
         {
             return Err("This thread's access policy allows read-only app actions.".into());
@@ -515,6 +517,19 @@ impl Shell {
                     }
                 }
             }
+            "api.list" | "api.read" | "api.run" | "api.import_curl" => {
+                self.app_background(
+                    call,
+                    move |_| {
+                        Ok((
+                            monocode_core::api::agent::action(&project, &action, &input)?,
+                            Effect::None,
+                        ))
+                    },
+                    cx,
+                );
+                return;
+            }
             "notes.list" | "notes.read" | "notes.write" => {
                 let caller = call.session;
                 let request = call.request_id.clone();
@@ -617,6 +632,8 @@ fn mutating(action: &str) -> bool {
             | "notes.list"
             | "notes.read"
             | "worktrees.list"
+            | "api.list"
+            | "api.read"
     )
 }
 fn worktree_json(tree: &monocode_core::git::Worktree) -> Value {
