@@ -812,6 +812,9 @@ pub(crate) struct Shell {
     /// A session review card's Review, opened beside its pane next frame.
     pending_review: Option<(i64, crate::review::ReviewTab)>,
     pending_composer_focus: Option<i64>,
+    /// A chat that "Add to Chat" wrote to: shown if its tab is not, since
+    /// text added to a draft out of sight looks like nothing happened.
+    pending_chat_reveal: Option<i64>,
     /// Text and files on their way to a data source's console, handled on the
     /// next frame (which has the window the Database view needs).
     pending_database_sends: Vec<database_send::DbSend>,
@@ -1198,6 +1201,7 @@ impl Shell {
             review_slide: None,
             pending_review: None,
             pending_composer_focus: None,
+            pending_chat_reveal: None,
             pending_database_sends: Vec::new(),
             database_dir: crate::data_dir().join("db"),
             api_state_dir: crate::data_dir().join("api"),
@@ -2530,6 +2534,7 @@ impl Shell {
         });
         self.chat_hidden_off(id, cx);
         self.pending_composer_focus = Some(id);
+        self.pending_chat_reveal = Some(id);
         cx.notify();
     }
     fn chat_hidden_off(&mut self, id: i64, cx: &mut Context<Self>) {
@@ -8851,6 +8856,14 @@ impl Render for Shell {
             window.defer(cx, move |window, cx| {
                 this.update(cx, |this, cx| this.settle_mono_panes(window, cx));
             });
+        }
+        // A file in a tab of its own has its chat in another tab: go there.
+        if let Some(id) = self.pending_chat_reveal.take()
+            && self.sessions.contains_key(&id)
+            && !(self.workspace.active_tab())
+                .is_some_and(|tab| self.workspace.layout(tab).leaf_ids().contains(&id))
+        {
+            self.open(id, window, cx);
         }
         if let Some(id) = self.pending_composer_focus.take()
             && self

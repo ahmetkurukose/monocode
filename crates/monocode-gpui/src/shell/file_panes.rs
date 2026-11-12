@@ -1049,4 +1049,51 @@ mod tests {
                 .unwrap();
         }
     }
+
+    #[gpui::test]
+    fn add_to_chat_from_a_file_in_its_own_tab_brings_the_chat_forward(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("main.rs").to_string_lossy().into_owned();
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let cwd = folder.path().to_string_lossy().into_owned();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let pane = window
+            .update(visual, |shell, w, cx| {
+                shell.open_file_at(cwd, path, None, w, cx);
+                let pane = shell.independent_file_pane(session, cx).unwrap();
+                shell.open_file_pane(pane, w, cx);
+                pane
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                // The file has a tab to itself: the chat is not on screen.
+                assert_eq!(shell.workspace.active, Some(pane));
+                assert_ne!(pane, session);
+                shell.reviews[&pane].update(cx, |_, cx| {
+                    cx.emit(crate::review::ReviewEvent::Comment(
+                        "@main.rs (lines 1-1)".into(),
+                    ))
+                });
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                let chat = shell.sessions[&session].read(cx);
+                assert_eq!(chat.input.read(cx).content, "@main.rs (lines 1-1)\n\n");
+                assert_eq!(
+                    shell.workspace.active,
+                    Some(session),
+                    "the chat that got the text is shown"
+                );
+                assert!(chat.input.focus_handle(cx).is_focused(w));
+            })
+            .unwrap();
+    }
 }
