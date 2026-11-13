@@ -156,6 +156,13 @@ impl Shell {
                 SettingsEvent::WhatsNew => {
                     this.open_whats_new(crate::notifications::updater::version().into(), cx)
                 }
+                SettingsEvent::BrowserPages(action) => {
+                    if *action == "close" {
+                        this.close_browser_pages(window, cx);
+                    } else {
+                        this.sleep_browser_pages(cx);
+                    }
+                }
                 SettingsEvent::CheckAppUpdates => {
                     this.notification_state
                         .updater
@@ -373,6 +380,7 @@ impl Shell {
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
+        self.apply_browser_agent_setting();
         // Turning the tree on makes an open app view its project's tab.
         if let Some(view) = self.active_app_view
             && self.project_app_scope(view)
@@ -732,6 +740,7 @@ mod tests {
             "settings-nav-connections",
             "settings-nav-appearance",
             "settings-nav-terminal",
+            "settings-nav-browser",
             "settings-nav-keybindings",
             "settings-nav-chat",
             "settings-nav-providers",

@@ -123,7 +123,7 @@ impl Shell {
     /// focused chat, else the project's last focused one.
     /// A session of the current project, preferring the one last focused, whose
     /// scope a terminal can take while no session is showing.
-    fn project_session_for_terminal(&self) -> Option<i64> {
+    pub(super) fn project_session_for_terminal(&self) -> Option<i64> {
         let project = monocode_core::files::path_key(&self.workspace.project);
         let in_project = |id: &i64| {
             self.session_summaries
@@ -137,7 +137,7 @@ impl Shell {
             .filter(in_project)
             .or_else(|| self.order.iter().copied().find(in_project))
     }
-    fn terminal_owner(&self) -> Option<i64> {
+    pub(super) fn terminal_owner(&self) -> Option<i64> {
         let known = |id: i64| self.session_summaries.contains_key(&id).then_some(id);
         self.workspace
             .active

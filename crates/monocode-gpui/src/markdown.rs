@@ -730,7 +730,7 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
 
 fn open_link(url: &str, window: &mut Window, cx: &mut App) {
     if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
-        cx.open_url(url);
+        crate::browser::open_link(url, cx);
     } else if !url.starts_with('#') && (!url.contains("://") || url.starts_with("file://")) {
         window.dispatch_action(Box::new(crate::file_editor::OpenPath(url.into())), cx);
     }

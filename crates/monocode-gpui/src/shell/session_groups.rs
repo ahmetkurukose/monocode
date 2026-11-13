@@ -770,6 +770,16 @@ impl Shell {
             cx.notify();
             return;
         }
+        if self
+            .workspace
+            .browser_panes
+            .iter()
+            .any(|(pane, b)| b.owner == id && self.workspace.tab_of(*pane).is_some())
+        {
+            self.error = Some("Close this session's browser pages before deleting it".into());
+            cx.notify();
+            return;
+        }
         if !self.session_summaries.contains_key(&id) || !self.deleting.insert(id) {
             return;
         }

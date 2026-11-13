@@ -627,7 +627,7 @@ impl Terminal {
             .as_ref()
             .is_some_and(|selection| !selection.is_empty());
         if !selected && self.link_at(event.position).as_ref() == Some(&link) {
-            cx.open_url(&link.uri);
+            crate::browser::open_link(&link.uri, cx);
         }
     }
     fn stop_selection(&mut self) {

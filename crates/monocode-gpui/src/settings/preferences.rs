@@ -94,6 +94,16 @@ pub(crate) struct Preferences {
     pub claude_hooks: bool,
     /// Start Claude Code with its Chrome integration.
     pub claude_chrome: bool,
+    /// What agents may do in the browser pane: "any" site, "local"
+    /// addresses only, or "off".
+    pub browser_agents: String,
+    /// Where web links in replies and terminals open: "monocode" (a
+    /// browser pane) or "system" (the user's own browser).
+    pub browser_links: String,
+    /// Minutes a page may be off screen before it is put to sleep; 0 never.
+    pub browser_sleep_minutes: u32,
+    /// How many pages may be loaded at once before the oldest sleeps.
+    pub browser_max_live: u32,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -195,6 +205,10 @@ impl Default for Preferences {
             idle_agents: 3,
             claude_hooks: true,
             claude_chrome: false,
+            browser_agents: "any".into(),
+            browser_links: "monocode".into(),
+            browser_sleep_minutes: 15,
+            browser_max_live: 4,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),

@@ -3,6 +3,9 @@ mod actions;
 mod app_commands;
 mod app_views;
 mod automation_runs;
+mod browser_agent;
+mod browser_panes;
+mod browser_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -569,6 +572,8 @@ enum PaneMark {
     Mono(String, u32),
     /// A terminal pulled out of its dock.
     Terminal,
+    /// A browser page.
+    Browser,
 }
 /// A split tab's headline rolling to the newly focused pane: the next pane
 /// rises from below, the previous one drops from above.
@@ -836,6 +841,15 @@ pub(crate) struct Shell {
     terminals: HashMap<String, Vec<Entity<Terminal>>>,
     /// Live shells of `workspace.terminal_panes`, spawned when first shown.
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
+    /// Pages of `workspace.browser_panes`, made when first shown.
+    browser_views: HashMap<i64, Entity<crate::browser::BrowserView>>,
+    browser_selftest_started: bool,
+    /// Sessions the user stopped from using the browser, until allowed again.
+    browser_agent_stopped: HashSet<i64>,
+    /// The page each session's agent used last.
+    browser_agent_last: HashMap<i64, i64>,
+    /// Addresses pages asked to open in windows of their own.
+    pending_browser_pages: Vec<String>,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1218,6 +1232,11 @@ impl Shell {
             sidebar_fitted_room: None,
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
+            browser_views: HashMap::new(),
+            browser_selftest_started: false,
+            browser_agent_stopped: HashSet::new(),
+            browser_agent_last: HashMap::new(),
+            pending_browser_pages: Vec::new(),
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -2565,6 +2584,7 @@ impl Shell {
             .map(|s| s.read(cx).display_title())
             .or_else(|| self.mono_pane_title(id, cx))
             .or_else(|| self.terminal_pane_title(id, cx))
+            .or_else(|| self.browser_pane_title(id, cx))
             .unwrap_or_default();
         let focused = self.workspace.active == Some(id) && !self.review_focused;
         div()
@@ -2949,6 +2969,9 @@ impl Shell {
         }
         if self.workspace.terminal_panes.contains_key(&id) {
             return self.terminal_pane_surface(id, split, cx);
+        }
+        if self.workspace.browser_panes.contains_key(&id) {
+            return self.browser_pane_surface(id, split, cx);
         }
         let in_split = split.is_some();
         let chat = self.sessions.get(&id).cloned();
@@ -3734,6 +3757,10 @@ impl Shell {
             self.open_terminal_pane(id, window, cx);
             return;
         }
+        if self.workspace.browser_panes.contains_key(&id) {
+            self.open_browser_pane(id, window, cx);
+            return;
+        }
         if self.workspace.active == Some(id) {
             return;
         }
@@ -4294,6 +4321,10 @@ impl Shell {
         for pane in self.workspace.prune_terminal_panes() {
             self.terminal_pane_views.remove(&pane);
         }
+        // A browser pane closed with its tab or pane frees its page.
+        for pane in self.workspace.prune_browser_panes() {
+            self.browser_views.remove(&pane);
+        }
         if let Some(id) = self.workspace.active {
             self.refresh_session_mark(id, cx);
         }
@@ -4379,7 +4410,10 @@ impl Shell {
             monos.update(cx, |m, cx| m.focus_active(window, cx));
             return;
         }
-        if self.focus_mono_pane(window, cx) || self.focus_terminal_pane(window, cx) {
+        if self.focus_mono_pane(window, cx)
+            || self.focus_terminal_pane(window, cx)
+            || self.focus_browser_pane(window, cx)
+        {
             return;
         }
         if let Some(review) = self
@@ -4487,6 +4521,10 @@ impl Shell {
             self.open_terminal_pane(id, window, cx);
             return;
         }
+        if self.workspace.browser_panes.contains_key(&id) {
+            self.open_browser_pane(id, window, cx);
+            return;
+        }
         if !self.session_summaries.contains_key(&id) || self.deleting.contains(&id) {
             return;
         }
@@ -4548,6 +4586,10 @@ impl Shell {
         }
         if self.workspace.terminal_panes.contains_key(&id) {
             self.open_terminal_pane(id, window, cx);
+            return;
+        }
+        if self.workspace.browser_panes.contains_key(&id) {
+            self.open_browser_pane(id, window, cx);
             return;
         }
         if let Some(monos) = &self.monos {
@@ -5707,6 +5749,9 @@ impl Shell {
                         .icon("terminal")
                         .shortcut(format!("{MOD}J"))
                         .into(),
+                    MenuAction::new("browser", "New Browser Page")
+                        .icon("globe")
+                        .into(),
                 ],
                 200.,
                 MenuStyle::Explorer,
@@ -6170,6 +6215,7 @@ impl Shell {
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
             MenuTarget::NewTab => match action {
                 "terminal" => self.new_title_terminal(window, cx),
+                "browser" => self.new_browser_pane(None, window, cx),
                 _ => self.new_chat(cx),
             },
             MenuTarget::TerminalDock => {
@@ -7545,6 +7591,7 @@ impl Shell {
             .filter(|id| {
                 self.workspace.mono_panes.contains_key(id)
                     || self.workspace.terminal_panes.contains_key(id)
+                    || self.workspace.browser_panes.contains_key(id)
             })
             .count();
         let multi_pane = sessions.len() + file_panes + mono_panes > 1;
@@ -7564,7 +7611,8 @@ impl Shell {
         let untitled = "New session".to_owned();
         let mono = self
             .mono_pane_title(focus, cx)
-            .or_else(|| self.terminal_pane_title(focus, cx));
+            .or_else(|| self.terminal_pane_title(focus, cx))
+            .or_else(|| self.browser_pane_title(focus, cx));
         let headline = if let Some(mono) = mono {
             mono
         } else if multi_pane && file_focused && !file.is_empty() {
@@ -7581,13 +7629,21 @@ impl Shell {
         for id in self.workspace.layout(tab).leaf_ids() {
             if let (Some(title), Some(mark)) = (
                 self.mono_pane_title(id, cx)
-                    .or_else(|| self.terminal_pane_title(id, cx)),
-                self.mono_pane_mark(id, cx).or_else(|| {
-                    self.workspace
-                        .terminal_panes
-                        .contains_key(&id)
-                        .then_some(PaneMark::Terminal)
-                }),
+                    .or_else(|| self.terminal_pane_title(id, cx))
+                    .or_else(|| self.browser_pane_title(id, cx)),
+                self.mono_pane_mark(id, cx)
+                    .or_else(|| {
+                        self.workspace
+                            .terminal_panes
+                            .contains_key(&id)
+                            .then_some(PaneMark::Terminal)
+                    })
+                    .or_else(|| {
+                        self.workspace
+                            .browser_panes
+                            .contains_key(&id)
+                            .then_some(PaneMark::Browser)
+                    }),
             ) {
                 panes.push(TabPane {
                     key: (id, false),
@@ -7650,6 +7706,7 @@ impl Shell {
             }
             PaneMark::File(None) => icon("git-compare", 14.).text_color(ink).into_any_element(),
             PaneMark::Terminal => icon("terminal", 14.).text_color(ink).into_any_element(),
+            PaneMark::Browser => icon("globe", 14.).text_color(ink).into_any_element(),
             PaneMark::Mono(mascot, color) => div()
                 .opacity(if active { 1. } else { 0.55 })
                 .child(crate::monos::avatar::avatar(
@@ -7836,6 +7893,12 @@ impl Shell {
             PaneMark::Terminal => (
                 Face::Neutral,
                 icon("terminal", 14.)
+                    .text_color(crate::tab_tile::tile_ink())
+                    .into_any_element(),
+            ),
+            PaneMark::Browser => (
+                Face::Neutral,
+                icon("globe", 14.)
                     .text_color(crate::tab_tile::tile_ink())
                     .into_any_element(),
             ),
@@ -8876,6 +8939,25 @@ impl Render for Shell {
             self.review_focused = false;
             window.focus(&view.read(cx).input.focus_handle(cx), cx);
         }
+        if let Some(links) = cx.try_global::<crate::browser::LinkQueue>()
+            && !links.0.is_empty()
+        {
+            let links = std::mem::take(&mut cx.global_mut::<crate::browser::LinkQueue>().0);
+            self.pending_browser_pages.extend(links);
+        }
+        for url in std::mem::take(&mut self.pending_browser_pages) {
+            // A page borrows a session's project; with none to borrow from,
+            // the link goes to the user's own browser rather than nowhere.
+            if self.terminal_owner().is_some() || self.project_session_for_terminal().is_some() {
+                self.new_browser_pane(Some(url), window, cx);
+            } else {
+                cx.open_url(&url);
+            }
+        }
+        if !std::mem::replace(&mut self.browser_selftest_started, true) {
+            self.start_browser_agent(window, cx);
+            self.start_browser_selftest(window, cx);
+        }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
             m.update(cx, |m, cx| m.bind_window(window, cx));
@@ -9623,6 +9705,7 @@ impl Render for Shell {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
             }))
+            .child(self.browser_frame(cx))
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children(self.link_modal(window, cx))

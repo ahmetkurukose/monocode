@@ -10,6 +10,7 @@ pub(crate) enum Section {
     Connections,
     Appearance,
     Terminal,
+    Browser,
     Keybindings,
     Chat,
     Providers,
@@ -29,6 +30,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
             Section::Connections,
             Section::Appearance,
             Section::Terminal,
+            Section::Browser,
             Section::Keybindings,
         ],
     ),
@@ -49,11 +51,12 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 13] = [
+    pub(crate) const ALL: [Section; 14] = [
         Section::General,
         Section::Connections,
         Section::Appearance,
         Section::Terminal,
+        Section::Browser,
         Section::Keybindings,
         Section::Chat,
         Section::Providers,
@@ -70,6 +73,7 @@ impl Section {
             Section::Connections => "connections",
             Section::Appearance => "appearance",
             Section::Terminal => "terminal",
+            Section::Browser => "browser",
             Section::Keybindings => "keybindings",
             Section::Chat => "chat",
             Section::Providers => "providers",
@@ -87,6 +91,7 @@ impl Section {
             Section::Connections => "Connections",
             Section::Appearance => "Appearance",
             Section::Terminal => "Terminal",
+            Section::Browser => "Browser",
             Section::Keybindings => "Keybindings",
             Section::Chat => "Chat",
             Section::Providers => "Providers",
@@ -109,6 +114,9 @@ impl Section {
             }
             Section::Terminal => {
                 "The size of the text in terminals, and what selecting in them does."
+            }
+            Section::Browser => {
+                "What agents may do in the browser pane, when pages give their memory back, and what sites stored."
             }
             Section::Keybindings => {
                 "Every shortcut the workspace handles, from the app menu and the key handler."
@@ -139,6 +147,9 @@ impl Section {
                 "theme dark light color accent glass blur zoom scale wallpaper rail sidebar"
             }
             Section::Terminal => "shell font size text zoom select copy clipboard selection iterm",
+            Section::Browser => {
+                "browser web page agent mcp cookies cache site data sign out sleep memory links user agent"
+            }
             Section::Keybindings => "shortcut hotkey keyboard binding",
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
@@ -165,6 +176,7 @@ impl Section {
             Section::Connections => "internet",
             Section::Appearance => "palette",
             Section::Terminal => "terminal",
+            Section::Browser => "window",
             Section::Keybindings => "keyboard",
             Section::Chat => "message-square",
             Section::Providers => "bot",

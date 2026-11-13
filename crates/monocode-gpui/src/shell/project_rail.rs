@@ -43,6 +43,8 @@ pub(super) enum ProjectRailRow {
 pub(super) enum RailTerminal {
     Dock(usize),
     Pane(i64),
+    /// A browser page of the project, listed with its terminals.
+    Browser(i64),
 }
 pub(super) struct ProjectRailList {
     state: ListState,
