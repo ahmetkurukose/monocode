@@ -1117,6 +1117,13 @@ impl MacWindowState {
     }
 
     fn is_occlusion_visible(&self) -> bool {
+        // Monocode: a self-test (shell/browser_selftest.rs) runs unattended,
+        // possibly behind other windows or a locked screen, and still has to
+        // draw to find out what a real frame does.
+        static DRAW_HIDDEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DRAW_HIDDEN.get_or_init(|| std::env::var_os("MONOCODE_DRAW_HIDDEN").is_some()) {
+            return true;
+        }
         unsafe {
             self.native_window
                 .occlusionState()

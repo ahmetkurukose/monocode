@@ -1,0 +1,7 @@
+<!doctype html><title>Selftest page</title>
+<body style="font:16px system-ui;padding:40px">
+<h1>Selftest</h1>
+<p><input id="a" placeholder="first" style="font-size:18px;width:300px;padding:6px"></p>
+<p><input id="b" placeholder="second" style="font-size:18px;width:300px;padding:6px"></p>
+<p><button id="go" onclick="window.pressed=(window.pressed||0)+1">Go</button> <a id="link" href="/second.html">second page</a> <a id="blank" href="/second.html" target="_blank">new window</a> <a id="zip" href="/file.zip">download</a></p>
+<script>window.clicks=0;document.addEventListener('mousedown',()=>window.clicks++);console.log('page ready');</script>
