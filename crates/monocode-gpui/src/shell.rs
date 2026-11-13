@@ -843,6 +843,8 @@ pub(crate) struct Shell {
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Pages of `workspace.browser_panes`, made when first shown.
     browser_views: HashMap<i64, Entity<crate::browser::BrowserView>>,
+    /// Active checkout file watchers keyed by project path for browser reload-on-save.
+    browser_file_watches: HashMap<String, gpui::Task<()>>,
     browser_selftest_started: bool,
     /// Sessions the user stopped from using the browser, until allowed again.
     browser_agent_stopped: HashSet<i64>,
@@ -1233,6 +1235,7 @@ impl Shell {
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
             browser_views: HashMap::new(),
+            browser_file_watches: HashMap::new(),
             browser_selftest_started: false,
             browser_agent_stopped: HashSet::new(),
             browser_agent_last: HashMap::new(),
@@ -4325,6 +4328,7 @@ impl Shell {
         for pane in self.workspace.prune_browser_panes() {
             self.browser_views.remove(&pane);
         }
+        self.sync_browser_file_watchers(cx);
         if let Some(id) = self.workspace.active {
             self.refresh_session_mark(id, cx);
         }
@@ -6103,6 +6107,9 @@ impl Shell {
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
                         .into(),
+                    MenuAction::new("browser-start-url", "Browser start page…")
+                        .icon("globe")
+                        .into(),
                 ];
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
@@ -6308,6 +6315,8 @@ impl Shell {
                     self.open_project_theme(path, window, cx);
                 } else if action == "background" {
                     self.open_background_dialog(path, window, cx);
+                } else if action == "browser-start-url" {
+                    self.open_browser_start_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9317,9 +9326,27 @@ impl Render for Shell {
                     .update(cx, |updater, cx| updater.check(true, cx));
             }))
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
-            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.step_ui_scale(1, cx)))
-            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.step_ui_scale(-1, cx)))
-            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.step_ui_scale(0, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
+                if let Some(page) = this.active_browser_for_zoom(window, cx) {
+                    page.update(cx, |page, cx| page.step_zoom(1, cx));
+                } else {
+                    this.step_ui_scale(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
+                if let Some(page) = this.active_browser_for_zoom(window, cx) {
+                    page.update(cx, |page, cx| page.step_zoom(-1, cx));
+                } else {
+                    this.step_ui_scale(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ResetZoom, window, cx| {
+                if let Some(page) = this.active_browser_for_zoom(window, cx) {
+                    page.update(cx, |page, cx| page.step_zoom(0, cx));
+                } else {
+                    this.step_ui_scale(0, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| this.request_reload(window, cx)))
             .on_action(cx.listener(|this, _: &SidebarAppearance, window, cx| {
                 this.open_settings(crate::settings::Section::Appearance, window, cx)

@@ -20,11 +20,18 @@ impl Shell {
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let asleep = !state.url.is_empty() && state.url != "about:blank";
-        let (viewport, keep_awake) = (state.viewport, state.keep_awake);
+        let (viewport, keep_awake, zoom_percent, reload_on_save) = (
+            state.viewport,
+            state.keep_awake,
+            monocode_core::browser::normalize_zoom(state.zoom_percent),
+            state.reload_on_save,
+        );
         let view = cx.new(|cx| {
             let mut page = BrowserView::new(state.url, state.title, state.user_agent, asleep, cx);
             page.viewport = viewport;
             page.keep_awake = keep_awake;
+            page.zoom_percent = zoom_percent;
+            page.reload_on_save = reload_on_save;
             page
         });
         self.watch_browser_pane(pane, &view, cx);
@@ -53,6 +60,8 @@ impl Shell {
                             user_agent: page.user_agent.clone(),
                             viewport: page.viewport,
                             keep_awake: page.keep_awake,
+                            zoom_percent: monocode_core::browser::stored_zoom(page.zoom_percent),
+                            reload_on_save: page.reload_on_save,
                         };
                         if let Some(state) = this.workspace.browser_panes.get_mut(&pane) {
                             let saved = crate::workspace::BrowserPane {
@@ -65,6 +74,13 @@ impl Shell {
                                 cx.notify();
                             }
                         }
+                        this.sync_browser_file_watchers(cx);
+                    }
+                    BrowserEvent::SetProjectStartUrl(url) => {
+                        let project = this
+                            .browser_pane_project(pane)
+                            .unwrap_or_else(|| this.workspace.project.clone());
+                        this.set_project_browser_url(&project, Some(url.clone()), cx);
                     }
                     // The switch on a page's banner: it holds for the session,
                     // on every page of it.
@@ -120,6 +136,219 @@ impl Shell {
         })
     }
 
+    fn browser_pane_project(&self, pane: i64) -> Option<String> {
+        let owner = self.workspace.browser_panes.get(&pane)?.owner;
+        self.session_summaries
+            .get(&owner)
+            .map(|session| session.cwd.clone())
+    }
+
+    pub(super) fn set_project_browser_url(
+        &mut self,
+        project: &str,
+        url: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let normalized = url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(monocode_core::browser::address);
+        let key = monocode_core::files::path_key(project);
+        self.workspace
+            .project_browser_urls
+            .retain(|existing, _| monocode_core::files::path_key(existing) != key);
+        if let Some(url) = normalized {
+            self.workspace
+                .project_browser_urls
+                .insert(project.to_owned(), url);
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// The start address saved for a project, however its path is written.
+    pub(super) fn project_browser_url(&self, project: &str) -> Option<&str> {
+        let key = monocode_core::files::path_key(project);
+        (self.workspace.project_browser_urls.iter())
+            .find(|(path, _)| monocode_core::files::path_key(path) == key)
+            .map(|(_, url)| url.trim())
+            .filter(|url| !url.is_empty())
+    }
+
+    pub(super) fn detect_project_dev_server_url(&self, project: &str, cx: &App) -> Option<String> {
+        let key = monocode_core::files::path_key(project);
+        let mut terminals: Vec<&Entity<Terminal>> = Vec::new();
+        for (dock_project, list) in &self.terminals {
+            if monocode_core::files::path_key(dock_project) != key {
+                continue;
+            }
+            let active = self
+                .workspace
+                .docks
+                .get(dock_project)
+                .map(|dock| dock.active)
+                .unwrap_or(0);
+            for (ix, terminal) in list.iter().enumerate() {
+                if ix != active {
+                    terminals.push(terminal);
+                }
+            }
+            if let Some(terminal) = list.get(active) {
+                terminals.push(terminal);
+            }
+        }
+        let mut pane_terminals: Vec<(i64, &Entity<Terminal>)> = self
+            .terminal_pane_views
+            .iter()
+            .filter(|(pane, terminal)| {
+                let pane_project = self
+                    .workspace
+                    .terminal_panes
+                    .get(pane)
+                    .and_then(|state| self.session_summaries.get(&state.owner))
+                    .map(|session| session.cwd.as_str())
+                    .unwrap_or_else(|| terminal.read(cx).cwd.as_str());
+                monocode_core::files::path_key(pane_project) == key
+            })
+            .map(|(pane, terminal)| (*pane, terminal))
+            .collect();
+        // Negative pane IDs count down as new panes are opened.
+        pane_terminals.sort_by_key(|(pane, _)| std::cmp::Reverse(*pane));
+        terminals.extend(pane_terminals.into_iter().map(|(_, t)| t));
+        terminals
+            .into_iter()
+            .filter_map(|terminal| {
+                let lines = terminal.read(cx).recent_lines(80);
+                monocode_core::browser::detect_dev_server_url(&lines)
+            })
+            .last()
+    }
+
+    pub(super) fn resolve_browser_start_url(&self, owner: i64, cx: &App) -> String {
+        let project = self
+            .session_summaries
+            .get(&owner)
+            .map(|session| session.cwd.as_str())
+            .unwrap_or(&self.workspace.project);
+        if let Some(configured) = self.project_browser_url(project) {
+            return monocode_core::browser::address(configured);
+        }
+        self.detect_project_dev_server_url(project, cx)
+            .unwrap_or_default()
+    }
+
+    pub(super) fn active_browser_for_zoom(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<BrowserView>> {
+        if self.active_app_view.is_some()
+            || self.settings.is_some()
+            || self.review_focused
+            || self.browser_covered(cx)
+            || self.dock_focused(window, cx).is_some()
+            || self.sidebar_focus.contains_focused(window, cx)
+        {
+            return None;
+        }
+        let pane = self
+            .workspace
+            .active
+            .filter(|id| self.workspace.browser_panes.contains_key(id))?;
+        let view = self.browser_views.get(&pane)?.clone();
+        let page = view.read(cx);
+        (!page.covered()
+            && (page.has_keyboard()
+                || gpui::Focusable::focus_handle(page, cx).contains_focused(window, cx)
+                || self.focus.is_focused(window)))
+        .then_some(view)
+    }
+
+    pub(super) fn sync_browser_file_watchers(&mut self, cx: &mut Context<Self>) {
+        let mut desired = HashSet::new();
+        for (&pane, view) in &self.browser_views {
+            if self.workspace.tab_of(pane).is_none() {
+                continue;
+            }
+            let page = view.read(cx);
+            if !page.reload_on_save || page.asleep() {
+                continue;
+            }
+            if let Some(project) = self.browser_pane_project(pane)
+                && !project.starts_with("remote://")
+            {
+                desired.insert(project);
+            }
+        }
+        self.browser_file_watches
+            .retain(|project, _| desired.contains(project));
+        for project in desired {
+            if self.browser_file_watches.contains_key(&project) {
+                continue;
+            }
+            let watch_project = project.clone();
+            let root = std::path::PathBuf::from(&project);
+            let task = cx.spawn(async move |this, cx| {
+                let watch_root = root.clone();
+                let watch = cx
+                    .background_executor()
+                    .spawn(async move { crate::fs_watch::watch_checkout(&[watch_root]) })
+                    .await;
+                let Some((_watch, changes, changed)) = watch else {
+                    return;
+                };
+                while changes.recv().await.is_ok() {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(200))
+                        .await;
+                    while changes.try_recv().is_ok() {}
+                    // A server's own logs, databases and build output are
+                    // not a save: a page reloaded for them would never rest.
+                    let (paths, root) = (changed.take(), root.clone());
+                    let source = cx
+                        .background_executor()
+                        .spawn(async move { crate::fs_watch::source_changed(&root, paths) })
+                        .await;
+                    if !source {
+                        continue;
+                    }
+                    if this
+                        .update(cx, |this, cx| {
+                            this.reload_project_browsers(&watch_project, cx)
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            self.browser_file_watches.insert(project, task);
+        }
+    }
+
+    fn reload_project_browsers(&mut self, project: &str, cx: &mut Context<Self>) {
+        let key = monocode_core::files::path_key(project);
+        let views: Vec<Entity<BrowserView>> = self
+            .browser_views
+            .iter()
+            .filter(|(pane, view)| {
+                self.workspace.tab_of(**pane).is_some()
+                    && self
+                        .browser_pane_project(**pane)
+                        .is_some_and(|p| monocode_core::files::path_key(&p) == key)
+                    && {
+                        let page = view.read(cx);
+                        page.reload_on_save && !page.asleep()
+                    }
+            })
+            .map(|(_, view)| view.clone())
+            .collect();
+        for view in views {
+            view.update(cx, |page, cx| page.reload_on_file_save(cx));
+        }
+    }
+
     /// A new page as its own title tab, at `url` or empty with the address
     /// field focused. It borrows the scope of the focused session, else of
     /// one of the project's.
@@ -140,7 +369,7 @@ impl Shell {
         };
         let url = url
             .map(|url| monocode_core::browser::address(&url))
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.resolve_browser_start_url(owner, cx));
         let pane = self.workspace.next_pane_id();
         self.workspace.browser_panes.insert(
             pane,
@@ -318,6 +547,7 @@ impl Shell {
                 view.update(cx, |page, cx| page.sleep(cx));
             }
         }
+        self.sync_browser_file_watchers(cx);
     }
 
     /// Frees every page of the app without closing its pane.
@@ -325,6 +555,7 @@ impl Shell {
         for view in self.browser_views.values() {
             view.update(cx, |view, cx| view.sleep(cx));
         }
+        self.sync_browser_file_watchers(cx);
         cx.notify();
     }
 
@@ -422,7 +653,7 @@ mod tests {
         visual.run_until_parked();
         assert!(visual.debug_bounds("browser-address-row").is_some());
         window
-            .update(visual, |shell, w, cx| {
+            .update(visual, |shell, _w, cx| {
                 // Where the page goes is saved with the pane.
                 shell.browser_views[&pane].update(cx, |page, cx| page.navigate("example.com", cx));
             })
@@ -501,5 +732,91 @@ mod tests {
         assert!(restored.tab_of(-2).is_none(), "its session is gone");
         // The next pane takes an id below every pane there is.
         assert_eq!(restored.next_pane_id(), -2);
+    }
+
+    #[gpui::test]
+    fn browser_zoom_and_reload_on_save_persist_and_restore(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let pane = window
+            .update(visual, |shell, w, cx| {
+                shell.open(session, w, cx);
+                shell.new_browser_pane(Some("http://localhost:3000".into()), w, cx);
+                let pane = shell.workspace.active.unwrap();
+                shell.browser_views[&pane].update(cx, |page, cx| {
+                    page.step_zoom(1, cx);
+                    page.toggle_reload_on_save(cx);
+                });
+                pane
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                let saved = &shell.workspace.browser_panes[&pane];
+                assert_eq!(saved.zoom_percent, Some(110));
+                assert!(saved.reload_on_save);
+                // Dropping the live view simulates an app restart restoring the pane.
+                shell.browser_views.clear();
+                let restored = shell.browser_pane_view(pane, cx).unwrap();
+                let page = restored.read(cx);
+                assert_eq!(page.zoom_percent, 110);
+                assert!(page.reload_on_save);
+                assert!(page.asleep());
+            })
+            .unwrap();
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn new_browser_pane_prefers_project_start_url_then_terminal_dev_server(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(session, w, cx);
+                let project = shell.workspace.project.clone();
+                let terminal = cx.new(|cx| Terminal::new(project.clone(), cx));
+                terminal.update(cx, |term, _| {
+                    term.write_test_output("  Local: http://localhost:5173/app\r\n");
+                });
+                shell.terminals.insert(project.clone(), vec![terminal]);
+
+                // Without an explicit project URL, the terminal's dev-server URL wins.
+                shell.new_browser_pane(None, w, cx);
+                let first_pane = shell.workspace.active.unwrap();
+                assert_eq!(
+                    shell.workspace.browser_panes[&first_pane].url,
+                    "http://localhost:5173/app"
+                );
+
+                // Setting the current/custom URL as project start page overrides terminal detection.
+                shell.browser_views[&first_pane].update(cx, |page, cx| {
+                    page.navigate("http://localhost:8080/admin", cx);
+                });
+                shell.set_project_browser_url(&project, Some("localhost:4173".into()), cx);
+                assert_eq!(
+                    shell
+                        .workspace
+                        .project_browser_urls
+                        .get(&monocode_core::files::path_key(&project))
+                        .map(String::as_str),
+                    Some("http://localhost:4173")
+                );
+
+                shell.new_browser_pane(None, w, cx);
+                let second_pane = shell.workspace.active.unwrap();
+                assert_ne!(second_pane, first_pane);
+                assert_eq!(
+                    shell.workspace.browser_panes[&second_pane].url,
+                    "http://localhost:4173"
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
     }
 }

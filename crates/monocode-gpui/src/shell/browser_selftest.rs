@@ -261,6 +261,147 @@ impl Shell {
         act!(|page: &crate::browser::BrowserView| page.press("v", 9, true));
         steps.push(("pasted".into(), eval!("document.getElementById('b').value")));
         steps.push(("clicks_seen".into(), eval!("window.clicks")));
+
+        // Per-page zoom scales the web view content independently and resets cleanly.
+        let inner_width_100 = eval!("window.innerWidth");
+        this.update_in(cx, |this, _, cx| {
+            if let Some(page) = page(this) {
+                page.update(cx, |page, cx| page.step_zoom(1, cx));
+            }
+        })
+        .map_err(gone)?;
+        wait(cx, 250).await;
+        let zoom_diag_110 = this
+            .update_in(cx, |this, _, cx| {
+                page(this).map(|page| page.read(cx).diagnostics())
+            })
+            .map_err(gone)?
+            .unwrap_or_default();
+        let inner_width_110 = eval!("window.innerWidth");
+        this.update_in(cx, |this, _, cx| {
+            if let Some(page) = page(this) {
+                page.update(cx, |page, cx| page.step_zoom(0, cx));
+            }
+        })
+        .map_err(gone)?;
+        wait(cx, 250).await;
+        let zoom_diag_reset = this
+            .update_in(cx, |this, _, cx| {
+                page(this).map(|page| page.read(cx).diagnostics())
+            })
+            .map_err(gone)?
+            .unwrap_or_default();
+        let inner_width_reset = eval!("window.innerWidth");
+        steps.push((
+            "zoom".into(),
+            serde_json::json!({
+                "percent": zoom_diag_110["zoom_percent"],
+                "percent_reset": zoom_diag_reset["zoom_percent"],
+                "inner_width_100": inner_width_100,
+                "inner_width_110": inner_width_110,
+                "inner_width_reset": inner_width_reset,
+            }),
+        ));
+
+        // The same from the keyboard while the page has it: the window's
+        // shortcuts reach the pane although AppKit's first responder is the
+        // web view.
+        macro_rules! pane_state {
+            () => {{
+                this.update_in(cx, |this, _, cx| {
+                    page(this).map(|page| {
+                        let page = page.read(cx);
+                        (page.zoom_percent, page.find_open(), page.has_keyboard())
+                    })
+                })
+                .map_err(gone)?
+                .unwrap_or_default()
+            }};
+        }
+        let before_keys = pane_state!();
+        act!(|page: &crate::browser::BrowserView| page.press("=", 24, true));
+        let after_zoom_in = pane_state!();
+        act!(|page: &crate::browser::BrowserView| page.press("0", 29, true));
+        let after_zoom_reset = pane_state!();
+        act!(|page: &crate::browser::BrowserView| page.press("f", 3, true));
+        let after_find = pane_state!();
+        steps.push((
+            "keys_in_page".into(),
+            serde_json::json!({
+                "keyboard_in_page": before_keys.2,
+                // Key 24 is `=` on a US keyboard and `-` on a Turkish one:
+                // which way the zoom went depends on the layout.
+                "zoom_changed_by_key": after_zoom_in.0 != before_keys.0,
+                "zoom_after_cmd_0": after_zoom_reset.0,
+                "find_open_after_cmd_f": after_find.1,
+            }),
+        ));
+        // Find in page opens cleanly and Escape dismisses it back to the page.
+        let find_opened = this
+            .update_in(cx, |this, window, cx| {
+                page(this).is_some_and(|page| {
+                    page.update(cx, |page, cx| {
+                        page.open_find(window, cx);
+                        page.find_open()
+                    })
+                })
+            })
+            .map_err(gone)?;
+        wait(cx, 150).await;
+        let _ = cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::shell::DismissMenu), cx);
+        });
+        wait(cx, 200).await;
+        let find_after_escape = this
+            .update_in(cx, |this, _, cx| {
+                page(this).is_some_and(|page| page.read(cx).find_open())
+            })
+            .map_err(gone)?;
+        steps.push((
+            "find_escape".into(),
+            serde_json::json!({
+                "opened": find_opened,
+                "open_after_escape": find_after_escape,
+            }),
+        ));
+        // Reload on save: a saved source file loads the page again; what
+        // Git ignores (a server's logs, its database) does not.
+        let project = this
+            .update_in(cx, |this, _, cx| {
+                if let Some(page) = page(this) {
+                    page.update(cx, |page, cx| page.toggle_reload_on_save(cx));
+                }
+                this.workspace.project.clone()
+            })
+            .map_err(gone)?;
+        let project = std::path::PathBuf::from(project);
+        let _ = std::fs::write(project.join(".gitignore"), "*.log\n");
+        // The watcher starts off the main thread, and FSEvents a little later.
+        wait(cx, 1200).await;
+        let loaded_at = eval!("performance.timeOrigin");
+        let _ = std::fs::write(project.join("server.log"), "GET /\n");
+        wait(cx, 1500).await;
+        let after_ignored = eval!("performance.timeOrigin");
+        let _ = std::fs::write(project.join("page.html"), "<p>saved</p>\n");
+        wait(cx, 1500).await;
+        let after_source = eval!("performance.timeOrigin");
+        this.update_in(cx, |this, _, cx| {
+            if let Some(page) = page(this) {
+                page.update(cx, |page, cx| page.toggle_reload_on_save(cx));
+            }
+        })
+        .map_err(gone)?;
+        let _ = std::fs::write(project.join("page.html"), "<p>saved again</p>\n");
+        wait(cx, 1500).await;
+        let after_off = eval!("performance.timeOrigin");
+        steps.push((
+            "reload_on_save".into(),
+            serde_json::json!({
+                "kept_for_ignored_file": loaded_at == after_ignored,
+                "reloaded_for_source_file": after_ignored != after_source,
+                "kept_when_off": after_source == after_off,
+            }),
+        ));
         // Something drawn over the panes: the page gives way to a picture
         // of itself, and comes back with the keyboard when it is gone.
         macro_rules! page_state {
@@ -357,6 +498,22 @@ impl Shell {
             })
             .map_err(gone)?;
         steps.push(("after_new_window".into(), pages));
+
+        // Web Inspector invocation (without emitting an error banner when available).
+        let inspect_diag = this
+            .update_in(cx, |this, _, cx| {
+                page(this).map(|page| {
+                    page.update(cx, |page, cx| {
+                        page.inspect(cx);
+                        page.diagnostics()
+                    })
+                })
+            })
+            .map_err(gone)?
+            .unwrap_or_default();
+        wait(cx, 250).await;
+        steps.push(("inspect_diagnostics".into(), inspect_diag));
+
         if let Some(clipboard) = clipboard {
             cx.update(|_, cx| cx.write_to_clipboard(clipboard))
                 .map_err(gone)?;

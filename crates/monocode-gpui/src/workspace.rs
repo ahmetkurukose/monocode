@@ -193,6 +193,10 @@ pub(crate) struct Workspace {
     pub preferences: crate::settings::Preferences,
     pub session_filters: monocode_core::session_filters::Filters,
     pub project_appearance: HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
+    /// Remembered starting web address per project (`project_path -> url`),
+    /// chosen in Project settings or via a browser pane's page menu.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_browser_urls: HashMap<String, String>,
     /// Last desktop source values, used to reconcile subsequent desktop changes
     /// while retaining deliberate native project and preference edits.
     pub desktop_project_preferences: Option<serde_json::Value>,
@@ -287,6 +291,12 @@ pub(crate) struct BrowserPane {
     pub viewport: Option<(u32, u32)>,
     /// The user asked for this page to stay loaded while off screen.
     pub keep_awake: bool,
+    /// Page zoom percentage (`None` means `100%`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_percent: Option<u16>,
+    /// Reload the page automatically when files in its project change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reload_on_save: bool,
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -432,6 +442,7 @@ impl Default for Workspace {
             preferences: crate::settings::Preferences::default(),
             session_filters: Default::default(),
             project_appearance: Default::default(),
+            project_browser_urls: Default::default(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
             desktop_preferences_metadata: None,
@@ -696,6 +707,14 @@ impl Workspace {
         }
         state.add_project(&state.project.clone());
         state.preferences.migrate();
+        state.project_browser_urls.retain(|project, url| {
+            let trimmed = url.trim();
+            if project.trim().is_empty() || trimmed.is_empty() {
+                return false;
+            }
+            *url = monocode_core::browser::address(trimmed);
+            true
+        });
         state.restore_project_apps();
         state
     }
@@ -1960,5 +1979,50 @@ mod tests {
         );
         assert_eq!(restored.review_owners.get(&-5), Some(&1));
         assert!(restored.tab_of(-2).is_some() && restored.tab_of(-3).is_some());
+    }
+
+    #[test]
+    fn browser_zoom_reload_and_project_start_url_round_trip() {
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        state
+            .project_browser_urls
+            .insert("/p".into(), "localhost:5173".into());
+        state
+            .project_browser_urls
+            .insert("/empty".into(), "   ".into());
+        state.browser_panes.insert(
+            -4,
+            BrowserPane {
+                owner: 1,
+                url: "http://localhost:5173".into(),
+                title: "Vite".into(),
+                user_agent: None,
+                viewport: None,
+                keep_awake: false,
+                zoom_percent: Some(125),
+                reload_on_save: true,
+            },
+        );
+        state.tabs = vec![1];
+        state.layouts.insert(
+            1,
+            PaneNode::Split {
+                dir: SplitDir::Right,
+                children: vec![PaneNode::Leaf { id: 1 }, PaneNode::Leaf { id: -4 }],
+                sizes: vec![0.5, 0.5],
+            },
+        );
+        state.focused.insert(1, -4);
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        assert_eq!(
+            restored.project_browser_urls.get("/p").map(String::as_str),
+            Some("http://localhost:5173")
+        );
+        assert!(!restored.project_browser_urls.contains_key("/empty"));
+        let pane = &restored.browser_panes[&-4];
+        assert_eq!(pane.zoom_percent, Some(125));
+        assert!(pane.reload_on_save);
     }
 }

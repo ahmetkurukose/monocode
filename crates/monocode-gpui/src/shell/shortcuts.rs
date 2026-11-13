@@ -25,6 +25,20 @@ pub(super) struct Shortcuts {
     _native: Option<macos::NativeKeys>,
 }
 
+impl Shell {
+    /// Focus handle of the active browser pane when its embedded WKWebView
+    /// currently owns AppKit first-responder focus.
+    pub(super) fn native_browser_focus(&self, cx: &App) -> Option<gpui::FocusHandle> {
+        let pane = self
+            .workspace
+            .active
+            .filter(|id| self.workspace.browser_panes.contains_key(id))?;
+        let view = self.browser_views.get(&pane)?;
+        let page = view.read(cx);
+        (page.has_keyboard() && !page.covered()).then(|| gpui::Focusable::focus_handle(page, cx))
+    }
+}
+
 fn workspace_action(action: &dyn Action) -> bool {
     let name = action.name();
     (name.starts_with("workspace::")
@@ -35,17 +49,23 @@ fn workspace_action(action: &dyn Action) -> bool {
         || name == "application::Quit"
 }
 
+fn shortcut_action(action: &dyn Action, browser: bool) -> bool {
+    workspace_action(action) || (browser && action.name().starts_with("browser::"))
+}
+
 /// Keymap owns precedence, disabled bindings, physical-key matching and chords.
-fn candidates(keys: &[Keystroke], cx: &App) -> Vec<KeyBinding> {
-    let context = KeyContext::parse("Workspace").expect("static workspace key context");
+fn candidates(keys: &[Keystroke], browser: bool, cx: &App) -> Vec<KeyBinding> {
+    let mut contexts = vec![KeyContext::parse("Workspace").expect("static workspace key context")];
+    if browser {
+        contexts.push(KeyContext::parse("Browser").expect("static browser key context"));
+    }
     let keymap = cx.key_bindings();
     let keymap = keymap.borrow();
-    let contexts = [context];
     let (complete, _) = keymap.bindings_for_input(keys, &contexts);
     complete
         .into_iter()
         .chain(keymap.possible_next_bindings_for_input(keys, &contexts))
-        .filter(|binding| workspace_action(binding.action()))
+        .filter(|binding| shortcut_action(binding.action(), browser))
         .collect()
 }
 
@@ -83,13 +103,17 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
         ) {
             return;
         }
+        let browser_focus = native
+            .then(|| owner.read(cx).native_browser_focus(cx))
+            .flatten();
+        let allow_browser = browser_focus.is_some();
         let mut sequence = pending.borrow_mut();
         sequence.push(event.keystroke.clone());
-        let mut matches = candidates(&sequence, cx);
+        let mut matches = candidates(&sequence, allow_browser, cx);
         if matches.is_empty() && sequence.len() > 1 {
             sequence.clear();
             sequence.push(event.keystroke.clone());
-            matches = candidates(&sequence, cx);
+            matches = candidates(&sequence, allow_browser, cx);
         }
         let action = matches
             .iter()
@@ -109,7 +133,13 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
                 // view's selection or its first-responder ownership.
                 owner.update(cx, |shell, cx| shell.focus_workspace(window, cx));
             }
-            root.dispatch_action(action.as_ref(), window, cx);
+            if action.name().starts_with("browser::")
+                && let Some(target) = browser_focus.as_ref()
+            {
+                target.dispatch_action(action.as_ref(), window, cx);
+            } else {
+                root.dispatch_action(action.as_ref(), window, cx);
+            }
             forwarding.handled.set(true);
             cx.stop_propagation();
         } else if partial {

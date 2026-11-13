@@ -417,7 +417,10 @@ Built and installed in one pass, in the order of §7. Checked by unit tests, by
 | Downloads to `~/Downloads`, never over an existing file, with a line in the pane | Built; passes the self-test. |
 | `alert` / `confirm` / `prompt`, HTTP sign-in, file upload | Built as AppKit sheets. Compiles; not exercised (a sheet would block an unattended run). |
 | Certificates of this machine and its network accepted | Built: localhost, `.localhost`, `.local`, loopback and private addresses. Others are judged by the system; there is no "trust anyway". |
-| Find in page, Web Inspector, clear this site's data, keep awake | Built. Web Inspector uses a WebKit call that is not public; if it is missing the pane says to use Safari's Develop menu. Not exercised. |
+| Find in page, Web Inspector, clear this site's data, keep awake | Built. Find (`⌘F`) and custom user-agent inputs dismiss with Escape and return focus to the page; Web Inspector opens via `⌘⌥I` (`Page options › Web Inspector`) with WebKit developer extras enabled (falling back to a Safari Develop notice if WebKit's private `_inspector` selector is unavailable). Clear this site's data uses `host_of` (including IPv6 `[::1]`). |
+| Per-page zoom (`25%`–`300%`) | Built. Stored per pane (`zoom_percent`), applied on top of window `content_zoom()` via `WKWebView.setPageZoom`, shown as a clickable `browser-zoom-badge` pill in the address row when `!= 100%`, and driven by `⌘+` / `⌘-` / `⌘0` while the active uncovered browser pane has focus (plus `Page options › Zoom`). Unit and live self-tested. |
+| Reload on save | Built per page (`reload_on_save` in `Page options`). `Shell` runs a debounced (200 ms) `fs_watch::watch_checkout` watcher only for local projects that currently have an awake page with Reload on Save enabled, tearing down watchers when disabled or asleep. A change only reloads when at least one changed path is not ignored by Git (`fs_watch::source_changed`, `git check-ignore`): a server's own logs, databases and build output would otherwise reload the page without end. Outside a Git checkout every change counts. Unit and live self-tested. |
+| Project start address & terminal dev-server detection | Built. Configured per project via `Project › Browser start page…` or `Page options › Use Current Page as Project Start Page` (`workspace.project_browser_urls`). When opening a new page with no explicit URL, falls back from the configured URL to the newest local dev-server URL detected in that project's dock/pane terminals (`terminal::recent_lines` + `monocode_core::browser::detect_dev_server_url`). Unit tested. |
 | User agent presets and custom, device sizes | Built. A page as Chrome (Android) at 412 × 915 reported that user agent and that size in the agent self-test. |
 | MCP server `monocode_browser`, 15 tools, for Claude, Codex and ACP providers | Built. Every tool was run against a real page by `agent.py` (OpenCode is not wired: it takes no MCP server from Monocode for visuals either). |
 | Agent access: Any site (default), Local addresses, Off; Stop on the page's banner | Built and unit tested. **"Ask for other sites" is not built.** |
@@ -432,9 +435,7 @@ Not built, against this plan:
   has no profile field yet; §3.1's `Project` and `Private` kinds are open.
 - **"Ask for other sites"**, with its approval card.
 - **Camera, microphone and location** prompts: a page asking is refused.
-- **Start address from a terminal line, reload on save.**
 - **Memory per page in Settings**; it is shown in the pane's menu only.
-- **Zoom** of a page by itself.
 
 Differences from the design worth knowing:
 

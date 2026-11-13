@@ -1079,3 +1079,216 @@ impl Render for BackgroundDialog {
             .children(self.effect_popup(cx))
     }
 }
+
+pub(crate) enum BrowserStartEvent {
+    Save(Option<String>),
+    Close,
+}
+
+pub(crate) struct BrowserStartDialog {
+    project: String,
+    appearance: ProjectAppearance,
+    input: Entity<Input>,
+    detected: Option<String>,
+    has_saved: bool,
+    bounds: AnchorSlot,
+    _events: Vec<Subscription>,
+}
+
+impl EventEmitter<BrowserStartEvent> for BrowserStartDialog {}
+
+impl Focusable for BrowserStartDialog {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.focus_handle(cx)
+    }
+}
+
+impl BrowserStartDialog {
+    pub(crate) fn new(
+        project: String,
+        appearance: ProjectAppearance,
+        current: Option<String>,
+        detected: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let has_saved = current.as_ref().is_some_and(|url| !url.trim().is_empty());
+        let input = cx.new(|cx| {
+            let mut field = Input::field(
+                "Browser start page",
+                "http://localhost:3000",
+                content(0.35),
+                cx,
+            );
+            if let Some(current) = &current {
+                field.set_text(current.clone(), cx);
+                field.select_range(0..field.content.len(), cx);
+            }
+            field
+        });
+        let events = vec![cx.subscribe(&input, |this, _, _: &input::Submitted, cx| {
+            this.save(cx);
+        })];
+        Self {
+            project,
+            appearance,
+            input,
+            detected,
+            has_saved,
+            bounds: AnchorSlot::default(),
+            _events: events,
+        }
+    }
+
+    pub(crate) fn measured_height(&self) -> Option<f32> {
+        self.bounds.get().map(|bounds| bounds.size.height.as_f32())
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let raw = self.input.read(cx).content.trim().to_owned();
+        let next = (!raw.is_empty()).then(|| monocode_core::browser::address(&raw));
+        cx.emit(BrowserStartEvent::Save(next));
+    }
+}
+
+impl Render for BrowserStartDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_text = !self.input.read(cx).content.trim().is_empty();
+        div()
+            .id("project-browser-start-dialog")
+            .debug_selector(|| "project-browser-start-dialog".into())
+            .role(Role::Dialog)
+            .aria_label("Browser Start Page")
+            .relative()
+            .min_h_0()
+            .max_h(px(window.viewport_size().height.as_f32() - 34.))
+            .flex()
+            .flex_col()
+            .text_color(content(1.))
+            .child(self.bounds.layout_probe())
+            .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.emit(BrowserStartEvent::Close);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .px_4()
+                    .pt_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .pt(px(2.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .line_height(px(20.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("Browser Start Page"),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .line_height(px(16.5))
+                                    .text_color(content(0.5))
+                                    .child(format!(
+                                        "Default address for new browser tabs in {}",
+                                        self.appearance.label(&self.project)
+                                    )),
+                            ),
+                    )
+                    .child(
+                        icon_button("close-project-browser-start", "Close", "close")
+                            .size(px(28.))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserStartEvent::Close))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .child(
+                        div()
+                            .h(px(36.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(content(0.1))
+                            .bg(content(0.04))
+                            .child(div().flex_1().min_w_0().child(self.input.clone())),
+                    )
+                    .when_some(self.detected.clone(), |d, url| {
+                        d.child(
+                            button("use-detected-browser-start-url", format!("Detected: {url}"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.input.update(cx, |input, cx| {
+                                        input.set_text(url.clone(), cx);
+                                        input.select_range(0..input.content.len(), cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .line_height(px(16.5))
+                            .text_color(content(0.45))
+                            .child("Leave blank to use any running dev server detected in project terminals."),
+                    )
+                    .child(
+                        div()
+                            .pt_1()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div().when(self.has_saved || has_text, |d| {
+                                    d.child(
+                                        button("clear-project-browser-start", "Clear")
+                                            .text_color(rgb(0xff6467))
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(BrowserStartEvent::Save(None));
+                                            })),
+                                    )
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        button("cancel-project-browser-start", "Cancel")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(BrowserStartEvent::Close);
+                                            })),
+                                    )
+                                    .child(
+                                        button("save-project-browser-start", "Save")
+                                            .text_color(content(1.))
+                                            .bg(content(0.1))
+                                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+}

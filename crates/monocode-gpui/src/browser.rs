@@ -22,7 +22,7 @@ mod native_ui;
 
 gpui::actions!(
     browser,
-    [FocusAddress, Reload, GoBack, GoForward, FindInPage]
+    [FocusAddress, Reload, GoBack, GoForward, FindInPage, Inspect]
 );
 
 /// The pane's keys. Copy, paste and the like are Monocode's actions bound
@@ -47,6 +47,15 @@ pub(crate) fn bind(cx: &mut gpui::App) {
         KeyBinding::new(&key("r"), Reload, Some("Browser")),
         KeyBinding::new(&key("["), GoBack, Some("Browser")),
         KeyBinding::new(&key("]"), GoForward, Some("Browser")),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-alt-i"
+            } else {
+                "ctrl-alt-i"
+            },
+            Inspect,
+            Some("Browser"),
+        ),
     ]);
 }
 
@@ -124,6 +133,8 @@ pub(crate) enum BrowserEvent {
     /// The user stopped, or allowed again, a session's agent in the browser.
     StopAgent(i64),
     AllowAgent(i64),
+    /// Save this URL as the project's default browser start page.
+    SetProjectStartUrl(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +163,7 @@ struct OpenMenu {
 /// or typing a user agent of one's own.
 struct Entry {
     input: Entity<Input>,
-    _events: Subscription,
+    _events: Vec<Subscription>,
 }
 
 pub(crate) struct BrowserView {
@@ -161,6 +172,10 @@ pub(crate) struct BrowserView {
     pub user_agent: Option<String>,
     /// A fixed size to hold the page at, as a device would; `None` fits the pane.
     pub viewport: Option<(u32, u32)>,
+    /// Independent page zoom in percent (`100` is actual size).
+    pub zoom_percent: u16,
+    /// Reload this page automatically when files in its project change.
+    pub reload_on_save: bool,
     /// The session whose agent last used the page, and its name.
     agent: Option<AgentNote>,
     /// The user asked for this page to stay loaded.
@@ -267,6 +282,8 @@ impl BrowserView {
             title,
             user_agent,
             viewport: None,
+            zoom_percent: 100,
+            reload_on_save: false,
             agent: None,
             keep_awake: false,
             last_used: Rc::new(std::cell::Cell::new(std::time::Instant::now())),
@@ -313,7 +330,6 @@ impl BrowserView {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn asleep(&self) -> bool {
         self.asleep
     }
@@ -388,6 +404,9 @@ impl BrowserView {
         self.can_forward = false;
         #[cfg(target_os = "macos")]
         self.host.borrow_mut().take();
+        if self.reload_on_save {
+            cx.emit(BrowserEvent::Changed);
+        }
         cx.notify();
     }
 
@@ -395,6 +414,9 @@ impl BrowserView {
         if self.asleep {
             self.asleep = false;
             self.failure = None;
+            if self.reload_on_save {
+                cx.emit(BrowserEvent::Changed);
+            }
             cx.notify();
         }
     }
@@ -403,6 +425,10 @@ impl BrowserView {
     pub(crate) fn set_covered(&mut self, covered: bool, cx: &mut Context<Self>) {
         self.shell_covered = covered;
         self.apply_cover(cx);
+    }
+
+    pub(crate) fn covered(&self) -> bool {
+        self.covered
     }
 
     /// The page gives way while the Shell or the pane's own menu is drawn
@@ -441,11 +467,6 @@ impl BrowserView {
                 .detach();
             });
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn covered(&self) -> bool {
-        self.covered
     }
 
     /// Starts a frame: the page counts as off screen until its pane paints.
@@ -487,6 +508,9 @@ impl BrowserView {
             if self.asleep {
                 self.asleep = false;
                 self.failure = None;
+                if self.reload_on_save {
+                    cx.emit(BrowserEvent::Changed);
+                }
                 cx.notify();
             }
             if self.host.borrow().is_some() {
@@ -519,7 +543,10 @@ impl BrowserView {
                 self.user_agent.as_deref(),
                 &self.url,
             );
-            hosted.place(parent, frame, frame, 1.);
+            // Off screen the frame is the page's size in its own pixels, so
+            // only the page's own zoom applies; the pane adds the
+            // interface's when it puts the page in place.
+            hosted.place(parent, frame, frame, f64::from(self.zoom_percent) / 100.);
             hosted.hide();
             *self.host.borrow_mut() = Some(hosted);
             true
@@ -579,6 +606,42 @@ impl BrowserView {
             cx.emit(BrowserEvent::Changed);
             cx.notify();
         }
+    }
+
+    /// Sets the independent zoom percentage (`25..=300`, `100` is actual size).
+    pub(crate) fn set_zoom_percent(&mut self, zoom: u16, cx: &mut Context<Self>) {
+        let zoom = monocode_core::browser::normalize_zoom(Some(zoom));
+        if self.zoom_percent != zoom {
+            self.zoom_percent = zoom;
+            cx.emit(BrowserEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    /// Steps this page's zoom one stop up (`1`), down (`-1`), or resets it (`0`).
+    pub(crate) fn step_zoom(&mut self, step: i8, cx: &mut Context<Self>) {
+        let next = monocode_core::browser::step_zoom(self.zoom_percent, step);
+        self.set_zoom_percent(next, cx);
+    }
+
+    /// Toggles automatic reloads when files in this page's project change.
+    pub(crate) fn toggle_reload_on_save(&mut self, cx: &mut Context<Self>) {
+        self.reload_on_save = !self.reload_on_save;
+        cx.emit(BrowserEvent::Changed);
+        cx.notify();
+    }
+
+    /// Reloads an awake, non-blank page after a project file save.
+    pub(crate) fn reload_on_file_save(&mut self, cx: &mut Context<Self>) {
+        if self.asleep || self.url.is_empty() || self.url == "about:blank" {
+            return;
+        }
+        self.failure = None;
+        #[cfg(target_os = "macos")]
+        if let Some(host) = self.host.borrow().as_ref() {
+            host.reload();
+        }
+        cx.notify();
     }
 
     /// A picture of the page as JPEG bytes, or `None` if it has no view.
@@ -703,6 +766,8 @@ impl BrowserView {
                 host::FAILED.load(std::sync::atomic::Ordering::Relaxed),
             ],
             "title": self.title,
+            "zoom_percent": self.zoom_percent,
+            "reload_on_save": self.reload_on_save,
             "paint": self.paint_note.get(),
             "loading": self.loading,
             "failure": self.failure,
@@ -898,7 +963,30 @@ impl BrowserView {
                     .rounded_md()
                     .bg(content(0.06))
                     .child(icon("globe", 12.).text_color(content(0.45)))
-                    .child(div().flex_1().min_w_0().child(self.address.clone())),
+                    .child(div().flex_1().min_w_0().child(self.address.clone()))
+                    .when(self.zoom_percent != 100, |d| {
+                        d.child(
+                            div()
+                                .id("browser-zoom-badge")
+                                .debug_selector(|| "browser-zoom-badge".into())
+                                .role(Role::Button)
+                                .aria_label("Reset zoom to 100%")
+                                .h(px(20.))
+                                .px(px(6.))
+                                .flex()
+                                .items_center()
+                                .flex_shrink_0()
+                                .rounded(px(4.))
+                                .bg(content(0.08))
+                                .hover(|s| s.bg(content(0.14)))
+                                .text_size(px(11.))
+                                .text_color(content(0.75))
+                                .child(format!("{}%", self.zoom_percent))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_zoom_percent(100, cx)),
+                                ),
+                        )
+                    }),
             )
             .child(
                 Self::tool(
@@ -943,15 +1031,58 @@ impl BrowserView {
                     "Ctrl F"
                 })
                 .into(),
-            MenuAction::new("inspect", "Web Inspector").into(),
+            MenuAction::new("inspect", "Web Inspector")
+                .shortcut(if cfg!(target_os = "macos") {
+                    "⌘⌥I"
+                } else {
+                    "Ctrl Alt I"
+                })
+                .into(),
             MenuAction::new("errors", "Add Console Errors to Chat").into(),
             MenuAction::new("clear", "Clear This Site's Data").into(),
             MenuAction::new("awake", "Keep This Page Awake")
                 .checked(self.keep_awake)
                 .into(),
+            MenuAction::new("reload-on-save", "Reload on Save")
+                .checked(self.reload_on_save)
+                .into(),
+        ];
+        if self.url.starts_with("http://") || self.url.starts_with("https://") {
+            items.push(
+                MenuAction::new("start-url", "Use Current Page as Project Start Page").into(),
+            );
+        }
+        items.extend([
+            MenuItem::Separator,
+            MenuItem::Header("Zoom".into()),
+            MenuAction::new("zoom:out", "Zoom Out")
+                .shortcut(if cfg!(target_os = "macos") {
+                    "⌘-"
+                } else {
+                    "Ctrl -"
+                })
+                .into(),
+            MenuAction::new(
+                "zoom:reset",
+                format!("Actual Size ({}%)", self.zoom_percent),
+            )
+            .shortcut(if cfg!(target_os = "macos") {
+                "⌘0"
+            } else {
+                "Ctrl 0"
+            })
+            .checked(self.zoom_percent == 100)
+            .into(),
+            MenuAction::new("zoom:in", "Zoom In")
+                .shortcut(if cfg!(target_os = "macos") {
+                    "⌘+"
+                } else {
+                    "Ctrl +"
+                })
+                .into(),
             MenuItem::Separator,
             MenuItem::Header("User agent".into()),
-        ];
+        ]);
         for (ix, (name, _)) in agents.iter().enumerate() {
             items.push(
                 MenuAction::new(format!("agent:{ix}"), *name)
@@ -1020,6 +1151,15 @@ impl BrowserView {
                 self.keep_awake = !self.keep_awake;
                 cx.emit(BrowserEvent::Changed);
             }
+            "reload-on-save" => self.toggle_reload_on_save(cx),
+            "start-url" => {
+                if !self.url.is_empty() {
+                    cx.emit(BrowserEvent::SetProjectStartUrl(self.url.clone()));
+                }
+            }
+            "zoom:out" => self.step_zoom(-1, cx),
+            "zoom:reset" => self.set_zoom_percent(100, cx),
+            "zoom:in" => self.step_zoom(1, cx),
             _ => {
                 let index = |prefix: &str| {
                     id.strip_prefix(prefix)
@@ -1045,6 +1185,7 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
         submit: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+        changed: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> Entry {
         let input = cx.new(|cx| {
             let mut input = Input::field(label, label, content(0.35), cx);
@@ -1052,10 +1193,15 @@ impl BrowserView {
             input.set_text(text, cx);
             input
         });
-        let events = cx.subscribe(&input, move |this, input, _: &input::Submitted, cx| {
-            let text = input.read(cx).content.to_string();
-            submit(this, text, cx);
-        });
+        let events = vec![
+            cx.subscribe(&input, move |this, input, _: &input::Submitted, cx| {
+                let text = input.read(cx).content.to_string();
+                submit(this, text, cx);
+            }),
+            cx.subscribe(&input, move |this, _, _: &input::Changed, cx| {
+                changed(this, cx);
+            }),
+        ];
         window.focus(&input.focus_handle(cx), cx);
         Entry {
             input,
@@ -1063,7 +1209,11 @@ impl BrowserView {
         }
     }
 
-    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
+    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.find {
             Some(find) => window.focus(&find.input.focus_handle(cx), cx),
             None => {
@@ -1074,6 +1224,12 @@ impl BrowserView {
                     window,
                     cx,
                     |this, text, cx| this.find_next(&text, false, cx),
+                    |this, cx| {
+                        if this.find_missed {
+                            this.find_missed = false;
+                            cx.notify();
+                        }
+                    },
                 ));
             }
         }
@@ -1118,11 +1274,12 @@ impl BrowserView {
                 this.custom_agent = None;
                 this.set_user_agent(monocode_core::browser::user_agent(&text), cx);
             },
+            |_, _| {},
         ));
         cx.notify();
     }
 
-    fn inspect(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn inspect(&mut self, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         let opened = (self.host.borrow().as_ref()).is_some_and(|host| host.inspect());
         #[cfg(not(target_os = "macos"))]
@@ -1169,17 +1326,12 @@ impl BrowserView {
     /// Signs out of the site on screen and forgets what it stored.
     fn clear_site_data(&mut self, cx: &mut Context<Self>) {
         let rest = (self.url.split_once("://")).map_or(self.url.as_str(), |(_, rest)| rest);
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        let host = authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, port)| {
-                if port.chars().all(|c| c.is_ascii_digit()) {
-                    host
-                } else {
-                    authority
-                }
-            });
+        let host = monocode_core::browser::host_of(rest);
         if host.is_empty() {
+            self.banner = Some(Banner::Info(
+                "Open a website first to clear its stored data.".into(),
+            ));
+            cx.notify();
             return;
         }
         #[cfg(target_os = "macos")]
@@ -1222,6 +1374,15 @@ impl BrowserView {
         if let Some(find) = &self.find {
             rows.push(
                 row("browser-find-row")
+                    .on_action(
+                        cx.listener(|this, _: &crate::shell::DismissMenu, window, cx| {
+                            cx.stop_propagation();
+                            this.find = None;
+                            this.find_missed = false;
+                            this.focus_page(window, cx);
+                            cx.notify();
+                        }),
+                    )
                     .child(icon("search", 12.).text_color(content(0.45)))
                     .child(div().flex_1().min_w_0().child(find.input.clone()))
                     .when(self.find_missed, |d| {
@@ -1242,8 +1403,10 @@ impl BrowserView {
                     )
                     .child(
                         Self::tool("browser-find-close", "Close", "close", true).on_click(
-                            cx.listener(|this, _, _, cx| {
+                            cx.listener(|this, _, window, cx| {
                                 this.find = None;
+                                this.find_missed = false;
+                                this.focus_page(window, cx);
                                 cx.notify();
                             }),
                         ),
@@ -1254,12 +1417,21 @@ impl BrowserView {
         if let Some(agent) = &self.custom_agent {
             rows.push(
                 row("browser-agent-entry")
+                    .on_action(
+                        cx.listener(|this, _: &crate::shell::DismissMenu, window, cx| {
+                            cx.stop_propagation();
+                            this.custom_agent = None;
+                            this.focus_page(window, cx);
+                            cx.notify();
+                        }),
+                    )
                     .child(div().text_color(content(0.5)).child("User agent"))
                     .child(div().flex_1().min_w_0().child(agent.input.clone()))
                     .child(
                         Self::tool("browser-agent-entry-close", "Cancel", "close", true).on_click(
-                            cx.listener(|this, _, _, cx| {
+                            cx.listener(|this, _, window, cx| {
                                 this.custom_agent = None;
+                                this.focus_page(window, cx);
                                 cx.notify();
                             }),
                         ),
@@ -1420,6 +1592,7 @@ impl BrowserView {
         let asleep = self.asleep;
         let (url, user_agent) = (self.url.clone(), self.user_agent.clone());
         let viewport = self.viewport;
+        let page_zoom_factor = f64::from(self.zoom_percent) / 100.;
         canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
@@ -1504,7 +1677,7 @@ impl BrowserView {
                 if let Some(host) = hosted.as_ref()
                     && shown
                 {
-                    host.place(parent, frame, web_frame, f64::from(zoom));
+                    host.place(parent, frame, web_frame, f64::from(zoom) * page_zoom_factor);
                     placed.set(true);
                     last_used.set(std::time::Instant::now());
                     note.set("placed");
@@ -1566,6 +1739,7 @@ impl gpui::Render for BrowserView {
                 window.dispatch_action(Box::new(input::SelectAll), cx);
             }))
             .on_action(cx.listener(|this, _: &FindInPage, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &Inspect, _, cx| this.inspect(cx)))
             .on_action(cx.listener(|this, _: &Reload, _, cx| this.reload_or_stop(cx)))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.back(cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.forward(cx)));

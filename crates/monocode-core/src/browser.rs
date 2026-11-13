@@ -26,7 +26,7 @@ pub fn private_host(host: &str) -> bool {
     }
 }
 
-fn host_of(text: &str) -> &str {
+pub fn host_of(text: &str) -> &str {
     let end = text.find(['/', '?', '#']).unwrap_or(text.len());
     let authority = &text[..end];
     if let Some(rest) = authority.strip_prefix('[') {
@@ -190,6 +190,194 @@ pub fn pages_to_sleep(
     sleeping
 }
 
+/// Page zoom presets, in whole percent (`100` is actual size).
+pub const ZOOM_STEPS: &[u16] = &[
+    25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300,
+];
+
+/// Clamps a saved or requested page zoom to the supported range.
+pub fn normalize_zoom(percent: Option<u16>) -> u16 {
+    percent.unwrap_or(100).clamp(25, 300)
+}
+
+/// Only non-default zoom values need to be persisted on a pane.
+pub fn stored_zoom(percent: u16) -> Option<u16> {
+    let clamped = normalize_zoom(Some(percent));
+    (clamped != 100).then_some(clamped)
+}
+
+/// Steps page zoom up (`delta > 0`) or down (`delta < 0`) along `ZOOM_STEPS`,
+/// or resets it to `100` when `delta == 0`.
+pub fn step_zoom(current: u16, delta: i8) -> u16 {
+    let current = normalize_zoom(Some(current));
+    if delta > 0 {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .find(|&step| step > current)
+            .unwrap_or(*ZOOM_STEPS.last().unwrap())
+    } else if delta < 0 {
+        ZOOM_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&step| step < current)
+            .unwrap_or(ZOOM_STEPS[0])
+    } else {
+        100
+    }
+}
+
+/// Scans recent terminal lines from newest to oldest for a local or private
+/// dev-server `http(s)` URL (e.g. `http://localhost:5173/`, `http://0.0.0.0:8080`).
+/// Wildcard bind hosts (`0.0.0.0`, `::`) are rewritten to `localhost`.
+pub fn detect_dev_server_url(lines: &[String]) -> Option<String> {
+    fn is_wildcard(host: &str) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "0.0.0.0" || host == "::"
+    }
+
+    fn strip_trailing(raw: &str) -> &str {
+        let mut s = raw;
+        while let Some(last) = s.chars().last() {
+            let trim = match last {
+                '.' | ',' | ';' | ')' | '}' | '"' | '\'' | '<' | '>' | '!' | '?' => true,
+                ']' => s.matches('[').count() < s.matches(']').count(),
+                _ => false,
+            };
+            if trim {
+                s = &s[..s.len() - last.len_utf8()];
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    #[derive(Clone)]
+    struct Candidate {
+        url: String,
+        port: Option<u16>,
+        loopback_or_wildcard: bool,
+    }
+
+    fn parse_candidate(raw: &str) -> Option<Candidate> {
+        let trimmed = strip_trailing(raw);
+        let lower = trimmed.to_ascii_lowercase();
+        let scheme_len = if lower.starts_with("http://") {
+            "http://".len()
+        } else if lower.starts_with("https://") {
+            "https://".len()
+        } else {
+            return None;
+        };
+        let rest = &trimmed[scheme_len..];
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..auth_end];
+        if authority.is_empty() {
+            return None;
+        }
+        // Ignore userinfo@ or malformed empty host.
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = host_of(authority);
+        if host.is_empty() {
+            return None;
+        }
+        let port = if let Some(bracketed) = authority.strip_prefix('[') {
+            bracketed
+                .split_once("]:")
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+        } else {
+            authority
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+        };
+        let host_lower = host.to_ascii_lowercase();
+        let wildcard = is_wildcard(&host_lower);
+        if !wildcard && !private_host(&host_lower) {
+            return None;
+        }
+        let loopback = wildcard
+            || host_lower == "localhost"
+            || host_lower.ends_with(".localhost")
+            || host_lower == "::1"
+            || host_lower
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        let url = if wildcard {
+            let port_suffix = port.map(|p| format!(":{p}")).unwrap_or_default();
+            format!(
+                "{}localhost{}{}",
+                &trimmed[..scheme_len],
+                port_suffix,
+                &rest[auth_end..]
+            )
+        } else {
+            trimmed.to_owned()
+        };
+        Some(Candidate {
+            url,
+            port,
+            loopback_or_wildcard: loopback,
+        })
+    }
+
+    fn scan_line(line: &str) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        let mut idx = 0;
+        let bytes = line.as_bytes();
+        while idx < bytes.len() {
+            let tail = &line[idx..];
+            let starts_url = tail
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+                || tail
+                    .get(..8)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
+            if starts_url {
+                let end = tail
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
+                    .unwrap_or(tail.len());
+                if let Some(candidate) = parse_candidate(&tail[..end]) {
+                    out.push(candidate);
+                }
+                idx += end.max(1);
+            } else {
+                let step = tail.chars().next().map_or(1, char::len_utf8);
+                idx += step;
+            }
+        }
+        out
+    }
+
+    for (rev_idx, line) in lines.iter().rev().enumerate() {
+        let candidates = scan_line(line);
+        if candidates.is_empty() {
+            continue;
+        }
+        // Prefer loopback/wildcard on the same line (e.g. "Local: ...  Network: ...").
+        if let Some(best) = candidates.iter().find(|c| c.loopback_or_wildcard) {
+            return Some(best.url.clone());
+        }
+        let fallback = &candidates[0];
+        // Tools like Vite/Astro print `Local: http://localhost:PORT/` on the line
+        // right before `Network: http://192.168.x.x:PORT/`. Prefer `Local:` when adjacent.
+        let forward_idx = lines.len() - 1 - rev_idx;
+        if let Some(prev_line) = forward_idx.checked_sub(1).and_then(|i| lines.get(i)) {
+            if let Some(local) = scan_line(prev_line)
+                .into_iter()
+                .find(|c| c.loopback_or_wildcard && c.port == fallback.port)
+            {
+                return Some(local.url);
+            }
+        }
+        return Some(fallback.url.clone());
+    }
+    None
+}
+
 /// A page's name for a tab or a row before it has a title.
 pub fn label(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -342,5 +530,58 @@ mod tests {
         assert_eq!(label("http://localhost:3000/"), "localhost:3000");
         assert_eq!(label("about:blank"), "about:blank");
         assert_eq!(label(""), "New page");
+    }
+
+    #[test]
+    fn zoom_helpers_clamp_step_and_elide_default() {
+        assert_eq!(normalize_zoom(None), 100);
+        assert_eq!(normalize_zoom(Some(5)), 25);
+        assert_eq!(normalize_zoom(Some(999)), 300);
+        assert_eq!(stored_zoom(100), None);
+        assert_eq!(stored_zoom(125), Some(125));
+        assert_eq!(step_zoom(100, 1), 110);
+        assert_eq!(step_zoom(100, -1), 90);
+        assert_eq!(step_zoom(112, 1), 125);
+        assert_eq!(step_zoom(112, -1), 110);
+        assert_eq!(step_zoom(300, 1), 300);
+        assert_eq!(step_zoom(25, -1), 25);
+        assert_eq!(step_zoom(110, 0), 100);
+        assert_eq!(step_zoom(75, 0), 100);
+    }
+
+    #[test]
+    fn detects_newest_local_dev_server_url_from_terminal_lines() {
+        let lines = vec![
+            "npm info using npm@10.0.0".into(),
+            "See https://vitejs.dev/config/ for options".into(),
+            "  ➜  Local:   http://localhost:5173/".into(),
+            "  ➜  Network: http://192.168.1.42:5173/".into(),
+        ];
+        assert_eq!(
+            detect_dev_server_url(&lines).as_deref(),
+            Some("http://localhost:5173/")
+        );
+
+        let wildcard = vec!["Listening on http://0.0.0.0:8080/api".into()];
+        assert_eq!(
+            detect_dev_server_url(&wildcard).as_deref(),
+            Some("http://localhost:8080/api")
+        );
+
+        let ipv6 = vec!["Server ready at http://[::1]:4321.".into()];
+        assert_eq!(
+            detect_dev_server_url(&ipv6).as_deref(),
+            Some("http://[::1]:4321")
+        );
+
+        let newest_wins = vec![
+            "old: http://localhost:3000/".into(),
+            "Ready in 120ms: http://127.0.0.1:4000/app".into(),
+            "docs: https://github.com/org/repo".into(),
+        ];
+        assert_eq!(
+            detect_dev_server_url(&newest_wins).as_deref(),
+            Some("http://127.0.0.1:4000/app")
+        );
     }
 }

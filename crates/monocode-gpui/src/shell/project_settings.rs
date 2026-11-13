@@ -1,12 +1,16 @@
 use super::*;
 use crate::{
     project_background::ProjectBackground,
-    project_settings::{AppearanceControls, BackgroundDialog, Event, project_icon},
+    project_settings::{
+        AppearanceControls, BackgroundDialog, BrowserStartDialog, BrowserStartEvent, Event,
+        project_icon,
+    },
     project_theme::ThemeDialog,
 };
 use monocode_core::project_appearance::ProjectAppearance;
 
-/// A project dialog from the project menu: its background or theme colors.
+/// A project dialog from the project menu: its background, theme colors, or
+/// browser start page.
 pub(super) struct OpenBackground {
     view: ProjectDialog,
     _events: Subscription,
@@ -15,6 +19,7 @@ pub(super) struct OpenBackground {
 enum ProjectDialog {
     Background(Entity<BackgroundDialog>),
     Theme(Entity<ThemeDialog>),
+    BrowserStartUrl(Entity<BrowserStartDialog>),
 }
 impl Shell {
     pub(super) fn appearance(&self, path: &str) -> ProjectAppearance {
@@ -178,6 +183,37 @@ impl Shell {
         });
         cx.notify();
     }
+    pub(super) fn open_browser_start_dialog(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        self.close_preview(cx);
+        let current = self.project_browser_url(&path).map(str::to_owned);
+        let detected = self.detect_project_dev_server_url(&path, cx);
+        let view = cx.new(|cx| {
+            BrowserStartDialog::new(path.clone(), self.appearance(&path), current, detected, cx)
+        });
+        let events = cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event: &BrowserStartEvent, window, cx| match event {
+                BrowserStartEvent::Save(url) => {
+                    this.set_project_browser_url(&path, url.clone(), cx);
+                    this.close_background_dialog(window, cx);
+                }
+                BrowserStartEvent::Close => this.close_background_dialog(window, cx),
+            },
+        );
+        window.focus(&view.focus_handle(cx), cx);
+        self.background_dialog = Some(OpenBackground {
+            view: ProjectDialog::BrowserStartUrl(view),
+            _events: events,
+        });
+        cx.notify();
+    }
     fn close_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.background_dialog = None;
         self.focus_workspace(window, cx);
@@ -199,6 +235,11 @@ impl Shell {
             ),
             ProjectDialog::Theme(view) => (
                 view.read(cx).measured_height().unwrap_or(490.),
+                Default::default(),
+                view.into(),
+            ),
+            ProjectDialog::BrowserStartUrl(view) => (
+                view.read(cx).measured_height().unwrap_or(240.),
                 Default::default(),
                 view.into(),
             ),

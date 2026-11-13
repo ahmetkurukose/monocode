@@ -268,6 +268,13 @@ impl Hosted {
             );
             config.userContentController().addUserScript(&hooks);
             config.setApplicationNameForUserAgent(Some(&NSString::from_str(&safari_suffix())));
+            let prefs = config.preferences();
+            let prefs_obj: &objc2::runtime::AnyObject = &prefs;
+            if msg_send![prefs_obj, respondsToSelector: sel!(_setDeveloperExtrasEnabled:)] {
+                let _: () = msg_send![prefs_obj, _setDeveloperExtrasEnabled: true];
+            } else if msg_send![prefs_obj, respondsToSelector: sel!(setDeveloperExtrasEnabled:)] {
+                let _: () = msg_send![prefs_obj, setDeveloperExtrasEnabled: true];
+            }
             let web = Page::alloc(mtm).set_ivars(link.clone());
             let web: Retained<Page> =
                 msg_send![super(web), initWithFrame: web_frame, configuration: &*config];

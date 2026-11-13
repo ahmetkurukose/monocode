@@ -8,7 +8,7 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
-    index::{Boundary, Column, Direction, Point as GridPoint, Side},
+    index::{Boundary, Column, Direction, Line as GridLine, Point as GridPoint, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{
@@ -739,6 +739,73 @@ impl Drop for Terminal {
                 libc::kill(-pid, libc::SIGHUP);
             }
         }
+    }
+}
+
+impl Terminal {
+    /// Returns up to `max_lines` most recent logical lines (oldest to newest),
+    /// unwrapping soft-wrapped rows (`Flags::WRAPLINE`) so URLs spanning multiple
+    /// columns remain intact.
+    pub(crate) fn recent_lines(&self, max_lines: usize) -> Vec<String> {
+        if max_lines == 0 {
+            return Vec::new();
+        }
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = grid.columns();
+        if cols == 0 {
+            return Vec::new();
+        }
+        let top = grid.topmost_line().0;
+        let mut bottom = grid.bottommost_line().0;
+        let last_col = Column(cols - 1);
+
+        let row_text = |line: GridLine| -> (String, bool) {
+            let row = &grid[line];
+            let mut s = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    s.push(cell.c);
+                }
+            }
+            let wrapped = row[last_col].flags.contains(Flags::WRAPLINE);
+            (s, wrapped)
+        };
+
+        // Trim blank trailing rows below the last output row.
+        while bottom >= top {
+            let (text, wrapped) = row_text(GridLine(bottom));
+            if wrapped || !text.trim_end().is_empty() {
+                break;
+            }
+            bottom -= 1;
+        }
+        if bottom < top {
+            return Vec::new();
+        }
+
+        let mut logical_rev = Vec::new();
+        let mut row = bottom;
+        while row >= top && logical_rev.len() < max_lines {
+            let mut segments = Vec::new();
+            let (first, _) = row_text(GridLine(row));
+            segments.push(first);
+            while row > top {
+                let (prev, prev_wrapped) = row_text(GridLine(row - 1));
+                if !prev_wrapped {
+                    break;
+                }
+                row -= 1;
+                segments.push(prev);
+            }
+            segments.reverse();
+            let joined: String = segments.concat();
+            logical_rev.push(joined.trim_end().to_owned());
+            row -= 1;
+        }
+        logical_rev.reverse();
+        logical_rev
     }
 }
 
@@ -1511,6 +1578,11 @@ impl Terminal {
     pub(crate) fn agent(&self) -> Option<&'static str> {
         agent_cli(self.foreground.as_deref()?)
     }
+
+    #[cfg(test)]
+    pub(crate) fn write_test_output(&self, text: &str) {
+        write_note(&self.term, text);
+    }
 }
 fn is_shell_name(name: &str) -> bool {
     matches!(
@@ -1899,5 +1971,31 @@ mod tests {
             }
         }
         assert!(exited);
+    }
+
+    #[gpui::test]
+    fn recent_lines_reconstruct_soft_wrapped_dev_server_urls(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        let lines = view.update(cx, |terminal, _| {
+            terminal.term.lock().resize(GridSize {
+                columns: 24,
+                lines: 12,
+            });
+            write_note(
+                &terminal.term,
+                "ready\r\n  Local:   http://localhost:5173/dashboard\r\n",
+            );
+            terminal.recent_lines(10)
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("http://localhost:5173/dashboard")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            monocode_core::browser::detect_dev_server_url(&lines).as_deref(),
+            Some("http://localhost:5173/dashboard")
+        );
     }
 }
