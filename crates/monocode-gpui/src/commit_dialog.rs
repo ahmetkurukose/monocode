@@ -1789,8 +1789,10 @@ mod tests {
         };
         // Up: the diff grows by as much, and its bottom stays put.
         let taller = drag(visual, -60.);
-        assert_eq!(taller.size.height, diff.size.height + px(60.));
-        assert_eq!(taller.bottom(), diff.bottom());
+        // Within a pixel: the grip sits on a half pixel at some window sizes.
+        let near = |a: gpui::Pixels, b: gpui::Pixels| (a - b).abs() <= px(1.);
+        assert!(near(taller.size.height, diff.size.height + px(60.)));
+        assert!(near(taller.bottom(), diff.bottom()));
         // Far down: the diff keeps some room.
         let least = drag(visual, 2000.);
         assert!(least.size.height > px(20.) && least.size.height < diff.size.height);
