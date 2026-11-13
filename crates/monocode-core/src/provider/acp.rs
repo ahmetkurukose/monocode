@@ -346,7 +346,28 @@ impl Protocol {
         let kind = self.request.kind;
         let settings = &self.request.settings;
         let planning = settings.plan || settings.access == AccessMode::ReadOnly;
+        let modes = setup["modes"]["availableModes"].as_array();
+        let offered = |id: &str| modes.is_some_and(|modes| modes.iter().any(|m| m["id"] == id));
         let mode = match kind {
+            // `agy acp` names its modes default, accept-edits, auto and plan,
+            // and rejects the standalone server's auto_edit and yolo. It has
+            // no mode that approves everything: under full access its
+            // remaining requests are approved in `request_permission`.
+            Kind::Antigravity if offered("accept-edits") => {
+                if planning {
+                    if offered("plan") {
+                        "plan"
+                    } else {
+                        "default"
+                    }
+                } else {
+                    match settings.access {
+                        AccessMode::FullAccess | AccessMode::Auto if offered("auto") => "auto",
+                        AccessMode::FullAccess | AccessMode::AutoAcceptEdits => "accept-edits",
+                        _ => "default",
+                    }
+                }
+            }
             Kind::Antigravity => {
                 if planning {
                     "default"
@@ -399,9 +420,8 @@ impl Protocol {
             Kind::Cursor => "",
             _ => "",
         };
-        let modes = setup["modes"]["availableModes"].as_array();
         if !mode.is_empty()
-            && (modes.is_some_and(|modes| modes.iter().any(|m| m["id"] == mode))
+            && (offered(mode)
                 || matches!(
                     kind,
                     Kind::Antigravity | Kind::Hermes | Kind::Devin | Kind::Fx
@@ -1700,6 +1720,42 @@ mod tests {
         assert_eq!(args("/opt/homebrew/bin/agy"), vec!["acp"]);
         let standalone = args("/home/me/.local/share/agy-acp/agy_acp_server.par");
         assert!(!standalone.contains(&"acp".to_string()));
+    }
+    #[test]
+    fn antigravity_picks_a_mode_the_server_offers() {
+        let agy = json!({"modes":{"availableModes":[
+            {"id":"default"},{"id":"accept-edits"},{"id":"auto"},{"id":"plan"}
+        ]}});
+        let mode = |access, plan, setup: &Value| {
+            let mut p = protocol(Kind::Antigravity);
+            p.request.settings.access = access;
+            p.request.settings.plan = plan;
+            p.acp_options(setup).unwrap();
+            p.acp.mode
+        };
+        for (access, plan, expected) in [
+            (AccessMode::FullAccess, false, "auto"),
+            (AccessMode::Auto, false, "auto"),
+            (AccessMode::AutoAcceptEdits, false, "accept-edits"),
+            (AccessMode::Supervised, false, "default"),
+            (AccessMode::ReadOnly, false, "plan"),
+            (AccessMode::FullAccess, true, "plan"),
+        ] {
+            assert_eq!(mode(access, plan, &agy), Some(expected), "{access:?}");
+        }
+        // The standalone server takes its own names without advertising them.
+        for (access, expected) in [
+            (AccessMode::FullAccess, "yolo"),
+            (AccessMode::AutoAcceptEdits, "auto_edit"),
+            (AccessMode::Auto, "default"),
+            (AccessMode::ReadOnly, "default"),
+        ] {
+            assert_eq!(
+                mode(access, false, &json!({})),
+                Some(expected),
+                "{access:?}"
+            );
+        }
     }
     #[test]
     fn cursor_planning_denies_execution_without_requiring_a_session_mode() {
