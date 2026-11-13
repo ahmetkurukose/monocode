@@ -493,6 +493,35 @@ impl Protocol {
         }
         Ok(())
     }
+    /// `agy acp` opens and resumes every session on its default model and
+    /// never sends `current_model_update`, so the model that runs is the one
+    /// its config options settle on: `<model>-<thought_level>`.
+    fn antigravity_model(&self, events: &mut Vec<Event>) {
+        if self.request.kind != Kind::Antigravity {
+            return;
+        }
+        let setup = &self.acp.setup;
+        let current = |id: &str| {
+            setup["configOptions"]
+                .as_array()?
+                .iter()
+                .find(|option| config_id(option) == id)?["currentValue"]
+                .as_str()
+        };
+        let Some(model) = current("model") else {
+            return;
+        };
+        let listed = |id: &str| {
+            setup["models"]["availableModels"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|m| m["modelId"] == id))
+        };
+        let model = current("thought_level")
+            .map(|level| format!("{model}-{level}"))
+            .filter(|id| listed(id))
+            .unwrap_or_else(|| model.into());
+        events.push(Event::Model(model));
+    }
     fn acp_settings(&mut self, setup: &Value) {
         let kind = self.request.kind;
         let settings = &self.request.settings;
@@ -926,6 +955,7 @@ impl Protocol {
             Stage::Configure => {
                 if result["configOptions"].is_array() {
                     self.acp.setup["configOptions"] = result["configOptions"].clone();
+                    self.antigravity_model(&mut events);
                 }
                 self.acp_next(stdin)?;
             }
@@ -1076,6 +1106,7 @@ impl Protocol {
             "config_option_update" | "config_options_update" => {
                 if update["configOptions"].is_array() {
                     self.acp.setup["configOptions"] = update["configOptions"].clone();
+                    self.antigravity_model(events);
                 }
             }
             "plan" => {
@@ -1720,6 +1751,36 @@ mod tests {
         assert_eq!(args("/opt/homebrew/bin/agy"), vec!["acp"]);
         let standalone = args("/home/me/.local/share/agy-acp/agy_acp_server.par");
         assert!(!standalone.contains(&"acp".to_string()));
+    }
+    #[test]
+    fn antigravity_reports_the_model_its_config_settles_on() {
+        let mut p = protocol(Kind::Antigravity);
+        p.request.model = Some("gemini-4-hydrogen".into());
+        p.request.settings.effort = Some("high".into());
+        let mut out = Vec::new();
+        p.acp_session(&mut out).unwrap();
+        let options = |model: &str, level: &str| {
+            json!([
+                {"id":"model","category":"model","currentValue":model,"options":[{"value":"gemini-4-carbon"},{"value":"gemini-4-hydrogen"}]},
+                {"id":"thought_level","category":"thought_level","currentValue":level,"options":[{"value":"medium"},{"value":"high"}]}
+            ])
+        };
+        let new = last(&mut out);
+        let events = p.frame(json!({"id":new["id"],"result":{
+            "sessionId":"s",
+            "models":{"currentModelId":"gemini-4-carbon-medium","availableModels":[
+                {"modelId":"gemini-4-carbon-medium"},{"modelId":"gemini-4-hydrogen-medium"},{"modelId":"gemini-4-hydrogen-high"}
+            ]},
+            "configOptions":options("gemini-4-carbon","medium")
+        }}), &mut out).unwrap();
+        assert!(events.contains(&Event::Model("gemini-4-carbon-medium".into())));
+        let model = last(&mut out);
+        assert_eq!(model["params"]["value"], "gemini-4-hydrogen");
+        p.frame(json!({"id":model["id"],"result":{"configOptions":options("gemini-4-hydrogen","medium")}}), &mut out).unwrap();
+        let level = last(&mut out);
+        assert_eq!(level["params"]["configId"], "thought_level");
+        let events = p.frame(json!({"id":level["id"],"result":{"configOptions":options("gemini-4-hydrogen","high")}}), &mut out).unwrap();
+        assert_eq!(events, vec![Event::Model("gemini-4-hydrogen-high".into())]);
     }
     #[test]
     fn antigravity_picks_a_mode_the_server_offers() {
