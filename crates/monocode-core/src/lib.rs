@@ -5,6 +5,8 @@ pub mod api;
 pub mod app_access;
 pub mod app_update;
 pub mod automations;
+pub mod browser;
+pub mod browser_bridge;
 pub mod catalog;
 pub mod checkpoint;
 pub mod context;

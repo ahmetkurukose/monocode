@@ -196,11 +196,12 @@ pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
     ] {
         candidates.push(Path::new(dir).join(kind.binary_name()));
     }
-    if matches!(kind, Kind::Cursor | Kind::Pi) {
-        let alias = if kind == Kind::Cursor {
-            "agent"
-        } else {
-            "pi-coding-agent"
+    if matches!(kind, Kind::Cursor | Kind::Pi | Kind::Antigravity) {
+        // Antigravity: the standalone server wins; otherwise `agy acp` serves it.
+        let alias = match kind {
+            Kind::Cursor => "agent",
+            Kind::Antigravity => "agy",
+            _ => "pi-coding-agent",
         };
         let paths: Vec<_> = candidates
             .iter()
@@ -1413,6 +1414,7 @@ fn run_operation(
         Kind::Codex => {
             command.arg("app-server");
             crate::visual_bridge::configure_codex(&mut command, &request.settings.environment);
+            crate::browser_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::mono::bridge::configure_codex(
                 &mut command,
                 request.settings.mono.as_ref(),
@@ -1490,6 +1492,13 @@ fn run_operation(
                 {
                     system.push(instructions);
                 }
+            }
+            if let Some(server) = (!settings.text_only)
+                .then(|| crate::browser_bridge::mcp_server(&settings.environment))
+                .flatten()
+            {
+                servers.insert(crate::browser_bridge::SERVER_NAME.into(), server);
+                allowed.push(crate::browser_bridge::CLAUDE_ALLOWED_TOOLS);
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);
@@ -1570,11 +1579,13 @@ fn run_operation(
         _ => acp::configure(&mut command, &request)?,
     }
     command
-        .current_dir(if request.kind == Kind::Antigravity {
-            request.binary.parent().unwrap_or(&request.cwd)
-        } else {
-            &request.cwd
-        })
+        .current_dir(
+            if request.kind == Kind::Antigravity && acp::antigravity_standalone(&request.binary) {
+                request.binary.parent().unwrap_or(&request.cwd)
+            } else {
+                &request.cwd
+            },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

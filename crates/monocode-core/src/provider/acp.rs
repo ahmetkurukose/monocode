@@ -48,11 +48,21 @@ pub(super) struct State {
     mode: Option<&'static str>,
 }
 
+/// Antigravity ships its ACP server two ways: the standalone
+/// `agy_acp_server.par`, and the `acp` subcommand of the `agy` CLI.
+pub(super) fn antigravity_standalone(binary: &Path) -> bool {
+    binary
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("par"))
+}
+
 pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), String> {
     let settings = &request.settings;
     match request.kind {
         Kind::Antigravity => {
-            if cfg!(target_os = "linux") {
+            if !antigravity_standalone(&request.binary) {
+                command.arg("acp");
+            } else if cfg!(target_os = "linux") {
                 command.arg("--uid=");
             }
         }
@@ -106,6 +116,12 @@ impl Protocol {
             crate::mono::bridge::acp_server(settings.mono.as_ref(), &settings.environment),
         ) {
             list.push(app);
+        }
+        if let (Some(list), Some(browser)) = (
+            servers.as_array_mut(),
+            crate::browser_bridge::acp_server(&settings.environment),
+        ) {
+            list.push(browser);
         }
         servers
     }
@@ -1668,6 +1684,22 @@ mod tests {
         assert!(choices
             .iter()
             .any(|p| p["configId"] == "fast" && p["type"].is_null() && p["value"] == "false"));
+    }
+    #[test]
+    fn antigravity_runs_the_agy_subcommand_when_there_is_no_standalone_server() {
+        let args = |binary: &str| {
+            let mut p = protocol(Kind::Antigravity);
+            p.request.binary = binary.into();
+            let mut command = Command::new("unused");
+            configure(&mut command, &p.request).unwrap();
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args("/opt/homebrew/bin/agy"), vec!["acp"]);
+        let standalone = args("/home/me/.local/share/agy-acp/agy_acp_server.par");
+        assert!(!standalone.contains(&"acp".to_string()));
     }
     #[test]
     fn cursor_planning_denies_execution_without_requiring_a_session_mode() {
