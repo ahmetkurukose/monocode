@@ -542,6 +542,42 @@ fn records_empty_binary_and_unusual_paths_without_the_old_file_limit() {
 }
 
 #[test]
+fn oversized_untracked_files_stay_out_of_snapshots() {
+    let f = Fixture::new();
+    let huge = |path: &str| {
+        std::fs::File::create(f.repo.join(path))
+            .unwrap()
+            .set_len(MAX_UNTRACKED_FILE_BYTES + 1)
+            .unwrap();
+    };
+    huge("before.bin");
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    huge("during.bin");
+    f.write("new.txt", "new\n");
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let status = f.store.status("session", f.cwd()).unwrap();
+    assert_eq!(
+        status
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect::<Vec<_>>(),
+        ["new.txt"]
+    );
+    let tree = run_git(
+        &f.repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &turn_ref("session", "first", "after"),
+        ],
+    )
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&tree).contains(".bin"));
+}
+
+#[test]
 fn commits_during_the_turn_clear_review_but_preserve_the_recorded_diff() {
     let f = Fixture::new();
     f.store.begin_turn("session", f.cwd(), "first").unwrap();

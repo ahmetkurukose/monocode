@@ -928,7 +928,26 @@ impl Drop for PrivateIndex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
         let _ = std::fs::remove_file(self.0.with_extension("lock"));
+        let _ = std::fs::remove_file(self.0.with_extension("paths"));
     }
+}
+
+/// Untracked files above this size stay out of workspace snapshots. A turn
+/// waits for its snapshot, and copying data dumps into the object store can
+/// take hours and fill the disk. Tracked files are recorded at any size.
+const MAX_UNTRACKED_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+fn within_untracked_limit(root: &Path, relative: &[u8]) -> bool {
+    #[cfg(unix)]
+    let relative = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(relative))
+    };
+    #[cfg(not(unix))]
+    let relative = PathBuf::from(String::from_utf8_lossy(relative).into_owned());
+    std::fs::symlink_metadata(root.join(relative))
+        .map(|meta| !meta.is_file() || meta.len() <= MAX_UNTRACKED_FILE_BYTES)
+        .unwrap_or(true)
 }
 
 fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
@@ -961,7 +980,39 @@ fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
         "-c",
         "core.fsyncMethod=fsync",
     ];
-    run(&[durable.as_slice(), &["add", "-A", "--", "."]].concat())?;
+    // Same result as `add -A`, except for oversized untracked files.
+    if let Err(error) = run(&[durable.as_slice(), &["add", "-u", "--", "."]].concat()) {
+        // `add -u` rejects a folder that has no tracked files yet.
+        if !run(&["ls-files", "-z", "--", "."])?.is_empty() {
+            return Err(error);
+        }
+    }
+    let untracked = run(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+    ])?;
+    let mut paths = Vec::with_capacity(untracked.len());
+    for relative in untracked
+        .split(|byte| *byte == 0)
+        .filter(|relative| !relative.is_empty() && within_untracked_limit(root, relative))
+    {
+        paths.extend_from_slice(relative);
+        paths.push(0);
+    }
+    if !paths.is_empty() {
+        let list = index.0.with_extension("paths");
+        std::fs::write(&list, paths).map_err(|e| e.to_string())?;
+        let from_file = format!("--pathspec-from-file={}", list.display());
+        run(&[
+            durable.as_slice(),
+            &["add", &from_file, "--pathspec-file-nul"],
+        ]
+        .concat())?;
+    }
     let tree = String::from_utf8(run(&[durable.as_slice(), &["write-tree"]].concat())?)
         .map_err(|e| e.to_string())?;
     let commit = String::from_utf8(run(&[
