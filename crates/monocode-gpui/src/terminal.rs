@@ -127,6 +127,13 @@ struct Link {
 }
 
 pub(crate) struct Terminal {
+    /// Text the keyboard is still composing: a dead key waiting for its
+    /// letter (Option-Ü on a Turkish layout is a tilde in waiting), or an
+    /// input method's candidate. Shown at the cursor, sent once it is final.
+    composing: Option<String>,
+    /// What was typed into the shell, for tests to read.
+    #[cfg(test)]
+    typed: std::cell::RefCell<Vec<u8>>,
     context_menu: Option<context_menu::EditingMenu>,
     term: Arc<FairMutex<Term<Listener>>>,
     sender: Option<EventLoopSender>,
@@ -328,6 +335,9 @@ impl Terminal {
             term,
             sender,
             focus: cx.focus_handle(),
+            composing: None,
+            #[cfg(test)]
+            typed: Default::default(),
             title: default_title(&cwd),
             cwd,
             foreground: None,
@@ -425,8 +435,11 @@ impl Terminal {
         self.set_foreground(None, cx);
     }
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        let bytes = bytes.into();
+        #[cfg(test)]
+        self.typed.borrow_mut().extend_from_slice(&bytes);
         if let Some(sender) = &self.sender {
-            let _ = sender.send(Msg::Input(bytes.into()));
+            let _ = sender.send(Msg::Input(bytes));
         }
     }
     /// Typing returns a scrolled-back view to the prompt.
@@ -809,6 +822,86 @@ impl Terminal {
     }
 }
 
+impl gpui::EntityInputHandler for Terminal {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        // Nothing is selected: composed text goes in at the cursor.
+        Some(gpui::UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let text = self.composing.as_ref()?;
+        Some(0..text.encode_utf16().count())
+    }
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.composing.take().is_some() {
+            cx.notify();
+        }
+    }
+    /// The keyboard settled on text: it is typed.
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composing = None;
+        if !text.is_empty() {
+            self.input(text.as_bytes().to_vec(), cx);
+        }
+        cx.notify();
+    }
+    /// The keyboard is still deciding: the text waits at the cursor.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composing = (!text.is_empty()).then(|| text.to_owned());
+        cx.notify();
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        element: Bounds<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        Some(element)
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for Terminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
@@ -863,6 +956,8 @@ struct Painted {
     lines: Vec<(gpui::Point<gpui::Pixels>, ShapedLine)>,
     rects: Vec<(Bounds<gpui::Pixels>, Hsla)>,
     cursor: Option<(Bounds<gpui::Pixels>, Hsla, bool)>,
+    /// Text being composed: the cells it covers, where it starts, the line.
+    composing: Option<(Bounds<gpui::Pixels>, gpui::Point<gpui::Pixels>, ShapedLine)>,
     line_height: gpui::Pixels,
     /// Set while the pointer is over a link, for the pointing hand.
     link_hitbox: Option<gpui::Hitbox>,
@@ -1015,6 +1110,7 @@ impl Element for Grid {
             lines: Vec::new(),
             rects: Vec::new(),
             cursor: None,
+            composing: None,
             line_height,
             link_hitbox: link.map(|_| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)),
         };
@@ -1126,6 +1222,30 @@ impl Element for Grid {
                 fill.a = 0.6;
             }
             painted.cursor = Some((bounds, fill, hollow));
+            // What is being composed sits at the cursor, underlined, until
+            // the keyboard settles on it.
+            if let Some(text) = self.terminal.read(cx).composing.clone()
+                && !text.is_empty()
+            {
+                let ink: Hsla = crate::theme::content(1.);
+                let run = TextRun {
+                    len: text.len(),
+                    font: base.clone(),
+                    color: ink,
+                    background_color: None,
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(ink),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let shaped =
+                    text_system.shape_line(SharedString::from(text), font_size, &[run], None);
+                let back =
+                    Bounds::new(point(x, y), size(shaped.width.max(cell_width), line_height));
+                painted.composing = Some((back, point(x, y), shaped));
+            }
         }
         painted
     }
@@ -1153,6 +1273,14 @@ impl Element for Grid {
                 let _ = terminal.update(cx, |terminal, cx| terminal.mouse_up(event, cx));
             }
         });
+        // Dead keys and input methods compose text before it is typed; the
+        // focused terminal takes what they produce.
+        let focus = self.terminal.read(cx).focus.clone();
+        window.handle_input(
+            &focus,
+            gpui::ElementInputHandler::new(bounds, self.terminal.clone()),
+            cx,
+        );
         if let Some(hitbox) = &painted.link_hitbox {
             window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
         }
@@ -1169,6 +1297,10 @@ impl Element for Grid {
                     window,
                     cx,
                 );
+            }
+            if let Some((back, at, line)) = &painted.composing {
+                window.paint_quad(gpui::fill(*back, pane_fill()));
+                let _ = line.paint(*at, painted.line_height, TextAlign::Left, None, window, cx);
             }
             if let Some((rect, fill, hollow)) = painted.cursor {
                 if hollow {
@@ -1470,6 +1602,24 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
     {
         return Some(typed.as_bytes().to_vec());
     }
+    // A dead key is left to the keyboard's own composing, whatever key it is
+    // on: Option-Ü (a tilde in waiting) and Option-, (a backtick) on a Turkish
+    // layout. GPUI reports one as the character it would give with a space,
+    // and with Option held that space is a no-break one, so it arrives as
+    // two characters. Sent as Meta it would be ESC and the key, which the
+    // shell takes for a command.
+    if m.alt
+        && keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|typed| typed.chars().count() > 1)
+    {
+        return None;
+    }
+    // Nor can a key with no ASCII name be a Meta key.
+    if m.alt && !key.is_ascii() {
+        return None;
+    }
     if m.alt {
         let text = if key == "space" {
             " ".to_owned()
@@ -1667,6 +1817,44 @@ mod tests {
             assert_eq!(terminal.link_at(at(2, 10)), None, "ftp:// stays inert");
             assert_eq!(terminal.link_at(point(px(-4.), px(1.))), None);
         });
+    }
+
+    #[gpui::test]
+    fn a_dead_key_waits_at_the_cursor_and_is_typed_once_composed(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| Terminal::new("/tmp".into(), cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |terminal, window, cx| {
+                terminal.typed.borrow_mut().clear();
+                // Option-Ü on a Turkish layout: a tilde, not yet typed.
+                terminal.replace_and_mark_text_in_range(None, "~", None, window, cx);
+                assert_eq!(terminal.composing.as_deref(), Some("~"));
+                assert_eq!(terminal.marked_text_range(window, cx), Some(0..1));
+                assert!(
+                    terminal.typed.borrow().is_empty(),
+                    "nothing reaches the shell yet"
+                );
+                // The next key settles it: a slash after it gives "~/".
+                terminal.replace_text_in_range(None, "~/", window, cx);
+                assert_eq!(terminal.composing, None);
+                assert_eq!(*terminal.typed.borrow(), b"~/");
+                assert_eq!(terminal.marked_text_range(window, cx), None);
+                // With a letter it combines: ñ, in UTF-8.
+                terminal.replace_and_mark_text_in_range(None, "~", None, window, cx);
+                terminal.replace_text_in_range(None, "ñ", window, cx);
+                assert_eq!(*terminal.typed.borrow(), "~/ñ".as_bytes());
+                // Escape drops what was waiting.
+                terminal.replace_and_mark_text_in_range(None, "~", None, window, cx);
+                terminal.unmark_text(window, cx);
+                assert_eq!(terminal.composing, None);
+                assert_eq!(*terminal.typed.borrow(), "~/ñ".as_bytes());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -1872,6 +2060,24 @@ mod tests {
         assert_eq!(send(option("7", "|", false)), Some(b"|".to_vec()));
         assert_eq!(send(option("b", "∫", false)), Some(b"\x1bb".to_vec()));
         assert_eq!(send(option("f", "ƒ", false)), Some(b"\x1bf".to_vec()));
+        // A dead key (Turkish Option-Ü, a tilde in waiting) types nothing by
+        // itself and is no Meta key either: it is left to be composed.
+        let dead = Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+            key: "ü".into(),
+            key_char: None,
+        };
+        assert_eq!(send(dead), None);
+        // As GPUI really reports them: the character, then the no-break
+        // space Option-Space gives. On an ASCII key too (Option-, is a
+        // backtick in waiting), where Meta would have sent ESC and a comma.
+        assert_eq!(send(option("ü", "~\u{a0}", false)), None);
+        assert_eq!(send(option(",", "`\u{a0}", false)), None);
+        // Option-N types a tilde outright on that layout: no composing.
+        assert_eq!(send(option("n", "~", false)), Some(b"~".to_vec()));
         // A key that types its own letter stays Meta.
         assert_eq!(send(option("b", "b", false)), Some(b"\x1bb".to_vec()));
         assert_eq!(send(option("b", "B", true)), Some(b"\x1bB".to_vec()));
