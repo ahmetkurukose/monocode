@@ -6,6 +6,9 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const env = {
   ...process.env,
   CARGO_BUILD_JOBS: process.env.CARGO_BUILD_JOBS || "1",
+  // This fork's local build is called SOCode. Release packaging does not go
+  // through this script, so it keeps the upstream name.
+  MONOCODE_NATIVE_APP_NAME: process.env.MONOCODE_NATIVE_APP_NAME || "SOCode",
 };
 
 function run(command, args, capture = false) {

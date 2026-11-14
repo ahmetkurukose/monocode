@@ -61,9 +61,9 @@ if [ "$install" = 1 ]; then
   cargo test --locked --manifest-path "$manifest" -p monocode-core --profile native-dev
   cargo test --locked --manifest-path "$manifest" -p monocode-gpui --profile native-dev -- --test-threads=1
   CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}" npm run native:build
-  ditto "crates/monocode-gpui/target/release/Monocode Native.app" "/Applications/Monocode Native.app"
-  codesign --verify --deep "/Applications/Monocode Native.app"
-  echo 'Installed. Restart Monocode Native.'
+  ditto "crates/monocode-gpui/target/release/SOCode.app" "/Applications/SOCode.app"
+  codesign --verify --deep "/Applications/SOCode.app"
+  echo 'Installed. Restart SOCode.'
 fi
 
 if [ "$push" = 1 ]; then

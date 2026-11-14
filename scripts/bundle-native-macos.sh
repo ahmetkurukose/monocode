@@ -20,7 +20,11 @@ case "$native_data_mode" in
   dev-data|monocode-data) ;;
   *) echo "Unknown data mode: $native_data_mode" >&2; exit 1 ;;
 esac
-native_bundle="$native_target/Monocode Native.app"
+# The name people see (Finder, Dock, menu bar) and the bundle's file name. The
+# bundle identifier and the executable never change with it, so a renamed
+# build keeps the same data, keychain items and website sign-ins.
+native_name="${MONOCODE_NATIVE_APP_NAME:-Monocode Native}"
+native_bundle="$native_target/$native_name.app"
 native_binary="$native_target/monocode-gpui"
 if [ ! -f "$native_binary" ]; then
   echo "Missing native executable: $native_binary" >&2
@@ -61,8 +65,8 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleExecutable</key><string>$native_executable</string>
 <key>MonocodeDataMode</key><string>$native_data_mode</string>
 <key>CFBundleIdentifier</key><string>dev.usemono.gpui</string>
-<key>CFBundleName</key><string>Monocode Native</string>
-<key>CFBundleDisplayName</key><string>Monocode Native</string>
+<key>CFBundleName</key><string>$native_name</string>
+<key>CFBundleDisplayName</key><string>$native_name</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$native_short_version</string>
 <key>CFBundleVersion</key><string>$native_build_version</string>

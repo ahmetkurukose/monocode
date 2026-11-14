@@ -59,4 +59,19 @@ test("Finder launches use development data for dev bundles and installed data fo
       assert.deepEqual(launched.stdout.trim().split("\n"), ["--cwd", "a project with spaces"]);
     });
   }
+  await t.test("a chosen name names the bundle and what the Finder shows, not the app's identity", async () => {
+    const output = join(target, "release");
+    const packaged = spawnSync("bash", ["scripts/bundle-native-macos.sh", "release", target, "0.16.0"], {
+      cwd: root,
+      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}`, MONOCODE_NATIVE_APP_NAME: "SOCode" },
+      encoding: "utf8",
+    });
+    assert.ifError(packaged.error);
+    assert.equal(packaged.status, 0, packaged.stdout + packaged.stderr);
+    const plist = await readFile(join(output, "SOCode.app/Contents/Info.plist"), "utf8");
+    assert.ok(plist.includes("<key>CFBundleName</key><string>SOCode</string>"));
+    assert.ok(plist.includes("<key>CFBundleDisplayName</key><string>SOCode</string>"));
+    assert.ok(plist.includes("<key>CFBundleIdentifier</key><string>dev.usemono.gpui</string>"));
+    assert.ok(plist.includes("<key>CFBundleExecutable</key><string>monocode-gpui</string>"));
+  });
 });
