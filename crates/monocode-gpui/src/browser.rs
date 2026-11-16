@@ -775,6 +775,15 @@ impl BrowserView {
     }
 
     /// Whether the keyboard is the page's.
+    /// Keys go to the app's own view, not to the page and not to nobody.
+    pub(crate) fn keyboard_with_app(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(host) = self.host.borrow().as_ref() {
+            return host.keyboard_with_app();
+        }
+        true
+    }
+
     pub(crate) fn has_keyboard(&self) -> bool {
         #[cfg(target_os = "macos")]
         if let Some(host) = self.host.borrow().as_ref() {

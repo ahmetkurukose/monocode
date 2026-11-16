@@ -439,6 +439,45 @@ impl Shell {
             .map_err(gone)?;
         wait(cx, 900).await;
         page_state!("after_overlay");
+        // Leaving for a chat while the page has the keyboard: the chat's
+        // input is focused, and the keys go to the app with it.
+        let (x, y) = centre(&eval!(&format!("{RECT}('a')")));
+        act!(|page: &crate::browser::BrowserView| page.click_at(x, y));
+        let in_page = this
+            .update_in(cx, |this, _, cx| {
+                page(this).is_some_and(|page| page.read(cx).has_keyboard())
+            })
+            .map_err(gone)?;
+        let chat = this
+            .update_in(cx, |this, window, cx| {
+                let chat = this
+                    .terminal_owner()
+                    .or_else(|| this.project_session_for_terminal())?;
+                this.open(chat, window, cx);
+                Some(chat)
+            })
+            .map_err(gone)?;
+        wait(cx, 900).await;
+        let in_chat = this
+            .update_in(cx, |this, window, cx| {
+                let input = chat
+                    .and_then(|chat| this.sessions.get(&chat))
+                    .map(|view| view.read(cx).input.read(cx).focus_handle(cx));
+                serde_json::json!({
+                    "chat": chat,
+                    "keyboard_was_in_page": in_page,
+                    "input_focused": input.is_some_and(|focus| focus.is_focused(window)),
+                    "keyboard_with_app":
+                        page(this).is_some_and(|page| page.read(cx).keyboard_with_app()),
+                })
+            })
+            .map_err(gone)?;
+        steps.push(("leave_for_chat".into(), in_chat));
+        this.update_in(cx, |this, window, cx| {
+            this.open_browser_pane(pane, window, cx)
+        })
+        .map_err(gone)?;
+        wait(cx, 900).await;
         // A file the page cannot show is saved, and the pane says so.
         let (x, y) = centre(&eval!(&format!("{RECT}('zip')")));
         act!(|page: &crate::browser::BrowserView| page.click_at(x, y));

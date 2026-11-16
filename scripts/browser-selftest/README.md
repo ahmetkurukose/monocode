@@ -16,7 +16,8 @@ Set up once per boot (the scripts expect `/tmp/mc-selftest`):
 - `run.sh` opens the test page in a browser pane and sends real mouse and key
   events through the app's own event path: a click focuses a field, typing
   reaches it, ⌘A ⌘C ⌘V work, the page gives way to a picture of itself under
-  an overlay and takes the keyboard back, a download is saved, a link for a
+  an overlay and takes the keyboard back, a chat opened while the page has
+  the keyboard can be typed in at once, a download is saved, a link for a
   new window opens a page of its own. Prints a JSON report.
 - `agent.py steps1.py` starts the app and drives the MCP tools the way a
   provider does (`monocode-gpui browser-mcp`): open, read, find, type, click,

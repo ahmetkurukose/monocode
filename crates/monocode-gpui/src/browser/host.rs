@@ -11,7 +11,7 @@ use objc2::{
     runtime::{ProtocolObject, Sel},
     sel,
 };
-use objc2_app_kit::{NSApplication, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_foundation::{
     NSError, NSObject, NSObjectProtocol, NSRect, NSString, NSURL, NSURLRequest,
 };
@@ -323,7 +323,24 @@ impl Hosted {
     }
 
     pub(super) fn hide(&self) {
+        self.release_keyboard();
         self.clip.setHidden(true);
+    }
+
+    /// A page that had the keyboard keeps it when it leaves the screen:
+    /// AppKit hands it to the window, not to GPUI's view, and whatever GPUI
+    /// focuses next shows its caret and hears no key until it is clicked.
+    /// The keyboard goes back to the view the page sits in.
+    fn release_keyboard(&self) {
+        let Some(window) = self.web.window() else {
+            return;
+        };
+        let held = (window.firstResponder())
+            .and_then(|responder| responder.downcast::<NSView>().ok())
+            .is_some_and(|view| view.isDescendantOf(&self.clip));
+        if held && let Some(parent) = unsafe { self.clip.superview() } {
+            window.makeFirstResponder(Some(&parent));
+        }
     }
 
     pub(super) fn load(&self, url: &str) {
@@ -394,6 +411,22 @@ impl Hosted {
     }
 
     /// Whether the keyboard is the page's: the web view, or a view inside it.
+    /// The keyboard is with the view the page sits in: GPUI's.
+    pub(super) fn keyboard_with_app(&self) -> bool {
+        let Some(window) = self.web.window() else {
+            return false;
+        };
+        let responder = window.firstResponder();
+        let parent = unsafe { self.clip.superview() };
+        match (responder, parent) {
+            (Some(responder), Some(parent)) => {
+                let (responder, parent): (&NSResponder, &NSResponder) = (&responder, &parent);
+                std::ptr::eq(responder, parent)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn has_keyboard(&self) -> bool {
         let Some(window) = self.web.window() else {
             return false;
