@@ -821,6 +821,9 @@ pub(crate) struct Shell {
     /// A chat that "Add to Chat" wrote to: shown if its tab is not, since
     /// text added to a draft out of sight looks like nothing happened.
     pending_chat_reveal: Option<i64>,
+    /// A file tab asked for its row in the Explorer; shown once a window
+    /// is at hand.
+    pending_explorer_reveal: Option<String>,
     /// Text and files on their way to a data source's console, handled on the
     /// next frame (which has the window the Database view needs).
     pending_database_sends: Vec<database_send::DbSend>,
@@ -1219,6 +1222,7 @@ impl Shell {
             pending_review: None,
             pending_composer_focus: None,
             pending_chat_reveal: None,
+            pending_explorer_reveal: None,
             pending_database_sends: Vec::new(),
             database_dir: crate::data_dir().join("db"),
             api_state_dir: crate::data_dir().join("api"),
@@ -2062,6 +2066,12 @@ impl Shell {
         let explorer = panel.read(cx).explorer.clone();
         let database_dir = self.database_dir.clone();
         explorer.update(cx, |explorer, _| explorer.database_dir = database_dir);
+        let follow = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            // The panel is in place by then; the file already in front is
+            // its first row to show.
+            let _ = follow.update(cx, |this, cx| this.follow_front_file(cx));
+        });
         self.observations.push(cx.subscribe(
             &explorer,
             |this, _, _: &crate::explorer::ToggleExcluded, cx| {
@@ -2348,7 +2358,12 @@ impl Shell {
                             return;
                         }
                         this.workspace.reviews.insert(id, state);
+                        this.follow_front_file(cx);
                         this.persist(cx);
+                    }
+                    ReviewEvent::ShowInExplorer(path) => {
+                        this.pending_explorer_reveal = Some(path.clone());
+                        cx.notify();
                     }
                     ReviewEvent::Comment(text) => {
                         let owner = this.workspace.session_for_pane(id);
@@ -4414,8 +4429,43 @@ impl Shell {
             });
         }
     }
+    /// The Explorer follows the editor: the file of the pane in front is
+    /// the row it shows. Nothing changes while no file is in front.
+    fn follow_front_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = (self.workspace.active)
+            .and_then(|pane| self.workspace.reviews.get(&pane))
+            .and_then(|state| state.tabs.get(state.active))
+            .and_then(|tab| tab.file())
+            .map(|(_, path)| path)
+        else {
+            return;
+        };
+        if let Some(panel) = &self.right_panel {
+            let explorer = panel.read(cx).explorer.clone();
+            explorer.update(cx, |explorer, cx| explorer.follow(&path, cx));
+        }
+    }
+    /// Opens the Explorer on a file's row.
+    fn show_in_explorer(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.classic_layout && !self.project_rail_tree_on() {
+            self.select_classic_sidebar_tab(classic_sidebar::ClassicSidebarTab::Files, window, cx);
+        } else {
+            self.ensure_right_panel(window, cx);
+            if let Some(panel) = self.right_panel.clone() {
+                panel.update(cx, |panel, cx| {
+                    panel.select(crate::right_panel::RightTab::Files, cx)
+                });
+            }
+            self.set_right_panel_open(true, window, cx);
+        }
+        if let Some(panel) = &self.right_panel {
+            let explorer = panel.read(cx).explorer.clone();
+            explorer.update(cx, |explorer, cx| explorer.show(path, cx));
+        }
+    }
     pub(crate) fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_visible_idle_agents(cx);
+        self.follow_front_file(cx);
         if let Some(search) = &self.app_search {
             window.focus(&search.view.focus_handle(cx), cx);
             return;
@@ -8948,6 +8998,9 @@ impl Render for Shell {
             });
         }
         // A file in a tab of its own has its chat in another tab: go there.
+        if let Some(path) = self.pending_explorer_reveal.take() {
+            self.show_in_explorer(&path, window, cx);
+        }
         if let Some(id) = self.pending_chat_reveal.take()
             && self.sessions.contains_key(&id)
             && !(self.workspace.active_tab())

@@ -209,6 +209,10 @@ pub(crate) struct Explorer {
     op_error: Option<String>,
     lines: Vec<Line>,
     list: ListState,
+    /// The file in front in the editor, and whether the tree still has
+    /// to open its folders and scroll to it.
+    front: Option<String>,
+    front_pending: bool,
     focus: FocusHandle,
     keyboard: bool,
     typeahead: (String, Option<Instant>),
@@ -312,6 +316,8 @@ impl Explorer {
             op_error: None,
             lines: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(300.)),
+            front: None,
+            front_pending: false,
             focus: cx.focus_handle(),
             keyboard: false,
             typeahead: (String::new(), None),
@@ -334,10 +340,61 @@ impl Explorer {
             if !was {
                 self.refresh_loaded(cx);
             }
+            self.show_front(cx);
         }
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_active(enabled, cx));
         }
+    }
+    /// The tree follows the editor: the file in front has its folders
+    /// opened and its row selected and scrolled to. A file that is already
+    /// the one followed is left alone, so folders closed by hand stay closed.
+    pub(crate) fn follow(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.front.as_deref() == Some(path) {
+            return;
+        }
+        self.front = Some(path.to_owned());
+        self.front_pending = true;
+        if self.enabled {
+            self.show_front(cx);
+        }
+    }
+    /// The file the tree was last told is in front, for tests.
+    #[cfg(test)]
+    pub(crate) fn front(&self) -> Option<&str> {
+        self.front.as_deref()
+    }
+    /// Asked for by name: shown again even when it is the file followed,
+    /// since its folders may have been closed since.
+    pub(crate) fn show(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.front = None;
+        self.follow(path, cx);
+    }
+    fn show_front(&mut self, cx: &mut Context<Self>) {
+        if !self.front_pending || !self.available() {
+            return;
+        }
+        let Some(path) = self.front.clone() else {
+            return;
+        };
+        // Another project's file, or the tree is still on the last project:
+        // it is shown when the tree gets there.
+        let Some(inside) = path
+            .strip_prefix(&self.cwd)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            return;
+        };
+        let mut dirs = vec![self.cwd.clone()];
+        let mut folder = self.cwd.clone();
+        let parts: Vec<&str> = inside.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            folder = format!("{folder}/{part}");
+            dirs.push(folder.clone());
+        }
+        self.expand(&dirs, cx);
+        self.selected = Some(path);
+        self.rebuild(cx);
     }
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_project(cx);
@@ -425,6 +482,9 @@ impl Explorer {
         self.list.scroll_to(gpui::ListOffset::default());
         self.read_dir(root, cx);
         self.rebuild(cx);
+        // The file in front may be this project's.
+        self.front_pending = self.front.is_some();
+        self.show_front(cx);
         true
     }
     fn available(&self) -> bool {
@@ -513,6 +573,16 @@ impl Explorer {
         let old = self.lines.len();
         self.lines = lines;
         self.list.splice(0..old, self.lines.len());
+        // Folders are read in the background: the followed file's row is
+        // scrolled to in the rebuild that first has it.
+        if self.front_pending
+            && let Some(front) = &self.front
+            && let Some(ix) = (self.lines.iter())
+                .position(|l| matches!(l, Line::Entry { entry, .. } if entry.path == *front))
+        {
+            self.front_pending = false;
+            self.list.scroll_to_reveal_item(ix);
+        }
         cx.notify();
     }
     fn push_children(&self, parent: &str, depth: usize, lines: &mut Vec<Line>, cx: &App) {
@@ -1794,5 +1864,72 @@ impl Render for Explorer {
             )
             .children(menu)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn the_tree_follows_the_file_in_front_and_leaves_closed_folders_closed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        std::fs::create_dir_all(format!("{cwd}/src/shell")).unwrap();
+        std::fs::write(format!("{cwd}/src/shell/panes.rs"), "").unwrap();
+        std::fs::write(format!("{cwd}/Cargo.toml"), "").unwrap();
+        let file = format!("{cwd}/src/shell/panes.rs");
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| Explorer::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        let shown = |explorer: &Explorer, path: &str| {
+            (explorer.lines.iter())
+                .any(|l| matches!(l, Line::Entry { entry, .. } if entry.path == path))
+        };
+        // Followed while the tree is hidden: shown as soon as it is not.
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.follow(&file, cx);
+                assert_eq!(explorer.selected, None);
+                explorer.set_enabled(true, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| {
+                assert_eq!(explorer.selected.as_deref(), Some(file.as_str()));
+                assert!(explorer.expanded.contains(&format!("{cwd}/src/shell")));
+                assert!(shown(explorer, &file), "its folders were read and opened");
+                assert!(!explorer.front_pending, "and its row scrolled to");
+                // A folder closed by hand stays closed while the same file
+                // is in front, however often the editor says so.
+                explorer.toggle(&format!("{cwd}/src"), cx);
+                explorer.follow(&file, cx);
+                assert!(!shown(explorer, &file));
+                // Another file in front moves the selection.
+                explorer.follow(&format!("{cwd}/Cargo.toml"), cx);
+                assert_eq!(
+                    explorer.selected.as_deref(),
+                    Some(format!("{cwd}/Cargo.toml").as_str())
+                );
+                // A file of another project changes nothing here.
+                explorer.follow("/elsewhere/notes.md", cx);
+                assert_eq!(
+                    explorer.selected.as_deref(),
+                    Some(format!("{cwd}/Cargo.toml").as_str())
+                );
+                // Asked for by name, the first file's folders open again.
+                explorer.show(&file, cx);
+                assert!(shown(explorer, &file));
+                assert_eq!(explorer.selected.as_deref(), Some(file.as_str()));
+            })
+            .unwrap();
     }
 }

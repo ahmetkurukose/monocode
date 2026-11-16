@@ -125,6 +125,35 @@ impl ReviewTab {
     }
 }
 
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else if cfg!(target_os = "windows") {
+    "Reveal in File Explorer"
+} else {
+    "Open Containing Folder"
+};
+
+impl ReviewTab {
+    /// The one file the tab is about, with the folder it is relative to.
+    pub(crate) fn file(&self) -> Option<(String, String)> {
+        match self {
+            Self::File { cwd, path }
+            | Self::Changes {
+                cwd,
+                path: Some(path),
+                ..
+            } => {
+                let path = match std::path::Path::new(path).is_absolute() {
+                    true => path.clone(),
+                    false => format!("{}/{path}", cwd.trim_end_matches('/')),
+                };
+                Some((cwd.clone(), path))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ReviewState {
@@ -150,6 +179,8 @@ pub(crate) enum ReviewEvent {
     DragPane(Point<Pixels>),
     /// The last tab closed.
     Empty,
+    /// A file's tab asked for its row in the Explorer.
+    ShowInExplorer(String),
     WordWrap(bool),
 }
 
@@ -1481,19 +1512,55 @@ impl ReviewPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = vec![
+        let mut items: Vec<crate::popover::MenuItem> = vec![
             MenuAction::new("close", "Close").into(),
             MenuAction::new("close-others", "Close Others")
                 .disabled(self.sources.len() < 2)
                 .into(),
         ];
+        // A tab that is one file offers what the Explorer does for it.
+        let file = self.sources.get(ix).and_then(|source| source.tab.file());
+        if file.is_some() {
+            items.extend([
+                crate::popover::MenuItem::Separator,
+                MenuAction::new("copy-path", "Copy Path").into(),
+                MenuAction::new("copy-relative-path", "Copy Relative Path").into(),
+                MenuAction::new("copy-name", "Copy File Name").into(),
+                crate::popover::MenuItem::Separator,
+                MenuAction::new("show-in-explorer", "Show in Explorer").into(),
+                MenuAction::new("reveal", REVEAL_LABEL).into(),
+            ]);
+        }
         let menu = cx.new(|cx| Menu::new("File tab actions", items, window, cx));
         let events = cx.subscribe(&menu, move |this, _, event: &MenuEvent, cx| {
             this.menu = None;
             if let MenuEvent::Picked(id, _) = event {
-                match id.as_ref() {
-                    "close" => this.close_tab(ix, cx),
-                    "close-others" => this.close_others(ix, cx),
+                let copy = |text: String, cx: &mut Context<Self>| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text))
+                };
+                match (id.as_ref(), &file) {
+                    ("close", _) => this.close_tab(ix, cx),
+                    ("close-others", _) => this.close_others(ix, cx),
+                    ("copy-path", Some((_, path))) => copy(path.clone(), cx),
+                    ("copy-relative-path", Some((cwd, path))) => {
+                        copy(monocode_core::files::display_path(path, Some(cwd)), cx)
+                    }
+                    ("copy-name", Some((_, path))) => {
+                        copy(path.rsplit('/').next().unwrap_or(path).to_owned(), cx)
+                    }
+                    ("show-in-explorer", Some((_, path))) => {
+                        cx.emit(ReviewEvent::ShowInExplorer(path.clone()))
+                    }
+                    ("reveal", Some((_, path))) => {
+                        let path = std::path::PathBuf::from(path);
+                        cx.background_executor()
+                            .spawn(async move {
+                                if let Err(error) = monocode_core::files::reveal_path(&path) {
+                                    log_error(&error);
+                                }
+                            })
+                            .detach();
+                    }
                     _ => {}
                 }
             }
@@ -1972,6 +2039,83 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[gpui::test]
+    fn a_file_tabs_menu_copies_its_paths_and_asks_for_its_explorer_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = Repo::new();
+        let cwd = repo.cwd();
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        std::fs::write(repo.0.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let path = format!("{cwd}/src/lib.rs");
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| ReviewPane::new(git, Default::default(), cx))
+            })
+            .unwrap()
+        });
+        let seen = asked.clone();
+        let _events = window
+            .update(cx, |pane, _, cx| {
+                pane.open(
+                    ReviewTab::File {
+                        cwd: cwd.clone(),
+                        path: path.clone(),
+                    },
+                    cx,
+                );
+                pane.set_visible(true, cx);
+                cx.subscribe(&cx.entity(), move |_, _, event: &ReviewEvent, _| {
+                    if let ReviewEvent::ShowInExplorer(path) = event {
+                        seen.borrow_mut().push(path.clone());
+                    }
+                })
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let mut pick = |action: &str| {
+            window
+                .update(visual, |pane, w, cx| {
+                    pane.open_tab_menu(0, gpui::point(px(40.), px(40.)), w, cx)
+                })
+                .unwrap();
+            visual.run_until_parked();
+            let at = visual
+                .debug_bounds(Box::leak(format!("menu-action-{action}").into_boxed_str()))
+                .unwrap_or_else(|| panic!("{action} is in the menu"))
+                .center();
+            visual.simulate_click(at, gpui::Modifiers::none());
+            visual.run_until_parked();
+            visual.read_from_clipboard().and_then(|item| item.text())
+        };
+        assert_eq!(pick("copy-path").as_deref(), Some(path.as_str()));
+        assert_eq!(pick("copy-relative-path").as_deref(), Some("src/lib.rs"));
+        assert_eq!(pick("copy-name").as_deref(), Some("lib.rs"));
+        pick("show-in-explorer");
+        assert_eq!(*asked.borrow(), vec![path.clone()]);
+
+        // A tab that is not one file keeps the two actions it had.
+        window
+            .update(visual, |pane, w, cx| {
+                pane.open(
+                    ReviewTab::Changes {
+                        cwd: cwd.clone(),
+                        path: None,
+                        staged: None,
+                    },
+                    cx,
+                );
+                pane.open_tab_menu(1, gpui::point(px(40.), px(40.)), w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("menu-action-close").is_some());
+        assert!(visual.debug_bounds("menu-action-copy-path").is_none());
     }
 
     #[gpui::test]

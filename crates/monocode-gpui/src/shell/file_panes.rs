@@ -116,6 +116,60 @@ mod tests {
     use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, point};
 
     #[gpui::test]
+    fn the_explorer_is_told_the_file_in_front_and_shown_on_request(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let front = |shell: &Shell, cx: &App| {
+            let panel = shell.right_panel.as_ref()?;
+            let explorer = panel.read(cx).explorer.clone();
+            explorer.read(cx).front().map(str::to_owned)
+        };
+        let file = |name: &str| ReviewTab::File {
+            cwd: "/work/monocode".into(),
+            path: format!("/work/monocode/{name}"),
+        };
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(session, w, cx);
+                shell.open_review(file("a.rs"), w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        // The panel made after the file was opened starts on that file.
+        window
+            .update(visual, |shell, w, cx| shell.ensure_right_panel(w, cx))
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                assert_eq!(front(shell, cx).as_deref(), Some("/work/monocode/a.rs"));
+                shell.open_review(file("b.rs"), w, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(front(shell, cx).as_deref(), Some("/work/monocode/b.rs"));
+                // The tab's menu asks for the row: the panel opens on Explorer.
+                shell.workspace.right_panel_open = false;
+                shell.pending_explorer_reveal = Some("/work/monocode/a.rs".into());
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.pending_explorer_reveal.is_none());
+                assert!(shell.workspace.right_panel_open || shell.workspace.classic_layout);
+                let panel = shell.right_panel.as_ref().unwrap();
+                assert_eq!(panel.read(cx).tab(), crate::right_panel::RightTab::Files);
+                assert_eq!(front(shell, cx).as_deref(), Some("/work/monocode/a.rs"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn mono_file_link_opens_visible_editor_and_preserves_its_chat(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, session) = window(cx);
