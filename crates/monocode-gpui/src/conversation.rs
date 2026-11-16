@@ -1152,7 +1152,7 @@ impl Conversation {
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| p.claude_chrome);
         settings.model = self.model.clone();
-        settings.environment.extend(self.app_environment.clone());
+        settings.environment.extend(self.transport_environment(cx));
         if settings.remote_action.as_ref().is_none_or(|action| {
             (action["type"] == "send"
                 && action["draftBlockId"].is_null()

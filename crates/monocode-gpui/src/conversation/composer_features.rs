@@ -20,6 +20,20 @@ impl Conversation {
                 .update(cx, |input, cx| input.set_text(format!("{text} "), cx));
         }
     }
+    /// What the agent's process is given on top of its saved settings:
+    /// the project's terminal setup, then this app's own capabilities.
+    /// None of it is saved with the conversation.
+    pub(super) fn transport_environment(
+        &self,
+        cx: &gpui::App,
+    ) -> std::collections::HashMap<String, String> {
+        let mut environment: std::collections::HashMap<String, String> =
+            crate::terminal_setup::agent_environment(&self.summary.cwd, self.execution_cwd(), cx)
+                .into_iter()
+                .collect();
+        environment.extend(self.app_environment.clone());
+        environment
+    }
     pub(crate) fn set_app_environment(
         &mut self,
         environment: std::collections::HashMap<String, String>,

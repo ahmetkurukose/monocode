@@ -88,8 +88,13 @@ impl Shell {
         if let Some(view) = self.terminal_pane_views.get(&pane) {
             return Some(view.clone());
         }
-        let cwd = self.workspace.terminal_panes.get(&pane)?.cwd.clone();
-        let view = self.spawn_terminal(cwd, cx);
+        let state = self.workspace.terminal_panes.get(&pane)?;
+        let cwd = state.cwd.clone();
+        // A restored pane belongs to its owner's project, which need not
+        // be the one in front.
+        let project = (self.session_summaries.get(&state.owner))
+            .map_or_else(|| self.workspace.project.clone(), |s| s.cwd.clone());
+        let view = self.spawn_terminal_in(&project, cwd, cx);
         self.terminal_pane_views.insert(pane, view.clone());
         Some(view)
     }

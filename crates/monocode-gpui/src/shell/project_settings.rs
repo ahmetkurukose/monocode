@@ -20,6 +20,7 @@ enum ProjectDialog {
     Background(Entity<BackgroundDialog>),
     Theme(Entity<ThemeDialog>),
     BrowserStartUrl(Entity<BrowserStartDialog>),
+    TerminalSetup(Entity<crate::terminal_setup::TerminalSetupDialog>),
 }
 impl Shell {
     pub(super) fn appearance(&self, path: &str) -> ProjectAppearance {
@@ -214,6 +215,30 @@ impl Shell {
         });
         cx.notify();
     }
+    #[cfg(test)]
+    pub(super) fn terminal_setup_dialog(
+        &self,
+    ) -> Option<Entity<crate::terminal_setup::TerminalSetupDialog>> {
+        match &self.background_dialog.as_ref()?.view {
+            ProjectDialog::TerminalSetup(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+    pub(super) fn close_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_background_dialog(window, cx);
+    }
+    pub(super) fn show_terminal_setup_dialog(
+        &mut self,
+        view: Entity<crate::terminal_setup::TerminalSetupDialog>,
+        events: Subscription,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_dialog = Some(OpenBackground {
+            view: ProjectDialog::TerminalSetup(view),
+            _events: events,
+        });
+        cx.notify();
+    }
     fn close_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.background_dialog = None;
         self.focus_workspace(window, cx);
@@ -240,6 +265,11 @@ impl Shell {
             ),
             ProjectDialog::BrowserStartUrl(view) => (
                 view.read(cx).measured_height().unwrap_or(240.),
+                Default::default(),
+                view.into(),
+            ),
+            ProjectDialog::TerminalSetup(view) => (
+                view.read(cx).measured_height().unwrap_or(560.),
                 Default::default(),
                 view.into(),
             ),

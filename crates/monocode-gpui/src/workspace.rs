@@ -197,6 +197,10 @@ pub(crate) struct Workspace {
     /// chosen in Project settings or via a browser pane's page menu.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_browser_urls: HashMap<String, String>,
+    /// What each project's terminals start with (`project_path -> setup`):
+    /// variables, an environment file, a virtual environment, commands.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_terminal_setups: HashMap<String, monocode_core::terminal_setup::TerminalSetup>,
     /// Last desktop source values, used to reconcile subsequent desktop changes
     /// while retaining deliberate native project and preference edits.
     pub desktop_project_preferences: Option<serde_json::Value>,
@@ -443,6 +447,7 @@ impl Default for Workspace {
             session_filters: Default::default(),
             project_appearance: Default::default(),
             project_browser_urls: Default::default(),
+            project_terminal_setups: Default::default(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
             desktop_preferences_metadata: None,
@@ -714,6 +719,10 @@ impl Workspace {
             }
             *url = monocode_core::browser::address(trimmed);
             true
+        });
+        state.project_terminal_setups.retain(|project, setup| {
+            *setup = std::mem::take(setup).normalized();
+            !project.trim().is_empty() && !setup.is_empty()
         });
         state.restore_project_apps();
         state
@@ -1979,6 +1988,37 @@ mod tests {
         );
         assert_eq!(restored.review_owners.get(&-5), Some(&1));
         assert!(restored.tab_of(-2).is_some() && restored.tab_of(-3).is_some());
+    }
+
+    #[test]
+    fn a_projects_terminal_setup_round_trips_and_an_empty_one_is_dropped() {
+        use monocode_core::terminal_setup::{TerminalSetup, Venv};
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        let setup = TerminalSetup {
+            environment: "  MODE=dev\n".into(),
+            venv: Venv::Auto,
+            agents: false,
+            ..Default::default()
+        };
+        state.project_terminal_setups.insert("/p".into(), setup);
+        state.project_terminal_setups.insert(
+            "/empty".into(),
+            TerminalSetup {
+                venv: Venv::Path("  ".into()),
+                ..Default::default()
+            },
+        );
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        let kept = &restored.project_terminal_setups["/p"];
+        assert_eq!(kept.environment, "MODE=dev");
+        assert_eq!(kept.venv, Venv::Auto);
+        assert!(!kept.agents);
+        assert!(!restored.project_terminal_setups.contains_key("/empty"));
+        // Nothing is written for a workspace without setups.
+        let plain = serde_json::to_string(&Workspace::default()).unwrap();
+        assert!(!plain.contains("project_terminal_setups"));
     }
 
     #[test]

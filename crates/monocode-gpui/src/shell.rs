@@ -51,6 +51,7 @@ mod sidebar_peek;
 mod space_reorder;
 mod terminal_dock;
 mod terminal_panes;
+mod terminal_setup;
 use terminal_panes::terminal_drag_ghost;
 mod title_tabs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1372,6 +1373,7 @@ impl Shell {
         this.update_chat_visibility(cx);
         this.update_usage_provider(cx);
         this.apply_preferences(cx);
+        this.publish_terminal_setups(cx);
         this.poll_reminders(cx);
         this.initialize_automations(cx);
         if this.workspace.active.is_none() {
@@ -3298,7 +3300,18 @@ impl Shell {
             .unwrap_or_else(|| self.working_copy().to_owned())
     }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
-        let terminal = cx.new(|cx| Terminal::new(cwd, cx));
+        let project = self.workspace.project.clone();
+        self.spawn_terminal_in(&project, cwd, cx)
+    }
+    /// A shell in `cwd`, started with the setup of the project it is for.
+    fn spawn_terminal_in(
+        &mut self,
+        project: &str,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
+        let launch = self.terminal_launch(project, &cwd);
+        let terminal = cx.new(|cx| Terminal::with_launch(cwd, launch, cx));
         self.observations.push(cx.subscribe(
             &terminal,
             |this, terminal, event: &TerminalEvent, cx| {
@@ -3321,7 +3334,7 @@ impl Shell {
         let wanted = dock.terminals.clone();
         let have = self.terminals.get(project).map_or(0, Vec::len);
         for cwd in wanted.into_iter().skip(have) {
-            let terminal = self.spawn_terminal(cwd, cx);
+            let terminal = self.spawn_terminal_in(project, cwd, cx);
             self.terminals
                 .entry(project.to_owned())
                 .or_default()
@@ -6110,6 +6123,9 @@ impl Shell {
                     MenuAction::new("browser-start-url", "Browser start page…")
                         .icon("globe")
                         .into(),
+                    MenuAction::new("terminal-setup", "Terminal setup…")
+                        .icon("terminal")
+                        .into(),
                 ];
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
@@ -6317,6 +6333,8 @@ impl Shell {
                     self.open_background_dialog(path, window, cx);
                 } else if action == "browser-start-url" {
                     self.open_browser_start_dialog(path, window, cx);
+                } else if action == "terminal-setup" {
+                    self.open_terminal_setup_dialog(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {

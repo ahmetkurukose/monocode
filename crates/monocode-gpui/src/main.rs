@@ -95,6 +95,7 @@ mod tab_label;
 mod tab_motion;
 mod tab_tile;
 mod terminal;
+mod terminal_setup;
 mod theme;
 #[cfg(target_os = "macos")]
 mod traffic_lights;

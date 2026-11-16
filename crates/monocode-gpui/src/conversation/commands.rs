@@ -123,7 +123,7 @@ impl Conversation {
         }
         self.attach_account(cx);
         let mut settings = self.settings.clone();
-        settings.environment.extend(self.app_environment.clone());
+        settings.environment.extend(self.transport_environment(cx));
         settings.disable_claude_hooks = cx
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|preferences| !preferences.claude_hooks);

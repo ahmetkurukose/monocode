@@ -29,6 +29,7 @@ use gpui::{
     ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle, Style, Task, TextAlign,
     TextRun, UnderlineStyle, Window, actions, div, point, prelude::*, px, rgb, size,
 };
+use monocode_core::terminal_setup::Launch;
 use std::{
     borrow::Cow, cell::Cell, collections::HashMap, ops::RangeInclusive, rc::Rc, sync::Arc,
     time::Duration,
@@ -131,6 +132,12 @@ pub(crate) struct Terminal {
     /// letter (Option-Ü on a Turkish layout is a tilde in waiting), or an
     /// input method's candidate. Shown at the cursor, sent once it is final.
     composing: Option<String>,
+    /// The project setup's commands, and what was asked to run behind
+    /// them, until the shell is ready for them.
+    startup: Option<Vec<String>>,
+    /// Counts the shell's output, to tell when it has gone quiet.
+    output: u64,
+    _startup: Option<Task<()>>,
     /// What was typed into the shell, for tests to read.
     #[cfg(test)]
     typed: std::cell::RefCell<Vec<u8>>,
@@ -168,6 +175,11 @@ impl Focusable for Terminal {
     }
 }
 
+/// How long the shell has to be quiet before the setup's commands go in,
+/// and how long a shell that never is gets.
+const STARTUP_QUIET_MS: u64 = 250;
+const STARTUP_WAIT: Duration = Duration::from_secs(5);
+
 struct Spawned {
     term: Arc<FairMutex<Term<Listener>>>,
     sender: Option<EventLoopSender>,
@@ -177,7 +189,13 @@ struct Spawned {
 }
 /// Start the login shell on a PTY with TerminalView's environment. A failure
 /// is written into the grid, as TerminalView prints it.
-fn spawn(cwd: &str, size: GridSize, scrollback: usize, id: u64) -> Spawned {
+fn spawn(
+    cwd: &str,
+    size: GridSize,
+    scrollback: usize,
+    id: u64,
+    setup: &[(String, String)],
+) -> Spawned {
     let (tx, rx) = async_channel::unbounded();
     let listener = Listener(tx);
     let config = Config {
@@ -202,6 +220,10 @@ fn spawn(cwd: &str, size: GridSize, scrollback: usize, id: u64) -> Spawned {
         ("PWD", workdir.to_string_lossy().into_owned()),
     ] {
         env.insert(key.to_owned(), value);
+    }
+    // The project's own variables, over the defaults.
+    for (key, value) in setup {
+        env.insert(key.clone(), value.clone());
     }
     let options = tty::Options {
         shell: Some(tty::Shell::new(shell::pty_program(&program), args)),
@@ -269,7 +291,13 @@ fn detached(size: GridSize) -> Spawned {
 }
 
 impl Terminal {
+    #[cfg(test)]
     pub(crate) fn new(cwd: String, cx: &mut Context<Self>) -> Self {
+        Self::with_launch(cwd, Launch::default(), cx)
+    }
+    /// A shell started with a project's terminal setup: its variables in
+    /// the environment, its commands typed at the first prompt.
+    pub(crate) fn with_launch(cwd: String, launch: Launch, cx: &mut Context<Self>) -> Self {
         let size = GridSize {
             columns: 80,
             lines: 24,
@@ -285,8 +313,23 @@ impl Terminal {
             // PTY thread; UI tests run the dock without a shell behind it.
             detached(size)
         } else {
-            spawn(&cwd, size, scrollback(cx), cx.entity_id().as_u64())
+            spawn(
+                &cwd,
+                size,
+                scrollback(cx),
+                cx.entity_id().as_u64(),
+                &launch.environment,
+            )
         };
+        for note in &launch.notes {
+            write_note(&term, &format!("\x1b[2m[terminal setup] {note}\x1b[0m\r\n"));
+        }
+        let shell = if cfg!(test) {
+            "zsh".to_owned()
+        } else {
+            default_shell(&monocode_core::scm::terminal_search_path()).0
+        };
+        let startup = launch.startup_lines(&shell);
         let events = cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
                 // Output arrives in bursts; one repaint covers the burst.
@@ -336,6 +379,9 @@ impl Terminal {
             sender,
             focus: cx.focus_handle(),
             composing: None,
+            startup: (!startup.is_empty()).then_some(startup),
+            output: 0,
+            _startup: None,
             #[cfg(test)]
             typed: Default::default(),
             title: default_title(&cwd),
@@ -361,9 +407,12 @@ impl Terminal {
 
     fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
-            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {
+            TermEvent::Wakeup => {
+                self.output += 1;
+                self.await_first_prompt(cx);
                 cx.notify()
             }
+            TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => cx.notify(),
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
             TermEvent::ColorRequest(index, format) => {
                 let colors = *self.term.lock().colors();
@@ -456,11 +505,52 @@ impl Terminal {
     /// Types `command` at the prompt and runs it. The footer names it at
     /// once; the foreground poll corrects the label within a second.
     pub(crate) fn run(&mut self, command: &str, cx: &mut Context<Self>) {
+        // Behind the project's setup: an action started with the terminal
+        // runs with the virtual environment already active.
+        if let Some(startup) = &mut self.startup {
+            startup.push(command.trim().to_owned());
+        } else {
+            self.type_line(command, cx);
+        }
+        if let Some(label) = command_label(command.trim()) {
+            self.set_foreground(Some(label), cx);
+        }
+    }
+    fn type_line(&mut self, command: &str, cx: &mut Context<Self>) {
         let mut line = command.trim().replace("\r\n", "\r").replace('\n', "\r");
         line.push('\r');
         self.input(line.into_bytes(), cx);
-        if let Some(label) = command_label(command.trim()) {
-            self.set_foreground(Some(label), cx);
+    }
+    /// The setup's commands wait for the shell: typed while it is still
+    /// reading its start-up files they are echoed twice, and a prompt
+    /// theme that asks a question would swallow them. They go in once the
+    /// shell has written something and then been quiet for a moment.
+    fn await_first_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.startup.is_none() || self._startup.is_some() {
+            return;
+        }
+        self._startup = Some(cx.spawn(async move |this, cx| {
+            let started = std::time::Instant::now();
+            loop {
+                let Ok(before) = this.update(cx, |this, _| this.output) else {
+                    return;
+                };
+                cx.background_executor()
+                    .timer(Duration::from_millis(STARTUP_QUIET_MS))
+                    .await;
+                let quiet = this.update(cx, |this, _| this.output == before);
+                match quiet {
+                    Ok(false) if started.elapsed() < STARTUP_WAIT => continue,
+                    Ok(_) => break,
+                    Err(_) => return,
+                }
+            }
+            let _ = this.update(cx, |this, cx| this.flush_startup(cx));
+        }));
+    }
+    fn flush_startup(&mut self, cx: &mut Context<Self>) {
+        for line in self.startup.take().unwrap_or_default() {
+            self.type_line(&line, cx);
         }
     }
     /// Fit the grid to the painted area; the PTY learns its new size.
@@ -1733,6 +1823,24 @@ impl Terminal {
     pub(crate) fn write_test_output(&self, text: &str) {
         write_note(&self.term, text);
     }
+
+    /// The setup's commands still waiting for the shell, for tests.
+    #[cfg(test)]
+    pub(crate) fn pending_startup(&self) -> Vec<String> {
+        self.startup.clone().unwrap_or_default()
+    }
+
+    /// What the grid shows, for tests to read.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> String {
+        use alacritty_terminal::index::Line;
+        let term = self.term.lock();
+        let end = GridPoint::new(
+            Line(term.screen_lines() as i32 - 1),
+            Column(term.columns() - 1),
+        );
+        term.bounds_to_string(GridPoint::new(Line(0), Column(0)), end)
+    }
 }
 fn is_shell_name(name: &str) -> bool {
     matches!(
@@ -1816,6 +1924,57 @@ mod tests {
             assert_eq!(terminal.link_at(at(2, 6)), None, "file:// stays inert");
             assert_eq!(terminal.link_at(at(2, 10)), None, "ftp:// stays inert");
             assert_eq!(terminal.link_at(point(px(-4.), px(1.))), None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_projects_setup_is_typed_once_the_shell_is_quiet_and_an_action_runs_behind_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let launch = Launch {
+            venv: Some("/p/.venv".into()),
+            commands: vec!["nvm use".into()],
+            notes: vec!["Environment file not found: .env".into()],
+            ..Default::default()
+        };
+        let view = cx.update(|cx| cx.new(|cx| Terminal::with_launch("/tmp".into(), launch, cx)));
+        view.update(cx, |terminal, cx| {
+            // What was not found is said in the terminal itself.
+            assert!(
+                terminal
+                    .text()
+                    .contains("[terminal setup] Environment file not found: .env")
+            );
+            assert!(
+                terminal.typed.borrow().is_empty(),
+                "the shell has not spoken yet"
+            );
+            // An action started together with the terminal waits its turn.
+            terminal.run("make test", cx);
+            assert!(terminal.typed.borrow().is_empty());
+            // The shell's first output starts the wait for quiet.
+            terminal.on_event(TermEvent::Wakeup, cx);
+            assert!(terminal.typed.borrow().is_empty());
+        });
+        cx.executor()
+            .advance_clock(Duration::from_millis(STARTUP_QUIET_MS + 50));
+        cx.run_until_parked();
+        view.update(cx, |terminal, cx| {
+            let bin = if cfg!(windows) { "Scripts" } else { "bin" };
+            assert_eq!(
+                String::from_utf8_lossy(&terminal.typed.borrow()),
+                format!("source /p/.venv/{bin}/activate\rnvm use\rmake test\r")
+            );
+            // Afterwards a command is typed at once, and nothing is repeated.
+            terminal.on_event(TermEvent::Wakeup, cx);
+            terminal.run("ls", cx);
+            assert!(terminal.typed.borrow().ends_with(b"make test\rls\r"));
+        });
+        // A terminal without a setup types what it is asked to at once.
+        let plain = cx.update(|cx| cx.new(|cx| Terminal::new("/tmp".into(), cx)));
+        plain.update(cx, |terminal, cx| {
+            terminal.run("ls", cx);
+            assert_eq!(*terminal.typed.borrow(), b"ls\r");
         });
     }
 
@@ -2139,10 +2298,14 @@ mod tests {
             columns: 60,
             lines: 10,
         };
-        let spawned = spawn(&dir, size, SCROLLBACK, 1);
+        // A variable of the project's setup is in the shell's environment.
+        let setup = [("MONO_SETUP".to_owned(), "mono".to_owned())];
+        let spawned = spawn(&dir, size, SCROLLBACK, 1, &setup);
         let sender = spawned.sender.expect("the shell started");
         assert!(spawned.shell_pid > 1);
-        let _ = sender.send(Msg::Input(Cow::Borrowed(b"printf 'mono%scode\\n' -\r")));
+        let _ = sender.send(Msg::Input(Cow::Borrowed(
+            b"printf '%s%scode\\n' \"$MONO_SETUP\" -\r",
+        )));
         let screen = || {
             let term = spawned.term.lock();
             let grid = term.grid();

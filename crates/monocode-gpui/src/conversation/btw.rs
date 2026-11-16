@@ -1829,7 +1829,7 @@ impl Conversation {
             return None;
         }
         let mut settings = self.settings.clone();
-        settings.environment.extend(self.app_environment.clone());
+        settings.environment.extend(self.transport_environment(cx));
         if provider != Kind::from_id(&self.summary.provider) {
             settings.account = crate::accounts::get(cx)
                 .map(|center| center.read(cx).selected(provider, self.execution_cwd()))
