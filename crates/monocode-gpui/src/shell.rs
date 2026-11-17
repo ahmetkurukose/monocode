@@ -30,6 +30,7 @@ mod picker_preferences;
 mod pinned_tabs;
 mod project_rail;
 mod project_rail_tree;
+mod project_rail_worktrees;
 mod project_removal;
 mod project_settings;
 mod quick_composer;
@@ -399,6 +400,11 @@ pub(crate) enum MenuTarget {
     Project {
         path: String,
         rail: bool,
+    },
+    /// A worktree row of the rail tree: `path` is a worktree of `project`.
+    RailWorktree {
+        project: String,
+        path: String,
     },
     /// ProjectTerminalDock's Move Terminal menu.
     TerminalDock,
@@ -802,6 +808,8 @@ pub(crate) struct Shell {
     worktree_creates: worktree_create::Creates,
     /// The Create/Delete Worktree dialogs, kept-branch cards and open switchers.
     worktree_ui: worktree_dialog::WorktreeUi,
+    /// Each open rail project's worktrees, read in the background.
+    rail_worktrees: project_rail_worktrees::RailWorktrees,
     tab_drag: Option<TabDrag>,
     /// Tabs sliding between slots: neighbours making room for a drag and,
     /// after a drop, every tab gliding from where it was drawn into place.
@@ -1225,6 +1233,7 @@ impl Shell {
             pending_worktrees: Vec::new(),
             worktree_creates: Default::default(),
             worktree_ui: Default::default(),
+            rail_worktrees: Default::default(),
             tab_drag: None,
             tab_shifts: HashMap::new(),
             pane_ticks: HashMap::new(),
@@ -5919,6 +5928,7 @@ impl Shell {
                 280.,
                 MenuStyle::Explorer,
             ),
+            MenuTarget::RailWorktree { project, path } => self.rail_worktree_menu(project, path),
             MenuTarget::NewTab => (
                 "New tab".into(),
                 vec![
@@ -6441,6 +6451,9 @@ impl Shell {
                 _ => {}
             },
             MenuTarget::CompactProjectPicker => {}
+            MenuTarget::RailWorktree { project, path } => {
+                self.run_rail_worktree_menu(project, path, action, window, cx)
+            }
             MenuTarget::RailSessions => {
                 if let Some(id) = action
                     .strip_prefix("rail-session:")

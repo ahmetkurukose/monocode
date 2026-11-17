@@ -33,6 +33,24 @@ pub(super) enum ProjectRailRow {
         hidden: usize,
         last: bool,
     },
+    // The project's worktrees (project_rail_worktrees.rs): a worktree, a
+    // session listed under an open worktree, and a creation in progress.
+    Worktree {
+        project: String,
+        path: String,
+        sessions: usize,
+        last: bool,
+    },
+    WorktreeSession {
+        project: String,
+        id: i64,
+        last: bool,
+    },
+    PendingWorktree {
+        project: String,
+        id: u64,
+        last: bool,
+    },
     Gap,
     Empty,
 }
@@ -45,7 +63,7 @@ pub(super) enum RailTerminal {
 }
 pub(super) struct ProjectRailList {
     state: ListState,
-    rows: Vec<ProjectRailRow>,
+    pub(super) rows: Vec<ProjectRailRow>,
     compact: bool,
     bounds: HashMap<String, AnchorSlot>,
     group_bounds: HashMap<String, AnchorSlot>,
@@ -607,7 +625,7 @@ impl Shell {
                 };
                 tree.push(row);
                 if let Some(path) = open {
-                    tree.extend(self.project_rail_children(&path, cx));
+                    tree.extend(self.project_rail_tree_children(&path, cx));
                 }
             }
             rows = tree;
@@ -634,6 +652,9 @@ impl Shell {
                     ProjectRailRow::Session { .. }
                         | ProjectRailRow::Terminal { .. }
                         | ProjectRailRow::More { .. }
+                        | ProjectRailRow::Worktree { .. }
+                        | ProjectRailRow::WorktreeSession { .. }
+                        | ProjectRailRow::PendingWorktree { .. }
                 )
             )
         };
@@ -662,7 +683,10 @@ impl Shell {
             ProjectRailRow::Group(id) => self.project_rail_group_header(id, cx),
             row @ (ProjectRailRow::Session { .. }
             | ProjectRailRow::Terminal { .. }
-            | ProjectRailRow::More { .. }) => self.project_rail_child_row(row, cx),
+            | ProjectRailRow::More { .. }
+            | ProjectRailRow::Worktree { .. }
+            | ProjectRailRow::WorktreeSession { .. }
+            | ProjectRailRow::PendingWorktree { .. }) => self.project_rail_child_row(row, cx),
             ProjectRailRow::Gap => div().h(px(8.)).into_any(),
             ProjectRailRow::Empty => div()
                 .px_4()
@@ -1454,6 +1478,10 @@ impl Shell {
         let pinned = self.workspace.project_rail_pinned.contains(&path);
         let tree = !compact && self.project_rail_tree_on();
         let expanded = self.project_rail_expanded(&path);
+        if tree && expanded {
+            // Only a drawn, open project reads its worktrees, off the main thread.
+            self.ensure_rail_worktrees(&path, cx);
+        }
         let chevron_path = path.clone();
         let app_icons = if compact {
             None

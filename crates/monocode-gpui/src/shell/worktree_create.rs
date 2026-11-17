@@ -7,9 +7,9 @@ use crate::notifications::errors;
 use crate::worktree_switcher::WorktreeFocus;
 use monocode_core::{
     files::path_key,
-    worktree::{self, CreateRequest, Created, Phase},
+    worktree::{self, CreateRequest, Created, Phase, SetupPlan},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which entry point opened the Create Worktree dialog; surfaces may show only their
 /// own rows.
@@ -30,8 +30,8 @@ pub(crate) struct PendingWorktree {
     pub error: Option<String>,
     pub request: CreateRequest,
     pub run_setup: bool,
-    // Read by the rail's pending tree rows (next phase); every surface shows all rows now.
-    #[allow(dead_code)]
+    /// Every surface lists every pending row; a creation started from the rail
+    /// also opens its project, and then its new worktree, in the rail tree.
     pub origin: WorktreeOrigin,
 }
 impl PendingWorktree {
@@ -60,8 +60,89 @@ pub(super) struct Creates {
     pub warnings: Option<String>,
 }
 
-/// Background result: the worktree and, when setup was asked for, its runner.
-type Outcome = Result<(Created, Option<Result<PathBuf, String>>), String>;
+/// What a creation made, local or remote.
+#[derive(Debug)]
+pub(super) struct Made {
+    pub path: PathBuf,
+    pub branch: String,
+    pub warnings: Vec<String>,
+    /// The repository's setup script (local only).
+    pub setup: Option<SetupPlan>,
+    /// The setup runner, when setup was asked for.
+    pub runner: Option<Result<PathBuf, String>>,
+}
+impl Made {
+    fn local(created: Created, runner: Option<Result<PathBuf, String>>) -> Self {
+        Self {
+            path: created.path,
+            branch: created.branch,
+            warnings: created.warnings,
+            setup: created.setup,
+            runner,
+        }
+    }
+}
+
+/// Background result.
+type Outcome = Result<Made, String>;
+
+/// The old remote-capable create: `git::create_project_worktree(cwd, branch, base, existing)`.
+pub(super) type RemoteCreate<'a> =
+    dyn Fn(&Path, &str, Option<&str>, bool) -> Result<monocode_core::git::Worktree, String> + 'a;
+
+/// Create the worktree `request` asks for. Local repositories go through the managed
+/// core ([`worktree::create::create`], with content paths and setup). Remote (SSH)
+/// projects keep the old path, `remote` (in the app,
+/// [`monocode_core::git::create_project_worktree`], which routes to `git::remote`):
+/// the branch is the request's branch, else its name; no meta, content paths or setup.
+pub(super) fn create_routed(
+    request: &CreateRequest,
+    run_setup: bool,
+    store: &Database,
+    progress: &dyn Fn(Phase),
+    remote: &RemoteCreate<'_>,
+) -> Outcome {
+    if monocode_core::files::remote::is_remote(&request.cwd) {
+        let branch = request
+            .branch
+            .clone()
+            .filter(|b| !b.trim().is_empty())
+            .unwrap_or_else(|| request.name.trim().to_owned());
+        if branch.is_empty() {
+            return Err("Enter a branch name for the worktree.".into());
+        }
+        progress(Phase::CheckingOut { percent: None });
+        let tree = remote(
+            &request.cwd,
+            &branch,
+            request.base.as_deref().filter(|b| !b.trim().is_empty()),
+            request.existing_branch,
+        )?;
+        return Ok(Made {
+            path: PathBuf::from(tree.path),
+            branch: tree.branch.unwrap_or(branch),
+            warnings: Vec::new(),
+            setup: None,
+            runner: None,
+        });
+    }
+    let created = worktree::create::create(request, store, progress)?;
+    let runner = match (&created.setup, run_setup) {
+        (Some(plan), true) => {
+            let main = PathBuf::from(&created.meta.repo);
+            if let Ok(db) = locked(store) {
+                let mut prefs = worktree::meta::repo_prefs(&db, &main).unwrap_or_default();
+                if prefs.setup_approved_hash.as_deref() != Some(plan.hash.as_str()) {
+                    prefs.setup_approved_hash = Some(plan.hash.clone());
+                    let _ = worktree::meta::save_repo_prefs(&db, &main, &prefs);
+                }
+            }
+            Some(worktree::setup::write_runner(&created.path, &plan.script))
+        }
+        _ => None,
+    };
+    Ok(Made::local(created, runner))
+}
 
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -98,6 +179,12 @@ impl Shell {
             .or_else(|| Some(request.name.trim().to_owned()).filter(|n| !n.is_empty()))
             .or_else(|| request.branch.clone())
             .unwrap_or_else(|| "New worktree".into());
+        if origin == WorktreeOrigin::Rail && self.project_rail_tree_on() {
+            // The pending row shows under its project.
+            self.workspace
+                .project_rail_expanded
+                .insert(project_main.clone());
+        }
         self.pending_worktrees.push(PendingWorktree {
             id,
             project: project_main,
@@ -153,24 +240,16 @@ impl Shell {
         let store = self.store.clone();
         let (tx, rx) = async_channel::unbounded::<Phase>();
         let work = cx.background_executor().spawn(async move {
-            let created = worktree::create::create(&request, &store, &|phase| {
+            let progress = |phase| {
                 let _ = tx.try_send(phase);
-            })?;
-            let runner = match (&created.setup, run_setup) {
-                (Some(plan), true) => {
-                    let main = PathBuf::from(&created.meta.repo);
-                    if let Ok(db) = locked(&store) {
-                        let mut prefs = worktree::meta::repo_prefs(&db, &main).unwrap_or_default();
-                        if prefs.setup_approved_hash.as_deref() != Some(plan.hash.as_str()) {
-                            prefs.setup_approved_hash = Some(plan.hash.clone());
-                            let _ = worktree::meta::save_repo_prefs(&db, &main, &prefs);
-                        }
-                    }
-                    Some(worktree::setup::write_runner(&created.path, &plan.script))
-                }
-                _ => None,
             };
-            Ok::<_, String>((created, runner))
+            create_routed(
+                &request,
+                run_setup,
+                &store,
+                &progress,
+                &monocode_core::git::create_project_worktree,
+            )
         });
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(phase) = rx.recv().await {
@@ -204,8 +283,8 @@ impl Shell {
             // Dismissed while running.
             return;
         };
-        let (created, runner) = match outcome {
-            Ok(done) => done,
+        let made = match outcome {
+            Ok(made) => made,
             Err(error) => {
                 self.pending_worktrees[ix].error = Some(error);
                 self.worktree_pending_changed(cx);
@@ -213,16 +292,25 @@ impl Shell {
             }
         };
         let pending = self.pending_worktrees.remove(ix);
-        let path = created.path.to_string_lossy().into_owned();
-        let mut warnings = created.warnings.clone();
-        if let Some(Err(error)) = &runner {
+        let path = made.path.to_string_lossy().into_owned();
+        let mut warnings = made.warnings.clone();
+        if let Some(Err(error)) = &made.runner {
             warnings.push(format!("Could not prepare the setup script: {error}"));
         }
         self.worktree_creates.warnings = (!warnings.is_empty()).then(|| warnings.join("\n"));
         let focus = WorktreeFocus {
             path: path.clone(),
-            branch: Some(created.branch.clone()),
+            branch: Some(made.branch.clone()),
         };
+        if pending.origin == WorktreeOrigin::Rail && self.project_rail_tree_on() {
+            // Created from the rail: its row opens there, on the chat it starts with.
+            self.workspace
+                .project_rail_expanded
+                .insert(pending.project.clone());
+            self.workspace
+                .project_rail_worktrees_expanded
+                .insert(path.clone());
+        }
         if path_key(&self.workspace.project) == path_key(&pending.project) {
             self.select_worktree(Some(focus), window, cx);
         } else {
@@ -230,11 +318,12 @@ impl Shell {
             self.worktree_focus.insert(pending.project.clone(), focus);
             self.persist(cx);
         }
-        if let (Some(Ok(runner)), Some(plan)) = (runner, &created.setup) {
+        if let (Some(Ok(runner)), Some(plan)) = (made.runner, &made.setup) {
             self.open_setup_terminal(&pending.project, &path, &runner, plan.env.clone(), cx);
         }
         self.sync_git(cx);
         self.refresh_settings_worktrees(cx);
+        self.invalidate_rail_worktrees(cx);
         self.worktree_pending_changed(cx);
     }
 
@@ -528,6 +617,89 @@ mod tests {
                 assert!(shell.pending_worktrees.is_empty());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn remote_requests_take_the_old_create_path_and_local_ones_the_core() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let remote = |cwd: &Path, branch: &str, base: Option<&str>, existing: bool| {
+            calls.borrow_mut().push((
+                cwd.to_string_lossy().into_owned(),
+                branch.to_owned(),
+                base.map(str::to_owned),
+                existing,
+            ));
+            Ok(monocode_core::git::Worktree {
+                path: "remote://host/project-worktrees/feature".into(),
+                branch: Some(branch.to_owned()),
+                ..Default::default()
+            })
+        };
+        let store: Database = Arc::new(Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let phases = std::cell::RefCell::new(Vec::new());
+        let progress = |phase| phases.borrow_mut().push(phase);
+        let request = CreateRequest {
+            base: Some("origin/main".into()),
+            ..CreateRequest::new(Path::new("remote://host/project"), "feature")
+        };
+        let made = create_routed(&request, true, &store, &progress, &remote).unwrap();
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [(
+                "remote://host/project".to_owned(),
+                "feature".to_owned(),
+                Some("origin/main".to_owned()),
+                false
+            )]
+        );
+        assert_eq!(
+            made.path,
+            PathBuf::from("remote://host/project-worktrees/feature")
+        );
+        assert_eq!(made.branch, "feature");
+        assert!(
+            made.setup.is_none() && made.runner.is_none(),
+            "no setup remotely"
+        );
+        assert!(!phases.borrow().is_empty());
+
+        // An explicit branch wins over the name; an empty one is refused.
+        let request = CreateRequest {
+            branch: Some("feature/x".into()),
+            existing_branch: true,
+            ..CreateRequest::new(Path::new("remote://host/project"), "ignored")
+        };
+        create_routed(&request, false, &store, &progress, &remote).unwrap();
+        assert_eq!(calls.borrow()[1].1, "feature/x");
+        assert!(calls.borrow()[1].3);
+        let empty = CreateRequest::new(Path::new("remote://host/project"), " ");
+        assert!(create_routed(&empty, false, &store, &progress, &remote).is_err());
+
+        // Local repositories never reach the old path.
+        let (_temp, main, root) = repo();
+        locked(&store)
+            .and_then(|db| {
+                worktree::meta::save_prefs(
+                    &db,
+                    &worktree::Prefs {
+                        root: Some(root.clone()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let made = create_routed(
+            &CreateRequest::new(Path::new(&main), "local-one"),
+            false,
+            &store,
+            &progress,
+            &remote,
+        )
+        .unwrap();
+        assert_eq!(calls.borrow().len(), 2);
+        assert!(made.path.starts_with(&root));
     }
 
     #[gpui::test]

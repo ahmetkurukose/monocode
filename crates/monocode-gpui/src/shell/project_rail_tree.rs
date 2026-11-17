@@ -11,6 +11,8 @@ use gpui::Div;
 /// Sessions listed under a project before "N more".
 const MAX_SESSIONS: usize = 8;
 const CHILD_HEIGHT: f32 = 30.;
+/// How far in a worktree's own sessions sit, against the project's 22px.
+const NESTED_INDENT: f32 = 38.;
 /// The space between two projects' cards.
 pub(super) const CARD_GAP: f32 = 6.;
 /// The apps a project's row offers, in order: preference name, view, icon.
@@ -58,6 +60,22 @@ impl Shell {
 
     /// Sessions, then terminals, of one project, as rail rows.
     pub(super) fn project_rail_children(&self, path: &str, cx: &App) -> Vec<ProjectRailRow> {
+        self.project_rail_children_with(path, false, cx)
+    }
+
+    /// The tree's rows under an open project: its own sessions, its worktrees
+    /// (each with the sessions working there), creations in progress, then
+    /// its terminals. A session listed under a worktree is not listed again.
+    pub(super) fn project_rail_tree_children(&self, path: &str, cx: &App) -> Vec<ProjectRailRow> {
+        self.project_rail_children_with(path, true, cx)
+    }
+
+    fn project_rail_children_with(
+        &self,
+        path: &str,
+        worktrees: bool,
+        cx: &App,
+    ) -> Vec<ProjectRailRow> {
         let start = self
             .workspace
             .session_filters
@@ -83,6 +101,12 @@ impl Shell {
         ids.sort_by_key(|id| {
             std::cmp::Reverse((self.session_metadata(*id, cx).summary.updated_at, *id))
         });
+        // Sessions working in a listed worktree go under its row.
+        let worktree_rows = if worktrees {
+            self.project_rail_worktree_rows(path, &mut ids, cx)
+        } else {
+            Vec::new()
+        };
         let hidden = ids.len().saturating_sub(MAX_SESSIONS);
         ids.truncate(MAX_SESSIONS);
         let docked = self
@@ -120,7 +144,7 @@ impl Shell {
         terminals.extend(pages.into_iter().map(RailTerminal::Browser));
 
         let project = path.to_owned();
-        let total = ids.len() + usize::from(hidden > 0) + terminals.len();
+        let total = ids.len() + usize::from(hidden > 0) + worktree_rows.len() + terminals.len();
         let mut rows = Vec::with_capacity(total);
         let last = |n: usize| n + 1 == total;
         for id in ids {
@@ -136,6 +160,12 @@ impl Shell {
                 hidden,
                 last: last(rows.len()),
             });
+        }
+        for mut row in worktree_rows {
+            if last(rows.len()) {
+                super::project_rail_worktrees::mark_last(&mut row);
+            }
+            rows.push(row);
         }
         for source in terminals {
             rows.push(ProjectRailRow::Terminal {
@@ -338,7 +368,7 @@ impl Shell {
 
     /// The frame every child row shares. A list item's root is placed by the
     /// list, so the drag offset goes on the button inside it.
-    fn project_rail_child_frame(
+    pub(super) fn project_rail_child_frame(
         &mut self,
         id: gpui::ElementId,
         project: &str,
@@ -372,7 +402,7 @@ impl Shell {
         frame
     }
 
-    fn project_rail_child_button(
+    pub(super) fn project_rail_child_button(
         &self,
         project: &str,
         id: impl Into<gpui::ElementId>,
@@ -420,12 +450,27 @@ impl Shell {
         let project = match &row {
             ProjectRailRow::Session { project, .. }
             | ProjectRailRow::Terminal { project, .. }
-            | ProjectRailRow::More { project, .. } => project.clone(),
+            | ProjectRailRow::More { project, .. }
+            | ProjectRailRow::Worktree { project, .. }
+            | ProjectRailRow::WorktreeSession { project, .. }
+            | ProjectRailRow::PendingWorktree { project, .. } => project.clone(),
             _ => String::new(),
         };
         let element = match row {
             ProjectRailRow::Session { project, id, last } => {
-                self.project_rail_session_row(project, id, last, cx)
+                self.project_rail_session_row(project, id, last, false, cx)
+            }
+            ProjectRailRow::WorktreeSession { project, id, last } => {
+                self.project_rail_session_row(project, id, last, true, cx)
+            }
+            ProjectRailRow::Worktree {
+                project,
+                path,
+                sessions,
+                last,
+            } => self.project_rail_worktree_row(project, path, sessions, last, cx),
+            ProjectRailRow::PendingWorktree { project, id, last } => {
+                self.project_rail_pending_worktree_row(project, id, last, cx)
             }
             ProjectRailRow::Terminal {
                 project,
@@ -474,11 +519,14 @@ impl Shell {
             .unwrap_or(0)
     }
 
+    /// A session's row; `nested` when it is listed under one of the project's
+    /// worktrees, one step further in.
     fn project_rail_session_row(
         &mut self,
         project: String,
         id: i64,
         last: bool,
+        nested: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, updated, provider, approval, working, archived) = {
@@ -581,6 +629,7 @@ impl Shell {
             )
             .group("rail-session-hover")
             .debug_selector(move || format!("rail-session-{id}"))
+            .when(nested, |d| d.ml(px(NESTED_INDENT)))
             .child(mark)
             .child(
                 div()
@@ -1090,7 +1139,10 @@ mod tests {
         assert!(visual.debug_bounds("rail-project-999").is_none());
         window
             .update(visual, |shell, _, _| {
-                assert_eq!(shell.sessions.len(), count)
+                assert_eq!(shell.sessions.len(), count);
+                // Only the open projects drawn on screen read their worktrees.
+                let loads = shell.rail_worktrees.loads;
+                assert!(loads > 0 && loads < 100, "{loads} worktree reads");
             })
             .unwrap();
     }

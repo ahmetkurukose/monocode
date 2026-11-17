@@ -1,8 +1,11 @@
 # Worktrees (GPUI) — Orca-style model
 
-Status: design + implementation spec. Scope: the native GPUI app only
-(`crates/monocode-core`, `crates/monocode-gpui`). Tauri/React and `host/` are untouched.
-Remote (SSH) projects keep today's `git::remote` path; everything below is local-only.
+Status: implemented (core, every create caller, Create/Delete dialogs, Settings, rail
+tree rows). Scope: the native GPUI app only (`crates/monocode-core`,
+`crates/monocode-gpui`). Tauri/React and `host/` are untouched. Remote (SSH) projects keep
+the old `git::create_project_worktree` → `git::remote` path from a reduced Create dialog
+(branch, start from, existing branch); everything below is local-only. User-facing summary:
+[README › Worktrees](README.md#worktrees).
 
 ## 0. Decisions (from the user)
 
@@ -154,6 +157,10 @@ call just created, delete meta; never touch pre-existing branches.
    repo's `show_external`) as expandable rows listing the sessions whose `worktree_cwd` is that
    path; the project's own sessions stay directly under the project. Row: display name,
    branch, session count; context menu: Open, New session here, Copy path, Reveal, Delete…
+   (`shell/project_rail_worktrees.rs`). The list is read with `catalog::list_in` in the
+   background only for an open project whose row is drawn, cached per project, and marked
+   stale after a create, a delete, a switcher metadata change or a Settings worktree pref
+   change. Open worktrees persist in `Workspace.project_rail_worktrees_expanded`.
 4. **Delete Worktree dialog**: preflight summary (dirty count, at-risk files sample, unpushed),
    "Also delete its sessions", Delete / Force delete; preserved-branch toast with "Delete branch".
 5. **Composer "New worktree"**: unchanged UX, now uses `worktree::create` with

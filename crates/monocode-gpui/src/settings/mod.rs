@@ -142,6 +142,8 @@ pub(crate) enum SettingsEvent {
     ChooseBackground,
     /// Settings › Worktrees "Create worktree": the Create Worktree dialog for this project.
     CreateWorktree(String),
+    /// A repository's worktree preferences changed (e.g. "Show other worktrees").
+    WorktreesChanged,
     /// A worktree's Delete button: the Delete Worktree dialog.
     DeleteWorktree {
         cwd: String,

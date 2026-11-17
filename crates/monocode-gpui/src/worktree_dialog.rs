@@ -1,6 +1,10 @@
 //! The Create Worktree dialog (spec §7.1): a name, where to start from, an optional
 //! branch override and the repository's setup script. Submitting hands a
 //! [`CreateRequest`] to the Shell's background creation service and closes at once.
+//!
+//! A remote (SSH) project gets a reduced form: the branch, where to start from and
+//! "use the existing branch". It is created by the host as before, without the
+//! managed features (default base, branch override, content paths, setup).
 use crate::{
     input::{self, Input},
     runtime::{Database, locked},
@@ -12,7 +16,7 @@ use gpui::{
 };
 use monocode_core::{
     git::Branch,
-    worktree::{self, CreateRequest, CreatedBy, REMOTE_UNAVAILABLE, SetupPlan},
+    worktree::{self, CreateRequest, CreatedBy, SetupPlan},
 };
 use std::path::{Path, PathBuf};
 
@@ -132,7 +136,22 @@ impl CreateWorktreeDialog {
         }));
         let remote = monocode_core::files::remote::is_remote(Path::new(&project));
         let cwd = PathBuf::from(&project);
-        if !remote {
+        // A remote project's branches are the ones the app already read from its host.
+        let loaded = remote.then(|| {
+            Ok(Loaded {
+                main: cwd.clone(),
+                saved_default: None,
+                detected: None,
+                branches: crate::git_cache::get(&project)
+                    .map(|s| s.branches)
+                    .unwrap_or_default(),
+                setup: None,
+            })
+        });
+        if remote {
+            name.update(cx, |input, cx| input.set_placeholder("feature/my-task", cx));
+            base.update(cx, |input, cx| input.set_placeholder("Default · HEAD", cx));
+        } else {
             let (folder, db) = (cwd.clone(), store.clone());
             let work = cx
                 .background_executor()
@@ -165,7 +184,7 @@ impl CreateWorktreeDialog {
             name,
             base,
             branch,
-            loaded: None,
+            loaded,
             set_default: false,
             advanced: false,
             use_existing: false,
@@ -222,27 +241,52 @@ impl CreateWorktreeDialog {
         cx.notify();
     }
 
-    /// The typed branch override already exists locally or on origin.
+    /// The typed branch override already exists locally or on origin. On a remote
+    /// project, only a local branch of the host can be checked out as it is.
     fn branch_exists(&self, branch: &str) -> bool {
         self.loaded
             .as_ref()
             .and_then(|l| l.as_ref().ok())
             .is_some_and(|l| {
-                l.branches
-                    .iter()
-                    .any(|b| b.name == branch && b.remote.as_deref().is_none_or(|r| r == "origin"))
+                l.branches.iter().any(|b| {
+                    b.name == branch
+                        && if self.remote {
+                            b.remote.is_none()
+                        } else {
+                            b.remote.as_deref().is_none_or(|r| r == "origin")
+                        }
+                })
             })
+    }
+
+    /// The remote form: the name is the branch.
+    fn validate_remote(&self, cx: &gpui::App) -> Result<(), Option<String>> {
+        let branch = Self::text(&self.name, cx);
+        if branch.is_empty() {
+            return Err(self
+                .attempted
+                .then(|| "Enter a branch name for the worktree.".to_owned()));
+        }
+        if branch.chars().any(char::is_whitespace) {
+            return Err(Some("A branch name cannot contain spaces.".into()));
+        }
+        if self.branch_exists(&branch) && !self.use_existing {
+            return Err(Some(format!(
+                "A branch named {branch} already exists. Use it, or choose another name."
+            )));
+        }
+        Ok(())
     }
 
     /// Why the form cannot be submitted yet; `Err(None)` while a check is running.
     fn validate(&self, cx: &gpui::App) -> Result<(), Option<String>> {
-        if self.remote {
-            return Err(Some(REMOTE_UNAVAILABLE.into()));
-        }
         match &self.loaded {
             None => return Err(None),
             Some(Err(error)) => return Err(Some(error.clone())),
             Some(Ok(_)) => {}
+        }
+        if self.remote {
+            return self.validate_remote(cx);
         }
         let name = Self::text(&self.name, cx);
         let branch = Self::text(&self.branch, cx);
@@ -285,6 +329,22 @@ impl CreateWorktreeDialog {
         };
         let name = Self::text(&self.name, cx);
         let base = Self::text(&self.base, cx);
+        if self.remote {
+            let existing = self.use_existing && self.branch_exists(&name);
+            let request = CreateRequest {
+                base: (!base.is_empty() && !existing).then(|| base.clone()),
+                branch: Some(name.clone()),
+                existing_branch: existing,
+                created_by: CreatedBy::Dialog,
+                ..CreateRequest::new(&self.cwd, &name)
+            };
+            cx.emit(DialogEvent::Submit {
+                request: Box::new(request),
+                run_setup: false,
+                default_base: None,
+            });
+            return;
+        }
         let branch = Self::text(&self.branch, cx);
         let existing = !branch.is_empty() && self.use_existing && self.branch_exists(&branch);
         let request = CreateRequest {
@@ -559,7 +619,8 @@ impl CreateWorktreeDialog {
 
 impl Render for CreateWorktreeDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let disabled = self.remote || matches!(self.loaded, Some(Err(_)));
+        let disabled = matches!(self.loaded, Some(Err(_)));
+        let remote = self.remote;
         for input in [&self.name, &self.base, &self.branch] {
             input.update(cx, |input, _| input.set_read_only(disabled));
         }
@@ -568,6 +629,8 @@ impl Render for CreateWorktreeDialog {
         let base = Self::text(&self.base, cx);
         let branch = Self::text(&self.branch, cx);
         let exists = !branch.is_empty() && self.branch_exists(&branch);
+        let name = Self::text(&self.name, cx);
+        let remote_exists = remote && !name.is_empty() && self.branch_exists(&name);
         let advanced = self.advanced;
         let card = crate::modal::card().w(px(460.)).child(
             crate::modal::card_body()
@@ -579,19 +642,36 @@ impl Render for CreateWorktreeDialog {
                         .gap(px(2.))
                         .child(crate::modal::title("New worktree"))
                         .child(
-                            crate::modal::body(format!(
-                                "A separate working copy of {} on its own branch.",
-                                self.project_label
-                            ))
+                            crate::modal::body(if remote {
+                                format!(
+                                    "A separate working copy of {} on its own branch, made on its host.",
+                                    self.project_label
+                                )
+                            } else {
+                                format!(
+                                    "A separate working copy of {} on its own branch.",
+                                    self.project_label
+                                )
+                            })
                             .text_size(px(12.)),
                         ),
                 )
                 .child(Self::field(
-                    "Name",
+                    if remote { "Branch name" } else { "Name" },
                     "worktree-dialog-name",
                     &self.name,
                     disabled,
                 ))
+                .when(remote_exists, |d| {
+                    let on = self.use_existing;
+                    d.child(Self::checkbox(
+                        "worktree-dialog-use-existing",
+                        format!("Use the existing branch {name}"),
+                        on,
+                        cx,
+                        |this| this.use_existing = !this.use_existing,
+                    ))
+                })
                 .child(
                     div()
                         .flex()
@@ -603,7 +683,7 @@ impl Render for CreateWorktreeDialog {
                             disabled,
                         ))
                         .children(self.base_suggestions(window, cx))
-                        .when(!base.is_empty() && !disabled, |d| {
+                        .when(!base.is_empty() && !disabled && !remote, |d| {
                             let on = self.set_default;
                             d.child(div().mt(px(8.)).child(Self::checkbox(
                                 "worktree-dialog-set-default",
@@ -614,7 +694,7 @@ impl Render for CreateWorktreeDialog {
                             )))
                         }),
                 )
-                .child(
+                .when(!remote, |d| d.child(
                     div()
                         .flex()
                         .flex_col()
@@ -668,7 +748,7 @@ impl Render for CreateWorktreeDialog {
                                 ))
                             })
                         }),
-                )
+                ))
                 .children(self.setup_row(cx))
                 .when(self.loaded.is_none() && !self.remote, |d| {
                     d.child(

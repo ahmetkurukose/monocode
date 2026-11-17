@@ -115,6 +115,7 @@ impl Shell {
                             }
                         }
                         this.sync_git(cx);
+                        this.invalidate_rail_worktrees(cx);
                         this.invalidate_chrome(cx);
                     }
                     Event::Selected(focus) if this.workspace.project == project => {

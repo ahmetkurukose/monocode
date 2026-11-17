@@ -311,6 +311,7 @@ impl Shell {
                 if let Some(view) = self.settings.clone() {
                     view.update(cx, |view, cx| view.worktree_removed(path, cx));
                 }
+                self.invalidate_rail_worktrees(cx);
             }
             Err(error) => match &mut self.worktree_ui.delete {
                 Some(dialog) => {

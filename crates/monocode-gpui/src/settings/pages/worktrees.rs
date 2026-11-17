@@ -111,6 +111,8 @@ impl SettingsView {
         let result = crate::runtime::locked(&store)
             .and_then(|db| worktree::meta::save_repo_prefs(&db, main, repo));
         self.discovery.worktrees.error = result.err();
+        // The rail tree lists external worktrees only when this says so.
+        cx.emit(SettingsEvent::WorktreesChanged);
         cx.notify();
     }
 

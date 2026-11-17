@@ -715,21 +715,70 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
-    fn remote_projects_show_the_unavailable_text(cx: &mut TestAppContext) {
+    fn remote_projects_get_the_reduced_form_and_create_through_their_host(cx: &mut TestAppContext) {
         bind(cx);
         let (window, _, _) = window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        open(window, visual, "remote://host/project", "x");
+        let project = "remote://host/project";
+        crate::git_cache::remember(
+            project,
+            &monocode_core::git::Snapshot {
+                branches: vec![monocode_core::git::Branch {
+                    name: "feature/old".into(),
+                    remote: None,
+                }],
+                ..Default::default()
+            },
+        );
+        open(window, visual, project, "feature/new");
         let view = dialog(window, visual).unwrap();
-        let problem = view.read_with(visual, |v, cx| v.problem(cx));
-        assert_eq!(problem.as_deref(), Some(worktree::REMOTE_UNAVAILABLE));
+        assert_eq!(view.read_with(visual, |v, cx| v.problem(cx)), None);
+        // Only the managed features are gone.
+        assert!(visual.debug_bounds("worktree-dialog-name").is_some());
+        assert!(visual.debug_bounds("worktree-dialog-base").is_some());
+        assert!(visual.debug_bounds("worktree-dialog-advanced").is_none());
+        assert!(visual.debug_bounds("worktree-dialog-setup").is_none());
+
+        // An existing host branch needs "Use the existing branch".
         window
-            .update(visual, |shell, _, cx| {
-                view.update(cx, |v, cx| v.submit(cx));
-                let _ = shell;
+            .update(visual, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.name
+                        .update(cx, |i, cx| i.set_text("feature/old".into(), cx))
+                })
             })
             .unwrap();
         visual.run_until_parked();
-        assert!(dialog(window, visual).is_some(), "nothing to submit");
+        assert!(view.read_with(visual, |v, cx| v.problem(cx)).is_some());
+        click(visual, "worktree-dialog-use-existing");
+        assert_eq!(view.read_with(visual, |v, cx| v.problem(cx)), None);
+        window
+            .update(visual, |_, _, cx| view.update(cx, |v, cx| v.submit(cx)))
+            .unwrap();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(
+                    shell.worktree_ui.create.is_none(),
+                    "Submit closes the dialog"
+                );
+                let pending = shell.pending_worktrees_for(project);
+                assert_eq!(pending.len(), 1);
+                let request = &pending[0].request;
+                assert_eq!(request.branch.as_deref(), Some("feature/old"));
+                assert!(request.existing_branch);
+                assert!(!pending[0].run_setup);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        // The old remote path ran: with no host connected it fails, and the row
+        // keeps the host's error (not the managed core's "not available").
+        window
+            .update(visual, |shell, _, _| {
+                let pending = shell.pending_worktrees_for(project);
+                let error = pending[0].error.clone().unwrap();
+                assert!(!error.is_empty());
+                assert_ne!(error, worktree::REMOTE_UNAVAILABLE);
+            })
+            .unwrap();
     }
 }

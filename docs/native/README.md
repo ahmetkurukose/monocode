@@ -53,6 +53,55 @@ the same follow-ups after a restart. Scheduled habits take priority over
 heartbeats. Live scheduler and provider behavior still need broader testing;
 see [verification](verification.md).
 
+## Worktrees
+
+A worktree is a separate working copy of a local Git project on its own branch,
+so several sessions can change the same repository without stepping on each
+other. A session uses a worktree only when you ask for one: **New worktree…**
+in the worktree switcher, a project's rail menu, **Settings → Worktrees →
+Create worktree**, or the composer's "New worktree".
+
+- **Where they live.** New worktrees go under one root,
+  `~/monocode/workspaces/<repository>/<name>`. Change it in **Settings →
+  Worktrees → Location**; the `MONOCODE_WORKTREE_ROOT` environment variable,
+  when set, replaces the default. The same page sets a branch prefix, each
+  project's default base and whether other worktrees are shown.
+- **Create dialog.** Pick a name (the folder and branch follow it), where to
+  start from (the project's default base, a local or remote branch, or a
+  commit), and optionally make that base the project's default. **Advanced**
+  takes an explicit branch name and can check out an existing branch. The
+  dialog closes at once; creation runs in the background with a pending row
+  in the rail and the switcher, and a failure keeps the row with **Retry** and
+  **Dismiss**. The new worktree becomes the project's current one.
+- **`monocode.yaml`** at the repository root (or Orca's `orca.yaml`, same
+  schema, when there is no `monocode.yaml`) configures new worktrees:
+  `worktree.sharedDirectories` lists ignored folders (for example
+  `node_modules`) linked from the main checkout instead of copied, and
+  `scripts.setup` is a script run in a **Setup** terminal in the new worktree.
+  A new or changed setup script is shown in the dialog and runs only once you
+  choose **Run setup**, which trusts that version for the repository.
+- **`.worktreeinclude`** at the repository root lists ignored files (one
+  relative path per line, such as `.env`) copied into each new worktree.
+- **Rail tree.** With **Project list: Tree** (Classic layout), an open project
+  lists its worktrees after its own sessions: name, branch and session count,
+  with the current one highlighted. Open a worktree to see the sessions
+  working in it; a click makes it the project's current worktree. Its menu
+  offers Open, New session here, Copy path, Reveal and Delete…. Worktrees
+  made outside Monocode are listed only when **Show other worktrees** is on.
+- **Delete.** The Delete dialog lists uncommitted changes, ignored local files
+  that would be lost and unpushed commits; a dirty worktree needs **Force
+  delete**. Its sessions are kept unless you also delete them. A managed
+  worktree's branch is deleted with it only when Git considers it merged; an
+  unmerged branch is kept and a card offers **Delete branch**.
+- **Older worktrees.** Worktrees created by earlier versions next to the
+  project (`<project>-worktrees/`) stay where they are, keep working and are
+  listed as legacy; their branches are never deleted with them.
+- **Remote (SSH) projects** create worktrees on their host from a reduced
+  dialog (branch, start from, existing branch), without shared folders,
+  included files or setup.
+
+Design notes: [worktrees.md](worktrees.md).
+
 ## Develop
 
 From the repository root:

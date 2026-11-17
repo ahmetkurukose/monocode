@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Worktrees** in the native app follow an Orca-style model: new worktrees live under `~/monocode/workspaces` (changeable in **Settings → Worktrees → Location**), get readable names from the project's default base, and are created from a **New worktree** dialog in the background with a pending row. `monocode.yaml` (or `orca.yaml`) shares ignored folders and runs an approved setup script, and `.worktreeinclude` copies ignored files. With the tree project list, each project lists its worktrees and the sessions working in them. A **Delete worktree** dialog shows what would be lost and keeps unmerged branches. Worktrees from earlier versions keep working where they are; remote projects create worktrees on their host.
+
 - The Database view connects to **MongoDB** as well as PostgreSQL. A MongoDB data source takes a host and port or a `mongodb://` / `mongodb+srv://` connection string, with an auth database and TLS. Its consoles speak the shell (`db.users.find({ … }).sort({ … })`, `aggregate`, inserts, updates, deletes, indexes, `runCommand`, `show dbs`, `use`), with `ObjectId`, `ISODate` and the other BSON helpers, completion of collections, methods, operators and fields, Explain and Analyze, Read-only protection, a confirmation before a sweeping delete or drop, and export of every document. The tree lists databases, collections and views with their fields, indexes and validation.
 
 ## [0.16.0] - 2026-10-19

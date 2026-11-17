@@ -222,6 +222,7 @@ impl Shell {
                     window,
                     cx,
                 ),
+                SettingsEvent::WorktreesChanged => this.invalidate_rail_worktrees(cx),
                 SettingsEvent::DeleteWorktree { cwd, path } => {
                     this.open_delete_worktree_dialog(cwd.clone(), path.clone(), window, cx)
                 }
