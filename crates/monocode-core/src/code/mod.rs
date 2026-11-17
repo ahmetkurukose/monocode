@@ -4,6 +4,7 @@
 pub mod dap;
 pub mod lsp;
 pub mod run;
+pub mod services;
 pub mod spawn;
 pub mod toolchain;
 pub mod wire;
