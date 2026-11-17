@@ -1,12 +1,38 @@
 //! Where managed worktrees live: `<root>/<repo>/<slug>`.
 use std::path::{Path, PathBuf};
 
-/// `~/monocode/workspaces` (falls back to the temp dir when no home is known).
+/// Overrides [`default_root`] when set and non-empty (tests point it at a temp dir).
+pub const ROOT_ENV: &str = "MONOCODE_WORKTREE_ROOT";
+
+/// `$MONOCODE_WORKTREE_ROOT`, else `~/monocode/workspaces` (falls back to the temp dir when
+/// no home is known).
 pub fn default_root() -> PathBuf {
+    #[cfg(test)]
+    isolate_for_tests();
+    if let Some(root) = std::env::var_os(ROOT_ENV).filter(|r| !r.is_empty()) {
+        return PathBuf::from(root);
+    }
     crate::accounts::home()
         .unwrap_or_else(std::env::temp_dir)
         .join("monocode")
         .join("workspaces")
+}
+
+/// Points [`ROOT_ENV`] at a process-wide temp dir unless the environment already sets it,
+/// so no test ever writes to the real `~/monocode`. Idempotent.
+pub fn isolate_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os(ROOT_ENV).is_some_and(|r| !r.is_empty()) {
+            return;
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("monocode-test-{}", std::process::id()))
+            .join("monocode")
+            .join("workspaces");
+        // Set once, before this process creates any worktree.
+        std::env::set_var(ROOT_ENV, dir);
+    });
 }
 
 /// `root/<basename(main) minus a trailing .git>`.

@@ -1,8 +1,7 @@
 use crate::{
     input::{self, Input},
     settings::{
-        SettingsView,
-        management::Target,
+        SettingsEvent, SettingsView,
         widgets::{note, secondary_button},
     },
     theme::*,
@@ -307,12 +306,27 @@ impl SettingsView {
         ))
     }
 
+    /// Reload the page after a worktree was created or changed elsewhere.
+    pub(crate) fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+    }
+
+    /// A worktree was deleted: leave it if it was the selected project, and reload.
+    pub(crate) fn worktree_removed(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.discovery.worktrees.main.is_empty()
+            && monocode_core::files::is_equal_or_inside(&self.selected_project, path)
+        {
+            self.selected_project = self.discovery.worktrees.main.clone();
+        }
+        self.refresh(cx);
+    }
+
     pub(super) fn worktrees_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let project = self.project_picker(cx);
         let ready = !self.discovery_loading
             && self.discovery.worktrees.error.is_none()
             && !self.discovery.worktrees.main.is_empty();
-        let mut page=vec![div().relative().child(self.reveal_probe("project-worktrees")).flex().items_center().gap_1().child(project).child(secondary_button("create-settings-worktree","Create worktree",false,!ready).child(icon("plus",12.)).child("Create worktree").on_click(cx.listener(move|this,_,window,cx|{if ready{this.open_management(Target::Worktree,window,cx);}}))).into_any_element(),div().mt_4().flex().items_center().justify_between().gap_3().child(div().min_w_0().flex_1().text_size(px(12.)).line_height(px(18.)).text_color(content(0.5)).child("Sessions can share a worktree. Deleting one keeps its sessions by default and discards uncommitted changes. Its branch and commits are kept.")).child(self.refresh_button("refresh-settings-worktrees","Refresh",cx)).into_any_element()];
+        let mut page=vec![div().relative().child(self.reveal_probe("project-worktrees")).flex().items_center().gap_1().child(project).child(secondary_button("create-settings-worktree","Create worktree",false,!ready).debug_selector(||"create-settings-worktree".into()).child(icon("plus",12.)).child("Create worktree").on_click(cx.listener(move|this,_,_,cx|{if ready{cx.emit(SettingsEvent::CreateWorktree(this.selected_project.clone()));}}))).into_any_element(),div().mt_4().flex().items_center().justify_between().gap_3().child(div().min_w_0().flex_1().text_size(px(12.)).line_height(px(18.)).text_color(content(0.5)).child("Sessions can share a worktree. Deleting one keeps its sessions by default. A managed worktree's merged branch is deleted with it; other branches are kept.")).child(self.refresh_button("refresh-settings-worktrees","Refresh",cx)).into_any_element()];
         if self.selected_project.is_empty() {
             page.push(note("Add a project to manage its worktrees."));
         } else if self.discovery_loading {
@@ -498,15 +512,15 @@ impl SettingsView {
                                     false,
                                     blocked,
                                 )
+                                .debug_selector(move || format!("delete-tree-{ix}"))
                                 .child(icon("trash", 16.))
                                 .on_click(cx.listener(
-                                    move |this, _, window, cx| {
+                                    move |this, _, _, cx| {
                                         if !blocked {
-                                            this.open_management(
-                                                Target::DeleteTree(tree.clone()),
-                                                window,
-                                                cx,
-                                            );
+                                            cx.emit(SettingsEvent::DeleteWorktree {
+                                                cwd: this.selected_project.clone(),
+                                                path: tree.tree.path.clone(),
+                                            });
                                         }
                                     },
                                 )),

@@ -178,6 +178,18 @@ pub(crate) fn origin_branch_exists(cwd: &Path, branch: &str) -> bool {
     )
 }
 
+/// Whether `name` is usable as a new branch (`git check-ref-format --branch`, no leading
+/// `-`/`@`), for live validation in the UI.
+pub fn validate_branch(cwd: &Path, name: &str) -> Result<(), String> {
+    super::ensure_local(cwd)?;
+    crate::git::valid_branch(cwd, name)
+}
+
+/// `refs/heads/<branch>` exists.
+pub fn branch_exists(cwd: &Path, branch: &str) -> bool {
+    local_branch_exists(cwd, branch)
+}
+
 /// Try `slug`, `slug-2` … `slug-100`; see spec §3. A candidate is taken when its path
 /// exists, is registered with Git (even as a missing/prunable worktree), is claimed by
 /// another in-process creation, or (without an explicit branch) its branch exists.

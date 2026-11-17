@@ -108,6 +108,7 @@ mod visuals;
 mod wheel_glide_tests;
 mod window_state;
 mod workspace;
+mod worktree_dialog;
 mod worktree_switcher;
 
 use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};

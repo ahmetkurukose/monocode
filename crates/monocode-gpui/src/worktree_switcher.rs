@@ -6,8 +6,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, Role, ScrollHandle, Subscription,
-    Window, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, ScrollHandle,
+    Subscription, Window, div, prelude::*, px,
 };
 use monocode_core::{files::path_key, git::Snapshot};
 use std::{
@@ -32,6 +32,18 @@ pub(crate) enum Event {
     Selected(Option<WorktreeFocus>),
     Metadata(Vec<(i64, Option<String>)>),
     Dismissed,
+    /// "New worktree…": open the Create Worktree dialog with the typed text.
+    NewWorktree(String),
+    RetryPending(u64),
+    DismissPending(u64),
+}
+/// A creation running in the background (or failed), shown above the copies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRow {
+    pub id: u64,
+    pub label: String,
+    pub status: String,
+    pub failed: bool,
 }
 #[derive(Clone)]
 struct Row {
@@ -125,11 +137,10 @@ pub(crate) struct WorktreeSwitcher {
     search: Entity<input::Input>,
     active: usize,
     scroll: ScrollHandle,
-    creating: bool,
+    pending: Vec<PendingRow>,
     load_error: Option<String>,
     error: Option<String>,
     tabs: HashMap<String, Tabs>,
-    store: Database,
     _changed: Subscription,
 }
 impl EventEmitter<Event> for WorktreeSwitcher {}
@@ -219,11 +230,10 @@ impl WorktreeSwitcher {
             search,
             active: 0,
             scroll: ScrollHandle::new(),
-            creating: false,
+            pending: Vec::new(),
             load_error: None,
             error: None,
             tabs,
-            store,
             _changed: changed,
         }
     }
@@ -233,16 +243,19 @@ impl WorktreeSwitcher {
     fn query(&self, cx: &gpui::App) -> String {
         self.search.read(cx).content.trim().to_owned()
     }
-    fn can_create(&self, cx: &gpui::App) -> bool {
+    /// Pending creations of this project, kept up to date by the Shell.
+    pub(crate) fn set_pending(&mut self, pending: Vec<PendingRow>, cx: &mut Context<Self>) {
+        if self.pending != pending {
+            self.pending = pending;
+            cx.notify();
+        }
+    }
+    fn can_create(&self) -> bool {
         self.state.is_some()
             && self.load_error.is_none()
-            && !self.query(cx).is_empty()
-            && rows(&self.cwd, self.state.as_ref(), &self.query(cx)).is_empty()
+            && !monocode_core::files::remote::is_remote(Path::new(&self.cwd))
     }
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.creating {
-            return;
-        }
         let count = rows(&self.cwd, self.state.as_ref(), &self.query(cx)).len();
         self.active = self
             .active
@@ -252,60 +265,108 @@ impl WorktreeSwitcher {
         cx.notify();
     }
     fn pick(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.creating {
-            return;
-        }
         if let Some(row) = rows(&self.cwd, self.state.as_ref(), &self.query(cx)).get(index) {
             cx.emit(Event::Selected((!row.all).then(|| WorktreeFocus {
                 path: row.path.clone(),
                 branch: row.branch.clone(),
             })));
-        } else if self.can_create(cx) {
+        } else if !self.query(cx).is_empty() {
             self.create(cx);
         }
     }
+    /// Hand the typed text to the Create Worktree dialog.
     fn create(&mut self, cx: &mut Context<Self>) {
-        if !self.can_create(cx) || self.creating {
-            return;
+        if self.can_create() {
+            cx.emit(Event::NewWorktree(self.query(cx)));
         }
-        let branch = self.query(cx);
-        let cwd = self.focused.as_ref().map_or(&self.cwd, |f| &f.path).clone();
-        self.creating = true;
-        self.error = None;
-        let store = self.store.clone();
-        let work = cx.background_executor().spawn(async move {
-            monocode_core::worktree_callers::named(
-                Path::new(&cwd),
-                &branch,
-                None,
-                false,
-                monocode_core::worktree::CreatedBy::Switcher,
-                &store,
+    }
+    fn pending_row(&self, row: &PendingRow, cx: &mut Context<Self>) -> AnyElement {
+        let id = row.id;
+        div()
+            .id(("pending-worktree", id as usize))
+            .debug_selector(move || format!("pending-worktree-{id}"))
+            .role(Role::Status)
+            .aria_label(format!("{} · {}", row.label, row.status))
+            .flex_shrink_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .px_2()
+            .py(px(6.))
+            .child(
+                icon(if row.failed { "circle-alert" } else { "loader" }, 14.).text_color(
+                    if row.failed {
+                        gpui::rgb(0xf87171).into()
+                    } else {
+                        content(0.5)
+                    },
+                ),
             )
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.creating = false;
-                match result {
-                    Ok(tree) => cx.emit(Event::Selected(Some(WorktreeFocus {
-                        path: tree.path,
-                        branch: tree.branch,
-                    }))),
-                    Err(error) => this.error = Some(error),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(content(0.8))
+                            .child(row.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.))
+                            .line_height(px(15.))
+                            .text_color(if row.failed {
+                                gpui::rgb(0xf87171).into()
+                            } else {
+                                content(0.45)
+                            })
+                            .child(row.status.clone()),
+                    ),
+            )
+            .when(row.failed, |d| {
+                d.child(
+                    div()
+                        .id(("pending-worktree-retry", id as usize))
+                        .debug_selector(move || format!("pending-worktree-retry-{id}"))
+                        .role(Role::Button)
+                        .aria_label("Retry")
+                        .px_2()
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .text_color(content(0.75))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(content(0.08)))
+                        .child("Retry")
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(Event::RetryPending(id)))),
+                )
+                .child(
+                    icon_button("pending-worktree-dismiss", "Dismiss", "close")
+                        .debug_selector(move || format!("pending-worktree-dismiss-{id}"))
+                        .on_click(
+                            cx.listener(move |_, _, _, cx| cx.emit(Event::DismissPending(id))),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 }
 impl Render for WorktreeSwitcher {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = rows(&self.cwd, self.state.as_ref(), &self.query(cx));
         let empty = rows.is_empty();
-        let can_create = self.can_create(cx);
+        let can_create = self.can_create();
+        let pending: Vec<AnyElement> = self
+            .pending
+            .clone()
+            .iter()
+            .map(|row| self.pending_row(row, cx))
+            .collect();
         div()
             .id("worktree-switcher")
             .debug_selector(|| "worktree-switcher".into())
@@ -329,17 +390,13 @@ impl Render for WorktreeSwitcher {
                 this.pick(this.active, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &popover::Cancel, _, cx| {
-                if !this.creating {
-                    cx.emit(Event::Dismissed);
-                }
+            .on_action(cx.listener(|_, _: &popover::Cancel, _, cx| {
+                cx.emit(Event::Dismissed);
                 cx.stop_propagation();
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
-                    if !this.creating {
-                        cx.emit(Event::Dismissed);
-                    }
+                    cx.emit(Event::Dismissed);
                     cx.stop_propagation();
                 }
             }))
@@ -355,13 +412,7 @@ impl Render for WorktreeSwitcher {
                     .border_color(content(0.07))
                     .px_3()
                     .child(icon("search-01", 16.).text_color(content(0.45)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(self.creating, |d| d.opacity(0.6))
-                            .child(self.search.clone()),
-                    ),
+                    .child(div().flex_1().min_w_0().child(self.search.clone())),
             )
             .child(
                 div()
@@ -375,6 +426,7 @@ impl Render for WorktreeSwitcher {
                     .p(px(6.))
                     .flex()
                     .flex_col()
+                    .children(pending)
                     .when(self.state.is_none() && self.load_error.is_none(), |d| {
                         d.child(
                             div()
@@ -426,8 +478,7 @@ impl Render for WorktreeSwitcher {
                             .px_2()
                             .py(px(6.))
                             .text_color(content(1.))
-                            .when(self.creating, |d| d.opacity(0.4))
-                            .when(!self.creating, |d| d.cursor_pointer())
+                            .cursor_pointer()
                             .map(|d| {
                                 if self.active == index {
                                     d.bg(content(0.1))
@@ -500,7 +551,7 @@ impl Render for WorktreeSwitcher {
                                 d.child(icon("check", 14.).text_color(content(1.)))
                             })
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                if *hovered && !this.creating {
+                                if *hovered {
                                     this.active = index;
                                     cx.notify();
                                 }
@@ -546,7 +597,7 @@ impl Render for WorktreeSwitcher {
                                 .id("create-sidebar-worktree")
                                 .debug_selector(|| "create-sidebar-worktree".into())
                                 .role(Role::Button)
-                                .aria_label(format!("Create worktree {}", self.query(cx)))
+                                .aria_label("New worktree…")
                                 .h(px(36.))
                                 .w_full()
                                 .flex()
@@ -556,13 +607,16 @@ impl Render for WorktreeSwitcher {
                                 .px(px(10.))
                                 .text_size(px(13.))
                                 .text_color(content(0.75))
-                                .when(self.creating, |d| d.opacity(0.6))
-                                .when(!self.creating, |d| {
-                                    d.cursor_pointer()
-                                        .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
-                                })
-                                .child(icon(if self.creating { "loader" } else { "plus" }, 16.))
-                                .child(format!("Create worktree {}", self.query(cx)))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
+                                .child(icon("plus", 16.))
+                                .child(div().flex_1().min_w_0().truncate().child(
+                                    if self.query(cx).is_empty() || !empty {
+                                        "New worktree…".to_owned()
+                                    } else {
+                                        format!("New worktree “{}”…", self.query(cx))
+                                    },
+                                ))
                                 .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                         ),
                 )

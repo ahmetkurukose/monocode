@@ -4,16 +4,12 @@
 use crate::{
     git,
     store::Store,
-    worktree::{self, catalog, meta, CreateRequest, CreatedBy, Entry},
+    worktree::{self, catalog, CreateRequest, CreatedBy, Entry},
 };
 use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
-
-fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
-    store.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// The empty-or-whitespace base means "use the default base" (spec §4).
 fn base(base: Option<&str>) -> Option<String> {
@@ -88,42 +84,25 @@ pub fn named_request(
     }
 }
 
-/// `catalog::list_with` after reading the metas, so Git never runs under the lock.
+/// [`catalog::list_in`]: Git never runs under the database lock.
 pub fn list(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<Entry>, String> {
-    let metas: Vec<_> = meta::all(&lock(store))?
-        .into_iter()
-        .map(|(_, m)| m)
-        .collect();
-    catalog::list_with(cwd, &metas)
+    catalog::list_in(cwd, store)
 }
 
-/// `catalog::reconcile` without holding the lock while Git runs: drops metas of
-/// this repository whose path is gone and no longer registered. Returns the keys.
+/// [`catalog::reconcile_in`]: drops metas of this repository whose path is gone and no
+/// longer registered, without holding the lock while Git runs. Returns the keys.
 pub fn reconcile(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<String>, String> {
-    let entries = catalog::list_with(cwd, &[])?;
-    let Some(main) = entries.first() else {
-        return Ok(Vec::new());
-    };
-    let main_key = meta::key(&main.path);
-    let live: std::collections::HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-    let store = lock(store);
-    let mut removed = Vec::new();
-    for (key, m) in meta::all(&store)? {
-        let path = Path::new(&m.path);
-        if meta::key(Path::new(&m.repo)) == main_key
-            && !live.contains(meta::key(path).as_str())
-            && path.symlink_metadata().is_err()
-        {
-            meta::delete(&store, path)?;
-            removed.push(key);
-        }
-    }
-    Ok(removed)
+    catalog::reconcile_in(cwd, store)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::meta;
+
+    fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+        store.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn repo() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();

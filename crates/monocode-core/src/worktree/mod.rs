@@ -7,7 +7,7 @@
 //! Public API (all errors are user-facing `String`s):
 //!
 //! ```text
-//! layout::default_root() -> PathBuf                                   // ~/monocode/workspaces
+//! layout::default_root() -> PathBuf                                   // $MONOCODE_WORKTREE_ROOT or ~/monocode/workspaces
 //! layout::repo_dir(root: &Path, main: &Path) -> PathBuf               // root/<basename(main) minus .git>
 //! layout::main_checkout(cwd: &Path) -> Result<PathBuf, String>        // first `worktree list` entry
 //!
@@ -17,6 +17,8 @@
 //! naming::resolve_prefix(prefix: &BranchPrefix, cwd: &Path) -> Option<String>
 //! naming::branch_for(slug: &str, prefix: &BranchPrefix, cwd: &Path) -> String
 //! naming::claim(path: &Path) -> Option<naming::Claim>                 // RAII, process-global
+//! naming::validate_branch(cwd: &Path, name: &str) -> Result<(), String> // check-ref-format
+//! naming::branch_exists(cwd: &Path, branch: &str) -> bool              // refs/heads/<branch>
 //! naming::pick(&naming::PickRequest) -> Result<naming::Picked, String> // collision loop slug, slug-2 … slug-100
 //!
 //! base::detect_default(cwd: &Path) -> Option<String>                  // origin/HEAD → origin/main → origin/master → main → master
@@ -366,6 +368,7 @@ pub(crate) mod fixture {
 
     /// `<tmp>/project` with one commit on `main`; returns (tempdir, main, root).
     pub fn repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        super::layout::isolate_for_tests();
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let main = base.join("project");
@@ -400,6 +403,7 @@ pub(crate) mod fixture {
     }
 
     pub fn store() -> std::sync::Mutex<crate::store::Store> {
+        super::layout::isolate_for_tests();
         std::sync::Mutex::new(crate::store::Store::open(Path::new(":memory:")).unwrap())
     }
 

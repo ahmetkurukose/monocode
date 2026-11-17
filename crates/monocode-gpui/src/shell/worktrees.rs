@@ -96,8 +96,13 @@ impl Shell {
                 cx,
             )
         });
+        self.track_worktree_switcher(&project, &view, cx);
         events.push(
             cx.subscribe_in(&view, window, move |this, _, event: &Event, window, cx| {
+                if this.worktree_switcher_event(&project, event, window, cx) {
+                    cx.notify();
+                    return;
+                }
                 match event {
                     Event::Metadata(paths) => {
                         for (id, path) in paths {
@@ -120,6 +125,7 @@ impl Shell {
                         this.close_menu(cx);
                         this.focus_workspace(window, cx);
                     }
+                    Event::NewWorktree(_) | Event::RetryPending(_) | Event::DismissPending(_) => {}
                 }
                 cx.notify();
             }),

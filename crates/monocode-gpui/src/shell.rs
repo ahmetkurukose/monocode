@@ -58,6 +58,8 @@ mod title_tabs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktree_create;
+mod worktree_delete;
+mod worktree_dialog;
 mod worktrees;
 
 use crate::{
@@ -798,6 +800,8 @@ pub(crate) struct Shell {
     /// Worktrees being created in the background, with their phase or error.
     pending_worktrees: Vec<worktree_create::PendingWorktree>,
     worktree_creates: worktree_create::Creates,
+    /// The Create/Delete Worktree dialogs, kept-branch cards and open switchers.
+    worktree_ui: worktree_dialog::WorktreeUi,
     tab_drag: Option<TabDrag>,
     /// Tabs sliding between slots: neighbours making room for a drag and,
     /// after a drop, every tab gliding from where it was drawn into place.
@@ -933,6 +937,9 @@ impl Shell {
         sidebar_metadata: monocode_core::store::SessionSidebarMetadata,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Test shells never create worktrees under the real home.
+        #[cfg(test)]
+        monocode_core::worktree::layout::isolate_for_tests();
         crate::accounts::install(store.clone(), cx);
         let remote_dir = locked(&store)
             .ok()
@@ -1217,6 +1224,7 @@ impl Shell {
             worktree_returns: HashMap::new(),
             pending_worktrees: Vec::new(),
             worktree_creates: Default::default(),
+            worktree_ui: Default::default(),
             tab_drag: None,
             tab_shifts: HashMap::new(),
             pane_ticks: HashMap::new(),
@@ -6344,6 +6352,13 @@ impl Shell {
                             .into(),
                     );
                 }
+                if *rail && self.offers_new_worktree(path) {
+                    items.push(
+                        MenuAction::new("new-worktree", "New worktree…")
+                            .icon("folder-tree")
+                            .into(),
+                    );
+                }
                 items.extend([
                     MenuAction::new("reveal", REVEAL_LABEL)
                         .icon("folder-open")
@@ -6491,6 +6506,14 @@ impl Shell {
                     } else {
                         cx.reveal_path(std::path::Path::new(&path));
                     }
+                } else if action == "new-worktree" {
+                    self.open_create_worktree_dialog(
+                        path,
+                        String::new(),
+                        worktree_create::WorktreeOrigin::Rail,
+                        window,
+                        cx,
+                    );
                 } else if action == "project-theme" {
                     self.open_project_theme(path, window, cx);
                 } else if action == "background" {
@@ -9940,6 +9963,7 @@ impl Render for Shell {
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))
             .children(self.close_session_modal(window, cx))
+            .children(self.worktree_modals(window, cx))
             .children(self.folder_picker_popover(window, cx))
             .children(crate::accounts::get(cx))
             .children(

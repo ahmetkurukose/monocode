@@ -8,8 +8,6 @@ pub(super) enum Target {
     Cli(Kind),
     Mcp,
     Skill,
-    Worktree,
-    DeleteTree(data::Tree),
     ResetMono(super::MonoSetting),
 }
 pub(super) struct Editor {
@@ -18,9 +16,6 @@ pub(super) struct Editor {
     pub body: Entity<Input>,
     pub provider: String,
     pub scope: String,
-    pub base: String,
-    pub existing: bool,
-    pub delete_sessions: bool,
     pub busy: bool,
     pub error: Option<String>,
     pub editing: bool,
@@ -43,7 +38,7 @@ impl SettingsView {
             Target::Cli(_) => ("CLI path", "Auto-detected path"),
             Target::Mcp => ("Name (optional with mcpServers)", "my-server"),
             Target::Skill => ("Skill name", "skill-name"),
-            _ => ("New branch name", "feature/my-task"),
+            Target::ResetMono(_) => ("", ""),
         };
         let name = cx.new(|cx| {
             let mut input = Input::field(label, placeholder, content(0.35), cx);
@@ -77,10 +72,7 @@ impl SettingsView {
             }),
         ];
         let previous = window.focused(cx);
-        if matches!(
-            target,
-            Target::Cli(_) | Target::DeleteTree(_) | Target::ResetMono(_)
-        ) {
+        if matches!(target, Target::Cli(_) | Target::ResetMono(_)) {
             window.focus(&self.focus, cx);
         } else {
             window.focus(&name.read(cx).focus_handle(cx), cx);
@@ -110,14 +102,6 @@ impl SettingsView {
             body,
             provider,
             scope,
-            // Local projects start from the repository's default base (spec §4).
-            base: if self.discovery.worktrees.prefs.is_some() {
-                String::new()
-            } else {
-                "HEAD".into()
-            },
-            existing: false,
-            delete_sessions: false,
             busy: false,
             error: None,
             editing: false,
@@ -193,15 +177,6 @@ impl SettingsView {
             editor.busy = false;
             match result {
                 Ok(()) => {
-                    if let Some(editor) = &self.management
-                        && let Target::DeleteTree(tree) = &editor.target
-                        && monocode_core::files::is_equal_or_inside(
-                            &self.selected_project,
-                            &tree.tree.path,
-                        )
-                    {
-                        self.selected_project = self.discovery.worktrees.main.clone();
-                    }
                     self.management = None;
                     self.refresh(cx);
                 }
@@ -227,9 +202,7 @@ impl SettingsView {
         let target = editor.target.clone();
         let provider = editor.provider.clone();
         let scope = editor.scope.clone();
-        let base = editor.base.clone();
-        let existing = editor.existing;
-        if matches!(target, Target::Worktree | Target::Skill) && name.is_empty() {
+        if matches!(target, Target::Skill) && name.is_empty() {
             return;
         }
         editor.busy = true;
@@ -239,41 +212,13 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        if let Target::DeleteTree(tree) = target {
-            cx.emit(SettingsEvent::RemoveWorktree {
-                cwd,
-                path: tree.tree.path,
-                delete_sessions: editor.delete_sessions,
-            });
-            cx.notify();
-            return;
-        }
         let generation = self.management_generation;
-        let store = self.ctx.store.clone().map(|s| s.0);
         let work = cx.background_executor().spawn(async move {
             match target {
                 Target::Mcp => monocode_core::mcp::mcp_add(cwd, provider, scope, name, body),
                 Target::Skill => {
                     monocode_core::skills::create_blank(&cwd, &name, scope == "user").map(|_| ())
                 }
-                Target::Worktree => match &store {
-                    Some(store) => monocode_core::worktree_callers::named(
-                        std::path::Path::new(&cwd),
-                        &name,
-                        Some(&base),
-                        existing,
-                        monocode_core::worktree::CreatedBy::Dialog,
-                        store,
-                    )
-                    .map(|_| ()),
-                    None => monocode_core::git::create_project_worktree(
-                        std::path::Path::new(&cwd),
-                        &name,
-                        Some(&base).filter(|b| !b.is_empty()).map(String::as_str),
-                        existing,
-                    )
-                    .map(|_| ()),
-                },
                 _ => Ok(()),
             }
         });
@@ -301,9 +246,6 @@ impl SettingsView {
         let error = e.error.clone();
         let provider = e.provider.clone();
         let scope = e.scope.clone();
-        let existing = e.existing;
-        let base = e.base.clone();
-        let deleting = e.delete_sessions;
         let editing = e.editing;
         let inspection = e.inspection.clone();
         let mut rows = Vec::new();
@@ -498,180 +440,6 @@ impl SettingsView {
                     "Creates a starter SKILL.md in .agents/skills. Edit it in your file editor.",
                 ));
             }
-            Target::Worktree => {
-                rows.push(note(format!("An independent working copy of {}. Existing uncommitted changes stay in their current working copy.",self.selected_project)));
-                rows.push(self.select(
-                    "worktree-type",
-                    "Branch type",
-                    if existing { "existing" } else { "new" },
-                    vec![
-                        ("new".into(), "Create a new branch".into(), None),
-                        (
-                            "existing".into(),
-                            "Use an existing local branch".into(),
-                            None,
-                        ),
-                    ],
-                    None,
-                    cx,
-                    |this, v, cx| {
-                        if let Some(e) = &mut this.management {
-                            e.existing = v == "existing";
-                            e.name.update(cx, |i, cx| i.set_text(String::new(), cx));
-                        }
-                        cx.notify();
-                    },
-                ));
-                if existing {
-                    let selected = name.read(cx).content.to_string();
-                    rows.push(
-                        self.select(
-                            "worktree-branch",
-                            "Existing branch",
-                            &selected,
-                            self.discovery
-                                .worktrees
-                                .branches
-                                .iter()
-                                .filter(|b| b.remote.is_none())
-                                .map(|b| (b.name.clone(), b.name.clone().into(), None))
-                                .collect(),
-                            None,
-                            cx,
-                            |this, v, cx| {
-                                if let Some(e) = &mut this.management {
-                                    e.name.update(cx, |i, cx| i.set_text(v, cx));
-                                }
-                                cx.notify();
-                            },
-                        ),
-                    );
-                } else {
-                    rows.push(form_field("New branch name", name, 36.));
-                    let mut options = Vec::new();
-                    if self.discovery.worktrees.prefs.is_some() {
-                        let default = self
-                            .discovery
-                            .worktrees
-                            .repo
-                            .as_ref()
-                            .and_then(|r| r.default_base.clone())
-                            .map_or_else(
-                                || "Default branch".to_owned(),
-                                |b| format!("Default ({b})"),
-                            );
-                        options.push((String::new(), default.into(), None));
-                    }
-                    options.push(("HEAD".into(), "Current commit".into(), None));
-                    options.extend(self.discovery.worktrees.branches.iter().map(|b| {
-                        let label = b
-                            .remote
-                            .as_ref()
-                            .map(|r| format!("{r}/{}", b.name))
-                            .unwrap_or_else(|| b.name.clone());
-                        (label.clone(), label.into(), None)
-                    }));
-                    rows.push(self.select(
-                        "worktree-base",
-                        "Start from",
-                        &base,
-                        options,
-                        None,
-                        cx,
-                        |this, v, cx| {
-                            if let Some(e) = &mut this.management {
-                                e.base = v;
-                            }
-                            cx.notify();
-                        },
-                    ));
-                }
-                rows.push(note(format!(
-                    "Created in {}",
-                    self.discovery.worktrees.default_root.display()
-                )));
-            }
-            Target::DeleteTree(tree) => {
-                let count = self
-                    .ctx
-                    .sessions
-                    .iter()
-                    .filter(|(_, p, _)| {
-                        monocode_core::files::is_equal_or_inside(p, &tree.tree.path)
-                    })
-                    .count();
-                rows.push(note(
-                    "This permanently deletes the working copy and everything inside it.",
-                ));
-                let mut consequences = div()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(content(0.1))
-                    .bg(content(0.05))
-                    .p_3()
-                    .text_size(px(12.))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(tree.tree.path.clone());
-                if count > 0 {
-                    consequences = consequences.child(format!(
-                        "{count} sessions using this worktree are {}",
-                        if deleting {
-                            "permanently deleted."
-                        } else {
-                            "kept. Select a branch or worktree to continue them."
-                        }
-                    ));
-                }
-                if tree.dirty != Some(false) {
-                    consequences = consequences.child(
-                        div()
-                            .text_color(gpui::rgb(0xfbbf24))
-                            .child("All uncommitted and untracked changes here are discarded."),
-                    );
-                }
-                consequences = consequences.child(format!(
-                    "The {} branch and its commits are kept.",
-                    tree.tree.branch.as_deref().unwrap_or("worktree")
-                ));
-                if tree.unpushed > 0 {
-                    consequences = consequences.child(format!(
-                        "{} unpublished commits stay on the branch.",
-                        tree.unpushed
-                    ));
-                }
-                rows.push(consequences.into_any_element());
-                if count > 0 {
-                    rows.push(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .gap_3()
-                            .p_3()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(content(0.1))
-                            .text_size(px(12.5))
-                            .child("Also delete associated sessions")
-                            .child(self.toggle(
-                                "delete-worktree-sessions",
-                                "Also delete associated sessions",
-                                deleting,
-                                busy,
-                                cx,
-                                |this, on, cx| {
-                                    if let Some(e) = &mut this.management {
-                                        e.delete_sessions = on;
-                                    }
-                                    cx.notify();
-                                },
-                            ))
-                            .into_any_element(),
-                    );
-                }
-            }
         }
         if let Some(error) = error {
             rows.push(
@@ -759,19 +527,11 @@ impl SettingsView {
                     "Create skill"
                 }
             }
-            Target::Worktree => "Create worktree",
             Target::ResetMono(_) => {
                 if busy {
                     "Resetting…"
                 } else {
                     "Reset Mono"
-                }
-            }
-            Target::DeleteTree(_) => {
-                if deleting {
-                    "Delete worktree and sessions"
-                } else {
-                    "Delete worktree"
                 }
             }
         };
@@ -785,7 +545,7 @@ impl SettingsView {
             )
             .child(
                 crate::modal::disabled(
-                    if matches!(target, Target::DeleteTree(_) | Target::ResetMono(_)) {
+                    if matches!(target, Target::ResetMono(_)) {
                         crate::modal::danger_button("submit-management", label)
                     } else {
                         crate::modal::primary_button("submit-management", label)
@@ -814,8 +574,6 @@ impl SettingsView {
         let title = match target {
             Target::Cli(kind) => format!("{} CLI details", kind.label()),
             Target::Mcp => "Add MCP server".into(),
-            Target::Worktree => "Create worktree".into(),
-            Target::DeleteTree(_) => "Delete worktree?".into(),
             Target::ResetMono(ref mono) => format!("Reset {} to its defaults?", mono.name),
             _ => String::new(),
         };

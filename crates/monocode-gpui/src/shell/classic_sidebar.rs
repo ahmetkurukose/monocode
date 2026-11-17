@@ -853,7 +853,12 @@ impl Shell {
             )
         });
         let observed_project = project.clone();
+        self.track_worktree_switcher(&project, &view, cx);
         let events = cx.subscribe_in(&view, window, move |this, _, event: &Event, window, cx| {
+            if this.worktree_switcher_event(&observed_project, event, window, cx) {
+                cx.notify();
+                return;
+            }
             match event {
                 Event::Metadata(paths) => {
                     for (id, path) in paths {
@@ -876,6 +881,7 @@ impl Shell {
                 Event::Selected(_) | Event::Dismissed => {
                     this.close_classic_worktree_picker(window, cx);
                 }
+                Event::NewWorktree(_) | Event::RetryPending(_) | Event::DismissPending(_) => {}
             }
             cx.notify();
         });

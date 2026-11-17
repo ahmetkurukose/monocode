@@ -35,12 +35,13 @@ session setting. Git is the source of truth for structure (`git worktree list
   (e.g. `origin/main`), `setup_approved_hash` (sha256 of trimmed setup script),
   `show_external` (bool, default false).
 - **Global prefs** (native settings key `worktree-prefs`): `root` (default
-  `~/monocode/workspaces`), `branch_prefix` (`none` default | `git-username` | `custom:<p>`).
+  `~/monocode/workspaces`, or `$MONOCODE_WORKTREE_ROOT` when that environment variable is set
+  and non-empty), `branch_prefix` (`none` default | `git-username` | `custom:<p>`).
 
 ## 2. Core API (`monocode_core::worktree`, new module dir)
 
 ```
-layout::default_root() -> PathBuf                     // ~/monocode/workspaces
+layout::default_root() -> PathBuf                     // $MONOCODE_WORKTREE_ROOT or ~/monocode/workspaces
 layout::repo_dir(root, main) -> PathBuf               // root/<basename(main) minus .git>
 naming::slug(name) -> Result<String>                  // see §3
 naming::branch_for(slug, prefix, cwd) -> String
@@ -161,3 +162,12 @@ call just created, delete meta; never touch pre-existing branches.
    "Show other worktrees"; list gains ownership label and uses the new Delete dialog.
 7. All other create callers (`app_access`, monos host `worktrees.create`, app commands,
    automations "Fresh worktree", quick composer, mobile host) go through `worktree::create`.
+
+## 8. Test isolation
+
+`layout::default_root()` honours `MONOCODE_WORKTREE_ROOT` (set and non-empty) before the home
+directory. Tests never write to the real `~/monocode`: `layout::isolate_for_tests()` sets the
+variable once per process to `<temp>/monocode-test-<pid>/monocode/workspaces` unless the
+environment already sets it. monocode-core calls it from `default_root()` under `cfg(test)` and
+from the worktree fixtures; the GPUI test `Shell` constructor calls it before anything else.
+Tests that check paths still set an explicit `worktree-prefs.root` in their temp dir.

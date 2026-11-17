@@ -2,7 +2,6 @@
 //! open conversations. Its breadcrumb/actions occupy the inset title bar.
 use super::*;
 use crate::settings::{ArchivedSession, Section, SettingsContext, SettingsEvent, SettingsView};
-use std::path::Path;
 impl Shell {
     fn settings_context(&self, cx: &App) -> SettingsContext {
         let mut archived: Vec<_> = self
@@ -216,17 +215,16 @@ impl Shell {
                 SettingsEvent::DeleteProject(path) => {
                     this.confirm_delete_project(path.clone(), window, cx)
                 }
-                SettingsEvent::RemoveWorktree {
-                    cwd,
-                    path,
-                    delete_sessions,
-                } => this.remove_settings_worktree(
-                    cwd.clone(),
-                    path.clone(),
-                    *delete_sessions,
+                SettingsEvent::CreateWorktree(project) => this.open_create_worktree_dialog(
+                    project.clone(),
+                    String::new(),
+                    super::worktree_create::WorktreeOrigin::Settings,
                     window,
                     cx,
                 ),
+                SettingsEvent::DeleteWorktree { cwd, path } => {
+                    this.open_delete_worktree_dialog(cwd.clone(), path.clone(), window, cx)
+                }
                 SettingsEvent::ChooseBackground => this.choose_chat_background(cx),
                 SettingsEvent::ResetMono(id) => {
                     if let Some(m) = this.monos.clone() {
@@ -461,79 +459,6 @@ impl Shell {
             }
         })
         .detach();
-    }
-    fn finish_worktree_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
-        if let Some(view) = &self.settings {
-            view.update(cx, |v, cx| v.management_finished(result, cx));
-        }
-        self.sync_git(cx);
-        self.sync_settings(cx);
-        self.invalidate_chrome(cx);
-        cx.notify();
-    }
-    fn remove_settings_worktree(
-        &mut self,
-        cwd: String,
-        path: String,
-        delete_sessions: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use monocode_core::files::is_equal_or_inside;
-        if self
-            .terminals
-            .values()
-            .flatten()
-            .any(|t| is_equal_or_inside(&t.read(cx).cwd, &path))
-        {
-            self.finish_worktree_action(
-                Err("Close the terminals using this worktree first.".into()),
-                cx,
-            );
-            return;
-        }
-        let ids = self
-            .session_summaries
-            .keys()
-            .filter(|id| is_equal_or_inside(self.session_working_copy(**id, cx), &path))
-            .copied()
-            .collect::<Vec<_>>();
-        if ids
-            .iter()
-            .any(|id| self.sessions.get(id).is_some_and(|v| v.read(cx).busy))
-        {
-            self.finish_worktree_action(
-                Err("Stop the running sessions using this worktree first.".into()),
-                cx,
-            );
-            return;
-        }
-        let check_cwd = cwd.clone();
-        let check_path = path.clone();
-        let work = cx.background_executor().spawn(async move {
-            monocode_core::worktree_management::check(Path::new(&check_cwd), Path::new(&check_path))
-        });
-        cx.spawn(async move|this,cx|{
-            let result=work.await;
-            if let Err(e)=result {let _=this.update(cx,|this,cx|this.finish_worktree_action(Err(e),cx));return;}
-            let pending=match this.update_in(cx,|this,window,cx| {
-                // Recheck before deleting any conversations after the preflight worker.
-                if this.terminals.values().flatten().any(|t|is_equal_or_inside(&t.read(cx).cwd,&path))||ids.iter().any(|id|this.sessions.get(id).is_some_and(|s|s.read(cx).busy)) {return Err("This worktree is now in use. Close its terminals and stop its sessions first.".to_owned());}
-                if delete_sessions {for id in &ids{this.delete_session(*id,window,cx);}}
-                Ok((this.group_writes.take(),this.store.clone()))
-            }) {Ok(Ok(v))=>v,Ok(Err(e))=>{let _=this.update(cx,|this,cx|this.finish_worktree_action(Err(e),cx));return;},Err(_)=>return};
-            if let Some(task)=pending.0 {task.await;}
-            let worker_cwd=cwd.clone();let worker_path=path.clone();let store=pending.1;
-            let work=cx.background_executor().spawn(async move{
-                if delete_sessions {let store=locked(&store)?;let paths=store.session_worktrees()?;if store.sessions()?.iter().any(|s|is_equal_or_inside(paths.get(&s.id).and_then(|p|p.as_deref()).unwrap_or(&s.cwd),&worker_path)){return Err("Some sessions could not be deleted, so the worktree was kept.".into());}}
-                let snapshot=monocode_core::git::snapshot(Path::new(&worker_cwd))?;
-                let main=snapshot.worktrees.first().ok_or("No main working copy found")?;
-                monocode_core::worktree_management::remove(Path::new(&main.path),Path::new(&worker_path))?;let _=monocode_core::worktree::meta::delete(&*locked(&store)?,Path::new(&worker_path));
-                locked(&store)?.detach_worktree(&worker_path,&main.path)
-            });let result=work.await;
-            let _=this.update(cx,|this,cx|{let result=result.map(|detached|{for(summary,settings)in detached{this.session_summaries.insert(summary.id, summary.clone());this.session_worktrees.insert(summary.id,settings.worktree_cwd.clone());if let Some(view)=this.sessions.get(&summary.id){view.update(cx,|v,cx|v.worktree_deleted(summary,settings,cx));}}this.worktree_focus.retain(|_,focus|!is_equal_or_inside(&focus.path,&path));});this.finish_worktree_action(result,cx);});
-        }).detach();
-        let _ = window;
     }
     fn delete_from_settings(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = window.prompt(

@@ -2,8 +2,6 @@
 //! and the switcher hand a request here and close. A pending row tracks its phase;
 //! success makes the worktree the project's focus and may open a "Setup" terminal;
 //! failure keeps the row with its error and shows a card with Retry.
-// The dialog, rail rows and switcher rows that call this arrive in the next phase.
-#![allow(dead_code)]
 use super::*;
 use crate::notifications::errors;
 use crate::worktree_switcher::WorktreeFocus;
@@ -13,10 +11,10 @@ use monocode_core::{
 };
 use std::path::PathBuf;
 
-/// Where a creation was started; surfaces may show only their own rows.
+/// Which entry point opened the Create Worktree dialog; surfaces may show only their
+/// own rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorktreeOrigin {
-    Dialog,
     Rail,
     Switcher,
     Settings,
@@ -32,6 +30,8 @@ pub(crate) struct PendingWorktree {
     pub error: Option<String>,
     pub request: CreateRequest,
     pub run_setup: bool,
+    // Read by the rail's pending tree rows (next phase); every surface shows all rows now.
+    #[allow(dead_code)]
     pub origin: WorktreeOrigin,
 }
 impl PendingWorktree {
@@ -137,7 +137,8 @@ impl Shell {
         self.worktree_pending_changed(cx);
     }
 
-    fn worktree_pending_changed(&self, cx: &mut Context<Self>) {
+    fn worktree_pending_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_switcher_pending(cx);
         self.invalidate_chrome(cx);
         self.projects_frame.update(cx, |_, cx| cx.notify());
         cx.notify();
@@ -233,6 +234,7 @@ impl Shell {
             self.open_setup_terminal(&pending.project, &path, &runner, plan.env.clone(), cx);
         }
         self.sync_git(cx);
+        self.refresh_settings_worktrees(cx);
         self.worktree_pending_changed(cx);
     }
 
@@ -270,7 +272,7 @@ impl Shell {
 
     /// Cards for failed creations (Retry / Dismiss) and creation warnings.
     pub(super) fn worktree_notices(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut cards = Vec::new();
+        let mut cards = self.kept_branch_cards(cx);
         for pending in self.pending_worktrees.iter().filter(|p| p.error.is_some()) {
             let id = pending.id;
             let message = format!(
@@ -424,7 +426,7 @@ mod tests {
                     main.clone(),
                     request,
                     false,
-                    WorktreeOrigin::Dialog,
+                    WorktreeOrigin::Settings,
                     w,
                     cx,
                 );
@@ -554,7 +556,7 @@ mod tests {
                     main.clone(),
                     request,
                     true,
-                    WorktreeOrigin::Dialog,
+                    WorktreeOrigin::Settings,
                     w,
                     cx,
                 );

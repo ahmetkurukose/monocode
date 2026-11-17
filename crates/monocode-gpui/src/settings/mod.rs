@@ -140,10 +140,12 @@ pub(crate) enum SettingsEvent {
     UnarchiveProject(String),
     DeleteProject(String),
     ChooseBackground,
-    RemoveWorktree {
+    /// Settings › Worktrees "Create worktree": the Create Worktree dialog for this project.
+    CreateWorktree(String),
+    /// A worktree's Delete button: the Delete Worktree dialog.
+    DeleteWorktree {
         cwd: String,
         path: String,
-        delete_sessions: bool,
     },
     ResetMono(String),
     MonoSidebar(String, bool, bool),
