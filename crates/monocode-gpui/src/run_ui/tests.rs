@@ -100,6 +100,8 @@ impl Fixture {
         let store = Arc::new(Mutex::new(store));
         let window = cx.update(|cx| {
             code_shell::register(cx);
+            // These tests install a debugger themselves where one matters.
+            launch::clear_debugger(cx);
             cx.open_window(Default::default(), |_, cx| {
                 cx.new(|cx| Shell::new(store, vec![session], project.clone(), Some(saved), cx))
             })
@@ -908,6 +910,8 @@ fn quick_open_runs_what_is_offered_reruns_the_last_and_stops_what_runs(cx: &mut 
         fx.visual.update(|_, cx| {
             (commands::commands(&scope, cx).iter())
                 .map(|command| (command.title.to_string(), command.subtitle.to_string()))
+                // The debug feature adds its own commands beside these.
+                .filter(|(title, _)| title.starts_with("Run:"))
                 .collect()
         })
     };

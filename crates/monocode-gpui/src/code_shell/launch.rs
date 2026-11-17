@@ -14,6 +14,13 @@ pub(crate) fn set_debugger(launcher: Launcher, cx: &mut App) {
     cx.set_global(Debugger(launcher));
 }
 
+#[cfg(test)]
+pub(crate) fn clear_debugger(cx: &mut App) {
+    if cx.has_global::<Debugger>() {
+        cx.remove_global::<Debugger>();
+    }
+}
+
 pub(crate) fn can_debug(cx: &App) -> bool {
     cx.try_global::<Debugger>().is_some()
 }
