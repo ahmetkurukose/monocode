@@ -20,6 +20,7 @@ pub mod git;
 pub mod github_star;
 pub mod harness_updates;
 pub mod inbox;
+pub mod kanban;
 pub mod mobile;
 pub mod mono;
 pub mod notes;

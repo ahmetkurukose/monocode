@@ -473,7 +473,7 @@ impl Store {
             self.shared_writable()?;
         }
         ensure_languages_table(&self.conn).map_err(|e| e.to_string())?;
-        let language = crate::notes::language(language).id;
+        let language = crate::notes::note_type(language);
         if language == crate::notes::DEFAULT_LANGUAGE {
             self.conn
                 .execute("DELETE FROM note_languages WHERE note_id = ?1", [id])
@@ -870,6 +870,9 @@ mod tests {
         // Unknown ids fall back to Markdown, which needs no row.
         store.set_note_language(&note.id, "nonsense").unwrap();
         assert!(store.note_languages().unwrap().is_empty());
+        // A kanban board is a note type of its own.
+        store.set_note_language(&note.id, "kanban").unwrap();
+        assert_eq!(store.note_languages().unwrap()[&note.id], "kanban");
         store.set_note_language(&note.id, "sql").unwrap();
         let columns: i64 = store
             .conn

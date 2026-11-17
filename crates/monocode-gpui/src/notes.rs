@@ -1,4 +1,5 @@
 //! The desktop Notes split view, backed by the same notes and image assets.
+mod kanban;
 mod preview;
 
 use crate::{
@@ -13,7 +14,10 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, MouseButton, Role, SharedString, Subscription, Task,
     Window, div, prelude::*, px,
 };
-use monocode_core::notes::{self, Note, NoteLanguage};
+use monocode_core::{
+    kanban::{Board, KANBAN},
+    notes::{self, Note, NoteLanguage},
+};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -65,6 +69,8 @@ pub(crate) struct Notes {
     source: bool,
     modes: HashMap<String, bool>,
     document: Option<Entity<preview::Preview>>,
+    /// The open note's board, when it is a kanban note.
+    kanban: Entity<kanban::KanbanBoard>,
     dirty: bool,
     revision: u64,
     loading: bool,
@@ -112,6 +118,7 @@ impl Notes {
             cx.new(|cx| Input::field("Find project", "Find project…", content(0.4), cx));
         let language_query =
             cx.new(|cx| Input::field("Filter languages", "Filter languages…", content(0.4), cx));
+        let board = cx.new(kanban::KanbanBoard::new);
         let subscriptions = vec![
             cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&title, |this, _, _: &input::Changed, cx| this.edited(cx)),
@@ -132,6 +139,11 @@ impl Notes {
             cx.subscribe(&title, |this, _, _: &input::Submitted, cx| this.flush(cx)),
             cx.subscribe(&project_query, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&language_query, |_, _, _: &input::Changed, cx| cx.notify()),
+            // A board edit becomes the note's body, saved like any typing.
+            cx.subscribe(&board, |this, board, _: &kanban::Changed, cx| {
+                let json = board.read(cx).board().to_json();
+                this.body.update(cx, |input, cx| input.set_text(json, cx));
+            }),
         ];
         let mut this = Self {
             store,
@@ -159,6 +171,7 @@ impl Notes {
             source: false,
             modes: HashMap::new(),
             document: None,
+            kanban: board,
             dirty: false,
             revision: 0,
             loading: true,
@@ -203,6 +216,18 @@ impl Notes {
             )
     }
 
+    fn is_kanban(&self, id: &str) -> bool {
+        self.languages
+            .get(id)
+            .is_some_and(|language| language == KANBAN)
+    }
+
+    fn selected_is_kanban(&self) -> bool {
+        self.selected
+            .as_deref()
+            .is_some_and(|id| self.is_kanban(id))
+    }
+
     fn language_of(&self, id: &str) -> &'static NoteLanguage {
         notes::language(self.languages.get(id).map_or("", String::as_str))
     }
@@ -210,6 +235,11 @@ impl Notes {
     /// Colours the editor for the note's language: Markdown headings here, any
     /// other type through the same analysis the file editor uses.
     fn highlight_source(&mut self, cx: &mut Context<Self>) {
+        if self.selected_is_kanban() {
+            // A board's body is its JSON, never shown as text.
+            self.analysis = None;
+            return;
+        }
         let language = self.current_language();
         let path = format!("note.{}", language.extension);
         self.body
@@ -367,6 +397,14 @@ impl Notes {
         .detach();
     }
 
+    #[cfg(test)]
+    fn draft_title(&self) -> String {
+        (self.notes.iter())
+            .find(|note| Some(&note.id) == self.selected.as_ref())
+            .map(|note| note.title.clone())
+            .unwrap_or_default()
+    }
+
     fn draft(&self, cx: &App) -> Option<Note> {
         let mut note = self
             .notes
@@ -421,7 +459,11 @@ impl Notes {
         self.dirty = true;
         if draft.title.trim().is_empty() {
             draft.title = if finalize {
-                notes::title(&draft.body)
+                if self.is_kanban(&draft.id) {
+                    "Untitled board".into()
+                } else {
+                    notes::title(&draft.body)
+                }
             } else {
                 saved_title
             };
@@ -484,6 +526,10 @@ impl Notes {
             )
         });
         self.highlight_source(cx);
+        if let Some(note) = note.as_ref().filter(|note| self.is_kanban(&note.id)) {
+            let body = note.body.clone();
+            self.kanban.update(cx, |board, cx| board.load(&body, cx));
+        }
         self.body
             .update(cx, |input, cx| input.set_word_wrap(true, cx));
         self.tag
@@ -518,10 +564,17 @@ impl Notes {
         if self.dirty {
             return;
         }
-        let language = notes::language(language).id;
+        let language = notes::note_type(language);
         let result = locked(&self.store).and_then(|store| {
-            let note = store.create_note(Some(self.cwd.clone()))?;
+            let mut note = store.create_note(Some(self.cwd.clone()))?;
             store.set_note_language(&note.id, language)?;
+            if language == KANBAN {
+                // A board starts empty, under a name of its own.
+                let mut upsert = note.upsert(false);
+                upsert.title = "Untitled board".into();
+                upsert.body = Board::default().to_json();
+                note = store.upsert_note(&upsert)?;
+            }
             Ok(note)
         });
         match result {
@@ -536,7 +589,11 @@ impl Notes {
                 self.query
                     .update(cx, |input, cx| input.set_text(String::new(), cx));
                 self.load_selection(Some(id), cx);
-                window.focus(&self.body.focus_handle(cx), cx);
+                if language == KANBAN {
+                    window.focus(&self.title.focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.body.focus_handle(cx), cx);
+                }
             }
             Err(error) => self.error = Some(error),
         }
@@ -974,9 +1031,19 @@ impl Notes {
     }
 
     fn detail(&mut self, note: Note, cx: &mut Context<Self>) -> AnyElement {
-        let body = note.body.clone();
+        let is_kanban = self.is_kanban(&note.id);
+        // A board reads as Markdown checklists everywhere outside its view.
+        let body = if is_kanban {
+            Board::parse(&note.body).to_markdown(&note.title)
+        } else {
+            note.body.clone()
+        };
         let source = note.source_session_id.clone();
-        let can_add = !body.trim().is_empty();
+        let can_add = if is_kanban {
+            !Board::parse(&note.body).tasks.is_empty()
+        } else {
+            !body.trim().is_empty()
+        };
         let project = div()
             .relative()
             .id("note-move-project")
@@ -1026,21 +1093,25 @@ impl Notes {
             .hover(|style| style.bg(content(0.08)))
             .when(self.picker == Some(Picker::Change), |d| d.bg(content(0.08)))
             .child(self.change_anchor.probe())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(crate::activity::file_icon(
+            .child(div().flex().items_center().gap_1p5().map(|d| {
+                if is_kanban {
+                    // A board keeps its type: its body is no text to retype.
+                    d.child(icon("kanban", 14.).text_color(content(0.7)))
+                        .child("Kanban")
+                } else {
+                    d.child(crate::activity::file_icon(
                         &format!("note.{}", language.extension),
                         14.,
                     ))
                     .child(if is_markdown { "Note" } else { language.label })
-                    .child(icon("chevron-down", 11.)),
-            )
-            .on_click(
-                cx.listener(|this, _, window, cx| this.open_picker(Picker::Change, window, cx)),
-            );
+                    .child(icon("chevron-down", 11.))
+                }
+            }))
+            .when(!is_kanban, |d| {
+                d.on_click(
+                    cx.listener(|this, _, window, cx| this.open_picker(Picker::Change, window, cx)),
+                )
+            });
         let tags = div()
             .flex()
             .flex_wrap()
@@ -1119,7 +1190,9 @@ impl Notes {
                                 && let Some(mut note) = this.draft(cx)
                             {
                                 let language = this.current_language();
-                                if language.id != notes::DEFAULT_LANGUAGE {
+                                if this.is_kanban(&note.id) {
+                                    note.body = Board::parse(&note.body).to_markdown(&note.title);
+                                } else if language.id != notes::DEFAULT_LANGUAGE {
                                     // A code note goes in as a code block, not as prose.
                                     note.body = format!(
                                         "```{}\n{}\n```",
@@ -1296,6 +1369,63 @@ impl Notes {
                         }),
                 )
             });
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child(language_chip)
+                    .child(div().min_w_0().truncate().child(note.slug.clone()))
+                    .child(project),
+            )
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child(format!("Updated {}", relative_time(note.updated_at))),
+            )
+            .child(tags)
+            .child(actions);
+        if is_kanban {
+            // The board takes the whole pane, its columns scrolling inside it.
+            return div()
+                .id("note-detail")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(32.))
+                        .pt(px(28.))
+                        .pb(px(18.))
+                        .child(header),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .px(px(24.))
+                        .pb(px(20.))
+                        .flex()
+                        .flex_col()
+                        .child(self.kanban.clone()),
+                )
+                .into_any_element();
+        }
         div()
             .id("note-detail")
             .flex_1()
@@ -1312,36 +1442,7 @@ impl Notes {
                     .max_w(px(1024.))
                     .mx_auto()
                     .p(px(32.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_size(px(12.))
-                                    .text_color(content(0.5))
-                                    .child(language_chip)
-                                    .child(div().min_w_0().truncate().child(note.slug.clone()))
-                                    .child(project),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(content(0.5))
-                                    .child(format!("Updated {}", relative_time(note.updated_at))),
-                            )
-                            .child(tags)
-                            .child(actions),
-                    )
+                    .child(header)
                     .children(is_markdown.then_some(tabs))
                     .child(editor),
             )
@@ -1402,18 +1503,20 @@ impl gpui::Render for Notes {
                 .child(div().flex_1().min_w_0().child(self.query.clone()))
                 .children(scope_toggle)
                 .child(icon_button("create-note", "New note", "plus").debug_selector(|| "create-note".into()).on_click(cx.listener(|this, _, window, cx| this.create(notes::DEFAULT_LANGUAGE, window, cx))))
+                .child(icon_button("create-kanban", "New kanban board", "kanban").debug_selector(|| "create-kanban".into()).on_click(cx.listener(|this, _, window, cx| this.create(KANBAN, window, cx))))
                 .child(self.new_type_button(cx)))
             .child(div().id("notes-list").role(Role::ListBox).aria_label("Saved notes").flex_1().min_h_0().overflow_y_scroll().p(px(6.))
                 .when(visible.is_empty(), |d| d.child(div().px_1p5().py_2().text_size(px(12.)).text_color(content(0.5)).child(if self.loading { "Loading notes…" } else if !query.trim().is_empty() { "No matching notes" } else if self.scope.is_some() && !self.all_projects && !self.notes.is_empty() { "No notes in this project yet. Create one here, or show every project's notes with All." } else { "No notes yet. Save a turn from the transcript, or create one here." })))
                 .children(visible.iter().enumerate().map(|(ix, note)| {
                     let id = note.id.clone();
                     let active = self.selected.as_ref() == Some(&id);
-                    let preview = note.preview();
+                    let kanban = self.is_kanban(&note.id);
+                    let preview = if kanban { Board::parse(&note.body).summary() } else { note.preview() };
                     div().id(("saved-note", ix)).role(Role::Button).aria_label(note.title.clone()).aria_selected(active).mb(px(2.)).px(px(10.)).py_2().rounded_md().text_color(content(0.8)).hover(|style| style.bg(content(0.05))).when(active, |d| d.bg(content(0.1)))
                         .child(div().flex().items_center().gap_2().text_size(px(11.)).text_color(content(0.45))
                             .child(div().flex_1().truncate().when_some(note.project_name(), |d, name| d.child(div().flex().items_center().gap_1p5().child(self.project_mark(note.source_cwd.as_deref().unwrap_or(""), 12.)).child(name))))
                             .child(relative_time(note.updated_at)))
-                        .child(div().mt_1().flex().items_center().gap_1p5().child(crate::activity::file_icon(&format!("note.{}", self.language_of(&note.id).extension), 14.)).child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone())))
+                        .child(div().mt_1().flex().items_center().gap_1p5().child(if kanban { icon("kanban", 14.).text_color(content(0.7)).into_any_element() } else { crate::activity::file_icon(&format!("note.{}", self.language_of(&note.id).extension), 14.).into_any_element() }).child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone())))
                         .when(!preview.is_empty(), |d| d.child(div().mt_1().truncate().text_size(px(12.)).text_color(content(0.45)).child(preview)))
                         .when(!note.tags.is_empty(), |d| d.child(div().mt_1p5().flex().items_center().gap_1().overflow_hidden()
                             .children(note.tags.iter().take(3).map(|tag| div().max_w(px(96.)).truncate().rounded_sm().bg(content(0.08)).px_1p5().py(px(2.)).text_size(px(10.)).text_color(content(0.55)).child(format!("#{tag}"))))
@@ -1465,7 +1568,8 @@ impl gpui::Render for Notes {
                     window.focus(&this.query.focus_handle(cx), cx);
                     cx.stop_propagation();
                 } else if key == "escape" {
-                    if this.picker.is_some() {
+                    if this.kanban.update(cx, |board, cx| board.dismiss(cx)) {
+                    } else if this.picker.is_some() {
                         this.picker = None;
                     } else if this.project_open {
                         this.project_open = false;
@@ -1781,5 +1885,169 @@ mod tests {
         visual.run_until_parked();
         assert_eq!(shown(visual).0, sorted(ids.to_vec()));
         assert!(visual.debug_bounds("notes-all-projects").is_none());
+    }
+
+    fn board(window: gpui::WindowHandle<Notes>, visual: &mut VisualTestContext) -> Board {
+        window
+            .update(visual, |notes, _, cx| notes.kanban.read(cx).board().clone())
+            .unwrap()
+    }
+
+    fn click(visual: &mut VisualTestContext, selector: &str) {
+        let bounds = visual
+            .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
+            .unwrap_or_else(|| panic!("{selector} is on screen"));
+        visual.simulate_click(bounds.center(), Default::default());
+        visual.run_until_parked();
+    }
+
+    fn new_board(cx: &mut TestAppContext) -> (gpui::WindowHandle<Notes>, VisualTestContext) {
+        cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let window = open(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1600.), px(900.)));
+        click(&mut visual, "create-kanban");
+        (window, visual)
+    }
+
+    #[gpui::test]
+    fn the_kanban_button_starts_a_board_with_blitzits_four_columns(cx: &mut TestAppContext) {
+        let (window, mut visual) = new_board(cx);
+        let visual = &mut visual;
+        window
+            .update(visual, |notes, _, _| {
+                let id = notes.selected.clone().unwrap();
+                assert!(notes.is_kanban(&id), "error: {:?}", notes.error);
+                assert_eq!(
+                    locked(&notes.store).unwrap().note_languages().unwrap()[&id],
+                    KANBAN
+                );
+                assert_eq!(notes.draft_title(), "Untitled board");
+            })
+            .unwrap();
+        let mut left = px(0.);
+        for column in ["backlog", "this-week", "today", "done"] {
+            let bounds = visual
+                .debug_bounds(Box::leak(
+                    format!("kanban-column-{column}").into_boxed_str(),
+                ))
+                .unwrap_or_else(|| panic!("the {column} column"));
+            assert!(bounds.left() > left, "columns run left to right");
+            assert!(
+                bounds.size.height > px(400.),
+                "{column} fills the pane: {bounds:?}"
+            );
+            left = bounds.left();
+        }
+        assert!(
+            visual.debug_bounds("note-source").is_none(),
+            "a board has no Preview or Source"
+        );
+        assert!(
+            visual.debug_bounds("kanban-add-done").is_none(),
+            "Done takes no new tasks"
+        );
+    }
+
+    #[gpui::test]
+    fn quick_add_reads_the_estimate_and_column_and_the_board_is_saved(cx: &mut TestAppContext) {
+        let (window, mut visual) = new_board(cx);
+        let visual = &mut visual;
+        click(visual, "kanban-add-backlog");
+        assert!(visual.debug_bounds("kanban-add-form-backlog").is_some());
+        visual.simulate_input("Write report 1h30m @today");
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        visual.simulate_input("Plan");
+        let form = visual.debug_bounds("kanban-add-form-backlog").unwrap();
+        let confirm = visual.debug_bounds("kanban-add-confirm").unwrap();
+        assert!(
+            confirm.right() <= form.right(),
+            "Confirm stays inside its column"
+        );
+        click(visual, "kanban-add-confirm");
+        let tasks = board(window, visual).tasks;
+        assert_eq!(tasks.len(), 2, "{tasks:?}");
+        assert_eq!(tasks[0].title, "Write report");
+        assert_eq!(tasks[0].column, monocode_core::kanban::Column::Today);
+        assert_eq!(tasks[0].estimate_min, 90);
+        assert_eq!(tasks[1].column, monocode_core::kanban::Column::Backlog);
+        // Escape closes the form, not the Notes view.
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("kanban-add-form-backlog").is_none());
+        assert!(visual.debug_bounds("kanban-board").is_some());
+        window
+            .update(visual, |notes, _, cx| {
+                notes.flush(cx);
+                let id = notes.selected.clone().unwrap();
+                let saved = locked(&notes.store)
+                    .unwrap()
+                    .list_notes()
+                    .unwrap()
+                    .into_iter()
+                    .find(|note| note.id == id)
+                    .unwrap();
+                assert_eq!(Board::parse(&saved.body).tasks.len(), 2, "saved as JSON");
+                assert_eq!(saved.title, "Untitled board");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_card_checks_off_to_done_and_drags_between_columns(cx: &mut TestAppContext) {
+        use monocode_core::kanban::Column;
+        let (window, mut visual) = new_board(cx);
+        let visual = &mut visual;
+        let (a, b) = window
+            .update(visual, |notes, _, cx| {
+                notes.kanban.update(cx, |board, cx| {
+                    let mut next = Board::default();
+                    let a = next.add("first", 30, Column::Today, 1);
+                    let b = next.add("second", 0, Column::Today, 1);
+                    board.load(&next.to_json(), cx);
+                    (a, b)
+                })
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let card = visual
+            .debug_bounds(Box::leak(format!("kanban-card-{a}").into_boxed_str()))
+            .unwrap();
+        visual.simulate_mouse_move(card.center(), None, Default::default());
+        visual.run_until_parked();
+        click(visual, &format!("kanban-check-{a}"));
+        assert_eq!(board(window, visual).task(&a).unwrap().column, Column::Done);
+        assert!(board(window, visual).task(&a).unwrap().done_at.is_some());
+
+        let card = visual
+            .debug_bounds(Box::leak(format!("kanban-card-{b}").into_boxed_str()))
+            .unwrap();
+        let backlog = visual.debug_bounds("kanban-column-backlog").unwrap();
+        let to = backlog.center();
+        visual.simulate_mouse_down(card.center(), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            card.center() + gpui::point(px(12.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("kanban-placeholder").is_some(),
+            "the drop place shows while dragging"
+        );
+        visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            board(window, visual).task(&b).unwrap().column,
+            Column::Backlog
+        );
+        assert!(visual.debug_bounds("kanban-placeholder").is_none());
     }
 }

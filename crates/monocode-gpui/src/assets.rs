@@ -168,6 +168,10 @@ impl AssetSource for Assets {
    "inbox-hi"=>include_bytes!("../assets/hugeicons/inbox-hi.svg"),
    "chevron-down-hi"=>include_bytes!("../assets/hugeicons/chevron-down-hi.svg"),
    "check-hi"=>include_bytes!("../assets/hugeicons/check-hi.svg"),
+   // Kanban notes: the board's mark and its cards' move arrows.
+   "kanban"=>include_bytes!("../assets/hugeicons/kanban.svg"),
+   "arrow-left-2"=>include_bytes!("../assets/hugeicons/arrow-left-2.svg"),
+   "arrow-right-2"=>include_bytes!("../assets/hugeicons/arrow-right-2.svg"),
    "monocode.png"=>include_bytes!("../assets/monocode.png"),
    "codex.svg"=>include_bytes!("../assets/codex.svg"),
    "codex-glyph.svg"=>include_bytes!("../assets/codex-glyph.svg"),

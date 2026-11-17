@@ -107,6 +107,16 @@ pub fn language(id: &str) -> &'static NoteLanguage {
         .unwrap_or(&LANGUAGES[0])
 }
 
+/// A saved note type: a language id, or a kanban board. Anything unknown is
+/// Markdown.
+pub fn note_type(id: &str) -> &'static str {
+    if id == crate::kanban::KANBAN {
+        crate::kanban::KANBAN
+    } else {
+        language(id).id
+    }
+}
+
 /// Languages whose label or id contains `query`, in catalogue order.
 pub fn matching_languages(query: &str) -> Vec<&'static NoteLanguage> {
     let query = query.trim().to_lowercase();
