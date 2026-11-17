@@ -16,6 +16,9 @@ pub(crate) struct Preferences {
     pub file_word_wrap: bool,
     pub file_view_mode: String,
     pub tab_animations: bool,
+    /// Closing a session tab: "ask", "archive" (it leaves the sidebar too)
+    /// or "keep" (only the tab closes; the session stays in the sidebar).
+    pub close_session_tab: String,
     pub notes: bool,
     pub quick_composer: bool,
     /// Global search floats as a command panel instead of opening a page.
@@ -148,6 +151,7 @@ impl Default for Preferences {
             file_word_wrap: true,
             file_view_mode: "preview".into(),
             tab_animations: false,
+            close_session_tab: "ask".into(),
             notes: true,
             quick_composer: true,
             search_panel: false,

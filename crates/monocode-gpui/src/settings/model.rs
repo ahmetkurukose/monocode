@@ -319,6 +319,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "files editor long lines horizontal scroll wrapping",
     ),
     (
+        "close-session-tab",
+        Section::General,
+        "Closing a session tab",
+        "close tab archive keep sidebar ask confirm session remove",
+    ),
+    (
         "tab-animations",
         Section::General,
         "Tab animations",

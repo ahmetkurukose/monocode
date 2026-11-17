@@ -269,7 +269,7 @@ impl Shell {
         }
         if action == "close" {
             if let Some(id) = tab.session() {
-                self.close(id, window, cx);
+                self.request_close(id, window, cx);
             } else {
                 self.close_title_tabs(&[tab], None, window, cx);
             }
@@ -289,7 +289,7 @@ impl Shell {
             })
             .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
-        self.close_title_tabs(&closing, (action == "others").then_some(tab), window, cx);
+        self.request_close_title_tabs(closing, (action == "others").then_some(tab), window, cx);
     }
 
     pub(super) fn close_title_tabs(
@@ -299,15 +299,32 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let panes = tabs
-            .iter()
+        self.close_title_tabs_archiving(tabs, preferred, Vec::new(), window, cx);
+    }
+
+    /// The panes inside the open ones of `tabs`.
+    pub(super) fn title_tab_panes(&self, tabs: &[TitleTab]) -> Vec<i64> {
+        tabs.iter()
             .filter(|tab| self.workspace.title_order.contains(tab))
             .filter_map(TitleTab::session)
             .flat_map(|id| self.workspace.layout(id).leaf_ids())
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Close `tabs`, then archive `archive` out of the sidebar.
+    pub(super) fn close_title_tabs_archiving(
+        &mut self,
+        tabs: &[TitleTab],
+        preferred: Option<TitleTab>,
+        archive: Vec<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panes = self.title_tab_panes(tabs);
         let tabs = tabs.to_vec();
         self.confirm_close_terminal_panes(&panes, window, cx, move |this, window, cx| {
             this.finish_close_title_tabs(&tabs, preferred, window, cx);
+            this.archive_closed_sessions(&archive, cx);
         });
     }
 

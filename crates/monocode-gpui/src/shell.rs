@@ -41,6 +41,7 @@ mod search;
 mod session_filters;
 mod session_folders;
 mod session_groups;
+mod session_close;
 mod session_loading;
 mod session_preview;
 mod session_shortcuts;
@@ -2719,7 +2720,7 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         if in_split {
-                            this.close_pane(id, window, cx);
+                            this.request_close_pane(id, window, cx);
                         } else if let Some(review) = this.reviews.get(&id).cloned() {
                             this.review_focused = true;
                             review.update(cx, |r, cx| {
@@ -3839,16 +3840,37 @@ impl Shell {
     }
     /// Close one pane of a split tab; the tab's only pane closes the tab.
     fn close_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_pane_archiving(id, Vec::new(), window, cx);
+    }
+    /// Close one pane, then archive `archive` out of the sidebar.
+    fn close_pane_archiving(
+        &mut self,
+        id: i64,
+        archive: Vec<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self
             .workspace
             .tab_of(id)
             .is_some_and(|tab| self.workspace.layout(tab).is_split())
         {
-            self.close(id, window, cx);
+            if !self.tab_can_close(id, cx) {
+                return;
+            }
+            self.close_menu(cx);
+            let tabs = self
+                .workspace
+                .tab_of(id)
+                .map(TitleTab::Session)
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.close_title_tabs_archiving(&tabs, None, archive, window, cx);
             return;
         }
         self.confirm_close_terminal_panes(&[id], window, cx, move |this, window, cx| {
             this.finish_close_pane(id, window, cx);
+            this.archive_closed_sessions(&archive, cx);
         });
     }
     fn finish_close_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
@@ -7254,7 +7276,7 @@ impl Shell {
             .into_iter()
             .filter(|tab| *tab != active)
             .collect::<Vec<_>>();
-        self.close_title_tabs(&tabs, Some(active), window, cx);
+        self.request_close_title_tabs(tabs, Some(active), window, cx);
     }
     fn activate_tab(&mut self, slot: isize, window: &mut Window, cx: &mut Context<Self>) {
         let tabs = self.visible_tabs(cx);
@@ -8708,7 +8730,7 @@ impl Shell {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.close(id, window, cx);
+                                    this.request_close(id, window, cx);
                                 })),
                         )
                     })
@@ -8756,7 +8778,7 @@ impl Shell {
                         MouseButton::Middle,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.close(id, window, cx);
+                            this.request_close(id, window, cx);
                         }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -9588,7 +9610,7 @@ impl Render for Shell {
                         return;
                     }
                     // Close Pane (⌘W) in a split; the whole tab otherwise.
-                    this.close_pane(id, window, cx);
+                    this.request_close_pane(id, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle(1, window, cx)))
@@ -9599,10 +9621,12 @@ impl Render for Shell {
                 // An empty strip can still have a new-tab request in flight.
                 this.navigation_revision += 1;
                 // Pins survive the bulk closes, as in the tab menu.
-                this.close_title_tabs(&this.strip_tabs(cx), None, window, cx);
-                if !this.mono_active(cx) {
-                    this.ensure_project_session(window, cx);
-                }
+                let tabs = this.strip_tabs(cx);
+                this.request_close_title_tabs_then(tabs, None, window, cx, |this, window, cx| {
+                    if !this.mono_active(cx) {
+                        this.ensure_project_session(window, cx);
+                    }
+                });
             }))
             .on_action(
                 cx.listener(|this, _: &CloseOtherTabs, window, cx| {
@@ -10312,6 +10336,10 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+        // The started session is asked about; keeping it keeps this test's
+        // close a plain tab close.
+        cx.simulate_prompt_answer("Close Tab Only");
+        cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, "/work/another-project");
@@ -10434,6 +10462,8 @@ mod tests {
             "ctrl"
         };
         cx.simulate_keystrokes(window.into(), &format!("{modifier}-shift-w"));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Close Tab Only");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
@@ -13318,6 +13348,8 @@ mod tests {
 
         // ⌘W closes the focused pane only; its neighbour takes focus.
         cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Close Tab Only");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {

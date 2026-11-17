@@ -481,12 +481,11 @@ impl Shell {
         last: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (title, updated, provider, approval, working, archived) = {
+        let (title, updated, approval, working, archived) = {
             let meta = self.session_metadata(id, cx);
             (
                 meta.display_title(),
                 meta.summary.updated_at,
-                meta.summary.provider.clone(),
                 meta.needs_approval(),
                 meta.responding() || meta.busy,
                 meta.summary.archived,
@@ -499,30 +498,42 @@ impl Shell {
                 .active
                 .map(|a| self.workspace.session_for_pane(a))
                 == Some(id);
-        // The same states the session list shows, in one small mark.
+        // The row leads with what the agent is doing: working, waiting on
+        // an answer, finished and not yet seen, or snoozing once it has been.
+        let mark = div()
+            .id(("rail-session-mark", id as u64 as usize))
+            .debug_selector(move || format!("rail-session-mark-{id}"))
+            .size(px(14.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .role(Role::Image);
+        let mark = if approval {
+            mark.aria_label("Needs approval")
+                .child(icon("alert-circle", 14.).text_color(rgb(0xfbbf24)))
+        } else if working {
+            // The shared mark spins on its own clock, so only it repaints.
+            mark.aria_label("Working")
+                .children(self.session_marks.get(&id).cloned())
+        } else if done {
+            mark.aria_label("Done, not yet seen")
+                .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
+        } else {
+            mark.aria_label("Snoozing")
+                .child(icon("snooze", 12.).text_color(content(0.35)))
+        };
         let status = div()
             .flex_shrink_0()
             .flex()
             .items_center()
             .text_size(px(11.))
             .text_color(content(0.4))
-            .group_hover("rail-session-hover", |s| s.invisible());
-        let status = if approval {
-            status
-                .text_color(rgb(0xfbbf24))
-                .child(icon("circle-alert", 13.))
-        } else if working {
-            status
-                .text_color(crate::theme::accent_color())
-                .children(self.session_marks.get(&id).cloned())
-        } else if done {
-            status.text_color(rgb(0x34d399)).child(icon("check", 13.))
-        } else {
-            status.child(monocode_core::time::relative(
+            .group_hover("rail-session-hover", |s| s.invisible())
+            .child(monocode_core::time::relative(
                 updated,
                 monocode_core::time::now_ms(),
-            ))
-        };
+            ));
         let label = format!("{} {title}", if archived { "Unarchive" } else { "Archive" });
         let archive = div()
             .id(("rail-session-archive", id as u64 as usize))
@@ -570,7 +581,7 @@ impl Shell {
             )
             .group("rail-session-hover")
             .debug_selector(move || format!("rail-session-{id}"))
-            .child(crate::theme::provider_icon(&provider, 14.))
+            .child(mark)
             .child(
                 div()
                     .flex_1()

@@ -334,7 +334,7 @@ impl Shell {
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             match close.session() {
-                                Some(id) => this.close(id, window, cx),
+                                Some(id) => this.request_close(id, window, cx),
                                 None => {
                                     this.close_title_tabs(
                                         std::slice::from_ref(&close),

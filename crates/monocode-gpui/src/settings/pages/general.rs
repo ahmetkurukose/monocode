@@ -76,6 +76,20 @@ impl SettingsView {
                 )],
             ),
             self.row(
+                Some("close-session-tab"),
+                false,
+                "Closing a session tab",
+                Some("Archive takes the session out of the sidebar too; Keep leaves it there to reopen.".into()),
+                vec![self.segmented(
+                    "close-session-tab",
+                    "Closing a session tab",
+                    &p.close_session_tab,
+                    &[("ask", "Ask"), ("archive", "Archive"), ("keep", "Keep")],
+                    cx,
+                    |this, v, cx| this.update(cx, |p| p.close_session_tab = v.into()),
+                )],
+            ),
+            self.row(
                 Some("tab-animations"),
                 false,
                 "Tab animations",
