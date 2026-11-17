@@ -1798,6 +1798,7 @@ pub fn div() -> Div {
         prepaint_listener: None,
         image_cache: None,
         prepaint_order_fn: None,
+        children_prepainted: false,
     }
 }
 
@@ -1808,6 +1809,10 @@ pub struct Div {
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
+    // Whether prepaint reached the children. Prepaint and paint compute the
+    // style apart (group hover from stored state vs the live hit test, drag
+    // over styles only at paint), so `display: none` can differ between them.
+    children_prepainted: bool,
 }
 
 impl Div {
@@ -2028,6 +2033,7 @@ impl Element for Div {
                 if style.display == Display::None {
                     return hitbox;
                 }
+                self.children_prepainted = true;
 
                 window.with_image_cache(image_cache, |window| {
                     window.with_element_offset(scroll_offset, |window| {
@@ -2081,7 +2087,9 @@ impl Element for Div {
                 cx,
                 |style, window, cx| {
                     // skip children
-                    if style.display == Display::None {
+                    // Children prepaint skipped can't be painted; the frame
+                    // after this one has both phases agree again.
+                    if style.display == Display::None || !self.children_prepainted {
                         return;
                     }
 

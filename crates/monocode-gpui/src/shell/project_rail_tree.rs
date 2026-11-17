@@ -1296,6 +1296,67 @@ mod tests {
         assert!(icons.right() <= row.right());
     }
 
+    struct HiddenOnRowHover {
+        left: Pixels,
+        painted: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Render for HiddenOnRowHover {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let painted = self.painted.clone();
+            div().relative().size_full().child(
+                div()
+                    .id("row")
+                    .absolute()
+                    .left(self.left)
+                    .top_0()
+                    .size(px(50.))
+                    .group("row")
+                    .child(
+                        div()
+                            .id("stats")
+                            .flex()
+                            .group_hover("row", |s| s.hidden())
+                            .child(div().size(px(10.)).child(gpui::canvas(
+                                |_, _, _| {},
+                                move |_, _, _, _| painted.set(painted.get() + 1),
+                            ))),
+                    ),
+            )
+        }
+    }
+
+    // The diff stats hide on row hover. Prepaint takes group hover from what
+    // the last mouse move left, paint from the live hit test, so a row moving
+    // out from under a still mouse hid the stats for prepaint (skipping their
+    // children) and showed them for paint, which panicked.
+    #[gpui::test]
+    fn hidden_on_row_hover_survives_the_row_moving_under_a_still_mouse(cx: &mut TestAppContext) {
+        let painted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.add_window({
+            let painted = painted.clone();
+            move |_, _| HiddenOnRowHover {
+                left: px(0.),
+                painted,
+            }
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        visual.simulate_mouse_move(gpui::point(px(25.), px(25.)), None, Default::default());
+        visual.run_until_parked();
+        let hovered = painted.get();
+        window
+            .update(visual, |view, _, cx| {
+                view.left = px(200.);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.simulate_mouse_move(gpui::point(px(30.), px(30.)), None, Default::default());
+        visual.run_until_parked();
+        assert!(painted.get() > hovered, "shown again once the row is gone");
+    }
+
     #[gpui::test]
     fn an_app_icon_switches_to_its_project_and_opens_the_app(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
