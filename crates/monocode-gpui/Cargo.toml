@@ -23,6 +23,8 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false }
 # The terminal dock: PTY, VT parser and grid (as Zed's terminal uses).
 alacritty_terminal = "0.26"
+# The PTY wrapper that copies a run's output implements alacritty's polling traits.
+polling = "3"
 libc = "0.2"
 rquickjs = "0.14.0"
 # The file editor's native syntax: incremental parses, highlights, folds and

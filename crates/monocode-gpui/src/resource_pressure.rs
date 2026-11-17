@@ -193,7 +193,12 @@ impl ResourceMonitor {
             loop {
                 let rows = cx
                     .background_executor()
-                    .spawn(async { resources::processes() })
+                    .spawn(async {
+                        // What the code features started is owned work too.
+                        let mut rows = resources::processes()?;
+                        rows.extend(crate::code_shell::processes::rows());
+                        Ok(rows)
+                    })
                     .await;
                 if this
                     .update(cx, |this, cx| {
@@ -227,9 +232,13 @@ impl ResourceMonitor {
         self.stop_error = None;
         self.stopping = Some(identity.clone());
         // A user's stop request must not wait behind the next listing.
-        let work = cx
-            .background_executor()
-            .spawn(async move { resources::stop_tool(pid, &identity) });
+        let work = cx.background_executor().spawn(async move {
+            if crate::code_shell::processes::owns(pid) {
+                crate::code_shell::processes::stop(pid, &identity)
+            } else {
+                resources::stop_tool(pid, &identity)
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -462,6 +471,7 @@ impl ResourceMonitor {
     ) -> AnyElement {
         let title: SharedString = session
             .map(|s| s.title.clone())
+            .or_else(|| crate::code_shell::processes::group_title(id).map(Into::into))
             .unwrap_or_else(|| "Background work".into());
         let memory: u64 = rows.iter().map(|r| r.memory_bytes).sum();
         let expanded = self.expanded.contains(&id);

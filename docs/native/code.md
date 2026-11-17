@@ -317,6 +317,48 @@ layer checks `driver()` before acting.
 - **Agent-driven debugging:** the session's rail row says where it stopped; the debug tab
   says the agent is driving and has a Take over button.
 
+### Shell extension points
+
+The features never edit `shell.rs`. They call `crate::code_shell` (`src/code_shell/`),
+whose shell side is `shell/code_shell.rs`; `shell.rs` and its siblings hold one-line hooks
+(the frame, the dock header, the footer, the project menu, the rail row). Each feature
+installs itself with one line in `code_shell::register`, called once from `main.rs`.
+
+| Module | What a feature gets |
+| --- | --- |
+| `dock` | `run(RunRequest, window, cx) -> Entity<Run>`: a dock tab whose child is the given process (`code::spawn::Spawn`), with the checkout's terminal environment and venv. `Run` has `state()`, `pid()`, `tail()`, `exited()`, `stop()`, `rerun()` and emits `RunEvent::{Started, Output, Exited, Closed}`. `add_tab(DockTab, …) -> DockTabHandle`: a tab showing a feature's view, with header controls, a close callback and its `DockPlacement`; `reveal`, `close`, `set_title`, `set_busy`, `find_tab`. |
+| `panel_tabs` | `show(PanelTab, cx)`, `remove(id, cx)`, `reveal(id, window, cx)`: a right panel tab beside Explorer and History. |
+| `chips` | `register(FooterChip, cx)`: a footer chip drawn while its `state` returns something, with a list on click. `code_shell::refresh(cx)` redraws it. |
+| `processes` | `register(pid, label, kind) -> Registration`: a child process listed in the running work dialog with its memory and a Stop. |
+| `commands` | `register_commands(id, source, cx)` for the `>` palette; `register_mode(Mode, cx)` for a prefix mode (`@`) with asynchronous rows. |
+| `settings` | `register(SettingsPage, cx)`: a row in the project menu opening the feature's form in the project dialog; `PageHost::save` stores a JSON value per project and page, `settings::value` reads it. |
+| `context` | `focused_checkout`, `focused_file`, `checkout_for_path`, `checkout_for_pane`, `terminal_setup`, `toolchain`, `open_file`, `open_url`; `events(cx)` emits `CodeEvent::{ProjectOpened, ProjectClosed, CheckoutAdded, CheckoutRemoved, FocusedFileChanged}`; `on_quit(cx, f)`. |
+| `rail` | `set_status(session, text, cx)`, `clear_status(session, cx)`: a status on the session's rail row in place of its age. |
+
+How it is built:
+
+- **A run or view tab is a `Terminal` entity** in the dock's own list (`terminal/run.rs`,
+  `terminal/hosted.rs`), so selection, reorder, close, close-others and moving the dock
+  work unchanged. A run's PTY is wrapped to copy its output out; the copy is stripped of
+  escape sequences and capped at 64 KiB. Stop sends SIGTERM to the process group and
+  SIGKILL after three seconds. Neither kind of tab can be pulled out into a pane, and
+  neither is saved (`TerminalDock::transient`): a restart reopens the shells only.
+- **Registries are GPUI globals** read while the shell draws; a contribution changes what
+  is drawn at the next frame. Processes are a process-wide list, usable from any thread.
+- **The context is a snapshot** refreshed once a frame, so lookups are safe from anywhere;
+  events are the difference between two snapshots.
+- **Calling rules.** A function taking a `Window` borrows the shell: call it from a
+  feature's own entities, tasks and click handlers, not from `FooterChip::state` or
+  `items`. Callbacks the shell makes with a `Window` (a picked command or chip row, a
+  settings page being built) run after the shell's update, and may call anything.
+  `code_shell::in_window(cx, f)` supplies the window to a task that has none.
+- **Tests.** A run starts a real process even under test, so a test that makes one calls
+  `cx.executor().allow_parking()`. `shell/code_shell_tests.rs` drives every extension
+  point with a fake feature and is the place to copy a usage from.
+
+Not covered: feature tabs do not appear in the Original layout's sidebar tool tabs, and
+the rail status shows in the project rail's tree only.
+
 ## 7. Agents (MCP)
 
 _To be filled in: tools, capability per session, as `browser_bridge.rs` does._

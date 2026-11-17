@@ -55,7 +55,7 @@ pub(crate) fn tabular() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RightTab {
     #[default]
@@ -65,6 +65,26 @@ pub(crate) enum RightTab {
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
     Terminal,
+    /// A tab a code feature added (`code_shell::panel_tabs`), by its id. It
+    /// is there only while the feature shows it, so it is never saved as
+    /// the open tab.
+    #[serde(skip)]
+    Extra(ExtraTab),
+}
+/// The id of a tab a code feature added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ExtraTab(pub(crate) &'static str);
+/// A feature's tab is saved as Explorer, which is what a restart shows in
+/// its place; the strip's own order is kept by key in the workspace.
+impl Serialize for RightTab {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Files | Self::Extra(_) => "files",
+            Self::Changes => "changes",
+            Self::Graph => "graph",
+            Self::Terminal => "terminal",
+        })
+    }
 }
 impl RightTab {
     fn label(self) -> &'static str {
@@ -73,6 +93,17 @@ impl RightTab {
             Self::Changes => "Changes",
             Self::Graph => "History",
             Self::Terminal => "Terminal",
+            Self::Extra(tab) => tab.0,
+        }
+    }
+    /// The name the strip's saved order knows the tab by.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Changes => "changes",
+            Self::Graph => "graph",
+            Self::Terminal => "terminal",
+            Self::Extra(tab) => tab.0,
         }
     }
     /// loadRightPanelTabOrder: unique known tabs, the missing ones appended.
@@ -80,7 +111,8 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes) && !out.contains(tab) {
+            if !matches!(tab, Self::Terminal | Self::Changes | Self::Extra(_)) && !out.contains(tab)
+            {
                 out.push(*tab);
             }
         }
@@ -90,7 +122,10 @@ impl RightTab {
 
 pub(crate) enum PanelEvent {
     Tab(RightTab),
+    /// The built-in tabs' new order.
     Reordered(Vec<RightTab>),
+    /// The whole strip's new order by key, feature tabs included.
+    Strip(Vec<String>),
 }
 
 /// Tool headers share the open-file tab bar's height and bottom rule.
@@ -265,6 +300,10 @@ pub(crate) struct RightPanel {
     reveal: Option<TabReveal>,
     skip_click: bool,
     tab_bounds: Vec<crate::popover::AnchorSlot>,
+    /// The tabs code features are showing, in `order` by their ids.
+    extras: Vec<crate::code_shell::panel_tabs::PanelTab>,
+    /// The strip's last saved order by key, for placing a tab that returns.
+    strip: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<PanelEvent> for RightPanel {}
@@ -292,6 +331,7 @@ impl RightPanel {
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),
+            crate::code_shell::panel_tabs::observe(cx, |this: &mut Self, cx| this.sync_extras(cx)),
         ];
         let panel = cx.entity();
         let tabs = cx.new(|cx| ProjectTabs {
@@ -315,7 +355,72 @@ impl RightPanel {
             reveal: None,
             skip_click: false,
             tab_bounds: (0..4).map(|_| Default::default()).collect(),
+            extras: Vec::new(),
+            strip: Vec::new(),
             _subscriptions: subscriptions,
+        }
+    }
+    /// The strip's saved order, then the feature tabs already showing.
+    pub(crate) fn set_strip(&mut self, strip: Vec<String>, cx: &mut Context<Self>) {
+        self.strip = strip;
+        self.sync_extras(cx);
+    }
+    /// The feature tabs in strip order, as the title bar's corner tabs list
+    /// them: element id, label, icon and tab.
+    pub(crate) fn extra_tabs(&self) -> Vec<(&'static str, &'static str, &'static str, RightTab)> {
+        (self.order.iter())
+            .filter_map(|tab| {
+                let extra = self.extra(*tab)?;
+                Some((extra.id, extra.title, extra.icon, *tab))
+            })
+            .collect()
+    }
+    fn extra(&self, tab: RightTab) -> Option<&crate::code_shell::panel_tabs::PanelTab> {
+        match tab {
+            RightTab::Extra(tab) => self.extras.iter().find(|extra| extra.id == tab.0),
+            _ => None,
+        }
+    }
+    /// Follows the tabs code features are showing: one that went leaves the
+    /// strip (and Explorer takes over if it was open), a new one goes where
+    /// it was last dragged to, else to the end.
+    fn sync_extras(&mut self, cx: &mut Context<Self>) {
+        self.extras = crate::code_shell::panel_tabs::tabs(cx);
+        let shown = |tab: &RightTab| match tab {
+            RightTab::Extra(tab) => self.extras.iter().any(|extra| extra.id == tab.0),
+            _ => true,
+        };
+        let mut order: Vec<RightTab> = self.order.iter().copied().filter(shown).collect();
+        for extra in &self.extras {
+            let tab = RightTab::Extra(ExtraTab(extra.id));
+            if order.contains(&tab) {
+                continue;
+            }
+            // After the nearest tab before it in the saved strip that is here.
+            let at = match self.strip.iter().position(|key| key == extra.id) {
+                Some(saved) => (self.strip[..saved].iter().rev())
+                    .find_map(|key| order.iter().position(|tab| tab.key() == key))
+                    .map_or(0, |ix| ix + 1),
+                None => order.len(),
+            };
+            order.insert(at, tab);
+        }
+        self.order = order;
+        let count = self.order.len() + 1;
+        if self.tab_bounds.len() < count {
+            self.tab_bounds.resize_with(count, Default::default);
+        }
+        if !shown(&self.tab) {
+            self.select(RightTab::Files, cx);
+        }
+        cx.notify();
+    }
+    /// Closes a feature's tab that allows it, the way the feature would.
+    pub(crate) fn close_extra(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+        if let Some(extra) = self.extra(tab).filter(|extra| extra.closable) {
+            let id = extra.id;
+            // The registry tells this panel in turn; not from inside it.
+            cx.defer(move |cx| crate::code_shell::panel_tabs::remove(id, cx));
         }
     }
     pub(crate) fn tab(&self) -> RightTab {
@@ -402,6 +507,9 @@ impl RightPanel {
         let focus = match (self.shown, self.tab) {
             (true, RightTab::Files) => self.explorer.focus_handle(cx),
             (true, RightTab::Graph) => self.history.focus_handle(cx),
+            (true, tab @ RightTab::Extra(_)) => (self.extra(tab))
+                .and_then(|extra| extra.focus.clone())
+                .unwrap_or_else(|| self.focus.clone()),
             _ => self.focus.clone(),
         };
         window.focus(&focus, cx);
@@ -488,7 +596,9 @@ impl RightPanel {
             && drag.active
         {
             self.skip_click = true;
-            cx.emit(PanelEvent::Reordered(self.order.clone()));
+            self.strip = self.order.iter().map(|tab| tab.key().to_owned()).collect();
+            cx.emit(PanelEvent::Reordered(RightTab::normalize(&self.order)));
+            cx.emit(PanelEvent::Strip(self.strip.clone()));
             cx.notify();
         }
     }
@@ -510,11 +620,15 @@ impl RightPanel {
             .enumerate()
             .map(|(ix, tab)| {
                 let active = self.tab == tab;
-                let (id, path) = match tab {
-                    RightTab::Files => ("right-panel-tab-Explorer", "file-script"),
-                    RightTab::Changes => ("right-panel-tab-Changes", "git-branch"),
-                    RightTab::Graph => ("right-panel-tab-History", "clock"),
-                    RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
+                let (id, path, label) = match tab {
+                    RightTab::Files => ("right-panel-tab-Explorer", "file-script", tab.label()),
+                    RightTab::Changes => ("right-panel-tab-Changes", "git-branch", tab.label()),
+                    RightTab::Graph => ("right-panel-tab-History", "clock", tab.label()),
+                    RightTab::Terminal => ("right-panel-tab-Terminal", "terminal", tab.label()),
+                    RightTab::Extra(ExtraTab(id)) => match self.extra(tab) {
+                        Some(extra) => (id, extra.icon, extra.title),
+                        None => (id, "file-script", tab.label()),
+                    },
                 };
                 let unfolded = match progress {
                     Some((_, p)) if active => p,
@@ -534,8 +648,7 @@ impl RightPanel {
                     .child(
                         tab_button(
                             id,
-                            TabLabel::from(tab.label())
-                                .max_width(tab_label_width(self.tab_width, count)),
+                            TabLabel::from(label).max_width(tab_label_width(self.tab_width, count)),
                             path,
                             active,
                             false,
@@ -552,6 +665,10 @@ impl RightPanel {
                             cx.listener(move |this, event: &MouseDownEvent, _, _| {
                                 this.start_drag(tab, event)
                             }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |this, _, _, cx| this.close_extra(tab, cx)),
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
@@ -613,6 +730,12 @@ impl Render for RightPanel {
                 .into_any_element(),
             // The shell paints the terminal over this pane.
             RightTab::Terminal => div().into_any_element(),
+            tab @ RightTab::Extra(_) => div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .children(self.extra(tab).map(|extra| extra.view.clone()))
+                .into_any_element(),
         };
         div()
             .id("right-panel")

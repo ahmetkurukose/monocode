@@ -75,6 +75,8 @@ pub(crate) enum Picked {
     /// A match inside a file: its path, line and column.
     Match(String, u32, u32),
     Command(Command),
+    /// A row a code feature contributed (`code_shell::commands`).
+    Action(crate::code_shell::commands::Action),
     Dismiss,
 }
 #[derive(Clone)]
@@ -87,6 +89,9 @@ struct Row {
     /// The file whose icon the row shows.
     file_name: String,
     command: Option<Command>,
+    /// A feature's row: its icon and what choosing it runs.
+    icon: Option<&'static str>,
+    run: Option<crate::code_shell::commands::Action>,
 }
 pub(crate) struct QuickOpen {
     pub(crate) search: Entity<input::Input>,
@@ -104,6 +109,10 @@ pub(crate) struct QuickOpen {
     searching: bool,
     content_task: Option<gpui::Task<()>>,
     content_cancel: Arc<AtomicBool>,
+    /// Rows of a feature's prefix mode for the last query, and its search.
+    mode_rows: Vec<Row>,
+    mode_task: Option<gpui::Task<()>>,
+    mode_searching: bool,
     _changed: Subscription,
 }
 impl EventEmitter<Picked> for QuickOpen {}
@@ -135,6 +144,7 @@ impl QuickOpen {
             this.active = 0;
             this.rank(cx);
             this.search_content(cx);
+            this.search_mode(cx);
             cx.notify();
         });
         let cwd_for_search = cwd.clone();
@@ -172,6 +182,9 @@ impl QuickOpen {
             searching: false,
             content_task: None,
             content_cancel: Arc::new(AtomicBool::new(false)),
+            mode_rows: Vec::new(),
+            mode_task: None,
+            mode_searching: false,
             _changed: changed,
         };
         this.rank(cx);
@@ -197,13 +210,36 @@ impl QuickOpen {
                                 at: None,
                                 file_name: String::new(),
                                 command: Some(*command),
+                                icon: None,
+                                run: None,
                             },
                         )
                     })
                 })
                 .collect();
+            // The commands the code features offer here, ranked with the rest.
+            let scope = crate::code_shell::context::scope(&self.cwd, cx);
+            for command in crate::code_shell::commands::commands(&scope, cx) {
+                if let Some(score) = composer::score(query.trim(), &command.title) {
+                    commands.push((
+                        score,
+                        Row {
+                            label: command.title.to_string(),
+                            detail: command.subtitle.to_string(),
+                            path: None,
+                            at: None,
+                            file_name: String::new(),
+                            command: None,
+                            icon: None,
+                            run: Some(command.run),
+                        },
+                    ));
+                }
+            }
             commands.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             commands.into_iter().map(|(_, row)| row).collect()
+        } else if crate::code_shell::commands::mode_for(query, cx).is_some() {
+            self.mode_rows.clone()
         } else if self.mode == Mode::Content {
             self.content_rows.clone()
         } else {
@@ -216,6 +252,8 @@ impl QuickOpen {
                     at: None,
                     file_name: file.name.clone(),
                     command: None,
+                    icon: None,
+                    run: None,
                 })
                 .collect()
         };
@@ -239,7 +277,11 @@ impl QuickOpen {
         self.content_task = None;
         self.searching = false;
         let query = self.search.read(cx).content.trim().to_owned();
-        if self.mode != Mode::Content || query.is_empty() || query.starts_with('>') {
+        if self.mode != Mode::Content
+            || query.is_empty()
+            || query.starts_with('>')
+            || crate::code_shell::commands::mode_for(&query, cx).is_some()
+        {
             if !self.content_rows.is_empty() {
                 self.content_rows.clear();
                 self.rank(cx);
@@ -299,6 +341,8 @@ impl QuickOpen {
                                 path: Some(m.path),
                                 at: Some((m.line, m.column)),
                                 command: None,
+                                icon: None,
+                                run: None,
                             })
                             .collect();
                     }
@@ -311,6 +355,57 @@ impl QuickOpen {
                 cx.notify();
             });
         }));
+    }
+    /// Behind a feature's prefix (`@` for symbols), asks that feature for
+    /// the rows after a short pause. A newer query drops the search before.
+    fn search_mode(&mut self, cx: &mut Context<Self>) {
+        self.mode_task = None;
+        self.mode_searching = false;
+        let typed = self.search.read(cx).content.trim().to_owned();
+        let Some((mode, query)) = crate::code_shell::commands::mode_for(&typed, cx) else {
+            self.mode_rows.clear();
+            return;
+        };
+        let scope = crate::code_shell::context::scope(&self.cwd, cx);
+        self.mode_searching = true;
+        self.mode_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let search = cx.update(|cx| (mode.search)(query, scope, cx));
+            let items = search.await;
+            let _ = this.update(cx, |this, cx| {
+                this.mode_searching = false;
+                this.mode_rows = items
+                    .into_iter()
+                    .map(|item| Row {
+                        label: item.title.to_string(),
+                        detail: item.detail.to_string(),
+                        file_name: (item.path.as_deref())
+                            .and_then(|path| path.rsplit('/').next())
+                            .unwrap_or_default()
+                            .to_owned(),
+                        at: (item.line > 0).then_some((item.line, item.column.max(1))),
+                        path: item.path,
+                        command: None,
+                        icon: item.icon,
+                        run: None,
+                    })
+                    .collect();
+                this.rank(cx);
+                cx.notify();
+            });
+        }));
+    }
+    #[cfg(test)]
+    pub(crate) fn row_labels(&self) -> Vec<(String, String)> {
+        (self.rows.iter())
+            .map(|row| (row.label.clone(), row.detail.clone()))
+            .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn pick_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.pick(ix, cx)
     }
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         if !self.rows.is_empty() {
@@ -325,7 +420,9 @@ impl QuickOpen {
             return;
         }
         if let Some(row) = self.rows.get(ix) {
-            if let Some(path) = &row.path {
+            if let Some(run) = &row.run {
+                cx.emit(Picked::Action(run.clone()));
+            } else if let Some(path) = &row.path {
                 match row.at {
                     Some((line, column)) => cx.emit(Picked::Match(path.clone(), line, column)),
                     None => cx.emit(Picked::File(path.clone())),
@@ -359,7 +456,9 @@ impl Render for QuickOpen {
                         content(0.)
                     })
                     .hover(|s| s.bg(content(0.07)))
-                    .child(if row.path.is_some() {
+                    .child(if let Some(path) = row.icon {
+                        icon(path, 16.).into_any_element()
+                    } else if row.path.is_some() {
                         crate::file_icons::file_type_icon(&row.file_name, false, false, 18.)
                     } else {
                         icon("sparkles", 16.).into_any_element()
@@ -484,6 +583,19 @@ impl Render for QuickOpen {
                                 .text_color(content(0.45))
                                 .child(if let Some(error) = self.error.clone() {
                                     error
+                                } else if let Some((mode, query)) =
+                                    crate::code_shell::commands::mode_for(
+                                        self.search.read(cx).content.trim(),
+                                        cx,
+                                    )
+                                {
+                                    if self.mode_searching {
+                                        "Searching…".to_owned()
+                                    } else if query.is_empty() {
+                                        mode.hint.to_owned()
+                                    } else {
+                                        "No results".to_owned()
+                                    }
                                 } else if self.mode == Mode::Content {
                                     if self.searching {
                                         "Searching…".to_owned()
