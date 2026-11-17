@@ -21,7 +21,7 @@
 //!
 //! base::detect_default(cwd: &Path) -> Option<String>                  // origin/HEAD → origin/main → origin/master → main → master
 //! base::resolve(cwd, explicit: Option<&str>, repo_default: Option<&str>) -> Result<base::Resolved, String>
-//! base::fetch(cwd, remote: &str, branch: &str, timeout: Duration) -> Result<(), String>
+//! base::fetch(cwd, remote: &str, branch: &str, timeout: Duration) -> Result<(), String> // +refs/heads/<b>:refs/remotes/<r>/<b>
 //!
 //! create::create(req: &CreateRequest, store: &Mutex<Store>, progress: &dyn Fn(Phase)) -> Result<Created, String>
 //!
@@ -37,9 +37,11 @@
 //! setup::plan(main, worktree, name, approved_hash: Option<&str>) -> Option<SetupPlan>
 //! setup::write_runner(worktree: &Path, script: &str) -> Result<PathBuf, String>
 //!
-//! catalog::list(cwd: &Path, store: &Store) -> Result<Vec<Entry>, String>
+//! catalog::list_in(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<Entry>, String>      // locks only for meta reads
+//! catalog::list(cwd: &Path, store: &Store) -> Result<Vec<Entry>, String>               // caller holds store during Git
 //! catalog::list_with(cwd: &Path, metas: &[WorktreeMeta]) -> Result<Vec<Entry>, String>
-//! catalog::reconcile(cwd: &Path, store: &Store) -> Result<Vec<String>, String> // removed meta keys
+//! catalog::reconcile_in(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<String>, String> // removed meta keys
+//! catalog::reconcile(cwd: &Path, store: &Store) -> Result<Vec<String>, String>         // caller holds store during Git
 //!
 //! remove::preflight(cwd: &Path, path: &Path) -> Result<Preflight, String>
 //! remove::remove(cwd, path, opts: &RemoveOptions, store: &Mutex<Store>) -> Result<Removed, String>
@@ -51,9 +53,11 @@
 //! meta::{prefs, save_prefs}(store, …)                                 // `worktree-prefs`
 //! ```
 //!
-//! `create` and `remove` take the store behind a `Mutex` (the GPUI app's
-//! `Database = Arc<Mutex<Store>>` derefs to it) and lock it only briefly, so they can run
-//! on a background thread without holding the database during Git work.
+//! `create`, `remove`, `catalog::list_in` and `catalog::reconcile_in` take the store behind
+//! a `Mutex` (the GPUI app's `Database = Arc<Mutex<Store>>` derefs to it) and lock it only
+//! briefly, so they can run on a background thread without holding the database during
+//! Git work. Never keep a `lock(store)` guard alive (e.g. as a temporary in a statement)
+//! across a call that may lock again, such as `create`'s rollback.
 pub mod base;
 pub mod catalog;
 pub mod config;
@@ -174,8 +178,51 @@ pub(crate) fn git_input(cwd: &Path, args: &[&str], input: &[u8]) -> Result<(i32,
     ))
 }
 
-/// Run Git, killing it after `timeout`. Stderr chunks (split on `\r`/`\n`) go to
-/// `on_stderr` as they arrive, so progress meters can be parsed live.
+/// How long `git_live` waits for its pipes to close after Git exits. A grandchild (ssh
+/// `ControlPersist`, a hook's background job) may inherit them and never close them.
+pub(crate) const PIPE_GRACE: Duration = Duration::from_secs(2);
+/// Between SIGTERM and SIGKILL when a timed-out Git process group is stopped.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(250);
+
+enum Chunk {
+    Out(Vec<u8>),
+    Err(Vec<u8>),
+}
+
+fn reader(
+    mut pipe: impl Read + Send + 'static,
+    tx: std::sync::mpsc::Sender<Chunk>,
+    wrap: fn(Vec<u8>) -> Chunk,
+) {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 || tx.send(wrap(chunk[..n].to_vec())).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Stop a timed-out Git and everything it started (it leads its own process group).
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // The unreaped leader keeps the group id reserved, so the group cannot be
+        // recycled between the two signals.
+        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        std::thread::sleep(KILL_GRACE);
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run Git, killing it (and, on Unix, its process group) after `timeout`. Stderr chunks
+/// (split on `\r`/`\n`) go to `on_stderr` as they arrive, so progress meters can be
+/// parsed live. Once Git exits, output still arriving is collected for at most
+/// [`PIPE_GRACE`]; readers held open by grandchildren are then detached.
 pub(crate) fn git_live(
     cwd: &Path,
     args: &[&str],
@@ -183,28 +230,26 @@ pub(crate) fn git_live(
     on_stderr: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
     ensure_local(cwd)?;
-    let mut child = command(cwd, args)
+    let mut command = command(cwd, args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Could not run Git: {e}"))?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let err_thread = std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        while let Ok(n) = stderr.read(&mut chunk) {
-            if n == 0 || tx.send(chunk[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
+    let (tx, rx) = std::sync::mpsc::channel::<Chunk>();
+    reader(
+        child.stdout.take().expect("piped stdout"),
+        tx.clone(),
+        Chunk::Out,
+    );
+    reader(child.stderr.take().expect("piped stderr"), tx, Chunk::Err);
     let deadline = timeout.map(|t| Instant::now() + t);
+    let mut out_all = Vec::new();
     let mut err_all = Vec::new();
     let mut pending = Vec::new();
     let mut emit = |bytes: &[u8], pending: &mut Vec<u8>, flush: bool| {
@@ -221,42 +266,55 @@ pub(crate) fn git_live(
             pending.clear();
         }
     };
+    let mut closed = false;
+    let mut exited: Option<(std::process::ExitStatus, Instant)> = None;
     let status = loop {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(bytes) => {
-                err_all.extend_from_slice(&bytes);
-                emit(&bytes, &mut pending, false);
-                continue;
+        if closed {
+            std::thread::sleep(Duration::from_millis(20));
+        } else {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Chunk::Out(bytes)) => out_all.extend_from_slice(&bytes),
+                Ok(Chunk::Err(bytes)) => {
+                    err_all.extend_from_slice(&bytes);
+                    emit(&bytes, &mut pending, false);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => closed = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break child
-                    .wait()
-                    .map_err(|e| format!("Could not run Git: {e}"))?;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            // Drain what the reader still has buffered.
-            while let Ok(bytes) = rx.recv_timeout(Duration::from_millis(200)) {
-                err_all.extend_from_slice(&bytes);
-                emit(&bytes, &mut pending, false);
+        match exited {
+            Some((status, grace)) => {
+                if closed || Instant::now() >= grace {
+                    break status;
+                }
             }
-            break status;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            let _ = child.wait();
-            // Grandchildren (ssh, credential helpers) may keep the pipes open, so the
-            // reader threads are left to finish on their own.
-            return Err(format!(
-                "Git timed out after {} s",
-                timeout.unwrap_or_default().as_secs()
-            ));
+            None => {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    exited = Some((status, Instant::now() + PIPE_GRACE));
+                    if closed {
+                        break status;
+                    }
+                } else if deadline.is_some_and(|d| Instant::now() >= d) {
+                    kill_tree(&mut child);
+                    return Err(format!(
+                        "Git timed out after {} s",
+                        timeout.unwrap_or_default().as_secs()
+                    ));
+                }
+            }
         }
     };
+    // Whatever is already queued; the readers themselves are not joined.
+    while let Ok(chunk) = rx.try_recv() {
+        match chunk {
+            Chunk::Out(bytes) => out_all.extend_from_slice(&bytes),
+            Chunk::Err(bytes) => {
+                err_all.extend_from_slice(&bytes);
+                emit(&bytes, &mut pending, false);
+            }
+        }
+    }
     emit(&[], &mut pending, true);
-    let _ = err_thread.join();
-    let stdout = out_thread.join().unwrap_or_default();
     if !status.success() {
         let err = String::from_utf8_lossy(&err_all).trim().to_owned();
         return Err(if err.is_empty() {
@@ -265,7 +323,7 @@ pub(crate) fn git_live(
             err
         });
     }
-    String::from_utf8(stdout).map_err(|e| e.to_string())
+    String::from_utf8(out_all).map_err(|e| e.to_string())
 }
 
 /// Canonical path when it exists, the path itself otherwise.
@@ -355,5 +413,69 @@ pub(crate) mod fixture {
                 &format!("refs/heads/{branch}"),
             ],
         )
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_git_live_does_not_wait_for_inherited_pipes() {
+        let (_t, main, _root) = fixture::repo();
+        // The background sleep inherits stdout/stderr and keeps them open for 30 s.
+        let started = Instant::now();
+        let out = git_live(
+            &main,
+            &["-c", "alias.bg=!sleep 30 & echo done", "bg"],
+            Some(Duration::from_secs(20)),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "done");
+        assert!(
+            started.elapsed() < PIPE_GRACE + Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn worktree_git_live_timeout_kills_the_process_group() {
+        let (t, main, _root) = fixture::repo();
+        let pid_file = t.path().join("pid");
+        let alias = format!(
+            "alias.hang=!sh -c 'echo $$ > \"{}\"; exec sleep 30' & sleep 30",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let err = git_live(
+            &main,
+            &["-c", &alias, "hang"],
+            Some(Duration::from_millis(500)),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        // The backgrounded grandchild went down with the group.
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "grandchild {pid} survived"
+        );
     }
 }

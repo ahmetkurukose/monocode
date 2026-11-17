@@ -132,11 +132,15 @@ pub fn resolve(
     Ok(found)
 }
 
-/// `git fetch --no-tags <remote> <branch>` with a timeout.
+/// `git fetch --no-tags <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>` with
+/// a timeout. The explicit refspec means a same-named tag can never be fetched instead,
+/// and the tracking ref is updated even when the configured refspec does not cover it
+/// (single-branch clones).
 pub fn fetch(cwd: &Path, remote: &str, branch: &str, timeout: Duration) -> Result<(), String> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
     super::git_live(
         cwd,
-        &["fetch", "--no-tags", "--end-of-options", remote, branch],
+        &["fetch", "--no-tags", "--end-of-options", remote, &refspec],
         Some(timeout),
         &mut |_| {},
     )
@@ -244,5 +248,62 @@ mod tests {
             &["remote", "set-url", "origin", &gone.to_string_lossy()],
         );
         assert!(fetch(&main, "origin", "main", FETCH_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn worktree_fetch_prefers_the_branch_over_a_same_named_tag() {
+        let (t, main, _root, origin) = fixture::with_origin();
+        let base = t.path().canonicalize().unwrap();
+        let seed = base.join("seed");
+        let old = run(&seed, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(&seed, &["tag", "feature", &old]);
+        run(&seed, &["checkout", "-q", "feature"]);
+        fixture::commit(&seed, "f.txt", "f\n", "Feature");
+        let tip = run(&seed, &["rev-parse", "HEAD"]).trim().to_owned();
+        let url = origin.to_string_lossy().into_owned();
+        run(
+            &seed,
+            &[
+                "push",
+                "-q",
+                &url,
+                "refs/heads/feature:refs/heads/feature",
+                "refs/tags/feature:refs/tags/feature",
+            ],
+        );
+        fetch(&main, "origin", "feature", FETCH_TIMEOUT).unwrap();
+        assert_eq!(
+            run(&main, &["rev-parse", "refs/remotes/origin/feature"]).trim(),
+            tip
+        );
+        // A single-branch clone has no refspec for feature; the tracking ref appears anyway.
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                "--branch",
+                "main",
+                "--",
+                "origin.git",
+                "single",
+            ],
+        );
+        let single = base.join("single");
+        assert!(!git_ok(
+            &single,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/feature"
+            ]
+        ));
+        fetch(&single, "origin", "feature", FETCH_TIMEOUT).unwrap();
+        assert_eq!(
+            run(&single, &["rev-parse", "refs/remotes/origin/feature"]).trim(),
+            tip
+        );
     }
 }

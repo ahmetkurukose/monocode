@@ -106,20 +106,58 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// Undo everything after `worktree add`. Only touches what this call created: the
-/// path did not exist before (collision loop) and `branch` is `Some` only for a branch
-/// this call created.
-fn rollback(main: &Path, path: &Path, branch: Option<&str>, store: &Mutex<Store>) {
+/// What existed just before `worktree add`, so a rollback undoes only this call's work.
+struct Undo {
+    path: PathBuf,
+    /// Something was already at `path` (never ours to delete).
+    path_existed: bool,
+    /// Git already had a worktree registered at `path` (never ours to remove).
+    registered: bool,
+    /// A branch `worktree add -b` creates and the commit it creates it at; `None` when
+    /// the branch already existed (it is the user's).
+    branch: Option<(String, String)>,
+}
+
+/// `Some(registered)`, or `None` when Git could not tell.
+fn is_registered(main: &Path, path: &Path) -> Option<bool> {
+    let key = meta::key(path);
+    super::catalog::registered(main)
+        .ok()
+        .map(|trees| trees.iter().any(|t| meta::key(Path::new(&t.path)) == key))
+}
+
+/// Undo `worktree add` and what followed. Removes only a registration this call's add
+/// created, never prunes other worktrees, and deletes a new branch only while it still
+/// points at the commit it was created at (`update-ref -d <ref> <old>`).
+fn rollback(main: &Path, undo: &Undo, store: &Mutex<Store>) {
+    let path = undo.path.as_path();
     let spelled = path.to_string_lossy();
-    let _ = git(main, &["worktree", "remove", "--force", "--", &spelled]);
-    if path.symlink_metadata().is_ok() {
+    let ours = !undo.path_existed && !undo.registered;
+    if !undo.registered && is_registered(main, path) == Some(true) {
+        let remove = ["worktree", "remove", "--force", "--force", "--", &spelled];
+        let _ = git(main, &remove);
+        if is_registered(main, path) == Some(true) {
+            // `remove` refuses a half-made checkout; once the folder is gone it only
+            // drops this registration.
+            if ours && path.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            let _ = git(main, &remove);
+        }
+    }
+    if ours && path.symlink_metadata().is_ok() {
         let _ = std::fs::remove_dir_all(path);
     }
-    let _ = git(main, &["worktree", "prune"]);
-    if let Some(branch) = branch {
-        let _ = git(main, &["branch", "-D", "--", branch]);
+    if let Some((branch, sha)) = &undo.branch {
+        let _ = git(
+            main,
+            &["update-ref", "-d", &format!("refs/heads/{branch}"), sha],
+        );
     }
-    let _ = meta::delete(&lock(store), path);
+    if ours {
+        let s = lock(store);
+        let _ = meta::delete(&s, path);
+    }
 }
 
 /// Create a worktree under the configured root. See spec §4 for the steps.
@@ -224,7 +262,8 @@ pub fn create(
 
     // 4. worktree add.
     let spelled = path.to_string_lossy().into_owned();
-    let remote_ref = format!("origin/{branch}");
+    // Fully qualified, so a tag or local branch named `origin/<b>` cannot win.
+    let remote_ref = format!("refs/remotes/origin/{branch}");
     let mut args: Vec<&str> = Vec::new();
     if !git_ok(&main, &["config", "--get", "checkout.workers"]) {
         args.extend(["-c", "checkout.workers=4"]);
@@ -249,7 +288,31 @@ pub fn create(
             remote_ref.as_str(),
         ]),
     }
-    let owned_branch = (!matches!(mode, Mode::Existing)).then_some(branch.as_str());
+    let start = match &mode {
+        Mode::New { sha } => Some(sha.clone()),
+        Mode::Existing => None,
+        Mode::Remote => Some(
+            git(
+                &main,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{remote_ref}^{{commit}}"),
+                ],
+            )?
+            .trim()
+            .to_owned(),
+        ),
+    };
+    let undo = Undo {
+        path_existed: path.symlink_metadata().is_ok(),
+        registered: is_registered(&main, &path).unwrap_or(true),
+        branch: start
+            .filter(|_| !naming::local_branch_exists(&main, &branch))
+            .map(|sha| (branch.clone(), sha)),
+        path: path.clone(),
+    };
     progress(Phase::CheckingOut { percent: None });
     let mut last = None;
     let added = git_live(&main, &args, None, &mut |line| {
@@ -261,12 +324,12 @@ pub fn create(
         }
     });
     if let Err(e) = added {
-        rollback(&main, &path, owned_branch, store);
+        rollback(&main, &undo, store);
         return Err(e);
     }
     let path = super::canonical(&path);
     let fail = |e: String| {
-        rollback(&main, &path, owned_branch, store);
+        rollback(&main, &undo, store);
         e
     };
 
@@ -323,7 +386,12 @@ pub fn create(
             .as_deref()
             .map(|p| super::canonical(p).to_string_lossy().into_owned()),
     };
-    meta::save(&lock(store), &record).map_err(fail)?;
+    // Bind first: `fail` locks the store again, so the guard must be gone by then.
+    let saved = {
+        let s = lock(store);
+        meta::save(&s, &record)
+    };
+    saved.map_err(fail)?;
 
     // 7. Content paths; never fatal.
     progress(Phase::CopyingFiles);
@@ -652,5 +720,214 @@ mod tests {
         std::fs::remove_file(&hook).unwrap();
         let ok = create(&request(&main, &root, "doomed"), &store, &|_| {}).unwrap();
         assert_eq!(ok.path, path);
+    }
+
+    /// Point `main` at a hooks dir with a `post-checkout` hook running `body`.
+    fn hook(t: &tempfile::TempDir, main: &Path, body: &str) -> PathBuf {
+        let hooks = t.path().canonicalize().unwrap().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        run(
+            main,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        hook
+    }
+
+    fn registered_paths(main: &Path) -> Vec<PathBuf> {
+        super::super::catalog::registered(main)
+            .unwrap()
+            .into_iter()
+            .map(|t| PathBuf::from(t.path))
+            .collect()
+    }
+
+    #[test]
+    fn worktree_create_meta_save_failure_rolls_back_without_deadlock() {
+        let (t, main, root) = fixture::repo();
+        let db = t.path().join("store.sqlite");
+        let store = Store::open(&db).unwrap();
+        // A real SQLite failure for worktree metas only (prefs still read and write).
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_meta BEFORE INSERT ON native_settings
+                 WHEN NEW.key LIKE 'worktree:%' BEGIN SELECT RAISE(ABORT, 'meta refused'); END;",
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let req = request(&main, &root, "stuck");
+        std::thread::spawn(move || {
+            let store = Mutex::new(store);
+            let result = create(&req, &store, &|_| {});
+            let _ = tx.send(result.map(|c| c.path));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("create deadlocked rolling back a failed meta save");
+        assert!(result.unwrap_err().contains("meta refused"));
+        assert!(!root.join("project/stuck").exists());
+        assert!(!has_branch(&main, "stuck"));
+        assert_eq!(registered_paths(&main).len(), 1);
+    }
+
+    #[test]
+    fn worktree_create_skips_a_missing_registered_path_and_rollback_spares_it() {
+        let (t, main, root) = fixture::repo();
+        let store = fixture::store();
+        let first = create(&request(&main, &root, "same"), &store, &|_| {}).unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap(); // deleted by hand, not pruned
+        let second = create(
+            &CreateRequest {
+                branch: Some("other".into()),
+                ..request(&main, &root, "same")
+            },
+            &store,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(second.path, root.join("project/same-2"));
+        assert!(registered_paths(&main).contains(&first.path));
+        // A failing creation must not prune the missing worktree or drop its meta.
+        hook(&t, &main, "exit 3");
+        assert!(create(&request(&main, &root, "doomed"), &store, &|_| {}).is_err());
+        assert!(!root.join("project/doomed").exists());
+        assert!(!has_branch(&main, "doomed"));
+        let paths = registered_paths(&main);
+        assert!(paths.contains(&first.path), "{paths:?}");
+        assert!(paths.contains(&second.path), "{paths:?}");
+        assert_eq!(paths.len(), 3);
+        let s = lock(&store);
+        assert!(meta::load(&s, &first.path).unwrap().is_some());
+        assert!(meta::load(&s, &second.path).unwrap().is_some());
+    }
+
+    #[test]
+    fn worktree_create_rollback_keeps_a_branch_that_moved() {
+        let (t, main, root) = fixture::repo();
+        let store = fixture::store();
+        // The hook commits on the new branch, then fails the checkout.
+        hook(
+            &t,
+            &main,
+            "git commit -q --allow-empty --no-verify -m 'work in hook' && exit 3",
+        );
+        assert!(create(&request(&main, &root, "moved"), &store, &|_| {}).is_err());
+        assert!(!root.join("project/moved").exists());
+        assert!(has_branch(&main, "moved"), "moved branch kept");
+        assert_eq!(
+            run(&main, &["log", "-1", "--format=%s", "moved"]).trim(),
+            "work in hook"
+        );
+        assert_eq!(registered_paths(&main).len(), 1);
+    }
+
+    #[test]
+    fn worktree_rollback_leaves_pre_existing_things_alone() {
+        let (t, main, _root) = fixture::repo();
+        let store = fixture::store();
+        let path = t.path().canonicalize().unwrap().join("theirs");
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "theirs",
+                "--",
+                &path.to_string_lossy(),
+            ],
+        );
+        let record = WorktreeMeta {
+            path: path.to_string_lossy().into(),
+            ..Default::default()
+        };
+        meta::save(&lock(&store), &record).unwrap();
+        let sha = run(&main, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(&main, &["branch", "cas"]);
+        fixture::commit(&main, "x.txt", "x\n", "Move main");
+        run(&main, &["branch", "-f", "cas", "HEAD"]);
+        rollback(
+            &main,
+            &Undo {
+                path: path.clone(),
+                path_existed: true,
+                registered: true,
+                branch: Some(("cas".into(), sha.clone())),
+            },
+            &store,
+        );
+        assert!(path.join("README.md").exists());
+        assert!(registered_paths(&main).contains(&path));
+        assert!(meta::load(&lock(&store), &path).unwrap().is_some());
+        assert!(
+            has_branch(&main, "cas"),
+            "moved since: compare-and-swap refuses"
+        );
+        let now = run(&main, &["rev-parse", "cas"]).trim().to_owned();
+        rollback(
+            &main,
+            &Undo {
+                path: path.clone(),
+                path_existed: true,
+                registered: true,
+                branch: Some(("cas".into(), now)),
+            },
+            &store,
+        );
+        assert!(!has_branch(&main, "cas"));
+        assert!(has_branch(&main, "theirs"));
+    }
+
+    #[test]
+    fn worktree_create_remote_branch_ignores_same_named_tags() {
+        let (t, main, root, origin) = fixture::with_origin();
+        let seed = t.path().canonicalize().unwrap().join("seed");
+        let old = run(&seed, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(&seed, &["tag", "feature", &old]);
+        run(&seed, &["checkout", "-q", "feature"]);
+        fixture::commit(&seed, "f.txt", "f\n", "Feature");
+        let tip = run(&seed, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(
+            &seed,
+            &[
+                "push",
+                "-q",
+                &origin.to_string_lossy(),
+                "refs/heads/feature:refs/heads/feature",
+                "refs/tags/feature:refs/tags/feature",
+            ],
+        );
+        // A local tag that `origin/feature` would resolve to first.
+        run(&main, &["tag", "origin/feature", &old]);
+        let store = fixture::store();
+        let r = create(
+            &CreateRequest {
+                branch: Some("feature".into()),
+                existing_branch: true,
+                ..request(&main, &root, "")
+            },
+            &store,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.head, tip);
+        assert_eq!(r.base, "origin/feature");
+        assert_eq!(
+            run(&r.path, &["config", "--get", "branch.feature.remote"]).trim(),
+            "origin"
+        );
+        assert_eq!(
+            run(&r.path, &["config", "--get", "branch.feature.merge"]).trim(),
+            "refs/heads/feature"
+        );
     }
 }

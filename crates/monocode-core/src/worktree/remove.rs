@@ -303,7 +303,11 @@ pub fn remove(
             .warnings
             .push(format!("Could not prune worktrees: {e}"));
     }
-    if let Err(e) = meta::delete(&lock(store), &pre.path) {
+    let forgotten = {
+        let s = lock(store);
+        meta::delete(&s, &pre.path)
+    };
+    if let Err(e) = forgotten {
         removed
             .warnings
             .push(format!("Could not forget the worktree: {e}"));

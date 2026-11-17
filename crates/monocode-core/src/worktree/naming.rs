@@ -178,7 +178,9 @@ pub(crate) fn origin_branch_exists(cwd: &Path, branch: &str) -> bool {
     )
 }
 
-/// Try `slug`, `slug-2` … `slug-100`; see spec §3.
+/// Try `slug`, `slug-2` … `slug-100`; see spec §3. A candidate is taken when its path
+/// exists, is registered with Git (even as a missing/prunable worktree), is claimed by
+/// another in-process creation, or (without an explicit branch) its branch exists.
 pub fn pick(req: &PickRequest) -> Result<Picked, String> {
     if let Some(branch) = req.branch {
         crate::git::valid_branch(req.cwd, branch)?;
@@ -193,6 +195,16 @@ pub fn pick(req: &PickRequest) -> Result<Picked, String> {
             ));
         }
     }
+    // `git worktree add` refuses a missing-but-registered path, and rolling that failure
+    // back must never touch the other worktree's registration or meta.
+    let registered: HashSet<String> = super::catalog::registered(req.cwd)
+        .map(|trees| {
+            trees
+                .iter()
+                .map(|t| super::meta::key(Path::new(&t.path)))
+                .collect()
+        })
+        .unwrap_or_default();
     for n in 1..=MAX_SUFFIX {
         let slug = if n == 1 {
             req.slug.to_owned()
@@ -200,7 +212,7 @@ pub fn pick(req: &PickRequest) -> Result<Picked, String> {
             format!("{}-{n}", req.slug)
         };
         let path = req.repo_dir.join(&slug);
-        if path.symlink_metadata().is_ok() {
+        if path.symlink_metadata().is_ok() || registered.contains(&super::meta::key(&path)) {
             continue;
         }
         let branch = match req.branch {
@@ -376,5 +388,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(p.branch, "taken");
+        drop(p);
+        // A registered worktree whose folder is gone (not pruned) still takes its path.
+        let gone = repo_dir.join("gone");
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "gone-branch",
+                "--",
+                &gone.to_string_lossy(),
+            ],
+        );
+        std::fs::remove_dir_all(&gone).unwrap();
+        let p = pick(&PickRequest {
+            branch: Some("fresh"),
+            ..req("gone")
+        })
+        .unwrap();
+        assert_eq!(p.slug, "gone-2");
     }
 }

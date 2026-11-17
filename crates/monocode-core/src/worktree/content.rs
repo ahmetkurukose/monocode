@@ -30,30 +30,67 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// The subset of `paths` Git ignores in `cwd` (tracked paths are never reported).
-pub(crate) fn ignored(cwd: &Path, paths: &[String]) -> HashSet<String> {
-    if paths.is_empty() {
-        return HashSet::new();
-    }
+/// `git check-ignore` over `paths`: `Some(ignored)` for exit 0 (some ignored) or 1 (none),
+/// `None` when Git refused the batch (exit 128, e.g. a path in a submodule).
+fn check_ignore(cwd: &Path, paths: &[&String]) -> Option<HashSet<String>> {
     let mut input = Vec::new();
     for p in paths {
         input.extend_from_slice(p.as_bytes());
         input.push(0);
     }
     match super::git_input(cwd, &["check-ignore", "-z", "--stdin"], &input) {
-        Ok((0, out)) => out
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim_end_matches('/').to_owned())
-            .collect(),
-        _ => HashSet::new(),
+        Ok((0, out)) => Some(
+            out.split('\0')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim_end_matches('/').to_owned())
+                .collect(),
+        ),
+        Ok((1, _)) => Some(HashSet::new()),
+        _ => None,
     }
+}
+
+/// The subset of `paths` Git ignores in `cwd` (tracked paths are never reported). One
+/// path Git refuses to check does not hide the others: a refused batch is retried per
+/// path, and refused paths count as not ignored.
+pub(crate) fn ignored(cwd: &Path, paths: &[String]) -> HashSet<String> {
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+    let all: Vec<&String> = paths.iter().collect();
+    if let Some(found) = check_ignore(cwd, &all) {
+        return found;
+    }
+    all.iter()
+        .filter_map(|p| check_ignore(cwd, std::slice::from_ref(p)))
+        .flatten()
+        .collect()
+}
+
+/// Whether a directory above `rel` (inside `main`) is a symlink. Git refuses such paths
+/// ("beyond a symbolic link") and copying through them would leave the checkout.
+fn through_symlink(main: &Path, rel: &str) -> bool {
+    Path::new(rel)
+        .ancestors()
+        .skip(1)
+        .filter(|a| !a.as_os_str().is_empty())
+        .any(|a| {
+            main.join(a)
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        })
 }
 
 /// Configured shared directories that exist as directories in `main` and are ignored.
 pub fn shared_directories(main: &Path, config: &Config, warnings: &mut Vec<String>) -> Vec<String> {
     let mut existing = Vec::new();
     for rel in &config.shared_directories {
+        if through_symlink(main, rel) {
+            warnings.push(format!(
+                "Skipping shared directory {rel}: it is inside a symbolic link."
+            ));
+            continue;
+        }
         match std::fs::metadata(main.join(rel)) {
             Ok(m) if m.is_dir() => existing.push(rel.clone()),
             Ok(_) => warnings.push(format!(
@@ -145,9 +182,19 @@ fn measure(path: &Path, budget: Budget) -> (u64, u64) {
     (bytes, entries)
 }
 
+/// Copy `from` to `to` without overwriting anything: an existing directory at `to` is
+/// completed (e.g. after a partial clone), any other existing entry is left alone.
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     let meta = from.symlink_metadata()?;
-    if to.symlink_metadata().is_ok() {
+    if let Ok(existing) = to.symlink_metadata() {
+        // `symlink_metadata` never reports a symlink as a directory, so this only
+        // descends into real directories on both sides.
+        if meta.is_dir() && existing.is_dir() {
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            }
+        }
         return Ok(()); // never overwrite
     }
     if meta.file_type().is_symlink() {
@@ -177,8 +224,9 @@ fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // `cp -R from to` would nest `from` inside an existing directory.
     #[cfg(target_os = "macos")]
-    {
+    if to.symlink_metadata().is_err() {
         let cloned = std::process::Command::new("cp")
             .args(["-c", "-R", "-n", "--"])
             .arg(from)
@@ -237,11 +285,20 @@ pub(crate) fn materialize_with(
             .iter()
             .any(|s| rel == s || rel.starts_with(&format!("{s}/")))
     };
-    let candidates: Vec<String> = parse_include(&text, &mut report.warnings)
+    let mut candidates: Vec<String> = parse_include(&text, &mut report.warnings)
         .into_iter()
         .filter(|rel| !under_shared(rel))
         .filter(|rel| main.join(rel).symlink_metadata().is_ok())
         .collect();
+    candidates.retain(|rel| {
+        let skip = through_symlink(main, rel);
+        if skip {
+            report
+                .warnings
+                .push(format!("Skipping {rel}: it is inside a symbolic link."));
+        }
+        !skip
+    });
     let ignored = ignored(main, &candidates);
     let mut used = Budget {
         bytes: 0,
@@ -446,5 +503,73 @@ mod tests {
         assert!(report.copied.contains(&".env".to_owned()));
         assert!(!report.copied.contains(&"secrets".to_owned()));
         assert!(report.warnings.iter().any(|w| w.contains("budget")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_symlinked_entry_does_not_hide_other_ignored_paths() {
+        let (_t, main, wt) = setup();
+        std::fs::create_dir_all(main.join("big/inner")).unwrap();
+        std::fs::write(main.join("big/inner/x"), "x").unwrap();
+        std::os::unix::fs::symlink("big", main.join("via")).unwrap();
+        std::fs::write(main.join(".env"), "A=1").unwrap();
+        std::fs::create_dir_all(main.join("node_modules")).unwrap();
+        std::fs::write(main.join(INCLUDE_FILE), "via/inner/x\n.env\n").unwrap();
+        // Git refuses `via/...` ("beyond a symbolic link") for the whole batch.
+        let (code, _) = super::super::git_input(
+            &main,
+            &["check-ignore", "-z", "--stdin"],
+            b"via/inner/x\0.env\0",
+        )
+        .unwrap();
+        assert_eq!(code, 128);
+        assert_eq!(
+            ignored(&main, &["via/inner/x".into(), ".env".into()]),
+            HashSet::from([".env".to_owned()])
+        );
+        assert!(ignored(&main, &["tracked.txt".into()]).is_empty());
+        let config = Config {
+            shared_directories: vec!["via/inner".into(), "node_modules".into()],
+            ..Config::default()
+        };
+        let report = materialize(&main, &wt, &config);
+        assert_eq!(report.shared, ["node_modules"]);
+        assert_eq!(report.copied, [".env"]);
+        let symlinked: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("symbolic link"))
+            .collect();
+        assert_eq!(symlinked.len(), 2, "{:?}", report.warnings);
+        assert!(symlinked.iter().any(|w| w.contains("via/inner/x")));
+        assert!(!wt.join("via").exists());
+    }
+
+    #[test]
+    fn worktree_copy_completes_a_partial_directory() {
+        let (_t, main, wt) = setup();
+        std::fs::create_dir_all(main.join("secrets/nested")).unwrap();
+        std::fs::write(main.join("secrets/nested/key"), "k").unwrap();
+        std::fs::write(main.join("secrets/nested/new"), "n").unwrap();
+        std::fs::write(main.join("secrets/top"), "t").unwrap();
+        // What an interrupted clone leaves behind, including a file the user changed.
+        for (dest, via_copy) in [(wt.join("secrets"), true), (wt.join("other"), false)] {
+            std::fs::create_dir_all(dest.join("nested")).unwrap();
+            std::fs::write(dest.join("nested/key"), "mine").unwrap();
+            if via_copy {
+                copy(&main.join("secrets"), &dest).unwrap();
+            } else {
+                copy_tree(&main.join("secrets"), &dest).unwrap();
+            }
+            let read = |rel: &str| std::fs::read_to_string(dest.join(rel)).unwrap();
+            assert_eq!(read("nested/new"), "n");
+            assert_eq!(read("top"), "t");
+            assert_eq!(read("nested/key"), "mine", "never overwritten");
+            assert!(!dest.join("secrets").exists(), "not nested");
+        }
+        // An existing file where the source has a directory is left alone.
+        std::fs::write(wt.join("blocked"), "file").unwrap();
+        copy_tree(&main.join("secrets"), &wt.join("blocked")).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.join("blocked")).unwrap(), "file");
     }
 }

@@ -1,7 +1,11 @@
 //! `git worktree list` joined with stored metadata (spec §1 ownership).
 use super::meta::{self, WorktreeMeta};
 use crate::store::Store;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
@@ -121,33 +125,92 @@ pub fn list_with(cwd: &Path, metas: &[WorktreeMeta]) -> Result<Vec<Entry>, Strin
         .collect())
 }
 
-/// [`list_with`] using every stored meta. Holds `store` only while reading metas.
-pub fn list(cwd: &Path, store: &Store) -> Result<Vec<Entry>, String> {
-    let metas: Vec<WorktreeMeta> = meta::all(store)?.into_iter().map(|(_, m)| m).collect();
-    list_with(cwd, &metas)
+fn metas(store: &Store) -> Result<Vec<WorktreeMeta>, String> {
+    Ok(meta::all(store)?.into_iter().map(|(_, m)| m).collect())
 }
 
-/// Drop metas of this repository whose path is gone and no longer registered.
-/// Returns the removed meta keys.
-pub fn reconcile(cwd: &Path, store: &Store) -> Result<Vec<String>, String> {
+/// [`list_with`] using every stored meta. The caller's borrow of `store` (and so any lock
+/// it came from) lasts through the `git worktree list` call; prefer [`list_in`] off the
+/// main thread.
+pub fn list(cwd: &Path, store: &Store) -> Result<Vec<Entry>, String> {
+    list_with(cwd, &metas(store)?)
+}
+
+/// [`list`] that locks `store` only while reading the metas, never while Git runs.
+pub fn list_in(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<Entry>, String> {
+    let metas = {
+        let s = super::lock(store);
+        metas(&s)
+    };
+    list_with(cwd, &metas?)
+}
+
+/// `(main checkout key, registered worktree keys)`, or `None` without any worktree.
+fn live_keys(cwd: &Path) -> Result<Option<(String, HashSet<String>)>, String> {
     super::ensure_local(cwd)?;
     let trees = registered(cwd)?;
     let Some(main) = trees.first() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let main_key = meta::key(Path::new(&main.path));
-    let live: std::collections::HashSet<String> = trees
+    let live = trees
         .iter()
         .map(|t| meta::key(Path::new(&t.path)))
         .collect();
+    Ok(Some((main_key, live)))
+}
+
+/// This repository's metas (from `all`) whose path is gone and no longer registered.
+fn stale(
+    main_key: &str,
+    live: &HashSet<String>,
+    all: Vec<(String, WorktreeMeta)>,
+) -> Vec<(String, WorktreeMeta)> {
+    all.into_iter()
+        .filter(|(_, m)| meta::key(Path::new(&m.repo)) == main_key)
+        .filter(|(_, m)| {
+            let path = Path::new(&m.path);
+            !live.contains(&meta::key(path)) && path.symlink_metadata().is_err()
+        })
+        .collect()
+}
+
+/// Drop metas of this repository whose path is gone and no longer registered.
+/// Returns the removed meta keys. The caller's borrow of `store` lasts through
+/// `git worktree list`; prefer [`reconcile_in`] off the main thread.
+pub fn reconcile(cwd: &Path, store: &Store) -> Result<Vec<String>, String> {
+    let Some((main_key, live)) = live_keys(cwd)? else {
+        return Ok(Vec::new());
+    };
     let mut removed = Vec::new();
-    for (key, m) in meta::all(store)? {
-        if meta::key(Path::new(&m.repo)) != main_key {
-            continue;
-        }
-        let path = Path::new(&m.path);
-        if !live.contains(&meta::key(path)) && path.symlink_metadata().is_err() {
-            meta::delete_key(store, &key)?;
+    for (key, _) in stale(&main_key, &live, meta::all(store)?) {
+        meta::delete_key(store, &key)?;
+        removed.push(key);
+    }
+    Ok(removed)
+}
+
+/// [`reconcile`] that runs Git without the lock and locks `store` only to read and
+/// delete metas. A row that changed (or whose path reappeared) in between is kept.
+pub fn reconcile_in(cwd: &Path, store: &Mutex<Store>) -> Result<Vec<String>, String> {
+    let Some((main_key, live)) = live_keys(cwd)? else {
+        return Ok(Vec::new());
+    };
+    let all = {
+        let s = super::lock(store);
+        meta::all(&s)
+    };
+    let candidates = stale(&main_key, &live, all?);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let s = super::lock(store);
+    let current = meta::all(&s)?;
+    let mut removed = Vec::new();
+    for (key, m) in candidates {
+        let unchanged = current.iter().any(|(k, now)| *k == key && *now == m);
+        if unchanged && Path::new(&m.path).symlink_metadata().is_err() {
+            meta::delete_key(&s, &key)?;
             removed.push(key);
         }
     }
@@ -276,5 +339,37 @@ mod tests {
             &main,
             &["worktree", "unlock", "--", &locked.to_string_lossy()],
         );
+    }
+
+    #[test]
+    fn worktree_catalog_mutex_variants_match() {
+        let (t, main, root) = fixture::repo();
+        let base = t.path().canonicalize().unwrap();
+        let store = fixture::store();
+        let req = super::super::CreateRequest {
+            root: Some(root.clone()),
+            ..super::super::CreateRequest::new(&main, "managed")
+        };
+        let created = super::super::create::create(&req, &store, &|_| {}).unwrap();
+        let gone = super::super::WorktreeMeta {
+            path: base.join("vanished").to_string_lossy().into(),
+            repo: main.to_string_lossy().into(),
+            ..Default::default()
+        };
+        meta::save(&super::super::lock(&store), &gone).unwrap();
+        let entries = list_in(&main, &store).unwrap();
+        assert_eq!(entries, list(&main, &super::super::lock(&store)).unwrap());
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].ownership, Ownership::Managed);
+        std::fs::remove_dir_all(&created.path).unwrap(); // registered, so kept
+        let removed = reconcile_in(&main, &store).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].ends_with("/vanished"));
+        assert!(reconcile_in(&main, &store).unwrap().is_empty());
+        let s = store.try_lock().expect("not left locked");
+        assert!(meta::load(&s, &created.path).unwrap().is_some());
+        drop(s);
+        assert!(list_in(Path::new("remote://env/x"), &store).is_err());
+        assert!(reconcile_in(Path::new("remote://env/x"), &store).is_err());
     }
 }
