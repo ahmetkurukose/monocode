@@ -1329,6 +1329,26 @@ impl Store {
         }
         sql(tx.commit())
     }
+    pub(super) fn shared_settings_by_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        self.shared
+            .as_ref()
+            .unwrap()
+            .extras
+            .borrow()
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+    pub(super) fn shared_delete_setting(&self, key: &str) -> Result<(), String> {
+        self.shared_writable()?;
+        let shared = self.shared.as_ref().unwrap();
+        if let Some(conn) = &shared.extras_db {
+            sql(conn.execute("DELETE FROM settings WHERE key=?1", [key]))?;
+        }
+        shared.extras.borrow_mut().remove(key);
+        Ok(())
+    }
     pub(super) fn shared_settings_with_prefix(
         &self,
         prefix: &str,

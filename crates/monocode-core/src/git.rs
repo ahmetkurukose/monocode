@@ -254,7 +254,7 @@ pub fn worktrees(cwd: &Path) -> Result<Vec<Worktree>, String> {
     }
     Ok(trees)
 }
-fn valid_branch(cwd: &Path, name: &str) -> Result<(), String> {
+pub(crate) fn valid_branch(cwd: &Path, name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with(['-', '@']) {
         return Err("Enter a valid branch name".into());
     }

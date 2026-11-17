@@ -20,6 +20,7 @@ rand = "0.9"
 regex = "1"
 zstd = "0.14.3"
 toml = "0.8"
+yaml-rust2 = { version = "0.13", default-features = false }
 ureq = "2.12"
 webpki-roots = "0.26.11"
 similar = "2"

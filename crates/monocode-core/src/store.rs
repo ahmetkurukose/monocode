@@ -214,6 +214,33 @@ impl Store {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        if self.shared.is_some() {
+            return self.shared_delete_setting(key);
+        }
+        self.conn
+            .execute("DELETE FROM native_settings WHERE key=?1", [key])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// Every `(key, value)` setting whose key starts with `prefix`, sorted by key.
+    /// The prefix is matched literally (no `LIKE` wildcards).
+    pub fn settings_by_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
+        if self.shared.is_some() {
+            return Ok(self.shared_settings_by_prefix(prefix));
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT key, value FROM native_settings
+                 WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
     pub fn ui_state(&self) -> Result<Option<String>, String> {
         if self.shared.is_some() {
             return self.shared_ui_state();
