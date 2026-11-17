@@ -360,14 +360,6 @@ impl Diagnostic {
     pub fn range(&self) -> Range<usize> {
         self.from..self.to
     }
-    pub fn priority(&self) -> u8 {
-        match self.severity.as_str() {
-            "error" => 3,
-            "warning" => 2,
-            "info" => 1,
-            _ => 0,
-        }
-    }
 }
 
 pub(crate) fn analyze(
