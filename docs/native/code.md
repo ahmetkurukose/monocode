@@ -119,7 +119,9 @@ class_name, row }`; `class_name` is the enclosing classes outermost first joined
 - `PythonTestFunction`: only in a test file; a `def`/`async def` (decorated or not) whose
   name starts with `test`, either at module level or directly in a test class.
 - `PythonTestClass`: only in a test file; a class whose name starts with `Test`, or with a
-  base whose text ends in `TestCase`; at module level or nested in another test class.
+  base whose text ends in `TestCase`; at module level or nested in another test class. The
+  editor leaves out a `Test…` class that has an `__init__` and no `TestCase` base, as
+  pytest does.
 - `PythonMain`: any `.py` file; a module-level `if` whose condition compares `__name__`
   with the string `__main__` (either quote, either order). `name` is the file name.
 - `GoTest`: `func TestXxx(…)` in `*_test.go`. `GoMain`: `func main()` in `package main`.
@@ -417,6 +419,77 @@ file name followed by the crumbs of the caret's enclosing symbols, the problem c
 TypeScript, Rust, Go, Java, C/C++ and Ruby, and `python_runnables(text)` with pytest and
 unittest rules plus the `__main__` guard. `FileEditor::outline()` is the open file's.
 
+### Run in the interface
+
+`crates/monocode-gpui/src/run_ui/`, attached only through the extension points above.
+
+**Starting** (`start.rs`). `run_ui::start(config, context, checkout, cx)`, `debug(…)`,
+`start_for_agent(session, …)` and `rerun_last(cx)` all go through `begin(Request, cx)`,
+which returns at once with an `Outcome` (a receiver of `Result<RunId, String>`): the focused
+file is saved if it has edits, the configuration is resolved on a background thread with
+the checkout's toolchain, and then on the UI thread the process gets a dock tab
+(`code_shell::dock::run`) and an entry in `services().runs()`. The tab's events feed the
+entry (`set_pid`, `append_output`, `finish`; a stop from the tab's header is recorded as
+`Stopped`), the process is listed with `code_shell::processes`, and
+`RunEvent::StopRequested` from the registry stops the tab, so an agent's `run_stop` and the
+footer work on tab runs. A run that cannot be resolved or started shows the core's sentence
+where the shell shows its own errors ("“Serve” cannot run. No file is focused.").
+
+- *Run again while running:* starting the same resolved process (same command, arguments,
+  folder and environment, same checkout, same starter) restarts it in its tab, as the tab's
+  own rerun button does: the old process is killed and recorded `Stopped`, the new one is a
+  new registry entry. The keyboard stays where it was. A different process of the same
+  configuration (another `$FILE`) gets its own tab; that configuration's finished tabs are
+  closed first, so they do not pile up.
+- *Last run:* a user's run is stored with `ProjectRuns::mark_used` and saved; an agent's is
+  not. `rerun_last` repeats the last resolved process of this app session.
+- *Debug* resolves the same way and calls `code_shell::launch::debug`; it is not a run.
+
+**Header** (`header.rs`). A Run button on files that have built-in tasks or whose project
+has configurations, and a Debug button beside it while a debugger is installed. A click
+starts the project's last run if it is offered here, else the first built-in task for the
+file, else the first configuration; a built-in task counts as offered only in the file it
+was made for, so the button follows the file while a user's configuration sticks. The
+dropdown lists the offered configurations, the file's tasks (the default ticked) and
+"Edit configurations…". Clicks get the caret and selection from the editor; the dropdown is
+listed from the document and the caret of the last draw, so a configuration that needs
+`$SELECTED_TEXT` shows in quick open but not there.
+
+| Key | Does | Where |
+|---|---|---|
+| Alt+Shift+R | Run the focused file's default | file editor |
+| Alt+Shift+D | Debug it | file editor |
+| Ctrl+Alt+R | Run the last run again | anywhere |
+
+**Gutter** (`gutter.rs`). Python documents are searched off the UI thread on every open
+and change (`symbols::python_runnables`), mapped to the core's `Runnable`s (tests only in
+`test_*.py` / `*_test.py`, the `__main__` guard anywhere, nothing the project's test runner
+cannot address) and pushed as `GutterSlot::Run` marks with tooltips. A click starts the
+first of `runnable_tasks`; a right click lists them all, each again as "Debug …" with a
+debugger installed. `$ROW` and `$SYMBOL` are the marker's.
+
+**Configurations** (`settings_page.rs`). Project menu › "Run configurations…": the list
+with add, duplicate, remove and move up/down, a form (name, command, arguments, working
+folder, environment), the command line it comes to for the focused file or the sentence
+saying what is missing, the variables, and pytest/unittest. List changes save at once,
+typing with Save. The store is `Workspace::project_runs` through
+`code_shell::settings::{runs, save_runs}`; a configuration with no command yet stays on
+the page unsaved, and deleting a project drops its entry.
+
+**Footer chip** (`chip.rs`, `output.rs`). "N running" while runs of the focused project
+are running, hidden otherwise. Its list has those and the last eight that ended: label
+(and worktree), state or exit code, time taken, and "you" or the agent session's title;
+each row shows its tab, stops it, runs it again (as the user, in a tab) or opens the local
+address it announced in the browser pane, which never happens by itself. A run with no tab
+(an agent's `run_start`) opens a read-only dock tab that follows the registry's output.
+
+**Quick open** (`commands.rs`). `Run: <name>` for every offered configuration and task,
+`Run: Rerun last`, `Run: Stop <label>` per running run, `Run: Edit configurations`.
+
+Not there: dragging to reorder configurations, a "running" state on the header button, an
+"Open in browser" control on the run tab's own header (it is on the chip's row), and
+markers for Go, Rust and JavaScript (their file tasks are in the header menu).
+
 ## 7. Agents (MCP)
 
 **Shared services.** `code::services` is the one home of the instances the panes and the
@@ -508,5 +581,19 @@ run. A file the editor shows under another spelling of its path than the resolve
 opened a second time by a tool rather than joined.
 
 ## 8. Verification
+
+**Run in the interface.** `cargo test … -p monocode-gpui run_ui -- --test-threads=1`: ten
+GPUI tests in `run_ui/tests.rs` on a real shell and a temporary project whose `.venv` holds
+a stand-in interpreter: a file task run with unsaved edits (saved first; tab, registry
+entry, output, exit code, last run, reuse of the tab on rerun); an unresolvable
+configuration's sentence; a stop through the registry and a restart while running; the
+gutter's marks, a real click on one and the `Spawn` it starts, its menu with and without a
+debugger; the header's buttons, menu inside and outside a package, default and key; the
+settings page into `Workspace::project_runs` and back through a restore; the chip with an
+agent's headless run, its output tab, stop, rerun and removal; the quick open commands; an
+agent's run in a tab. With `MONOCODE_TEST_PYTHON`, one test runs real pytest from a marker
+(a passing and a failing test, exit codes 0 and 1, pytest's output). Nothing was looked at
+in the running app: the page's and the output tab's layout, the right-click menu on a
+marker and opening a detected address in the browser pane are untested beyond compiling.
 
 _To be filled in: what was run, by hand and by test._
