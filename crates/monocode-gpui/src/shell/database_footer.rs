@@ -221,6 +221,12 @@ impl Shell {
             }
         })
         .detach();
+        // The receiver is process-wide: each shell's call closes the last
+        // one. Tests open a shell per test on their own threads, and a task
+        // parked on a closed receiver would wake on the next test's thread.
+        if cfg!(test) {
+            return;
+        }
         let Ok(activity) = db_bridge::activity() else {
             return;
         };
