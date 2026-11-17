@@ -1197,3 +1197,131 @@ fn a_new_source_in_a_project_belongs_to_it_and_the_dialog_switches_projects(
     click(visual, "database-all-projects");
     assert_eq!(assigned(visual), [a]);
 }
+
+fn mongo_source(name: &str, read_only: bool) -> DataSource {
+    let mut source = DataSource::new_of(DbKind::MongoDb, name);
+    source.database = "shop".into();
+    source.read_only = read_only;
+    source
+}
+
+#[gpui::test]
+fn a_mongodb_console_reads_shell_statements_and_guards_writes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(mongo_source("mongo-ro", true), None, cx);
+            // A chained statement over several lines is one statement, and
+            // `$1` is not a parameter here.
+            type_text(
+                view,
+                "db.users\n  .updateMany({ a: $1 }, { $set: { b: 1 } })\n",
+                cx,
+            );
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            let source = view.selected.clone().unwrap();
+            view.run(&source, 1, false, cx);
+            assert!(
+                view.pending.is_none(),
+                "no parameter dialog in a MongoDB console"
+            );
+            assert!(!view.consoles[0].running, "nothing was sent");
+            let (error, statement) = view.consoles[0].error.clone().unwrap();
+            assert!(error.message.contains("read-only"), "{}", error.message);
+            assert_eq!(
+                statement,
+                "db.users\n  .updateMany({ a: $1 }, { $set: { b: 1 } })"
+            );
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(mongo_source("mongo-rw", false), None, cx);
+            let source = view.selected.clone().unwrap();
+            let ix = view
+                .consoles
+                .iter()
+                .position(|c| c.source == source)
+                .unwrap();
+            let text = "// cleanup\ndb.users.deleteMany({})";
+            view.consoles[ix]
+                .editor
+                .update(cx, |i, cx| i.replace_bytes(0..0, text, text.len(), cx));
+        })
+        .unwrap();
+    window
+        .update(cx, |view, _, cx| {
+            let source = view.selected.clone().unwrap();
+            let id = view.consoles.iter().find(|c| c.source == source).unwrap().id;
+            view.run(&source, id, true, cx);
+            assert!(
+                matches!(&view.pending, Some(Pending::Confirm { reason, .. }) if reason.contains("every document")),
+                "deleteMany({{}}) asks first"
+            );
+            let ix = view.console_index(&source, id).unwrap();
+            assert_eq!(view.tab_title(&view.consoles[ix], cx), "cleanup", "a // comment names it");
+            view.pending = None;
+        })
+        .unwrap();
+    // Painting a MongoDB console (pills, labels) must not panic.
+    cx.refresh().unwrap();
+}
+
+#[gpui::test]
+fn a_mongodb_source_names_its_tree_pages_and_sent_text_in_its_own_terms(cx: &mut TestAppContext) {
+    assert_eq!(
+        SchemaFolder::Tables.label_for(DbKind::MongoDb),
+        "Collections"
+    );
+    assert_eq!(SchemaFolder::Tables.label_for(DbKind::Postgres), "Tables");
+    assert_eq!(GroupKind::Columns.label_for(DbKind::MongoDb), "Fields");
+    assert_eq!(
+        GroupKind::Constraints.label_for(DbKind::MongoDb),
+        "Validation"
+    );
+    let paging = Paging {
+        schema: "shop".into(),
+        table: "orders".into(),
+        page: 1,
+        sort: Some(("total".into(), true)),
+    };
+    assert_eq!(
+        page_statement(DbKind::MongoDb, &paging, 100),
+        "db.getSiblingDB(\"shop\").orders.find({}).sort({ total: -1 }).skip(100).limit(100)"
+    );
+    assert_eq!(
+        page_statement(DbKind::Postgres, &paging, 100),
+        page_sql(&paging, 100)
+    );
+    assert_eq!(
+        table_statement(DbKind::MongoDb, &paging),
+        "db.getSiblingDB(\"shop\").orders.find({}).sort({ total: -1 })"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(mongo_source("mongo", false), None, cx);
+            let id = view.selected.clone().unwrap();
+            let origin = Origin {
+                path: "/p/seed.js".into(),
+                label: "seed.js".into(),
+                name: "seed.js".into(),
+            };
+            view.send_text(&id, &origin, "db.t.insertOne({ a: 1 })", cx)
+                .unwrap();
+            let texts = view.console_texts(&id, cx);
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.starts_with("// from seed.js\ndb.t.insertOne")),
+                "{texts:?}"
+            );
+        })
+        .unwrap();
+}

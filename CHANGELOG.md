@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The Database view connects to **MongoDB** as well as PostgreSQL. A MongoDB data source takes a host and port or a `mongodb://` / `mongodb+srv://` connection string, with an auth database and TLS. Its consoles speak the shell (`db.users.find({ … }).sort({ … })`, `aggregate`, inserts, updates, deletes, indexes, `runCommand`, `show dbs`, `use`), with `ObjectId`, `ISODate` and the other BSON helpers, completion of collections, methods, operators and fields, Explain and Analyze, Read-only protection, a confirmation before a sweeping delete or drop, and export of every document. The tree lists databases, collections and views with their fields, indexes and validation.
+
 ## [0.16.0] - 2026-10-19
 
 ### Added

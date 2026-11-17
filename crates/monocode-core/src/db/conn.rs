@@ -1,9 +1,15 @@
-//! A PostgreSQL connection that runs statements over the simple query
-//! protocol: the server sends every value as text, so no per-type decoding is
-//! needed and any column type (json, arrays, enums, ranges…) just works.
+//! A database connection. [`Connection`] is what the Database view holds; it
+//! dispatches to the server's kind. [`PgConnection`] runs PostgreSQL
+//! statements over the simple query protocol: the server sends every value as
+//! text, so no per-type decoding is needed and any column type (json, arrays,
+//! enums, ranges…) just works. MongoDB lives in [`super::mongo`].
 
+use super::introspect::{
+    CatalogEntry, ColumnInfo, SchemaObjects, TableDetails, TableInfo, TableKind,
+};
+use super::mongo::MongoConnection;
 use super::runtime::runtime;
-use super::source::DataSource;
+use super::source::{DataSource, DbKind};
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -51,7 +57,7 @@ impl std::fmt::Display for DbError {
 }
 
 impl DbError {
-    fn plain(message: impl Into<String>) -> Self {
+    pub(crate) fn plain(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             ..Self::default()
@@ -130,19 +136,19 @@ pub fn config(source: &DataSource, password: Option<&str>) -> Config {
     config
 }
 
-pub struct Connection {
+pub struct PgConnection {
     client: Client,
     driver: JoinHandle<()>,
     cancelling: AtomicBool,
 }
 
-impl Drop for Connection {
+impl Drop for PgConnection {
     fn drop(&mut self) {
         self.driver.abort();
     }
 }
 
-impl Connection {
+impl PgConnection {
     pub async fn connect(source: &DataSource, password: Option<&str>) -> Result<Self, DbError> {
         Self::connect_with(config(source, password)).await
     }
@@ -320,6 +326,176 @@ impl Connection {
             }
         }
         Ok(out)
+    }
+}
+
+/// A connection to a data source of either kind.
+pub enum Connection {
+    Postgres(PgConnection),
+    Mongo(MongoConnection),
+}
+
+fn postgres_only(what: &str) -> DbError {
+    DbError::plain(format!("{what} exists only for PostgreSQL data sources"))
+}
+
+impl Connection {
+    pub async fn connect(source: &DataSource, password: Option<&str>) -> Result<Self, DbError> {
+        Ok(match source.kind {
+            DbKind::Postgres => Self::Postgres(PgConnection::connect(source, password).await?),
+            DbKind::MongoDb => Self::Mongo(MongoConnection::connect(source, password).await?),
+        })
+    }
+
+    pub fn kind(&self) -> DbKind {
+        match self {
+            Self::Postgres(_) => DbKind::Postgres,
+            Self::Mongo(_) => DbKind::MongoDb,
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Self::Postgres(c) => c.is_closed(),
+            Self::Mongo(c) => c.is_closed(),
+        }
+    }
+
+    /// Stops the running statement; it then fails with `cancelled` set.
+    pub fn cancel(&self) {
+        match self {
+            Self::Postgres(c) => c.cancel(),
+            Self::Mongo(c) => c.cancel(),
+        }
+    }
+
+    /// Runs one statement (SQL, or a MongoDB shell command) and keeps at
+    /// most `max_rows` rows.
+    pub async fn execute(&self, statement: &str, max_rows: usize) -> Result<QueryResult, DbError> {
+        match self {
+            Self::Postgres(c) => c.execute(statement, max_rows).await,
+            Self::Mongo(c) => c.execute(statement, max_rows).await,
+        }
+    }
+
+    /// Runs `statement` again without the row limit and streams it to `path`.
+    pub async fn export(
+        &self,
+        statement: &str,
+        path: &std::path::Path,
+        format: super::export::ExportFormat,
+        options: super::export::ExportOptions,
+    ) -> Result<u64, DbError> {
+        match self {
+            Self::Postgres(c) => c.export(statement, path, format, options).await,
+            Self::Mongo(c) => c.export(statement, path, format, options).await,
+        }
+    }
+
+    /// The server's name and version, for "Test Connection".
+    pub async fn version(&self) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(c) => {
+                let rows = c.rows("select version()").await?;
+                Ok(rows
+                    .first()
+                    .and_then(|r| r.first().cloned().flatten())
+                    .unwrap_or_default())
+            }
+            Self::Mongo(c) => c.version().await,
+        }
+    }
+
+    /// The plan of `statement` as text. `analyze` runs it (PostgreSQL
+    /// `EXPLAIN ANALYZE`, MongoDB `executionStats`).
+    pub async fn explain(&self, statement: &str, analyze: bool) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(c) => {
+                let sql = format!(
+                    "explain ({}) {statement}",
+                    if analyze { "analyze, buffers" } else { "costs" }
+                );
+                let result = c.execute(&sql, 10_000).await?;
+                Ok(result
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.first().cloned().flatten())
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+            Self::Mongo(c) => c.explain(statement, analyze).await,
+        }
+    }
+
+    pub async fn catalog(&self) -> Result<Vec<CatalogEntry>, DbError> {
+        match self {
+            Self::Postgres(c) => c.catalog().await,
+            Self::Mongo(c) => c.catalog().await,
+        }
+    }
+
+    /// Schemas, or MongoDB databases.
+    pub async fn schemas(&self, system: bool) -> Result<Vec<String>, DbError> {
+        match self {
+            Self::Postgres(c) => c.schemas(system).await,
+            Self::Mongo(c) => c.databases(system).await,
+        }
+    }
+
+    /// Tables and views, or MongoDB collections and views.
+    pub async fn tables(&self, schema: &str) -> Result<Vec<TableInfo>, DbError> {
+        match self {
+            Self::Postgres(c) => c.tables(schema).await,
+            Self::Mongo(c) => c.collections(schema).await,
+        }
+    }
+
+    /// Routines and sequences; MongoDB has none.
+    pub async fn schema_objects(&self, schema: &str) -> Result<SchemaObjects, DbError> {
+        match self {
+            Self::Postgres(c) => c.schema_objects(schema).await,
+            Self::Mongo(_) => Ok(SchemaObjects::default()),
+        }
+    }
+
+    pub async fn routine_ddl(&self, oid: &str) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(c) => c.routine_ddl(oid).await,
+            Self::Mongo(_) => Err(postgres_only("A routine")),
+        }
+    }
+
+    pub async fn sequence_ddl(&self, schema: &str, name: &str) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(c) => c.sequence_ddl(schema, name).await,
+            Self::Mongo(_) => Err(postgres_only("A sequence")),
+        }
+    }
+
+    /// Indexes, constraints, references and triggers; for MongoDB, indexes
+    /// and the validator.
+    pub async fn table_details(&self, schema: &str, table: &str) -> Result<TableDetails, DbError> {
+        match self {
+            Self::Postgres(c) => c.table_details(schema, table).await,
+            Self::Mongo(c) => c.collection_details(schema, table).await,
+        }
+    }
+
+    /// The script that recreates the object: `CREATE …` for PostgreSQL, the
+    /// shell commands (`db.createCollection`, `createIndex`) for MongoDB.
+    pub async fn ddl(&self, schema: &str, table: &str, kind: TableKind) -> Result<String, DbError> {
+        match self {
+            Self::Postgres(c) => c.ddl(schema, table, kind).await,
+            Self::Mongo(c) => c.collection_script(schema, table).await,
+        }
+    }
+
+    /// Columns, or for MongoDB the fields a sample of documents holds.
+    pub async fn columns(&self, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
+        match self {
+            Self::Postgres(c) => c.columns(schema, table).await,
+            Self::Mongo(c) => c.fields(schema, table).await,
+        }
     }
 }
 

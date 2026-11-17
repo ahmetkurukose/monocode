@@ -134,7 +134,7 @@ impl DatabaseView {
                             .contains(&group_key(source, schema, table, *kind)),
                     ),
                     "",
-                    kind.label().to_owned(),
+                    kind.label_for(self.kind_of(source)).to_owned(),
                     count.map(|n| n.to_string()),
                     false,
                 )
@@ -178,7 +178,7 @@ impl DatabaseView {
                     2,
                     Some(self.expanded.contains(&folder_key(source, schema, *folder))),
                     "",
-                    folder.label().to_owned(),
+                    folder.label_for(self.kind_of(source)).to_owned(),
                     count.map(|n| n.to_string()),
                     false,
                 )
@@ -669,14 +669,24 @@ impl DatabaseView {
             })
             .child(div().flex_1())
             .child(
-                icon_button("database-format", "Format SQL (⌘⌥L)", "db-format")
-                    .size(px(26.))
-                    .on_click(cx.listener(|this, _, _, cx| this.format_console(cx))),
+                icon_button(
+                    "database-format",
+                    match source.kind {
+                        DbKind::Postgres => "Format SQL (⌘⌥L)",
+                        DbKind::MongoDb => "Format script (⌘⌥L)",
+                    },
+                    "db-format",
+                )
+                .size(px(26.))
+                .on_click(cx.listener(|this, _, _, cx| this.format_console(cx))),
             )
             .child(
                 icon_button(
                     "database-save-file",
-                    "Save console to a .sql file",
+                    match source.kind {
+                        DbKind::Postgres => "Save console to a .sql file",
+                        DbKind::MongoDb => "Save console to a .js file",
+                    },
                     "file-add",
                 )
                 .size(px(26.))
@@ -730,6 +740,9 @@ impl DatabaseView {
                         cx.notify();
                     })),
             )
+            .when(source.kind == DbKind::MongoDb, |d| {
+                d.child(pill("MongoDB", 0x4ade80))
+            })
             .child(if source.read_only {
                 pill("read-only", 0x4ade80)
             } else {
@@ -775,7 +788,7 @@ impl DatabaseView {
         )
     }
 
-    fn error_panel(error: &DbError, statement: &str) -> AnyElement {
+    fn error_panel(error: &DbError, statement: &str, kind: DbKind) -> AnyElement {
         let location = error.position.map(|byte| {
             let before = &statement[..byte.min(statement.len())];
             let line = before.matches('\n').count() + 1;
@@ -812,7 +825,10 @@ impl DatabaseView {
                     div()
                         .text_size(px(11.))
                         .text_color(content(0.35))
-                        .child(format!("SQLSTATE {t}")),
+                        .child(match kind {
+                            DbKind::Postgres => format!("SQLSTATE {t}"),
+                            DbKind::MongoDb => format!("Error code {t}"),
+                        }),
                 )
             })
             .into_any_element()
@@ -1155,6 +1171,7 @@ impl DatabaseView {
                 .child(label)
         };
         let tabular = format.is_tabular();
+        let mongo = self.kind_of(&console.source) == DbKind::MongoDb;
         let card = modal::card().w(px(540.)).child(
             modal::card_body()
                 .gap(px(12.))
@@ -1164,7 +1181,13 @@ impl DatabaseView {
                         .flex()
                         .flex_wrap()
                         .gap(px(6.))
-                        .children(ExportFormat::ALL.into_iter().map(chip)),
+                        .children(
+                            ExportFormat::ALL
+                                .into_iter()
+                                // Inserts are SQL; a MongoDB result exports as data.
+                                .filter(|f| !(mongo && *f == ExportFormat::SqlInserts))
+                                .map(chip),
+                        ),
                 )
                 .child(
                     div()
@@ -1336,7 +1359,7 @@ impl DatabaseView {
                 }))
         });
         let body: AnyElement = if let Some((error, statement)) = console.error.clone() {
-            Self::error_panel(&error, &statement)
+            Self::error_panel(&error, &statement, self.kind_of(&console.source))
         } else if let Some(result) = console.result.clone() {
             if result.columns.is_empty() {
                 div()
@@ -1921,7 +1944,7 @@ impl DatabaseView {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .child("Add a PostgreSQL data source to start"),
+                        .child("Add a PostgreSQL or MongoDB data source to start"),
                 )
                 .child(
                     modal::primary_button("database-empty-add", "New data source").on_click(

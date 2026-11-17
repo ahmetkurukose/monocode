@@ -1,6 +1,8 @@
 //! The object tree from `pg_catalog`: schemas, tables and their columns.
 
-use super::conn::{Connection, DbError};
+#[cfg(test)]
+use super::conn::Connection;
+use super::conn::{DbError, PgConnection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableKind {
@@ -123,7 +125,7 @@ pub struct CatalogEntry {
     pub type_name: String,
 }
 
-impl Connection {
+impl PgConnection {
     /// Every user column of every relation (capped), so completion knows
     /// schemas, tables and columns without a round trip per keystroke.
     pub async fn catalog(&self) -> Result<Vec<CatalogEntry>, DbError> {

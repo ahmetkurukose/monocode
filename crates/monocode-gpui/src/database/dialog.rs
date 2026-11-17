@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, SharedString,
     Subscription, Task, Window, div, prelude::*, px, rgb,
 };
-use monocode_core::db::{Connection, DataSource, runtime::runtime};
+use monocode_core::db::{Connection, DataSource, DbKind, runtime::runtime};
 
 pub(crate) enum DialogEvent {
     Close,
@@ -40,6 +40,10 @@ pub(crate) struct SourceDialog {
     user: Entity<Input>,
     password: Entity<Input>,
     comment: Entity<Input>,
+    /// MongoDB: a connection string, replacing host and port.
+    uri: Entity<Input>,
+    /// MongoDB: the database users authenticate against.
+    auth_source: Entity<Input>,
     test: Test,
     task: Option<Task<()>>,
     focus: FocusHandle,
@@ -82,6 +86,8 @@ impl SourceDialog {
         let user = field("User", cx);
         let password = field("Password", cx);
         let comment = field("Comment", cx);
+        let uri = field("mongodb://host:27017/?replicaSet=rs0", cx);
+        let auth_source = field("admin", cx);
         password.update(cx, |input, _| input.set_secret(true));
         set(&name, &source.name, cx);
         set(&host, &source.host, cx);
@@ -89,15 +95,27 @@ impl SourceDialog {
         set(&database, &source.database, cx);
         set(&user, &source.user, cx);
         set(&comment, &source.comment, cx);
-        let subscriptions = [&name, &host, &port, &database, &user, &password, &comment]
-            .into_iter()
-            .map(|input| {
-                cx.subscribe(input, |this, _, _: &input::Changed, cx| {
-                    this.test = Test::Idle;
-                    cx.notify();
-                })
+        set(&uri, &source.uri, cx);
+        set(&auth_source, &source.auth_source, cx);
+        let subscriptions = [
+            &name,
+            &host,
+            &port,
+            &database,
+            &user,
+            &password,
+            &comment,
+            &uri,
+            &auth_source,
+        ]
+        .into_iter()
+        .map(|input| {
+            cx.subscribe(input, |this, _, _: &input::Changed, cx| {
+                this.test = Test::Idle;
+                cx.notify();
             })
-            .collect();
+        })
+        .collect();
         Self {
             source,
             projects,
@@ -110,6 +128,8 @@ impl SourceDialog {
             user,
             password,
             comment,
+            uri,
+            auth_source,
             test: Test::Idle,
             task: None,
             focus: cx.focus_handle(),
@@ -129,16 +149,94 @@ impl SourceDialog {
         source.database = Self::text(&self.database, cx);
         source.user = Self::text(&self.user, cx);
         source.comment = Self::text(&self.comment, cx);
-        source.port = Self::text(&self.port, cx)
-            .parse()
-            .map_err(|_| "The port must be a number")?;
+        let mongo = source.kind == DbKind::MongoDb;
+        source.uri = if mongo {
+            Self::text(&self.uri, cx)
+        } else {
+            String::new()
+        };
+        source.auth_source = if mongo {
+            Self::text(&self.auth_source, cx)
+        } else {
+            String::new()
+        };
+        if !mongo {
+            source.tls = false;
+        }
+        let port = Self::text(&self.port, cx);
+        source.port = if port.is_empty() && !source.uri.is_empty() {
+            source.kind.default_port()
+        } else {
+            port.parse().map_err(|_| "The port must be a number")?
+        };
         if source.name.is_empty() {
             return Err("Give the data source a name");
         }
-        if source.host.is_empty() {
-            return Err("Enter a host");
+        if !source.uri.is_empty()
+            && !(source.uri.starts_with("mongodb://") || source.uri.starts_with("mongodb+srv://"))
+        {
+            return Err("A connection string starts with mongodb:// or mongodb+srv://");
+        }
+        if source.host.is_empty() && source.uri.is_empty() {
+            return Err(if mongo {
+                "Enter a host or a connection string"
+            } else {
+                "Enter a host"
+            });
         }
         Ok(source)
+    }
+
+    /// Switches a new source between PostgreSQL and MongoDB; a port left
+    /// at one kind's default moves to the other's.
+    fn set_kind(&mut self, kind: DbKind, cx: &mut Context<Self>) {
+        if self.source.kind == kind {
+            return;
+        }
+        let old = self.source.kind;
+        self.source.kind = kind;
+        let port = Self::text(&self.port, cx);
+        if port.is_empty() || port == old.default_port().to_string() {
+            set(&self.port, &kind.default_port().to_string(), cx);
+        }
+        self.test = Test::Idle;
+        cx.notify();
+    }
+
+    /// The PostgreSQL / MongoDB choice, for a source being made.
+    fn kind_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.source.kind;
+        div()
+            .flex()
+            .gap(px(6.))
+            .children(DbKind::ALL.into_iter().map(|kind| {
+                let on = kind == current;
+                div()
+                    .id(SharedString::from(format!(
+                        "database-kind-{}",
+                        kind.label()
+                    )))
+                    .role(Role::RadioButton)
+                    .aria_label(kind.label())
+                    .aria_selected(on)
+                    .h(px(28.))
+                    .px(px(12.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(content(if on { 0.5 } else { 0.12 }))
+                    .when(on, |d| d.bg(content(0.1)))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(content(if on { 1. } else { 0.7 }))
+                    .hover(|s| s.bg(content(0.08)))
+                    .child(icon("database", 13.))
+                    .child(kind.label())
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_kind(kind, cx)))
+            }))
+            .into_any_element()
     }
 
     fn typed_password(&self, cx: &Context<Self>) -> Option<String> {
@@ -176,17 +274,7 @@ impl SourceDialog {
             let conn = Connection::connect(&source, password.as_deref())
                 .await
                 .map_err(|e| e.message)?;
-            let result = conn
-                .execute("select version()", 1)
-                .await
-                .map_err(|e| e.message)?;
-            Ok::<_, String>(
-                result
-                    .rows
-                    .first()
-                    .and_then(|r| r.first().cloned().flatten())
-                    .unwrap_or_default(),
-            )
+            conn.version().await.map_err(|e| e.message)
         });
         self.task = Some(cx.spawn(async move |this, cx| {
             let outcome = work.await.unwrap_or_else(|e| Err(e.to_string()));
@@ -358,15 +446,25 @@ impl gpui::Render for SourceDialog {
             ),
             Test::Failed(message) => (message.clone().into(), rgb(0xf87171).into()),
         };
+        let mongo = self.source.kind == DbKind::MongoDb;
+        let title: SharedString = if self.editing {
+            format!("Edit {} data source", self.source.kind.label()).into()
+        } else {
+            "New data source".into()
+        };
         let card = modal::card().w(px(520.)).child(
             modal::card_body()
                 .gap(px(12.))
-                .child(modal::title(if self.editing {
-                    "Edit data source"
-                } else {
-                    "New PostgreSQL data source"
-                }))
+                .child(modal::title(title))
+                .when(!self.editing, |d| d.child(self.kind_row(cx)))
                 .child(Self::labeled("Name", &self.name, None))
+                .when(mongo, |d| {
+                    d.child(Self::labeled(
+                        "Connection string (optional — replaces host and port)",
+                        &self.uri,
+                        None,
+                    ))
+                })
                 .child(
                     div()
                         .flex()
@@ -389,7 +487,20 @@ impl gpui::Render for SourceDialog {
                             None,
                         )),
                 )
-                .child(Self::labeled("Database", &self.database, None))
+                .child(if mongo {
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(Self::labeled("Default database", &self.database, None))
+                        .child(Self::labeled(
+                            "Auth database",
+                            &self.auth_source,
+                            Some(160.),
+                        ))
+                        .into_any_element()
+                } else {
+                    Self::labeled("Database", &self.database, None)
+                })
                 .child(Self::labeled("Comment", &self.comment, None))
                 .children(self.projects_row(cx))
                 .child(
@@ -409,7 +520,16 @@ impl gpui::Render for SourceDialog {
                             self.source.read_only,
                             cx,
                             |s| s.read_only = !s.read_only,
-                        )),
+                        ))
+                        .when(mongo, |d| {
+                            d.child(Self::switch(
+                                "database-tls",
+                                "TLS",
+                                self.source.tls,
+                                cx,
+                                |s| s.tls = !s.tls,
+                            ))
+                        }),
                 )
                 .child(
                     div()

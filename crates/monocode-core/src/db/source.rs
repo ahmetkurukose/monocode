@@ -16,11 +16,57 @@ pub enum DbColor {
     Gray,
 }
 
+/// The kind of server a data source talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbKind {
+    /// Files written before MongoDB support had no kind: they are PostgreSQL.
+    #[default]
+    Postgres,
+    #[serde(rename = "mongodb")]
+    MongoDb,
+}
+
+impl DbKind {
+    pub const ALL: [Self; 2] = [Self::Postgres, Self::MongoDb];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::MongoDb => "MongoDB",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Postgres => 5432,
+            Self::MongoDb => 27017,
+        }
+    }
+
+    /// The extension a console of this kind is saved with.
+    pub fn console_extension(self) -> &'static str {
+        match self {
+            Self::Postgres => "sql",
+            Self::MongoDb => "js",
+        }
+    }
+
+    /// How a line comment starts in its console language.
+    pub fn line_comment(self) -> &'static str {
+        match self {
+            Self::Postgres => "--",
+            Self::MongoDb => "//",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataSource {
     pub id: String,
     pub name: String,
+    pub kind: DbKind,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -36,6 +82,13 @@ pub struct DataSource {
     pub search_path: Option<String>,
     /// The projects this source belongs to; empty means every project.
     pub projects: Vec<String>,
+    /// MongoDB: a full connection string (`mongodb://…`, `mongodb+srv://…`).
+    /// When set it replaces host and port; user and password still apply.
+    pub uri: String,
+    /// MongoDB: the database the user authenticates against (`authSource`).
+    pub auth_source: String,
+    /// MongoDB: connect over TLS.
+    pub tls: bool,
 }
 
 impl DataSource {
@@ -59,6 +112,7 @@ impl Default for DataSource {
         Self {
             id: String::new(),
             name: String::new(),
+            kind: DbKind::Postgres,
             host: "127.0.0.1".into(),
             port: 5432,
             database: String::new(),
@@ -71,6 +125,9 @@ impl Default for DataSource {
             statement_timeout_ms: None,
             search_path: None,
             projects: Vec::new(),
+            uri: String::new(),
+            auth_source: String::new(),
+            tls: false,
         }
     }
 }
@@ -80,6 +137,7 @@ impl std::fmt::Debug for DataSource {
         f.debug_struct("DataSource")
             .field("id", &self.id)
             .field("name", &self.name)
+            .field("kind", &self.kind)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("database", &self.database)
@@ -96,6 +154,19 @@ impl DataSource {
             name: name.into(),
             ..Self::default()
         }
+    }
+
+    /// A new source of `kind`, with that kind's port.
+    pub fn new_of(kind: DbKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            port: kind.default_port(),
+            ..Self::new(name)
+        }
+    }
+
+    pub fn is_mongo(&self) -> bool {
+        self.kind == DbKind::MongoDb
     }
 }
 
@@ -426,5 +497,25 @@ mod tests {
             serde_json::from_str(r#"[{"id":"1","name":"n","host":"h"}]"#).unwrap();
         assert!(parsed[0].read_only);
         assert_eq!(parsed[0].port, 5432);
+        assert_eq!(
+            parsed[0].kind,
+            DbKind::Postgres,
+            "older files are PostgreSQL"
+        );
+    }
+
+    #[test]
+    fn a_mongodb_source_round_trips_with_its_own_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DataSourceStore::new(dir.path());
+        let mut source = DataSource::new_of(DbKind::MongoDb, "atlas");
+        assert_eq!(source.port, 27017);
+        source.uri = "mongodb+srv://cluster0.example.net/app".into();
+        source.auth_source = "admin".into();
+        source.tls = true;
+        store.save(std::slice::from_ref(&source)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("datasources.json")).unwrap();
+        assert!(text.contains("\"kind\": \"mongodb\""), "{text}");
+        assert_eq!(store.load(), vec![source]);
     }
 }

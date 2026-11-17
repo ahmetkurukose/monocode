@@ -1,10 +1,12 @@
-//! The Database view: data sources and their object tree on the left, SQL
+//! The Database view: data sources and their object tree on the left,
 //! consoles (each with its own connection) on the right with the result grid
-//! beneath. PostgreSQL only; the work lives in `monocode_core::db` and runs on
-//! its tokio runtime, never on the UI thread.
+//! beneath. PostgreSQL consoles take SQL; MongoDB consoles take shell
+//! commands (`db.users.find({ … })`). The work lives in `monocode_core::db`
+//! and runs on its tokio runtime, never on the UI thread.
 
 mod dialog;
 mod grid;
+mod mongo;
 mod render;
 mod send;
 mod sql;
@@ -24,7 +26,7 @@ use gpui::{
     rgb, uniform_list,
 };
 use monocode_core::db::{
-    ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError,
+    ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError, DbKind,
     HistoryEntry, HistoryStore, QueryResult, RoutineKind, SchemaObjects, TableDetails, TableInfo,
     TableKind, analysis, format, params, runtime::runtime, source, split,
 };
@@ -113,6 +115,15 @@ enum GroupKind {
 }
 
 impl GroupKind {
+    /// What the folder is called for a source of `kind`.
+    fn label_for(self, kind: DbKind) -> &'static str {
+        match (kind, self) {
+            (DbKind::MongoDb, Self::Columns) => "Fields",
+            (DbKind::MongoDb, Self::Constraints) => "Validation",
+            _ => self.label(),
+        }
+    }
+
     const ALL: [Self; 6] = [
         Self::Columns,
         Self::Indexes,
@@ -246,6 +257,14 @@ enum SchemaFolder {
 }
 
 impl SchemaFolder {
+    /// What the folder is called for a source of `kind`.
+    fn label_for(self, kind: DbKind) -> &'static str {
+        match (kind, self) {
+            (DbKind::MongoDb, Self::Tables) => "Collections",
+            _ => self.label(),
+        }
+    }
+
     const ALL: [Self; 6] = [
         Self::Tables,
         Self::Views,
@@ -445,6 +464,28 @@ fn next_sort(current: Option<(String, bool)>, clicked: String) -> Option<(String
     }
 }
 
+/// The statement for one page, in the console language of `kind`.
+fn page_statement(kind: DbKind, paging: &Paging, limit: usize) -> String {
+    match kind {
+        DbKind::Postgres => page_sql(paging, limit),
+        DbKind::MongoDb => mongo::page_statement(
+            &paging.schema,
+            &paging.table,
+            &paging.sort,
+            paging.page,
+            limit,
+        ),
+    }
+}
+
+/// The whole table or collection, for exporting every row.
+fn table_statement(kind: DbKind, paging: &Paging) -> String {
+    match kind {
+        DbKind::Postgres => table_sql(paging),
+        DbKind::MongoDb => mongo::collection_statement(&paging.schema, &paging.table, &paging.sort),
+    }
+}
+
 /// The same table read whole, for exporting every row.
 fn table_sql(paging: &Paging) -> String {
     let order = paging
@@ -559,13 +600,18 @@ impl Focusable for DatabaseView {
     }
 }
 
-/// A console's name: its first line when that is a `-- comment`, else its number.
+/// A console's name: its first line when that is a comment, else its number.
 fn title_of(name: Option<&str>, text: &str, id: u32) -> String {
     if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
         return name.to_owned();
     }
     let first = text.lines().next().unwrap_or("").trim();
-    match first.strip_prefix("--").map(str::trim) {
+    // `-- name` in SQL, `// name` in a MongoDB console.
+    match first
+        .strip_prefix("--")
+        .or_else(|| first.strip_prefix("//"))
+        .map(str::trim)
+    {
         Some(title) if !title.is_empty() => title.chars().take(24).collect(),
         _ => format!("Console {id}"),
     }
@@ -751,6 +797,35 @@ impl DatabaseView {
         self.sources.iter().find(|s| s.id == id)
     }
 
+    /// The kind of server `id` talks to (PostgreSQL when unknown).
+    fn kind_of(&self, id: &str) -> DbKind {
+        self.source(id).map_or(DbKind::Postgres, |s| s.kind)
+    }
+
+    /// Statements of `text` in the console language of `kind`.
+    fn split_for(kind: DbKind, text: &str) -> Vec<split::Statement> {
+        match kind {
+            DbKind::Postgres => split::split(text),
+            DbKind::MongoDb => monocode_core::db::mongo::script::split(text),
+        }
+    }
+
+    /// The statement at `cursor` in the console language of `kind`.
+    fn at_cursor_for(kind: DbKind, text: &str, cursor: usize) -> Option<split::Statement> {
+        match kind {
+            DbKind::Postgres => split::at_cursor(text, cursor),
+            DbKind::MongoDb => monocode_core::db::mongo::script::at_cursor(text, cursor),
+        }
+    }
+
+    /// Colours for a console of `kind`.
+    fn colours(kind: DbKind, text: &str) -> crate::editor_analysis::Analysis {
+        match kind {
+            DbKind::Postgres => sql::analyse(text),
+            DbKind::MongoDb => mongo::analyse(text),
+        }
+    }
+
     /// Whether the tree lists `source` in the current scope.
     fn source_shown(&self, source: &DataSource) -> bool {
         self.scope
@@ -925,17 +1000,25 @@ impl DatabaseView {
 
     fn add_console(&mut self, source: &str, id: u32, text: String, cx: &mut Context<Self>) {
         let catalog = self.catalog_for(source);
+        let kind = self.kind_of(source);
+        let default_db = self
+            .source(source)
+            .map(monocode_core::db::mongo::default_database)
+            .unwrap_or_default();
         let editor = cx.new(Input::editor);
         editor.update(cx, |input, cx| {
-            input.set_editor_path("console.sql".into());
+            input.set_editor_path(format!("console.{}", kind.console_extension()));
             input.set_editor_completer(Arc::new(move |text, at, explicit| match catalog.read() {
-                Ok(catalog) => sql::complete(&catalog, text, at, explicit),
+                Ok(catalog) => match kind {
+                    DbKind::Postgres => sql::complete(&catalog, text, at, explicit),
+                    DbKind::MongoDb => mongo::complete(&catalog, &default_db, text, at, explicit),
+                },
                 Err(_) => Vec::new(),
             }));
             if !text.is_empty() {
                 input.set_text(text.clone(), cx);
             }
-            input.set_editor_analysis(sql::analyse(&text), cx);
+            input.set_editor_analysis(Self::colours(kind, &text), cx);
         });
         let key = (source.to_owned(), id);
         let subscriptions = vec![
@@ -1102,12 +1185,13 @@ impl DatabaseView {
         };
         let editor = self.consoles[ix].editor.clone();
         let text = editor.read(cx).content.to_string();
+        let kind = self.kind_of(source);
         // Colours follow the text at once; the analysis is a single pass.
         editor.update(cx, |input, cx| {
             // The edit already moved the notes with the text; the colours are redone,
             // and an error underline is stale once the text changes.
             let mut analysis = input.editor_analysis().clone();
-            analysis.tokens = sql::analyse(&text).tokens;
+            analysis.tokens = Self::colours(kind, &text).tokens;
             analysis.diagnostics.clear();
             input.set_editor_analysis(analysis, cx);
         });
@@ -1155,6 +1239,7 @@ impl DatabaseView {
         if self.consoles[ix].running {
             return;
         }
+        let kind = self.kind_of(source);
         let editor = self.consoles[ix].editor.read(cx);
         let text = editor.content.to_string();
         let selection = editor.selection_range();
@@ -1166,17 +1251,17 @@ impl DatabaseView {
         };
         let statements: Vec<Stmt> = if !selection.is_empty() {
             let offset = selection.start;
-            split::split(&text[selection])
+            Self::split_for(kind, &text[selection])
                 .into_iter()
                 .map(|s| stmt(offset, s))
                 .collect()
         } else if all {
-            split::split(&text)
+            Self::split_for(kind, &text)
                 .into_iter()
                 .map(|s| stmt(0, s))
                 .collect()
         } else {
-            split::at_cursor(&text, selection.start)
+            Self::at_cursor_for(kind, &text, selection.start)
                 .map(|s| vec![stmt(0, s)])
                 .unwrap_or_default()
         };
@@ -1196,7 +1281,11 @@ impl DatabaseView {
             return;
         }
         let texts: Vec<String> = statements.iter().map(|s| s.text.clone()).collect();
-        let names = params::names(&texts);
+        // Parameters are SQL's; in a MongoDB console `$name` is an operator.
+        let names = match self.kind_of(source) {
+            DbKind::Postgres => params::names(&texts),
+            DbKind::MongoDb => Vec::new(),
+        };
         if names.is_empty() {
             self.vet(source, id, statements, paging, cx);
             return;
@@ -1283,10 +1372,18 @@ impl DatabaseView {
             return;
         };
         let read_only = self.source(source).is_some_and(|s| s.read_only);
-        let impacts: Vec<analysis::Impact> = statements
+        let kind = self.kind_of(source);
+        let assessed: Vec<(analysis::Impact, Option<&'static str>)> = statements
             .iter()
-            .map(|s| analysis::classify(&s.text))
+            .map(|s| match kind {
+                DbKind::Postgres => (analysis::classify(&s.text), None),
+                DbKind::MongoDb => {
+                    let a = monocode_core::db::mongo::script::assess(&s.text);
+                    (a.impact, a.reason)
+                }
+            })
             .collect();
+        let impacts: Vec<analysis::Impact> = assessed.iter().map(|(i, _)| *i).collect();
         if read_only && let Some(at) = impacts.iter().position(|i| i.writes) {
             let blocked = &statements[at];
             self.results_hidden = false;
@@ -1327,12 +1424,12 @@ impl DatabaseView {
                 .next()
                 .unwrap_or("")
                 .to_uppercase();
-            let reason = match first.as_str() {
+            let reason = assessed[at].1.unwrap_or(match first.as_str() {
                 "UPDATE" => "UPDATE without WHERE changes every row of the table.",
                 "DELETE" => "DELETE without WHERE removes every row of the table.",
                 "TRUNCATE" => "TRUNCATE empties the table at once.",
                 _ => "DROP removes the object for good.",
-            };
+            });
             self.pending = Some(Pending::Confirm {
                 source: source.to_owned(),
                 id,
@@ -1394,6 +1491,7 @@ impl DatabaseView {
             })
             .collect();
         let key = (source.to_owned(), id);
+        let kind = data_source.kind;
         let history = self.history.clone();
         let history_key = source.to_owned();
         let work = async move {
@@ -1428,6 +1526,9 @@ impl DatabaseView {
                     Ok(r) => (
                         Some(if r.columns.is_empty() {
                             r.affected.unwrap_or(0)
+                        } else if kind == DbKind::MongoDb {
+                            // A write's summary is one row; what counts is what it changed.
+                            r.affected.unwrap_or(r.rows.len() as u64)
                         } else {
                             r.rows.len() as u64
                         }),
@@ -1508,7 +1609,7 @@ impl DatabaseView {
                 console.all = shown;
                 console.select_result(last);
                 console.note = None;
-                console.export_sql = paging.as_ref().map(table_sql);
+                console.export_sql = paging.as_ref().map(|p| table_statement(kind, p));
                 console.paging = paging;
             }
             if let Some(failure) = done.failure {
@@ -1592,6 +1693,10 @@ impl DatabaseView {
             let input = editor.read(cx);
             (input.content.to_string(), input.selection_range())
         };
+        if self.kind_of(&self.consoles[ix].source) == DbKind::MongoDb {
+            self.format_script(ix, text, selection.start, cx);
+            return;
+        }
         let range = (!selection.is_empty()).then_some((selection.start, selection.end));
         let edits = format::format_sql(&text, range);
         let (Some(first), Some(last)) = (edits.first(), edits.last()) else {
@@ -1614,10 +1719,40 @@ impl DatabaseView {
         });
     }
 
+    /// Formats a MongoDB console as JavaScript, off the UI thread.
+    fn format_script(&mut self, ix: usize, text: String, cursor: usize, cx: &mut Context<Self>) {
+        let editor = self.consoles[ix].editor.clone();
+        let original = text.clone();
+        cx.spawn(async move |this, cx| {
+            let formatted = cx
+                .background_executor()
+                .spawn(async move { crate::editor_analysis::format("console.js", &text, cursor) })
+                .await;
+            let _ = this.update(cx, |this, cx| match formatted {
+                Ok(Some(done)) => {
+                    // Typing meanwhile wins over a stale format.
+                    if editor.read(cx).content.as_str() != original || done.formatted == original {
+                        return;
+                    }
+                    let length = original.len();
+                    editor.update(cx, |input, cx| {
+                        input.replace_bytes(0..length, &done.formatted, done.cursor, cx)
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    this.notice = Some(format!("Could not format: {error}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Reads the page `paging` describes into console `ix`.
     fn show_page(&mut self, ix: usize, paging: Paging, cx: &mut Context<Self>) {
         let (source, id) = (self.consoles[ix].source.clone(), self.consoles[ix].id);
-        let sql = page_sql(&paging, self.limit);
+        let sql = page_statement(self.kind_of(&source), &paging, self.limit);
         let stmt = Stmt {
             text: sql,
             start: 0,
@@ -1693,7 +1828,7 @@ impl DatabaseView {
         cx.notify();
     }
 
-    /// Writes the active console to a `.sql` file of the user's choosing.
+    /// Writes the active console to a `.sql` (MongoDB: `.js`) file of the user's choosing.
     fn save_console_file(&mut self, cx: &mut Context<Self>) {
         let Some(ix) = self.active_index() else {
             return;
@@ -1701,6 +1836,7 @@ impl DatabaseView {
         let console = &self.consoles[ix];
         let text = console.editor.read(cx).content.to_string();
         let (source, id) = (console.source.clone(), console.id);
+        let extension = self.kind_of(&source).console_extension();
         let stem: String = self
             .tab_title(console, cx)
             .chars()
@@ -1716,7 +1852,7 @@ impl DatabaseView {
             .map(|home| PathBuf::from(home).join("Documents"))
             .filter(|p| p.is_dir())
             .unwrap_or_else(std::env::temp_dir);
-        let picker = cx.prompt_for_new_path(&directory, Some(&format!("{stem}.sql")));
+        let picker = cx.prompt_for_new_path(&directory, Some(&format!("{stem}.{extension}")));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = picker.await else {
                 return;
@@ -1856,11 +1992,19 @@ impl DatabaseView {
         });
     }
 
-    /// The reference to a tree row as SQL would write it.
+    /// The reference to a tree row as the console would write it: SQL, or
+    /// for MongoDB the shell (`db.getSiblingDB("shop").orders`).
     fn reference(&self, row: &TreeRow) -> Option<String> {
         use monocode_core::db::introspect::quote;
+        let mongo = match row {
+            TreeRow::Source(s) | TreeRow::Schema(s, _) | TreeRow::Table(s, _, _) => {
+                self.kind_of(s) == DbKind::MongoDb
+            }
+            _ => false,
+        };
         Some(match row {
             TreeRow::Source(id) => self.source(id)?.name.clone(),
+            TreeRow::Schema(_, schema) if mongo => schema.clone(),
             TreeRow::Schema(_, schema) => quote(schema),
             TreeRow::Table(source, schema, ix) => {
                 let table = self
@@ -1868,6 +2012,9 @@ impl DatabaseView {
                     .tables
                     .as_ref()?
                     .get(*ix)?;
+                if mongo {
+                    return Some(mongo::collection_ref(schema, &table.info.name));
+                }
                 format!("{}.{}", quote(schema), quote(&table.info.name))
             }
             TreeRow::Routine(source, schema, ix) => {
@@ -1902,6 +2049,17 @@ impl DatabaseView {
     ) {
         let mut items: Vec<MenuItem> = Vec::new();
         let copy = || MenuAction::new("copy-name", "Copy name").into();
+        let mongo = match &row {
+            TreeRow::Source(s) | TreeRow::Schema(s, _) | TreeRow::Table(s, _, _) => {
+                self.kind_of(s) == DbKind::MongoDb
+            }
+            _ => false,
+        };
+        let (ddl, ddl_copy, ddl_console) = if mongo {
+            ("Show script", "Copy script", "Script to console")
+        } else {
+            ("Show DDL", "Copy DDL", "DDL to console")
+        };
         match &row {
             TreeRow::Source(id) => {
                 let live = self.is_connected(id);
@@ -1930,11 +2088,21 @@ impl DatabaseView {
                 items.push(MenuAction::new("data", "Open data").into());
                 items.push(MenuAction::new("refresh", "Refresh").into());
                 items.push(MenuItem::Separator);
-                items.push(MenuAction::new("ddl", "Show DDL").into());
-                items.push(MenuAction::new("ddl-copy", "Copy DDL").into());
-                items.push(MenuAction::new("ddl-console", "DDL to console").into());
+                items.push(MenuAction::new("ddl", ddl).into());
+                items.push(MenuAction::new("ddl-copy", ddl_copy).into());
+                items.push(MenuAction::new("ddl-console", ddl_console).into());
                 items.push(MenuItem::Separator);
-                items.push(MenuAction::new("select-console", "Select * in console").into());
+                items.push(
+                    MenuAction::new(
+                        "select-console",
+                        if mongo {
+                            "Find in console"
+                        } else {
+                            "Select * in console"
+                        },
+                    )
+                    .into(),
+                );
                 items.push(copy());
             }
             TreeRow::Routine(..) | TreeRow::Sequence(..) => {
@@ -2068,9 +2236,14 @@ impl DatabaseView {
                 if let TreeRow::Table(..) = row
                     && let Some(name) = self.reference(row)
                 {
-                    self.select_source(source.as_deref().unwrap_or_default(), cx);
+                    let source = source.as_deref().unwrap_or_default();
+                    let text = match self.kind_of(source) {
+                        DbKind::Postgres => format!("select * from {name} limit 100;"),
+                        DbKind::MongoDb => format!("{name}.find({{}}).limit(100)"),
+                    };
+                    self.select_source(source, cx);
                     if let Some(ix) = self.active_index() {
-                        self.append_to_console(ix, &format!("select * from {name} limit 100;"), cx);
+                        self.append_to_console(ix, &text, cx);
                     }
                 }
             }
@@ -2139,13 +2312,14 @@ impl DatabaseView {
         if self.consoles[ix].running {
             return;
         }
+        let kind = self.kind_of(source);
         let editor = self.consoles[ix].editor.read(cx);
         let text = editor.content.to_string();
         let selection = editor.selection_range();
         let Some(statement) = (if selection.is_empty() {
-            split::at_cursor(&text, selection.start).map(|s| s.text)
+            Self::at_cursor_for(kind, &text, selection.start).map(|s| s.text)
         } else {
-            split::split(&text[selection])
+            Self::split_for(kind, &text[selection])
                 .into_iter()
                 .next()
                 .map(|s| s.text)
@@ -2157,7 +2331,11 @@ impl DatabaseView {
             .next()
             .unwrap_or("")
             .to_lowercase();
-        if analyze && !matches!(first.as_str(), "select" | "with" | "values" | "table") {
+        // MongoDB's explain never applies a write, even with execution statistics.
+        if analyze
+            && kind == DbKind::Postgres
+            && !matches!(first.as_str(), "select" | "with" | "values" | "table")
+        {
             self.notice =
                 Some("Analyze runs the statement; it only accepts queries that read".into());
             cx.notify();
@@ -2171,10 +2349,6 @@ impl DatabaseView {
         self.consoles[ix].running = true;
         self.consoles[ix].error = None;
         let key = (source.to_owned(), id);
-        let sql = format!(
-            "explain ({}) {statement}",
-            if analyze { "analyze, buffers" } else { "costs" }
-        );
         let work = async move {
             let conn = match existing {
                 Some(conn) => conn,
@@ -2187,8 +2361,8 @@ impl DatabaseView {
                     .map_err(|e| (None, e))?,
                 ),
             };
-            match conn.execute(&sql, 10_000).await {
-                Ok(result) => Ok((conn, result)),
+            match conn.explain(&statement, analyze).await {
+                Ok(plan) => Ok((conn, plan)),
                 Err(error) => Err((Some(conn), error)),
             }
         };
@@ -2199,16 +2373,11 @@ impl DatabaseView {
             this.consoles[ix].running = false;
             this.consoles[ix].task = None;
             match out {
-                Some(Ok((conn, result))) => {
+                Some(Ok((conn, plan))) => {
                     this.consoles[ix].conn = Some(conn);
-                    let plan: Vec<String> = result
-                        .rows
-                        .iter()
-                        .filter_map(|r| r.first().cloned().flatten())
-                        .collect();
                     this.preview = Some((
                         if analyze { "Plan (analyzed)" } else { "Plan" }.to_owned(),
-                        plan.join("\n"),
+                        plan,
                     ));
                 }
                 Some(Err((conn, error))) => {
@@ -2303,19 +2472,29 @@ impl DatabaseView {
         node.link = Link::Connecting;
         let password = self.password_for(&data_source);
         let key = id.to_owned();
+        // MongoDB's catalog samples documents: it loads after the tree shows.
+        let mongo = data_source.kind == DbKind::MongoDb;
         let work = async move {
             let conn = Connection::connect(&data_source, password.resolve()?.as_deref()).await?;
             let schemas = conn.schemas(false).await?;
-            let catalog = conn.catalog().await.unwrap_or_default();
+            let catalog = if mongo {
+                Vec::new()
+            } else {
+                conn.catalog().await.unwrap_or_default()
+            };
             Ok::<_, DbError>((Arc::new(conn), schemas, catalog))
         };
         self.spawn_db(cx, work, move |this, out, cx| {
             match out {
                 Some(Ok((conn, schemas, catalog))) => {
-                    if let Ok(mut shared) = this.catalog_for(&key).write() {
-                        *shared = sql::Catalog::from_entries(catalog);
+                    if mongo {
+                        this.load_catalog(&key, conn.clone(), cx);
+                    } else {
+                        if let Ok(mut shared) = this.catalog_for(&key).write() {
+                            *shared = sql::Catalog::from_entries(catalog);
+                        }
+                        this.catalog_started.insert(key.clone());
                     }
-                    this.catalog_started.insert(key.clone());
                     let node = this
                         .nodes
                         .entry(key.clone())
@@ -2515,7 +2694,14 @@ impl DatabaseView {
                     && schema.objects.routines.is_empty()
                     && schema.objects.sequences.is_empty();
                 if empty {
-                    rows.push(TreeRow::Note(2, "Empty schema".into()));
+                    rows.push(TreeRow::Note(
+                        2,
+                        if source.kind == DbKind::MongoDb {
+                            "No collections yet".into()
+                        } else {
+                            "Empty schema".into()
+                        },
+                    ));
                 }
                 for folder in SchemaFolder::ALL {
                     let members: Vec<usize> = match folder {
@@ -2715,11 +2901,14 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         self.select_source(source, cx);
-        let sql = format!(
-            "select * from {}.{}",
-            quote_ident(schema),
-            quote_ident(table)
-        );
+        let sql = match self.kind_of(source) {
+            DbKind::Postgres => format!(
+                "select * from {}.{}",
+                quote_ident(schema),
+                quote_ident(table)
+            ),
+            DbKind::MongoDb => format!("{}.find({{}})", mongo::collection_ref(schema, table)),
+        };
         let Some(ix) = self.active_index() else {
             return;
         };
@@ -2994,6 +3183,12 @@ impl DatabaseView {
         self.export_table.update(cx, |input, cx| {
             input.set_text(table.unwrap_or_else(|| "table_name".into()), cx)
         });
+        let mongo = self
+            .active_console()
+            .is_some_and(|c| self.kind_of(&c.source) == DbKind::MongoDb);
+        if mongo && self.export_format == monocode_core::db::ExportFormat::SqlInserts {
+            self.export_format = monocode_core::db::ExportFormat::Json;
+        }
         self.export_menu = true;
         cx.notify();
     }

@@ -82,7 +82,8 @@ impl DatabaseView {
         }
         self.ensure_consoles(source, cx);
         let block = format!(
-            "-- from {}\n{}{}",
+            "{} from {}\n{}{}",
+            self.kind_of(source).line_comment(),
             origin.label,
             text,
             if text.ends_with('\n') { "" } else { "\n" }
