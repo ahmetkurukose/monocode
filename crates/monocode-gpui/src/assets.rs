@@ -37,7 +37,6 @@ impl AssetSource for Assets {
    "check-circle"=>include_bytes!("../assets/hugeicons/check-circle.svg"),
    // The title tab's done check, at the React tab's 2 stroke.
    "check-circle-2"=>include_bytes!("../assets/hugeicons/check-circle-2.svg"),
-   "snooze"=>include_bytes!("../assets/hugeicons/snooze.svg"),
    "circle-x"=>include_bytes!("../assets/hugeicons/circle-x.svg"),
    "loader-03"=>include_bytes!("../assets/hugeicons/loader-03.svg"),
    "alert-circle"=>include_bytes!("../assets/hugeicons/alert-circle.svg"),

@@ -481,11 +481,12 @@ impl Shell {
         last: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (title, updated, approval, working, archived) = {
+        let (title, updated, provider, approval, working, archived) = {
             let meta = self.session_metadata(id, cx);
             (
                 meta.display_title(),
                 meta.summary.updated_at,
+                meta.summary.provider.clone(),
                 meta.needs_approval(),
                 meta.responding() || meta.busy,
                 meta.summary.archived,
@@ -499,7 +500,7 @@ impl Shell {
                 .map(|a| self.workspace.session_for_pane(a))
                 == Some(id);
         // The row leads with what the agent is doing: working, waiting on
-        // an answer, finished and not yet seen, or snoozing once it has been.
+        // an answer, or finished and not yet seen; otherwise its provider.
         let mark = div()
             .id(("rail-session-mark", id as u64 as usize))
             .debug_selector(move || format!("rail-session-mark-{id}"))
@@ -520,8 +521,7 @@ impl Shell {
             mark.aria_label("Done, not yet seen")
                 .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
         } else {
-            mark.aria_label("Snoozing")
-                .child(icon("snooze", 12.).text_color(content(0.35)))
+            mark.child(crate::theme::provider_icon(&provider, 14.))
         };
         let status = div()
             .flex_shrink_0()
