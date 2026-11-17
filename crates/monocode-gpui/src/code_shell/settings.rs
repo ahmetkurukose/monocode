@@ -8,7 +8,7 @@ use gpui::{
     AnyView, App, Context, EventEmitter, FocusHandle, Focusable, Global, Role, SharedString,
     Window, div, prelude::*, px,
 };
-use monocode_core::files::path_key;
+use monocode_core::{code::run::ProjectRuns, files::path_key};
 use serde_json::Value;
 use std::{collections::HashMap, rc::Rc};
 
@@ -68,6 +68,26 @@ impl Global for Pages {}
 #[derive(Default)]
 pub(crate) struct Saved(pub(crate) HashMap<String, HashMap<String, Value>>);
 impl Global for Saved {}
+
+/// The projects' run configurations (`path_key`), published by the shell
+/// from `Workspace::project_runs`, which is where they are kept.
+#[derive(Default)]
+pub(crate) struct SavedRuns(pub(crate) HashMap<String, ProjectRuns>);
+impl Global for SavedRuns {}
+
+/// The project's run configurations, last run and test runner.
+pub(crate) fn runs(project: &str, cx: &App) -> ProjectRuns {
+    cx.try_global::<SavedRuns>()
+        .and_then(|saved| saved.0.get(&path_key(project)).cloned())
+        .unwrap_or_default()
+}
+
+/// Stores the project's run configurations in the workspace and saves it.
+pub(crate) fn save_runs(project: &str, runs: ProjectRuns, window: &mut Window, cx: &mut App) {
+    super::with_shell(window, cx, |shell, _, cx| {
+        shell.save_project_runs(project, runs, cx)
+    });
+}
 
 /// Adds a page to every project's settings, replacing one with the same id.
 pub(crate) fn register(page: SettingsPage, cx: &mut App) {

@@ -730,9 +730,43 @@ impl Shell {
         cx.notify();
     }
 
+    /// Replaces the project's run configurations; an empty set is dropped.
+    pub(crate) fn save_project_runs(
+        &mut self,
+        project: &str,
+        runs: monocode_core::code::run::ProjectRuns,
+        cx: &mut Context<Self>,
+    ) {
+        let key = path_key(project);
+        let saved = &mut self.workspace.project_runs;
+        saved.retain(|path, _| path_key(path) != key);
+        let runs = runs.normalized();
+        if !runs.is_empty() {
+            saved.insert(project.to_owned(), runs);
+        }
+        self.publish_code_settings(cx);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// A sentence from a feature, shown where the shell shows its own.
+    pub(crate) fn code_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.error = Some(text);
+        cx.notify();
+    }
+
+    pub(crate) fn code_session_title(&self, session: i64) -> Option<String> {
+        (self.session_summaries.get(&session)).map(|summary| summary.title.clone())
+    }
+
     /// Features read their saved values without the workspace.
     pub(super) fn publish_code_settings(&mut self, cx: &mut Context<Self>) {
         self.code.published = true;
+        cx.set_global(settings::SavedRuns(
+            (self.workspace.project_runs.iter())
+                .map(|(project, runs)| (path_key(project), runs.clone()))
+                .collect(),
+        ));
         cx.set_global(settings::Saved(
             (self.workspace.project_code_settings.iter())
                 .map(|(project, pages)| (path_key(project), pages.clone()))
