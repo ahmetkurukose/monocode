@@ -9,6 +9,7 @@ pub mod browser;
 pub mod browser_bridge;
 pub mod catalog;
 pub mod checkpoint;
+pub mod code;
 pub mod context;
 pub mod db;
 pub mod desktop_preferences;
