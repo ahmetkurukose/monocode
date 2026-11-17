@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Scripted peers for the tests of crates that call the code services.
+test-support = []
+
 [dependencies]
 serde.workspace = true
 # Stored floats must reload exactly, or saved revisions stop matching.

@@ -9,8 +9,10 @@ mod manager;
 mod session;
 mod types;
 
-#[cfg(test)]
-mod fake;
+/// The scripted adapter the tests of this module and of its callers use.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fake;
 #[cfg(test)]
 mod real_tests;
 #[cfg(test)]
@@ -22,7 +24,7 @@ pub use adapter::{
 pub use breakpoints::{
     Breakpoint, BreakpointChange, BreakpointStatus, BreakpointStore, ExceptionFilters,
 };
-pub use manager::Manager;
+pub use manager::{Manager, ManagerEvent};
 pub use session::{Refresh, Session, SessionEvent, SessionId, TerminalRequest};
 pub use types::{
     Actor, DapError, EvaluateContext, Evaluation, Frame, FrameLocals, Output, OutputCategory, Page,
