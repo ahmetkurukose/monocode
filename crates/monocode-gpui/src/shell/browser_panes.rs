@@ -136,7 +136,7 @@ impl Shell {
         })
     }
 
-    fn browser_pane_project(&self, pane: i64) -> Option<String> {
+    pub(super) fn browser_pane_project(&self, pane: i64) -> Option<String> {
         let owner = self.workspace.browser_panes.get(&pane)?.owner;
         self.session_summaries
             .get(&owner)

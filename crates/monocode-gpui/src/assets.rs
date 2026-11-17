@@ -99,6 +99,8 @@ impl AssetSource for Assets {
    "app-window"=>include_bytes!("../assets/hugeicons/app-window.svg"),
    "archive"=>include_bytes!("../assets/hugeicons/archive.svg"),
    "bell-off"=>include_bytes!("../assets/hugeicons/bell-off.svg"),
+   "moon"=>include_bytes!("../assets/hugeicons/moon.svg"),
+   "sun"=>include_bytes!("../assets/hugeicons/sun.svg"),
    "check"=>include_bytes!("../assets/hugeicons/check.svg"),
    "check-2"=>include_bytes!("../assets/hugeicons/check-2.svg"),
    "cursor-magic"=>include_bytes!("../assets/hugeicons/cursor-magic.svg"),

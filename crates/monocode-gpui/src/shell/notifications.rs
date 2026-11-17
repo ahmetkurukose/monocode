@@ -11,7 +11,7 @@ use crate::notifications::{
     layout_notice::{LayoutNotice, LayoutNoticeEvent},
     linked_activity::{Cleanup, LinkedActivity, LinkedActivityEvent},
     platform, reminders,
-    sent_notice::SentNotice,
+    sent_notice::{NoticeKind, SentNotice},
     updater::{self, Event as UpdaterEvent, Updater},
 };
 use std::{sync::mpsc::Receiver, time::Duration};
@@ -26,6 +26,8 @@ pub(super) struct State {
     pub updater: Entity<Updater>,
     pub file_error: Entity<FileActionError>,
     pub database_sent: Entity<SentNotice>,
+    /// What the last Sleep freed.
+    pub project_slept: Entity<SentNotice>,
     pub reminder_error: Option<String>,
     pub github: Entity<GithubActivity>,
     linked: HashMap<i64, Entity<LinkedActivity>>,
@@ -68,6 +70,7 @@ impl State {
             updater: updater::shared(store, cx),
             file_error: cx.new(|_| FileActionError::new()),
             database_sent: cx.new(|_| SentNotice::default()),
+            project_slept: cx.new(|_| SentNotice::new(NoticeKind::PROJECT_SLEEP)),
             reminder_error: None,
             github: cx.new(|_| GithubActivity::new(HashMap::new())),
             linked: HashMap::new(),
@@ -985,6 +988,9 @@ impl Shell {
             })
             .when(state.file_error.read(cx).is_visible(), |stack| {
                 stack.child(state.file_error.clone())
+            })
+            .when(state.project_slept.read(cx).is_visible(), |stack| {
+                stack.child(state.project_slept.clone())
             })
             .when(state.database_sent.read(cx).is_visible(), |stack| {
                 stack.child(state.database_sent.clone())

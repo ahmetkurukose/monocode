@@ -153,7 +153,7 @@ impl Shell {
         .detach();
     }
 
-    fn project_sessions(&self, path: &str) -> Vec<i64> {
+    pub(super) fn project_sessions(&self, path: &str) -> Vec<i64> {
         self.session_summaries
             .values()
             .filter(|summary| summary.cwd == path)
@@ -173,6 +173,7 @@ impl Shell {
             self.close_pane(pane, window, cx);
         }
         self.workspace.projects.retain(|p| p != path);
+        self.forget_project_sleep(path);
         let gone =
             |tab: &TitleTab| matches!(tab, TitleTab::ProjectApp { project, .. } if project == path);
         self.workspace.title_order.retain(|tab| !gone(tab));

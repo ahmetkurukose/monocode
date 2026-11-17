@@ -470,6 +470,18 @@ impl Terminal {
         self.foreground = label;
         cx.emit(TerminalEvent::Changed);
     }
+    /// The job holding the terminal right now, other than the shell. Hidden
+    /// docks stop polling, so `foreground` can be stale; ask the kernel.
+    pub(crate) fn running_job(&self) -> Option<String> {
+        if self.exited {
+            return None;
+        }
+        // Tests stand a job in by naming it, as the close prompts' tests do.
+        if self.master_fd < 0 || (cfg!(test) && self.foreground.is_some()) {
+            return self.foreground.clone();
+        }
+        foreground_label(self.master_fd, self.shell_pid)
+    }
     /// Hangs up the job holding the terminal, leaving the shell at its prompt.
     pub(crate) fn stop_foreground(&mut self, cx: &mut Context<Self>) {
         #[cfg(unix)]

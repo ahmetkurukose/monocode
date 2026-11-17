@@ -1,16 +1,69 @@
-//! A quiet confirmation that text reached a data source's console. It clears
-//! itself: sending never moves the user off the file, so this is the answer.
+//! A quiet confirmation that clears itself: text reached a data source's
+//! console, or a project went to sleep. Neither moves the user anywhere, so
+//! this is the answer.
 use crate::theme::*;
 use gpui::{Context, FontWeight, Render, Role, Task, Window, div, prelude::*, px, rgb};
 use std::time::Duration;
 
-#[derive(Default)]
+/// What a notice is about: its selector, icon, tint and heading.
+#[derive(Clone, Copy)]
+pub(crate) struct NoticeKind {
+    pub(crate) id: &'static str,
+    pub(crate) close: &'static str,
+    pub(crate) icon: &'static str,
+    pub(crate) color: u32,
+    pub(crate) title: &'static str,
+}
+impl NoticeKind {
+    pub(crate) const DATABASE: Self = Self {
+        id: "database-sent",
+        close: "database-sent-close",
+        icon: "database",
+        color: 0x34d399,
+        title: "Sent to Database",
+    };
+    pub(crate) const PROJECT_SLEEP: Self = Self {
+        id: "project-slept",
+        close: "project-slept-close",
+        icon: "moon",
+        color: 0xa5b4fc,
+        title: "Project asleep",
+    };
+}
+
 pub(crate) struct SentNotice {
+    kind: NoticeKind,
     message: Option<String>,
     clear: Option<Task<()>>,
 }
+impl Default for SentNotice {
+    fn default() -> Self {
+        Self::new(NoticeKind::DATABASE)
+    }
+}
 
 impl SentNotice {
+    pub(crate) fn new(kind: NoticeKind) -> Self {
+        Self {
+            kind,
+            message: None,
+            clear: None,
+        }
+    }
+    /// Show with a heading of its own ("3 projects asleep").
+    pub(crate) fn show_titled(
+        &mut self,
+        title: &'static str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.kind.title = title;
+        self.show(message, cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
     pub(crate) fn show(&mut self, message: String, cx: &mut Context<Self>) {
         self.message = Some(message);
         self.clear = Some(cx.spawn(async move |this, cx| {
@@ -32,9 +85,10 @@ impl Render for SentNotice {
         let Some(message) = self.message.clone() else {
             return div().into_any_element();
         };
+        let kind = self.kind;
         super::surface::toast_frame()
-            .id("database-sent")
-            .debug_selector(|| "database-sent".into())
+            .id(kind.id)
+            .debug_selector(move || kind.id.into())
             .role(Role::Status)
             .child(
                 div()
@@ -43,7 +97,7 @@ impl Render for SentNotice {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(icon("database", 16.).text_color(rgb(0x34d399)))
+                    .child(icon(kind.icon, 16.).text_color(rgb(kind.color)))
                     .child(
                         div()
                             .flex_1()
@@ -54,7 +108,7 @@ impl Render for SentNotice {
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Sent to Database"),
+                                    .child(kind.title),
                             )
                             .child(
                                 div()
@@ -65,13 +119,13 @@ impl Render for SentNotice {
                             ),
                     )
                     .child(
-                        icon_button("database-sent-close", "Dismiss", "close").on_click(
-                            cx.listener(|this, _, _, cx| {
+                        icon_button(kind.close, "Dismiss", "close").on_click(cx.listener(
+                            |this, _, _, cx| {
                                 this.message = None;
                                 this.clear = None;
                                 cx.notify();
-                            }),
-                        ),
+                            },
+                        )),
                     ),
             )
             .into_any_element()

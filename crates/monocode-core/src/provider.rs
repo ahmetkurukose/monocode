@@ -39,6 +39,12 @@ pub fn configure_idle_agents(limit: usize) {
 pub fn keep_idle_agents(ids: Vec<i64>) {
     parked::keep(ids);
 }
+/// Stop the warm, idle provider processes these Monocode conversations left
+/// behind and return how many stopped. Their next turn resumes the saved
+/// provider session (`--resume`, `thread/resume`, `session/load`) cold.
+pub fn retire_idle_sessions(ids: &std::collections::HashSet<i64>) -> usize {
+    parked::retire_owners(ids)
+}
 pub fn discard_worktree(path: &Path) {
     parked::discard_worktree(path);
     opencode::discard_worktree(path);

@@ -245,11 +245,18 @@ pub fn configure(limit: usize) {
     thread::spawn(enforce_idle_limit);
 }
 
+/// Eviction decisions over both pools, one at a time.
+fn eviction() -> std::sync::MutexGuard<'static, ()> {
+    static EVICT: OnceLock<Mutex<()>> = OnceLock::new();
+    EVICT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 /// The desktop registry applies one idle-child budget across every provider.
 /// Serialize eviction decisions, but never hold either pool while reaping.
 pub(super) fn enforce_idle_limit() {
-    static EVICT: OnceLock<Mutex<()>> = OnceLock::new();
-    let _evict = EVICT.get_or_init(Default::default).lock().unwrap();
+    let _evict = eviction();
     let mut entries: Vec<_> = idle_pool()
         .lock()
         .unwrap()
@@ -288,6 +295,52 @@ pub(super) fn enforce_idle_limit() {
     };
     drop(retired);
     opencode::retire_idle(&retire);
+}
+/// The pids, among idle `(pid, parked at, owner)` entries, that one of these
+/// conversations left warm.
+fn owned_pids(
+    entries: Vec<(u32, Instant, Option<i64>)>,
+    owners: &std::collections::HashSet<i64>,
+) -> std::collections::HashSet<u32> {
+    entries
+        .into_iter()
+        .filter(|(_, _, owner)| owner.is_some_and(|owner| owners.contains(&owner)))
+        .map(|(pid, _, _)| pid)
+        .collect()
+}
+/// Stop the idle children these conversations left warm, across every
+/// provider pool, and return how many stopped. Reaping happens on a worker;
+/// the next turn resumes the saved provider session in a fresh process.
+pub(super) fn retire_owners(owners: &std::collections::HashSet<i64>) -> usize {
+    let _evict = eviction();
+    let mut entries: Vec<_> = idle_pool()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry.wire.child.id(), entry.at, entry.owner))
+        .collect();
+    entries.extend(opencode::idle_entries());
+    let retire = owned_pids(entries, owners);
+    if retire.is_empty() {
+        return 0;
+    }
+    let retired = {
+        let mut pool = idle_pool().lock().unwrap();
+        let mut retired = Vec::new();
+        let mut index = 0;
+        while index < pool.len() {
+            if retire.contains(&pool[index].wire.child.id()) {
+                retired.push(pool.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        retired
+    };
+    thread::spawn(move || drop(retired));
+    let pids = retire.clone();
+    thread::spawn(move || opencode::retire_idle(&pids));
+    retire.len()
 }
 pub(super) fn key(request: &Request) -> String {
     let mut settings = request.settings.clone();
@@ -564,6 +617,23 @@ pub(super) fn discard_session(request: &Request) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn only_the_named_conversations_lose_their_idle_children() {
+        let at = Instant::now();
+        let owners = std::collections::HashSet::from([7, 9]);
+        let pids = owned_pids(
+            vec![
+                (100, at, Some(7)),
+                (101, at, Some(8)),
+                (102, at, None),
+                (103, at, Some(9)),
+            ],
+            &owners,
+        );
+        assert_eq!(pids, std::collections::HashSet::from([100, 103]));
+        assert!(owned_pids(vec![(104, at, Some(7))], &Default::default()).is_empty());
+    }
 
     #[test]
     fn parked_keys_separate_mono_identity_and_private_storage_from_regular_sessions() {
