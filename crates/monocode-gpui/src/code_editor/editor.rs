@@ -42,6 +42,7 @@ pub(super) struct Ext {
     pub(super) link_task: Option<Task<()>>,
     pub(super) navigation: Option<Task<()>>,
     pub(super) picker: Option<popups::Picker>,
+    pub(super) gutter_menu: Option<popups::GutterMenuState>,
     pub(super) gutter_tip: Option<(SharedString, f32)>,
     /// Where the mouse last was over the text and whether the link
     /// modifier was held, to tell a real move from a replayed one.

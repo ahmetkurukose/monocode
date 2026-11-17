@@ -11,6 +11,14 @@ use crate::code::spawn::Spawn;
 use crate::code::toolchain::Toolchain;
 use std::sync::{Arc, Mutex};
 
+/// A top-level session joined or left the manager's list. A restart is a
+/// `Removed` for the old session followed by an `Added` for the new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagerEvent {
+    Added(SessionId),
+    Removed(SessionId),
+}
+
 /// Ended sessions kept for their output and exit code; older ones go.
 const ENDED_KEPT: usize = 8;
 
@@ -22,6 +30,7 @@ struct Entry {
 pub struct Manager {
     breakpoints: BreakpointStore,
     sessions: Mutex<Vec<Entry>>,
+    subscribers: Mutex<Vec<async_channel::Sender<ManagerEvent>>>,
 }
 
 impl Manager {
@@ -30,7 +39,20 @@ impl Manager {
         Self {
             breakpoints,
             sessions: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Sessions coming and going from now on, whoever starts or ends them.
+    /// Nothing is replayed: subscribe, then read `sessions()` once.
+    pub fn subscribe(&self) -> async_channel::Receiver<ManagerEvent> {
+        let (sender, receiver) = async_channel::unbounded();
+        lock(&self.subscribers).push(sender);
+        receiver
+    }
+
+    fn emit(&self, event: ManagerEvent) {
+        lock(&self.subscribers).retain(|subscriber| subscriber.try_send(event).is_ok());
     }
 
     pub fn breakpoints(&self) -> &BreakpointStore {
@@ -60,23 +82,70 @@ impl Manager {
         origin: Actor,
     ) -> Result<Arc<Session>, DapError> {
         let session = self.open(request, toolchain, origin.clone(), origin)?;
-        let mut sessions = lock(&self.sessions);
-        let ended = |entry: &Entry| entry.session.state().is_terminated();
-        let mut excess = sessions
-            .iter()
-            .filter(|entry| ended(entry))
-            .count()
-            .saturating_sub(ENDED_KEPT);
-        sessions.retain(|entry| {
-            let dropped = excess > 0 && ended(entry);
-            excess -= usize::from(dropped);
-            !dropped
-        });
-        sessions.push(Entry {
-            session: session.clone(),
-            toolchain: toolchain.clone(),
-        });
+        self.adopt(session.clone(), toolchain.clone());
         Ok(session)
+    }
+
+    /// Lists a started session, letting the oldest ended ones go.
+    fn adopt(&self, session: Arc<Session>, toolchain: Toolchain) {
+        let id = session.id();
+        let mut dropped = Vec::new();
+        {
+            let mut sessions = lock(&self.sessions);
+            let ended = |entry: &Entry| entry.session.state().is_terminated();
+            let mut excess = sessions
+                .iter()
+                .filter(|entry| ended(entry))
+                .count()
+                .saturating_sub(ENDED_KEPT);
+            sessions.retain(|entry| {
+                let goes = excess > 0 && ended(entry);
+                excess -= usize::from(goes);
+                if goes {
+                    dropped.push(entry.session.id());
+                }
+                !goes
+            });
+            sessions.push(Entry { session, toolchain });
+        }
+        for id in dropped {
+            self.emit(ManagerEvent::Removed(id));
+        }
+        self.emit(ManagerEvent::Added(id));
+    }
+
+    /// A session over a scripted adapter instead of a process, listed like
+    /// any other, for tests of the manager's callers. The handle is the
+    /// script's thread: join it so a failed expectation fails the test.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn start_scripted(
+        &self,
+        request: DebugRequest,
+        origin: Actor,
+        script: impl FnOnce(&mut super::fake::Peer) + Send + 'static,
+    ) -> Result<(Arc<Session>, std::thread::JoinHandle<()>), DapError> {
+        let adapter = adapter(request.adapter).ok_or_else(|| {
+            DapError::Start(format!(
+                "There is no debug adapter named {}.",
+                request.adapter
+            ))
+        })?;
+        let (client, incoming, handle) = super::fake::fake(script);
+        let session = Session::open(
+            client,
+            incoming,
+            Setup {
+                adapter,
+                request,
+                store: self.breakpoints.clone(),
+                origin: origin.clone(),
+                driver: origin,
+                parent: None,
+            },
+        )?;
+        self.adopt(session.clone(), Toolchain::default());
+        Ok((session, handle))
     }
 
     fn open(
@@ -145,15 +214,19 @@ impl Manager {
             old.origin().clone(),
             old.driver(),
         )?;
-        let mut sessions = lock(&self.sessions);
-        let entry = Entry {
-            session: session.clone(),
-            toolchain,
-        };
-        match sessions.iter().position(|entry| entry.session.id() == id) {
-            Some(index) => sessions[index] = entry,
-            None => sessions.push(entry),
+        {
+            let mut sessions = lock(&self.sessions);
+            let entry = Entry {
+                session: session.clone(),
+                toolchain,
+            };
+            match sessions.iter().position(|entry| entry.session.id() == id) {
+                Some(index) => sessions[index] = entry,
+                None => sessions.push(entry),
+            }
         }
+        self.emit(ManagerEvent::Removed(id));
+        self.emit(ManagerEvent::Added(session.id()));
         Ok(session)
     }
 
@@ -169,6 +242,7 @@ impl Manager {
         };
         for entry in removed {
             entry.session.close();
+            self.emit(ManagerEvent::Removed(entry.session.id()));
         }
     }
 
@@ -177,6 +251,7 @@ impl Manager {
         let sessions = std::mem::take(&mut *lock(&self.sessions));
         for entry in sessions {
             entry.session.close();
+            self.emit(ManagerEvent::Removed(entry.session.id()));
         }
     }
 }
@@ -184,5 +259,45 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         self.stop_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::code::dap::adapter::{RequestKind, DEBUGPY};
+    use serde_json::json;
+
+    #[test]
+    fn sessions_coming_and_going_are_announced() {
+        let manager = Manager::new(BreakpointStore::new());
+        let events = manager.subscribe();
+        let request = DebugRequest {
+            adapter: DEBUGPY,
+            kind: RequestKind::Launch,
+            label: "app.py".into(),
+            cwd: "/p".into(),
+            arguments: serde_json::Map::new(),
+        };
+        // An adapter that agrees to everything until the client hangs up.
+        let (session, adapter) = manager
+            .start_scripted(request, Actor::User, |peer| {
+                while let Some(message) = peer.next() {
+                    if message["type"] == json!("request") {
+                        peer.respond(&message, json!({}));
+                    }
+                }
+            })
+            .unwrap();
+        assert_eq!(events.try_recv(), Ok(ManagerEvent::Added(session.id())));
+        assert_eq!(manager.sessions().len(), 1);
+        assert!(manager.get(session.id()).is_some());
+
+        manager.remove(session.id());
+        assert_eq!(events.try_recv(), Ok(ManagerEvent::Removed(session.id())));
+        assert!(manager.sessions().is_empty());
+        assert!(events.try_recv().is_err());
+        drop(session);
+        adapter.join().unwrap();
     }
 }

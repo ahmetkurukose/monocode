@@ -67,8 +67,16 @@ impl Input {
                 position: e.position,
             };
             // After this update, so the provider is free to reach the editor.
+            let this = cx.weak_entity();
             window.defer(cx, move |window, cx| {
-                provider.click(&doc, &click, window, cx)
+                match provider.menu(&doc, &click, window, cx) {
+                    Some(menu) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.open_gutter_menu(menu, click.position, window, cx)
+                        });
+                    }
+                    None => provider.click(&doc, &click, window, cx),
+                }
             });
         }
         cx.stop_propagation();

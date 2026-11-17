@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Exposes the scripted language server so the interface's tests can use it.
+# Scripted peers for the tests of crates that call the code services.
 test-support = []
 
 [dependencies]
