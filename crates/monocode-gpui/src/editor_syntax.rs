@@ -81,6 +81,29 @@ pub(crate) fn supports(path: &str) -> bool {
     language_for_path(path).is_some()
 }
 
+/// The language server name of a file's language, for the grammars here.
+pub(crate) fn language_id(path: &str) -> Option<&'static str> {
+    Some(match language_for_path(path)? {
+        Lang::JavaScript => "javascript",
+        Lang::TypeScript => "typescript",
+        Lang::Tsx => "typescriptreact",
+        Lang::Json => "json",
+        Lang::Css => "css",
+        Lang::Html => "html",
+        Lang::Python => "python",
+        Lang::Rust => "rust",
+        Lang::Go => "go",
+        Lang::Bash => "shellscript",
+        Lang::C => "c",
+        Lang::Cpp => "cpp",
+        Lang::Java => "java",
+        Lang::Yaml => "yaml",
+        Lang::Toml => "toml",
+        Lang::Ruby => "ruby",
+        Lang::Zig => "zig",
+    })
+}
+
 /// Same list as LINTABLE_EXTENSIONS in editorLint.ts.
 /// Zig is excluded: its pinned grammar rejects valid modern asm clobbers.
 fn lintable(path: &str) -> bool {
@@ -800,6 +823,11 @@ impl Session {
         &self.path
     }
 
+    /// The tree for `text`, reparsed only when it differs from the last one.
+    pub(crate) fn tree(&mut self, text: &str) -> Option<Tree> {
+        self.update(text).cloned()
+    }
+
     fn full_tokens(&self, tree: &Tree, text: &str) -> Vec<Token> {
         let mut tokens = highlight(self.grammar, tree, text, 0..text.len());
         if self.lang == Lang::Html {
@@ -922,6 +950,23 @@ pub(crate) fn analyze(
         .as_mut()
         .ok_or_else(|| format!("no syntax grammar for {path}"))?;
     Ok(session.analyze(text, original))
+}
+
+/// Runs `read` over the tree of `text` in the session held for a file, so
+/// symbol queries share the parse the highlighter already paid for.
+pub(crate) fn with_tree<R>(
+    session: &Mutex<Option<Session>>,
+    path: &str,
+    text: &str,
+    read: impl FnOnce(&Tree, &'static str) -> R,
+) -> Option<R> {
+    let language = language_id(path)?;
+    let mut session = session.lock().ok()?;
+    if session.as_ref().is_none_or(|s| s.path() != path) {
+        *session = Session::new(path);
+    }
+    let tree = session.as_mut()?.tree(text)?;
+    Some(read(&tree, language))
 }
 
 #[cfg(test)]

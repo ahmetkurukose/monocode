@@ -24,6 +24,28 @@ impl Input {
                 .into()
         };
         let mut items = Vec::new();
+        // Shown only in an editor a code insight provider is installed on.
+        if self.link_provider().is_some() {
+            items.push(
+                MenuAction::new("definition", "Go to Definition")
+                    .shortcut("F12")
+                    .into(),
+            );
+        }
+        if self.references_provider().is_some() {
+            items.push(
+                MenuAction::new("usages", "Find Usages")
+                    .shortcut(if cfg!(target_os = "macos") {
+                        "⇧F12"
+                    } else {
+                        "Shift+F12"
+                    })
+                    .into(),
+            );
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
         if self.code.is_some() {
             items.extend([
                 action("undo", "Undo", "Z", self.history_available(false)),
@@ -80,6 +102,8 @@ impl Input {
                     "copy" => Box::new(Copy),
                     "paste" => Box::new(Paste),
                     "select-all" => Box::new(SelectAll),
+                    "definition" => Box::new(GoToDefinition),
+                    "usages" => Box::new(FindUsages),
                     _ => return,
                 };
                 window.focus(&this.focus, cx);

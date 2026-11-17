@@ -15,6 +15,7 @@ mod branch_popup;
 mod browser;
 mod change_tree;
 mod changes;
+mod code_editor;
 mod code_shell;
 mod commit_dialog;
 mod composer_completion;
