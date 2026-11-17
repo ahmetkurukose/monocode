@@ -123,7 +123,8 @@ fn a_document_reports_open_coalesced_changes_save_and_close_in_order(cx: &mut Te
         .unwrap();
     cx.run_until_parked();
     assert_eq!(events.borrow().last().unwrap(), "close app.py");
-    cx.update(|_, cx| {
+    // The window is gone, so this asks the application itself.
+    cx.cx.update(|cx| {
         assert_eq!(code_editor::hub(cx).read(cx).open_documents().count(), 0);
     });
     drop(subscription);

@@ -528,13 +528,13 @@ impl Input {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(code) = &mut self.code else {
+        // Only an editor something is installed on answers the key.
+        let Some(ext) = self.code.as_mut().and_then(|code| code.ext.as_mut()) else {
             cx.propagate();
             return;
         };
         let at = self.selection.end.min(self.content.len());
         let range = links::word_at(&self.content, at).unwrap_or(at..at);
-        let ext = code.ext_mut();
         ext.hover = None;
         ext.hover_pinned = true;
         ext.hover_probe = Some(range.clone());
@@ -585,7 +585,12 @@ impl Input {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.code.is_some() {
+        let installed = self
+            .code
+            .as_ref()
+            .and_then(|code| code.ext.as_ref())
+            .is_some_and(|ext| ext.providers.signature.is_some());
+        if installed {
             self.request_signature(window, cx);
         } else {
             cx.propagate();
