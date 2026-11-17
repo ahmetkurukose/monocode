@@ -63,7 +63,73 @@ _To be filled in: configuration format and storage, variables, built-in tasks, A
 
 ## 4. Code insight
 
-_To be filled in: servers per language, lifecycle and memory policy, API._
+`code::lsp` is a headless Language Server Protocol client and the manager that runs the
+servers. `lsp::Manager` is the only way in, for the editor and for the agents' tools alike.
+
+**Servers** (`registry.rs`; language is decided by file extension, order is priority):
+
+| Language | Server id | Looked for, in order | Asked for |
+| --- | --- | --- | --- |
+| Python | `basedpyright` | `basedpyright-langserver --stdio`, `pyright-langserver --stdio` | everything |
+| Python | `ruff` | `ruff server` | diagnostics only |
+| TS/JS (+x) | `typescript` | `vtsls --stdio`, `typescript-language-server --stdio` | everything |
+| Go | `gopls` | `gopls` | everything |
+| Rust | `rust-analyzer` | `rust-analyzer` | everything |
+
+(based)pyright gets the interpreter as `python.pythonPath` and `diagnosticMode:
+openFilesOnly` through `workspace/configuration`, so a monorepo is not analysed whole.
+A path the user set for a server id (`ManagerOptions::tool_paths`) is used or nothing is.
+Only Python has been run against real servers; the others are registered and untested.
+
+**Root and identity.** The root is the nearest folder at or above the file, inside the
+checkout, holding one of the server's markers (`pyproject.toml`, `setup.py`,
+`package.json`, `go.mod`, `Cargo.toml`, ...), else the checkout. One process per (root,
+server id, toolchain). A file outside the checkout (a library reached by go to
+definition) joins the server that pointed at it, else the checkout's most recently used
+server of that kind; it never starts a server rooted outside.
+
+**Lifecycle and memory.** Servers start on the first `open`, off the caller's thread;
+documents opened meanwhile are sent when the handshake is done. Each server counts its
+open documents. With none left it is stopped after `idle_period` (5 minutes), and at most
+`max_servers` (6) are alive: idle ones are stopped least recently used first; servers with
+documents are never stopped for the cap, so it can be exceeded. Each server leads its own
+process group and the group is killed, since basedpyright is a launcher that runs node:
+memory for `ServerStatus::pid` is the sum over that group. A failed start is retried on
+the next `open`, three times, then only by `restart_server`.
+
+**API** (`Manager` is `Clone + Send + Sync`; paths are absolute; offsets are UTF-8 bytes):
+
+- Never wait (fine on the UI thread): `open(path, text, &DocumentContext)`,
+  `change(path, text)` (whole text), `close(path)`, `is_open`, `diagnostics(path)`,
+  `triggers(path)`, `statuses()`, `stop_server(id)`, `restart_server(id)`, `stop_all()`,
+  `subscribe()`, `sweep()`. `open` is counted: every `open` needs its `close`, and a
+  second opener does not replace the text.
+- Wait for a server, at most `request_timeout` (10 s) for it to start plus the same for
+  its answer, so call them on a background thread, each with a `CancelToken` whose
+  `cancel()` returns the call at once: `definition`, `references`, `hover`, `completion`,
+  `resolve_completion`, `signature_help`, `document_symbols`.
+- `diagnostics_settled(path, timeout)` waits until every server has reported on the
+  current text. `with_file(path, &context, |manager| ...)` is for one-off questions about
+  a file nobody has open: it opens from disk (or joins the editor's copy), asks, closes.
+- `subscribe()` returns an `async_channel::Receiver<LspEvent>`:
+  `DiagnosticsChanged { path }` (then read `diagnostics(path)`) and
+  `ServerChanged(ServerStatus)`. States: `Starting`, `Ready`, `Indexing { title }` (from
+  `$/progress`), `Failed { message, log_tail }`, `Stopped`, `ToolNotFound { looked_for,
+  hint }`. A stopped or missing server nothing uses is reported once and then forgotten.
+
+**Results** carry paths and `Span`s of `Point { line, column }`, the column in bytes.
+Lines follow the protocol (`\n`, `\r\n` and lone `\r` all end one), so convert with
+`LineIndex::new(text).offset_of(text, point)` rather than by counting lines yourself.
+Positions are exact for UTF-16 servers (and UTF-8, which is negotiated when offered);
+for files that are not open the text is read from disk to count. Diagnostics from all
+servers of a document are merged in document order, each with `server` (`basedpyright`,
+`ruff`) and the server's own `source` and `code`. Completion items come with snippet
+syntax already reduced to plain text, since snippets are declined in the handshake.
+
+**Not there:** incremental sync (the whole text is sent per change), `didSave`, file
+watching, workspace symbols, rename, code actions, formatting, semantic tokens, and
+`workspace/applyEdit` (refused). Changing `tool_paths` or the toolchain needs the
+documents reopened.
 
 ## 5. Debug
 
