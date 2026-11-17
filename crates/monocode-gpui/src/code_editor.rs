@@ -27,7 +27,8 @@ pub(crate) mod markdown;
 pub(crate) mod symbols;
 
 pub(crate) use completion::{
-    CompletionItem, CompletionProvider, CompletionRequest, CompletionTrigger, rank,
+    CompletionItem, CompletionProvider, CompletionRequest, CompletionTrigger,
+    carry as carry_completions, rank,
 };
 pub(crate) use diagnostics::{
     DiagnosticCounts, ExternalDiagnostic, Severity, remap as remap_diagnostics,

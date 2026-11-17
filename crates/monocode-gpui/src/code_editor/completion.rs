@@ -107,9 +107,95 @@ pub(crate) fn rank(
     items
 }
 
+/// Carries a list over one more word character typed or deleted at the
+/// caret, narrowed to what is typed now, so the popup stays while a slow
+/// provider is asked again instead of closing on every keystroke. `old` and
+/// `old_at` are the text and caret the items were answered for. Empty when
+/// the change was anything else.
+pub(crate) fn carry(
+    items: Vec<CompletionItem>,
+    old: &str,
+    old_at: usize,
+    new: &str,
+    new_at: usize,
+) -> Vec<CompletionItem> {
+    let (kept, changed) = if new_at > old_at {
+        (old_at, new.get(old_at..new_at))
+    } else {
+        (new_at, old.get(new_at..old_at))
+    };
+    let word =
+        |text: &str| !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_');
+    let around = old.get(..kept) == new.get(..kept)
+        && old.get(old_at..).is_some()
+        && old.get(old_at..) == new.get(new_at..);
+    if !around || !changed.is_some_and(word) {
+        return Vec::new();
+    }
+    let moved = |at: usize| at - old_at + new_at;
+    let items = items
+        .into_iter()
+        .filter_map(|mut item| {
+            if item.replace.start > kept || item.replace.end < old_at {
+                return None;
+            }
+            item.replace.end = moved(item.replace.end);
+            for edit in &mut item.additional_edits {
+                if edit.range.start >= old_at {
+                    edit.range = moved(edit.range.start)..moved(edit.range.end);
+                } else if edit.range.end > kept {
+                    return None;
+                }
+            }
+            Some(item)
+        })
+        .collect();
+    rank(items, new, new_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_follows_typing_and_deleting_inside_its_word() {
+        let old = "import os\nos.pa\nrest";
+        let at = old.find("\nrest").unwrap();
+        let items = || {
+            let mut path = item("path", None);
+            path.replace = at - 2..at;
+            path.additional_edits = vec![
+                TextEdit {
+                    range: 0..0,
+                    text: "import sys\n".into(),
+                },
+                TextEdit {
+                    range: at + 1..at + 5,
+                    text: "tail".into(),
+                },
+            ];
+            let mut partition = item("partition", None);
+            partition.replace = at - 2..at;
+            vec![path, partition]
+        };
+        // One more letter narrows the list and moves what lies after it.
+        let typed = "import os\nos.pat\nrest";
+        let carried = carry(items(), old, at, typed, at + 1);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(&typed[carried[0].replace.clone()], "pat");
+        assert_eq!(carried[0].additional_edits[0].range, 0..0);
+        assert_eq!(&typed[carried[0].additional_edits[1].range.clone()], "rest");
+        // A deleted letter widens it again.
+        let deleted = "import os\nos.p\nrest";
+        let carried = carry(items(), old, at, deleted, at - 1);
+        assert_eq!(carried.len(), 2);
+        assert_eq!(&deleted[carried[0].replace.clone()], "p");
+        // Anything else starts over: a typed space, an edit elsewhere, and
+        // a deletion that reaches before the word.
+        assert!(carry(items(), old, at, "import os\nos.pa \nrest", at + 1).is_empty());
+        assert!(carry(items(), old, at, "import  os\nos.pa\nrest", at + 1).is_empty());
+        assert!(carry(items(), old, at, "import os\nos\nrest", at - 3).is_empty());
+    }
 
     fn item(label: &str, sort: Option<&str>) -> CompletionItem {
         CompletionItem {
