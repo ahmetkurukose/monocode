@@ -700,6 +700,8 @@ pub(crate) struct Shell {
     github_star: github_star::State,
     quick: crate::quick_composer::Controller,
     unseen_finished: HashSet<i64>,
+    /// The question a session tab's close asks, while it is open.
+    close_dialog: Option<session_close::CloseDialog>,
     archiving: HashSet<i64>,
     archive_shortcut_held: bool,
     /// Editors offered by a project's "Open in editor"; `None` while scanning.
@@ -1131,6 +1133,7 @@ impl Shell {
             github_star: Default::default(),
             quick: Default::default(),
             unseen_finished: HashSet::new(),
+            close_dialog: None,
             archiving: HashSet::new(),
             archive_shortcut_held: false,
             external_editors: None,
@@ -9924,6 +9927,7 @@ impl Render for Shell {
             .children(self.search_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
             .children(self.notice_modals(window, cx))
+            .children(self.close_session_modal(window, cx))
             .children(self.folder_picker_popover(window, cx))
             .children(crate::accounts::get(cx))
             .children(
@@ -10338,7 +10342,11 @@ mod tests {
         cx.run_until_parked();
         // The started session is asked about; keeping it keeps this test's
         // close a plain tab close.
-        cx.simulate_prompt_answer("Close Tab Only");
+        window
+            .update(cx, |shell, w, cx| {
+                shell.answer_close_dialog(Some(session_close::CloseChoice::Keep), w, cx)
+            })
+            .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
@@ -10463,7 +10471,11 @@ mod tests {
         };
         cx.simulate_keystrokes(window.into(), &format!("{modifier}-shift-w"));
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Close Tab Only");
+        window
+            .update(cx, |shell, w, cx| {
+                shell.answer_close_dialog(Some(session_close::CloseChoice::Keep), w, cx)
+            })
+            .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
@@ -13349,7 +13361,11 @@ mod tests {
         // ⌘W closes the focused pane only; its neighbour takes focus.
         cx.simulate_keystrokes("cmd-w");
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Close Tab Only");
+        window
+            .update(cx, |shell, w, cx| {
+                shell.answer_close_dialog(Some(session_close::CloseChoice::Keep), w, cx)
+            })
+            .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |shell, _, _| {
