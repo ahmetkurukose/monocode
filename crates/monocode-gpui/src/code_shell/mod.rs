@@ -20,6 +20,7 @@ pub(crate) mod chips;
 pub(crate) mod commands;
 pub(crate) mod context;
 pub(crate) mod dock;
+pub(crate) mod launch;
 pub(crate) mod panel_tabs;
 pub(crate) mod processes;
 pub(crate) mod rail;
@@ -39,6 +40,10 @@ impl Global for Host {}
 /// opens; each feature adds one line here that calls its own `init`.
 pub(crate) fn register(cx: &mut App) {
     context::init(cx);
+    // Order matters: debug wraps the hover that code insight installs.
+    crate::code_insight::init(cx);
+    crate::run_ui::init(cx);
+    crate::debug_ui::init(cx);
 }
 
 /// The shell's hook, once a frame: remembers the window and tells the

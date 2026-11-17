@@ -15,7 +15,9 @@ mod branch_popup;
 mod browser;
 mod change_tree;
 mod changes;
+mod code_agent;
 mod code_editor;
+mod code_insight;
 mod code_shell;
 mod commit_dialog;
 mod composer_completion;
@@ -24,6 +26,7 @@ mod composer_runner;
 mod context_meter;
 mod conversation;
 mod database;
+mod debug_ui;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod dialog_resize;
@@ -84,6 +87,7 @@ mod response_actions;
 mod reveal;
 mod review;
 mod right_panel;
+mod run_ui;
 mod runtime;
 mod search;
 mod send_morph;
@@ -211,6 +215,13 @@ fn main() {
     }
     if cli_args.first().is_some_and(|a| a == "browser-mcp") {
         if let Err(error) = monocode_core::browser_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if cli_args.first().is_some_and(|a| a == "code-mcp") {
+        if let Err(error) = monocode_core::code::bridge::mcp_stdio() {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -539,6 +550,7 @@ fn main() {
                             cx,
                         )
                     });
+                    code_agent::install(&shell, cx);
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
                     #[cfg(target_os = "macos")]
                     {

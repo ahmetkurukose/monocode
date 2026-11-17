@@ -184,6 +184,15 @@ impl Manager {
                     "textDocument/didClose",
                     json!({ "textDocument": { "uri": path_to_uri(path) } }),
                 );
+                // basedpyright drops a file it first met as an open document
+                // when that is closed, and its uses then go missing from find
+                // references. Told the file exists, it tracks it again.
+                if path.is_file() {
+                    client.notify(
+                        "workspace/didChangeWatchedFiles",
+                        json!({ "changes": [{ "uri": path_to_uri(path), "type": 1 }] }),
+                    );
+                }
             }
             let unused = entry.documents.is_empty();
             let live = entry.live();

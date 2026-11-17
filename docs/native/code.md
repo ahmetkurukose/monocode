@@ -419,7 +419,93 @@ unittest rules plus the `__main__` guard. `FileEditor::outline()` is the open fi
 
 ## 7. Agents (MCP)
 
-_To be filled in: tools, capability per session, as `browser_bridge.rs` does._
+**Shared services.** `code::services` is the one home of the instances the panes and the
+tools share. `services() -> &'static Services` (made on first use, any thread) gives
+`lsp() -> &lsp::Manager`, `dap() -> &dap::Manager`, `breakpoints() -> &BreakpointStore` and
+`runs() -> &run::Registry` (the same registry as `run::registry()`). `shutdown()` stops debug
+sessions, language servers and headless runs; the app calls it at quit.
+
+`Services::context(path) -> CodeContext { checkout, project, setup, runs }` says where an
+absolute file or folder belongs and what its project has: the `TerminalSetup` and the
+`ProjectRuns`. `CodeContext::toolchain()`, `.document()` (an `lsp::DocumentContext`) and
+`.run_context()` build what the cores take. The answer comes from a resolver the app
+registers with `set_resolver`; it is called on any thread, the interface's included, so it
+must not wait. Without one, or for a path it does not know, `locate(path)` decides by the
+disk: the checkout is the nearest folder with `.git`, the project that checkout or, for a
+linked git worktree, the repository it was added to; the setup and runs are the defaults.
+
+`monocode-gpui/src/code_agent.rs` is the app's resolver. `install(&shell, cx)` (one line in
+`main.rs`) keeps a copy of the workspace's project list, terminal setups and run
+configurations behind a lock, refreshed whenever the shell notifies and something in them
+changed, and answers from the copy: the innermost project folder holding the path, else
+the project whose linked worktree the path is in. A project that is a folder inside a
+larger repository is its own checkout. It also applies the setting below and registers
+`shutdown` for quit.
+
+**The server.** `code::bridge`, built like `browser_bridge.rs`: a listener on `127.0.0.1`,
+a random token per agent session, and the stdio subcommand `code-mcp` of the Monocode
+binary, which each provider is handed when a session starts (Claude `--mcp-config`, Codex
+`mcp_servers.monocode_code.*`, ACP `mcpServers`) and which forwards every `tools/call` as
+one JSON line `{session, token, tool, arguments}`. Server name `monocode_code`. Unlike the
+browser, a call needs no interface thread: it is answered on its connection's thread and
+may wait there for a program (at most 300 s; the stdio side waits a minute longer).
+
+**Capability.** `bridge::environment(session, cwd, project, executable)` is called by
+`runtime.rs` for a local session that is not text-only. The token maps to the session id,
+the folder the agent runs in and its project. Every path a tool is given is made absolute
+(relative ones from the session's folder), has `..` and symbolic links resolved, and must
+lie inside the session's folder, its project or its checkout; anything else is refused.
+Runs and debug sessions of other projects do not exist as far as the tools can tell. No
+answer is longer than 30,000 bytes. Settings › Providers › "Code tools for agents"
+(`Preferences::code_agents`, on by default) turns the capability off for sessions started
+afterwards.
+
+**Tools.** Answers are plain text; paths are shown from the checkout; lines and columns
+count from 1.
+
+| Tool | Does | Asks first (Claude) |
+|---|---|---|
+| `code_diagnostics` | Errors and warnings for up to 20 files once the servers have settled (20 s default) | no |
+| `code_definition` | Definition of the symbol at `file` + `line` + `column`, or + `symbol` (a name on that line): path, line, the line's text | no |
+| `code_references` | Every use, the same way; at most 120 listed | no |
+| `code_hover` | Type, signature and documentation | no |
+| `code_symbols` | A file's outline with line ranges | no |
+| `run_list` | The project's configurations and the built-in tasks for a file or test, each as the command it becomes in this checkout | no |
+| `run_start` | A configuration or task by `name`, or a `command` line (+ `cwd`, `env`); headless, `StartedBy::Agent`; `wait_s` waits for the exit code and output | yes |
+| `run_output` | Output and state, incrementally with a `cursor` | no |
+| `run_stop` | Stops a run this session started | no |
+| `run_status` | Running and recently ended runs of the checkout, the user's included, with local addresses | no |
+| `debug_start` | `run_start`'s targets under debugpy (`internalConsole`), `breakpoints` set first; returns at the first stop or the end | yes |
+| `debug_breakpoints` | `list` / `set` / `clear` by file and line, with a condition; the editor's store | no |
+| `debug_continue`, `debug_step` | Continue (or keep waiting), step `over` / `in` / `out`; return the next stop or the end | no |
+| `debug_stack` | Frames with ids and the locals of the top 1 to 5 | no |
+| `debug_variables` | The children of one `ref`, paged | no |
+| `debug_evaluate` | An expression in a frame (it can change the program) | yes |
+| `debug_stop`, `debug_sessions` | End a session; list the project's sessions | no |
+
+A stop is reported as the reason, file and line, three source lines either side, up to 12
+frames, the top frame's locals (40 at most, each value cut at 240 bytes, `ref=N` where it
+can be expanded) and what the program printed since the last report. An end is the exit
+code and that output. A wait that runs out says the program is still running and changes
+nothing.
+
+**Who steers.** Sessions an agent starts have `Actor::Agent(session id)` as origin and
+driver. `debug_continue`, `debug_step`, `debug_evaluate` and `debug_stop` check
+`Session::driver()` and refuse, saying so, once the user has taken the session over;
+`debug_stack`, `debug_variables` and `debug_sessions` keep working. A run is stopped only
+by whoever started it.
+
+**Trust.** Program output, variable values, evaluation results and hover text are the
+project's own text and can be written to steer an agent. They are returned under a line
+saying they are data, and the server's instructions and each such tool's description say
+the same. Claude is given the reading and steering tools ahead of its permission mode
+(`bridge::claude_allowed_tools()`); `run_start`, `debug_start` and `debug_evaluate` run the
+project's code and go through the session's permission mode like a shell command.
+
+**Not there.** Completion and signature help (an editor's needs), attach to a process,
+exception filters, log points, and remembering what an agent ran as the project's last
+run. A file the editor shows under another spelling of its path than the resolved one is
+opened a second time by a tool rather than joined.
 
 ## 8. Verification
 
