@@ -3,8 +3,9 @@
 //! way in for both the editor and the agents' tools; the rest is how it works
 //! (docs/native/code.md, section 4).
 pub mod client;
-#[cfg(test)]
-mod fake;
+// The scripted server, also for the interface's tests (`test-support`).
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake;
 pub mod manager;
 #[cfg(test)]
 mod manager_tests;
@@ -16,7 +17,10 @@ pub mod registry;
 pub mod types;
 
 pub use client::CancelToken;
-pub use manager::{Clock, DocumentContext, Manager, ManagerOptions};
+pub use manager::{
+    Clock, DocumentContext, DocumentDiagnostics, Manager, ManagerOptions, ProjectSettings,
+    ServerDiagnostics,
+};
 pub use position::{Encoding, LineIndex, Point, Position, Span};
 pub use registry::{Language, Registry, Role, ServerSpec};
 pub use types::{

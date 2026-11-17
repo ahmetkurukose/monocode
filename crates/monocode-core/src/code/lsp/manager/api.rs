@@ -6,7 +6,7 @@ use super::*;
 /// same manager. Dropping the last one kills every server.
 #[derive(Clone)]
 pub struct Manager {
-    shared: Arc<Shared>,
+    pub(super) shared: Arc<Shared>,
 }
 
 impl Manager {
@@ -78,7 +78,18 @@ impl Manager {
             document.opens += 1;
             return;
         }
-        let specs: Vec<ServerSpec> = shared.registry.for_language(language).cloned().collect();
+        let settings = state.projects.get(&context.project);
+        if settings.is_some_and(|settings| settings.disabled) {
+            return;
+        }
+        let specs: Vec<ServerSpec> = shared
+            .registry
+            .for_language(language)
+            .filter(|spec| {
+                settings.is_none_or(|settings| !settings.disabled_servers.contains(spec.id))
+            })
+            .cloned()
+            .collect();
         let mut servers = Vec::new();
         for spec in &specs {
             let id = shared.attach(&mut state, path, spec, context, now);
