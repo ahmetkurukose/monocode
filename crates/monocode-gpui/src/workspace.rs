@@ -201,6 +201,16 @@ pub(crate) struct Workspace {
     /// variables, an environment file, a virtual environment, commands.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_terminal_setups: HashMap<String, monocode_core::terminal_setup::TerminalSetup>,
+    /// What the code features keep for each project
+    /// (`project_path -> page id -> value`), edited on the pages they add to
+    /// the project's settings (`code_shell::settings`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_code_settings: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// The right panel's whole tab strip by tab key, feature tabs included,
+    /// so one that comes back takes the place it was dragged to.
+    /// `right_panel_tabs` keeps the built-in tabs alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub right_panel_strip: Vec<String>,
     /// Last desktop source values, used to reconcile subsequent desktop changes
     /// while retaining deliberate native project and preference edits.
     pub desktop_project_preferences: Option<serde_json::Value>,
@@ -305,7 +315,7 @@ pub(crate) struct BrowserPane {
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
 /// not restored; the dock reopens the same tabs in their directories.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub(crate) struct TerminalDock {
     pub side: DockSide,
@@ -314,6 +324,11 @@ pub(crate) struct TerminalDock {
     /// Each terminal's working directory, in tab order.
     pub terminals: Vec<String>,
     pub active: usize,
+    /// Which tabs are a run or a feature's view rather than a shell, by
+    /// position. They end with the app, so they are never saved. Tabs past
+    /// its end are shells.
+    #[serde(skip)]
+    pub transient: Vec<bool>,
 }
 impl Default for TerminalDock {
     fn default() -> Self {
@@ -323,7 +338,29 @@ impl Default for TerminalDock {
             open: true,
             terminals: Vec::new(),
             active: 0,
+            transient: Vec::new(),
         }
+    }
+}
+/// Only the shells are saved: a restart reopens those, and a run or a debug
+/// session is over by then.
+impl Serialize for TerminalDock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let shells: Vec<&String> = (self.terminals.iter().enumerate())
+            .filter(|(ix, _)| !self.is_transient(*ix))
+            .map(|(_, cwd)| cwd)
+            .collect();
+        let before = (0..self.active.min(self.terminals.len()))
+            .filter(|ix| !self.is_transient(*ix))
+            .count();
+        let mut dock = serializer.serialize_struct("TerminalDock", 5)?;
+        dock.serialize_field("side", &self.side)?;
+        dock.serialize_field("size", &self.size)?;
+        dock.serialize_field("open", &self.open)?;
+        dock.serialize_field("active", &before.min(shells.len().saturating_sub(1)))?;
+        dock.serialize_field("terminals", &shells)?;
+        dock.end()
     }
 }
 impl TerminalDock {
@@ -334,11 +371,25 @@ impl TerminalDock {
         self.open = true;
         self.active
     }
+    /// A run's or a feature's tab for the checkout in `cwd`: active like a
+    /// new terminal, and left out when the dock is saved.
+    pub fn add_transient(&mut self, cwd: String) -> usize {
+        let ix = self.add(cwd);
+        self.transient.resize(ix, false);
+        self.transient.push(true);
+        ix
+    }
+    pub fn is_transient(&self, ix: usize) -> bool {
+        self.transient.get(ix).copied().unwrap_or(false)
+    }
     /// closeTerminalInDock: the next tab takes over a closed active one.
     /// False once the last terminal is gone.
     pub fn close(&mut self, ix: usize) -> bool {
         if ix >= self.terminals.len() {
             return true;
+        }
+        if ix < self.transient.len() {
+            self.transient.remove(ix);
         }
         self.terminals.remove(ix);
         if self.terminals.is_empty() {
@@ -359,6 +410,11 @@ impl TerminalDock {
         let active = self.active;
         let cwd = self.terminals.remove(from);
         self.terminals.insert(to, cwd);
+        if self.transient.iter().any(|transient| *transient) {
+            self.transient.resize(len, false);
+            let transient = self.transient.remove(from);
+            self.transient.insert(to, transient);
+        }
         self.active = if active == from {
             to
         } else if from < active && active <= to {
@@ -372,6 +428,7 @@ impl TerminalDock {
     /// onCloseOtherProjectTerminals: `keep` is left, and active.
     pub fn keep_only(&mut self, keep: usize) {
         if keep < self.terminals.len() {
+            self.transient = vec![self.is_transient(keep)];
             self.terminals = vec![self.terminals.swap_remove(keep)];
             self.active = 0;
         }
@@ -448,6 +505,8 @@ impl Default for Workspace {
             project_appearance: Default::default(),
             project_browser_urls: Default::default(),
             project_terminal_setups: Default::default(),
+            project_code_settings: Default::default(),
+            right_panel_strip: Vec::new(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
             desktop_preferences_metadata: None,
@@ -724,6 +783,9 @@ impl Workspace {
             *setup = std::mem::take(setup).normalized();
             !project.trim().is_empty() && !setup.is_empty()
         });
+        state
+            .project_code_settings
+            .retain(|project, pages| !project.trim().is_empty() && !pages.is_empty());
         state.restore_project_apps();
         state
     }

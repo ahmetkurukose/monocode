@@ -1,5 +1,7 @@
 //! Port of TerminalView.tsx: a login shell on a PTY, emulated by
 //! alacritty_terminal and painted as a grid of cell-snapped text runs.
+pub(crate) mod hosted;
+pub(crate) mod run;
 mod shell;
 use shell::default_shell;
 
@@ -165,13 +167,21 @@ pub(crate) struct Terminal {
     /// The link a plain click pressed; releasing on it opens it.
     pressed_link: Option<Link>,
     pub(crate) visible: bool,
+    /// The process this terminal runs in place of a shell (`run.rs`).
+    run: Option<run::Session>,
+    /// The view this tab shows in place of a grid (`hosted.rs`).
+    hosted: Option<hosted::Hosted>,
+    _release: Option<gpui::Subscription>,
     _events: Task<()>,
     _poll: Task<()>,
 }
 impl EventEmitter<TerminalEvent> for Terminal {}
 impl Focusable for Terminal {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+        self.hosted
+            .as_ref()
+            .and_then(|hosted| hosted.focus.clone())
+            .unwrap_or_else(|| self.focus.clone())
     }
 }
 
@@ -186,6 +196,8 @@ struct Spawned {
     master_fd: i32,
     shell_pid: u32,
     events: async_channel::Receiver<TermEvent>,
+    /// A run's raw output, in step with `events`.
+    output: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
 }
 /// Start the login shell on a PTY with TerminalView's environment. A failure
 /// is written into the grid, as TerminalView prints it.
@@ -195,6 +207,34 @@ fn spawn(
     scrollback: usize,
     id: u64,
     setup: &[(String, String)],
+) -> Spawned {
+    spawn_child(cwd, size, scrollback, id, setup, None)
+}
+/// Hands the PTY to its reader thread.
+fn start_loop<P>(
+    term: &Arc<FairMutex<Term<Listener>>>,
+    listener: Listener,
+    pty: P,
+    drain: bool,
+) -> std::io::Result<EventLoopSender>
+where
+    P: tty::EventedPty + alacritty_terminal::event::OnResize + Send + 'static,
+{
+    let event_loop = EventLoop::new(term.clone(), listener, pty, drain, false)?;
+    let sender = event_loop.channel();
+    event_loop.spawn();
+    Ok(sender)
+}
+/// The login shell, or `run` in its place: a run's process is the PTY's own
+/// child, its output is copied out for `Run`, and what it wrote last is still
+/// read once it has exited.
+fn spawn_child(
+    cwd: &str,
+    size: GridSize,
+    scrollback: usize,
+    id: u64,
+    setup: &[(String, String)],
+    run: Option<&run::Program>,
 ) -> Spawned {
     let (tx, rx) = async_channel::unbounded();
     let listener = Listener(tx);
@@ -209,7 +249,11 @@ fn spawn(
     let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
     let workdir = working_dir(cwd);
     let search_path = monocode_core::scm::terminal_search_path();
-    let (program, args) = default_shell(&search_path);
+    let (program, args) = match run {
+        Some(run) => (run.program.clone(), run.args.clone()),
+        None => default_shell(&search_path),
+    };
+    let what = if run.is_some() { "process" } else { "shell" };
     let mut env = HashMap::new();
     for (key, value) in [
         ("TERM", "xterm-256color".to_owned()),
@@ -228,7 +272,7 @@ fn spawn(
     let options = tty::Options {
         shell: Some(tty::Shell::new(shell::pty_program(&program), args)),
         working_directory: Some(workdir),
-        drain_on_exit: false,
+        drain_on_exit: run.is_some(),
         env,
         #[cfg(target_os = "windows")]
         escape_args: true,
@@ -241,6 +285,7 @@ fn spawn(
     };
     let mut master_fd = -1;
     let mut shell_pid = 0;
+    let mut output = None;
     let sender = match tty::new(&options, window, id) {
         Ok(pty) => {
             #[cfg(unix)]
@@ -249,12 +294,15 @@ fn spawn(
                 master_fd = pty.file().as_raw_fd();
                 shell_pid = pty.child().id();
             }
-            match EventLoop::new(term.clone(), listener, pty, false, false) {
-                Ok(event_loop) => {
-                    let sender = event_loop.channel();
-                    event_loop.spawn();
-                    Some(sender)
-                }
+            let started = if run.is_some() {
+                let (tap, copied) = std::sync::mpsc::channel();
+                output = Some(copied);
+                start_loop(&term, listener, run::Tee { pty, tap }, true)
+            } else {
+                start_loop(&term, listener, pty, false)
+            };
+            match started {
+                Ok(sender) => Some(sender),
                 Err(error) => {
                     write_note(&term, &format!("\x1b[31m{error}\x1b[0m"));
                     None
@@ -264,7 +312,7 @@ fn spawn(
         Err(error) => {
             write_note(
                 &term,
-                &format!("\x1b[31mCould not start the shell ({program}): {error}\x1b[0m"),
+                &format!("\x1b[31mCould not start the {what} ({program}): {error}\x1b[0m"),
             );
             None
         }
@@ -275,6 +323,7 @@ fn spawn(
         master_fd,
         shell_pid,
         events: rx,
+        output,
     }
 }
 
@@ -287,6 +336,7 @@ fn detached(size: GridSize) -> Spawned {
         master_fd: -1,
         shell_pid: 0,
         events: rx,
+        output: None,
     }
 }
 
@@ -302,13 +352,7 @@ impl Terminal {
             columns: 80,
             lines: 24,
         };
-        let Spawned {
-            term,
-            sender,
-            master_fd,
-            shell_pid,
-            events: rx,
-        } = if cfg!(test) {
+        let spawned = if cfg!(test) {
             // GPUI's deterministic test scheduler rejects wakeups from the
             // PTY thread; UI tests run the dock without a shell behind it.
             detached(size)
@@ -322,7 +366,10 @@ impl Terminal {
             )
         };
         for note in &launch.notes {
-            write_note(&term, &format!("\x1b[2m[terminal setup] {note}\x1b[0m\r\n"));
+            write_note(
+                &spawned.term,
+                &format!("\x1b[2m[terminal setup] {note}\x1b[0m\r\n"),
+            );
         }
         let shell = if cfg!(test) {
             "zsh".to_owned()
@@ -330,7 +377,12 @@ impl Terminal {
             default_shell(&monocode_core::scm::terminal_search_path()).0
         };
         let startup = launch.startup_lines(&shell);
-        let events = cx.spawn(async move |this, cx| {
+        Self::assemble(cwd, size, spawned, startup, cx)
+    }
+
+    /// Follows a PTY's events on the UI thread until it or the terminal is gone.
+    fn listen(rx: async_channel::Receiver<TermEvent>, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
                 // Output arrives in bursts; one repaint covers the burst.
                 let mut batch = vec![event];
@@ -339,6 +391,9 @@ impl Terminal {
                 }
                 if this
                     .update(cx, |this, cx| {
+                        // What a run wrote before these events was copied
+                        // out before they were sent.
+                        this.copy_run_output(cx);
                         for event in batch {
                             this.on_event(event, cx);
                         }
@@ -348,13 +403,32 @@ impl Terminal {
                     break;
                 }
             }
-        });
+        })
+    }
+
+    fn assemble(
+        cwd: String,
+        size: GridSize,
+        spawned: Spawned,
+        startup: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let Spawned {
+            term,
+            sender,
+            master_fd,
+            shell_pid,
+            events: rx,
+            output: _,
+        } = spawned;
+        let events = Self::listen(rx, cx);
         // TerminalView's 1s foreground poll; a hidden dock has no title to paint.
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let Ok(Some((fd, pid))) = this.update(cx, |this, _| {
-                    (this.visible && !this.exited).then_some((this.master_fd, this.shell_pid))
+                    (this.visible && !this.exited && this.is_shell())
+                        .then_some((this.master_fd, this.shell_pid))
                 }) else {
                     if this.update(cx, |_, _| ()).is_err() {
                         break;
@@ -400,9 +474,16 @@ impl Terminal {
             hover: None,
             pressed_link: None,
             visible: true,
+            run: None,
+            hosted: None,
+            _release: None,
             _events: events,
             _poll: poll,
         }
+    }
+    /// A login shell, rather than a run's process or a hosted view.
+    pub(crate) fn is_shell(&self) -> bool {
+        self.run.is_none() && self.hosted.is_none()
     }
 
     fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -444,8 +525,13 @@ impl Terminal {
             TermEvent::ChildExit(status) => {
                 let code = status.code().map(|c| format!(" ({c})")).unwrap_or_default();
                 write_note(&self.term, &format!("\r\n[process exited{code}]"));
-                self.finish(status.success(), cx);
+                match &mut self.run {
+                    // Its last output is still on the way; `Exit` follows it.
+                    Some(session) => session.status = Some(status),
+                    None => self.finish(status.success(), cx),
+                }
             }
+            TermEvent::Exit if self.run.is_some() => self.run_ended(cx),
             TermEvent::Exit => self.finish(false, cx),
             TermEvent::Title(_) | TermEvent::ResetTitle | TermEvent::Bell => {}
         }
@@ -464,6 +550,12 @@ impl Terminal {
     }
     fn set_foreground(&mut self, label: Option<String>, cx: &mut Context<Self>) {
         if label == self.foreground {
+            return;
+        }
+        if !self.is_shell() {
+            // A run or a hosted view keeps the title it was given.
+            self.foreground = label;
+            cx.emit(TerminalEvent::Changed);
             return;
         }
         self.title = label.clone().unwrap_or_else(|| default_title(&self.cwd));
@@ -994,6 +1086,9 @@ impl gpui::EntityInputHandler for Terminal {
 
 impl Render for Terminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(hosted) = &self.hosted {
+            return hosted.surface(&self.focus);
+        }
         let focused = self.focus.is_focused(window);
         div()
             .id("terminal")
@@ -1038,6 +1133,7 @@ impl Render for Terminal {
                 focused,
             })
             .children(self.editing_menu(cx))
+            .into_any_element()
     }
 }
 
