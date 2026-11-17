@@ -153,7 +153,89 @@ _To be filled in: servers per language, lifecycle and memory policy, API._
 
 ## 5. Debug
 
-_To be filled in: adapters, session model, breakpoints, API._
+`code::dap` is headless. The pane and the MCP tools call `Manager`, `Session` and
+`BreakpointStore`; nothing else needs to be touched.
+
+**Adapters.** `Adapter` (trait) + a static registry (`adapters()`, `adapter(id)`). Only
+`Debugpy` exists: it runs `<Toolchain::python()> -m debugpy.adapter` over stdio after asking
+that interpreter whether `debugpy` is importable; if not, `DapError::ToolMissing { tool:
+"debugpy", hint: "… -m pip install debugpy" }`. An adapter gives: how to start it
+(`AdapterStart`, stdio or a TCP port), the launch request for a `Spawn`, the attach-by-pid
+request, its names for the exception filters, and where a child session connects. Go, JS
+and LLDB are one more `impl Adapter` each.
+
+**Run → debug.** `derive(&Spawn, &LaunchOptions) -> Option<DebugRequest>`:
+`python file.py …` → `program`; `python -m mod …` / `-mmod` → `module`; `python -c code` →
+`code`; `pytest …`, `py.test …`, `python -m pytest …` → `module: pytest`. Interpreter
+options (`-u`, `-X dev`, `-W error`) go to `pythonArgs`; an interpreter named by path goes
+to `python`, a bare `python` means the adapter's own. `cwd` and `env` are the spawn's.
+`None` for anything else (`uv run …`, `node`, `python` with no program, `-m debugpy`).
+`LaunchOptions { console, just_my_code: true, stop_on_entry: false, subprocesses: true }`.
+`attach_to_process(pid, cwd, &options)` builds the attach-by-pid request; it is untested
+against a real process (debugpy injects with lldb, which macOS may refuse).
+
+**Console.** `Console::IntegratedTerminal` (default): debugpy sends `runInTerminal`; the
+session emits `SessionEvent::RunInTerminal(TerminalRequest)` and keeps it in
+`pending_terminal()`. The pane starts `request.spawn` (command, args, cwd, env to add to the
+checkout's) in a terminal tab and calls `request.started(Some(pid))` or `.failed(reason)`;
+the session stays `Starting` until then. `Console::InternalConsole`: debugpy starts the
+debuggee and its output arrives as `SessionEvent::Output` / `session.output()`; for agents
+and tests.
+
+**Session.** States: `Starting`, `Running`, `Stopped(Stop { reason, thread_id, frame_id,
+path, line, exception })`, `Terminated { exit_code }`. A start that fails ends in
+`Terminated` with `failure()` set. Three kinds of call:
+- *Cache, immediate, any thread:* `state()`, `cached_threads()`, `cached_stack(thread)`,
+  `cached_scopes(frame)`, `cached_variables(reference, page)`, `output()`, `children()`,
+  `driver()`, `supports(capability)`. On every stop the threads and the stopped thread's
+  stack are fetched before the stop is announced. Frames, scopes and variables are dropped
+  when the debuggee runs again.
+- *Control, returns at once, runs on the session's worker thread:* `resume`, `pause`,
+  `step(StepKind, thread)`, `terminate`, `disconnect`, `refresh(Refresh::…)`. A failure
+  arrives as `SessionEvent::Failed { action, message }`.
+- *Blocking, for background threads and MCP tools (10 s per request):* `threads()`,
+  `stack(thread)`, `scopes(frame)`, `variables(reference, Option<Page>)`,
+  `evaluate(expr, frame, Repl | Hover | Watch)`, `set_variable(reference, name, value)`,
+  `stack_with_locals(frames)`, `wait_for_stop(timeout)`, `wait_for_exit(timeout)`,
+  `continue_and_wait(timeout)`, `step_and_wait(kind, timeout)`. A wait that runs out returns
+  `DapError::StillRunning`; the session is unaffected.
+
+`subscribe()` gives each caller its own `async_channel::Receiver<SessionEvent>`:
+`StateChanged`, `Stopped`, `Terminated`, `Threads`, `Stack`, `Scopes`, `Variables`, `Output`,
+`RunInTerminal`, `ChildStarted`, `DriverChanged`, `Failed`. Events before the subscription
+are not replayed: subscribe, then read `state()` and `pending_terminal()` once.
+Capabilities are followed: hover evaluation, `setVariable`, conditions, hit conditions and
+log points are only used when announced; debugpy cannot page variables, so a `Page` is cut
+on our side.
+
+**Child sessions.** `initialize` announces `supportsStartDebuggingRequest`, so debugpy 1.8
+sends a `startDebugging` request per subprocess (the older `debugpyAttach` event is handled
+the same way). The parent connects a second client to the adapter's TCP port, attaches with
+the given configuration, and lists the result under `children()`; it shares the breakpoint
+store, origin and driver, and ends with its parent. `Manager::get(id)` finds children too.
+
+**Breakpoints.** `BreakpointStore` (cloneable handle, all calls cheap): `toggle`, `set`,
+`remove`, `clear`, `in_file`, `files`, `exceptions` / `set_exceptions(ExceptionFilters {
+raised, uncaught })`, `lines_changed(path, start, removed, inserted)` for the editor,
+`to_json(under)` / `load_json`, `subscribe()` → `BreakpointChange::{File, Status,
+Exceptions}`. Each `Breakpoint` has `line`, `enabled`, `condition`, `hit_condition`,
+`log_message` and a runtime `status`: `Idle`, `Verified { line }` (the line the adapter
+placed it on; draw it there) or `Rejected { message }`. Sessions send every file at start and
+a file again on each change, and write the answers back; statuses return to `Idle` when a
+top-level session ends.
+
+**Manager.** `Manager::new(store)`; `start(&Spawn, &Toolchain, &LaunchOptions, Actor)`,
+`start_request`, `restart(id)` (ends the session and starts its request again in the same
+slot, new id; debugpy has no in-place restart), `sessions()`, `get(id)`, `remove(id)`,
+`stop_all()`, and `stop_all` on drop. `start` and `restart` block for the adapter's start.
+Ending a session sends `disconnect`, kills the adapter's process group and, for a debuggee
+the adapter started itself, the debuggee's group. `Actor::{User, Agent(id)}`:
+`session.origin()` is who started it, `driver()` who steers it, `take_over(actor)` changes
+the driver (children included). The core does not refuse calls from a non-driver; the MCP
+layer checks `driver()` before acting.
+
+**Known behaviour.** With the `uncaught` filter on (the default), debugpy also stops on
+`sys.exit(n)` for `n != 0`, as `SystemExit: n`. Windows: the debuggee is not force-killed.
 
 ## 6. Interface
 
