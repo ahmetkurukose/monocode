@@ -273,13 +273,6 @@ impl State {
     }
 }
 
-fn text_for(documents: &HashMap<PathBuf, Document>, path: &Path) -> Option<Arc<str>> {
-    documents
-        .get(path)
-        .map(|document| document.text.clone())
-        .or_else(|| std::fs::read_to_string(path).ok().map(Arc::from))
-}
-
 fn send_open(client: &Client, path: &Path, document: &Document) {
     client.notify(
         "textDocument/didOpen",
@@ -603,6 +596,19 @@ impl Shared {
     }
 
     fn client_event(self: &Arc<Self>, id: ServerId, generation: u64, event: ClientEvent) {
+        let event = match event {
+            ClientEvent::Diagnostics {
+                uri,
+                version,
+                items,
+            } => {
+                if let Some(path) = uri_to_path(&uri) {
+                    self.report_diagnostics(id, generation, path, version, &items);
+                }
+                return;
+            }
+            other => other,
+        };
         let mut state = self.state();
         let Some(entry) = state
             .entries
@@ -612,16 +618,7 @@ impl Shared {
             return;
         };
         match event {
-            ClientEvent::Diagnostics {
-                uri,
-                version,
-                items,
-            } => {
-                if let Some(path) = uri_to_path(&uri) {
-                    let path = state.known_path(path);
-                    self.store_diagnostics(&mut state, id, &path, version, &items);
-                }
-            }
+            ClientEvent::Diagnostics { .. } => {}
             ClientEvent::ProgressBegin { token, title } => {
                 entry.progress.retain(|(known, _)| *known != token);
                 entry.progress.push((token, title));
@@ -651,41 +648,75 @@ impl Shared {
         }
     }
 
+    /// A file's text: an open document's, else what is on disk.
+    fn text_of(&self, path: &Path) -> Option<Arc<str>> {
+        let open = self
+            .state()
+            .documents
+            .get(path)
+            .map(|document| document.text.clone());
+        open.or_else(|| std::fs::read_to_string(path).ok().map(Arc::from))
+    }
+
     /// Records what server `id` reports for `path`. A report for an older
     /// version of an open document is dropped: a newer one is on its way.
-    fn store_diagnostics(
+    /// Positions are converted between two short locks, not under one, since
+    /// that can mean reading files.
+    fn report_diagnostics(
         &self,
-        state: &mut State,
         id: ServerId,
-        path: &Path,
+        generation: u64,
+        path: PathBuf,
         version: Option<i64>,
         items: &[Value],
     ) {
-        let Some(entry) = state.entries.get(&id) else {
+        let current = |state: &State| {
+            let entry = state.entries.get(&id)?;
+            let client = entry.client.as_ref()?;
+            (entry.generation == generation).then(|| (client.encoding(), entry.spec.id))
+        };
+        let (path, known) = {
+            let state = self.state();
+            (state.known_path(path), current(&state))
+        };
+        let Some((encoding, server)) = known else {
             return;
         };
-        let Some(client) = entry.client.as_ref() else {
-            return;
-        };
-        let current = state.documents.get(path).map(|document| document.version);
-        if matches!((current, version), (Some(current), Some(version)) if version < current) {
-            return;
-        }
         let found = {
-            let documents = &state.documents;
-            let mut converter =
-                Converter::new(client.encoding(), |path: &Path| text_for(documents, path));
-            protocol::diagnostics(&mut converter, path, items, entry.spec.id)
+            let mut converter = Converter::new(encoding, |other: &Path| self.text_of(other));
+            protocol::diagnostics(&mut converter, &path, items, server)
         };
-        if let (Some(current), Some(entry)) = (current, state.entries.get_mut(&id)) {
-            entry.reported.insert(path.to_path_buf(), current);
+        let mut state = self.state();
+        if current(&state).is_none() {
+            return;
         }
-        if state.set_diagnostics(path, id, found) {
-            state.emit(LspEvent::DiagnosticsChanged {
-                path: path.to_path_buf(),
-            });
+        let open = state.documents.get(&path).map(|document| document.version);
+        if matches!((open, version), (Some(open), Some(version)) if version < open) {
+            return;
+        }
+        if let (Some(open), Some(entry)) = (open, state.entries.get_mut(&id)) {
+            entry.reported.insert(path.clone(), open);
+        }
+        if state.set_diagnostics(&path, id, found) {
+            state.emit(LspEvent::DiagnosticsChanged { path });
         }
         self.changed.notify_all();
+    }
+
+    /// The server said its earlier report still stands.
+    fn report_unchanged(&self, id: ServerId, generation: u64, path: &Path, version: i64) {
+        let mut state = self.state();
+        let open = state.documents.get(path).map(|document| document.version);
+        let entry = state
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.generation == generation);
+        if let (Some(open), Some(entry)) = (open, entry) {
+            if version >= open {
+                entry.reported.insert(path.to_path_buf(), open);
+                self.changed.notify_all();
+            }
+        }
     }
 
     /// Stops a server on purpose. Its entry stays, as stopped, only while
@@ -838,12 +869,7 @@ impl Shared {
             if other == path {
                 return Some(target.text.clone());
             }
-            let open = self
-                .state()
-                .documents
-                .get(other)
-                .map(|document| document.text.clone());
-            open.or_else(|| std::fs::read_to_string(other).ok().map(Arc::from))
+            self.text_of(other)
         });
         let params = params(&mut converter);
         let result = target
@@ -910,26 +936,16 @@ fn pull_loop(weak: &Weak<Shared>, id: ServerId, generation: u64, queue: &mpsc::R
                 };
                 match answer {
                     Ok(report) => {
-                        let mut state = shared.state();
-                        let current = state
-                            .entries
-                            .get(&id)
-                            .is_some_and(|entry| entry.generation == generation);
-                        if !current {
-                            return;
-                        }
                         match report.get("items").and_then(Value::as_array) {
-                            Some(items) => {
-                                shared.store_diagnostics(
-                                    &mut state,
-                                    id,
-                                    &path,
-                                    Some(version),
-                                    items,
-                                );
-                            }
+                            Some(items) => shared.report_diagnostics(
+                                id,
+                                generation,
+                                path.clone(),
+                                Some(version),
+                                items,
+                            ),
                             // "unchanged": what we hold is still right.
-                            None => shared.store_unchanged(&mut state, id, &path, version),
+                            None => shared.report_unchanged(id, generation, &path, version),
                         }
                         break;
                     }
@@ -942,18 +958,6 @@ fn pull_loop(weak: &Weak<Shared>, id: ServerId, generation: u64, queue: &mpsc::R
                     Err(LspError::Closed) => return,
                     Err(_) => break,
                 }
-            }
-        }
-    }
-}
-
-impl Shared {
-    fn store_unchanged(&self, state: &mut State, id: ServerId, path: &Path, version: i64) {
-        let current = state.documents.get(path).map(|document| document.version);
-        if let (Some(current), Some(entry)) = (current, state.entries.get_mut(&id)) {
-            if version >= current {
-                entry.reported.insert(path.to_path_buf(), current);
-                self.changed.notify_all();
             }
         }
     }
