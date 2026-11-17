@@ -66,6 +66,7 @@ impl Shell {
         }
         SettingsContext {
             remote: Some(self.remote.clone()),
+            store: Some(crate::settings::SettingsStore(self.store.clone())),
             mobile: self.mobile_status(),
             mobile_invite: self.mobile.invite.clone(),
             quick_error: self.quick.error.clone(),
@@ -527,7 +528,7 @@ impl Shell {
                 if delete_sessions {let store=locked(&store)?;let paths=store.session_worktrees()?;if store.sessions()?.iter().any(|s|is_equal_or_inside(paths.get(&s.id).and_then(|p|p.as_deref()).unwrap_or(&s.cwd),&worker_path)){return Err("Some sessions could not be deleted, so the worktree was kept.".into());}}
                 let snapshot=monocode_core::git::snapshot(Path::new(&worker_cwd))?;
                 let main=snapshot.worktrees.first().ok_or("No main working copy found")?;
-                monocode_core::worktree_management::remove(Path::new(&main.path),Path::new(&worker_path))?;
+                monocode_core::worktree_management::remove(Path::new(&main.path),Path::new(&worker_path))?;let _=monocode_core::worktree::meta::delete(&*locked(&store)?,Path::new(&worker_path));
                 locked(&store)?.detach_worktree(&worker_path,&main.path)
             });let result=work.await;
             let _=this.update(cx,|this,cx|{let result=result.map(|detached|{for(summary,settings)in detached{this.session_summaries.insert(summary.id, summary.clone());this.session_worktrees.insert(summary.id,settings.worktree_cwd.clone());if let Some(view)=this.sessions.get(&summary.id){view.update(cx,|v,cx|v.worktree_deleted(summary,settings,cx));}}this.worktree_focus.retain(|_,focus|!is_equal_or_inside(&focus.path,&path));});this.finish_worktree_action(result,cx);});

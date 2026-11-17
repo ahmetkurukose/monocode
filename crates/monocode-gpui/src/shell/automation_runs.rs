@@ -388,7 +388,9 @@ impl Shell {
             .and_then(|value| value.parse().ok());
         settings.access = monocode_core::agent::AccessMode::from_id(&automation.runtime_mode);
         settings.new_worktree = automation.workspace_mode == "worktree";
-        settings.worktree_base = (automation.workspace_mode == "worktree").then(|| "HEAD".into());
+        // A fresh worktree starts from the repository's default base (spec §4);
+        // the first send creates it through `worktree::create`.
+        settings.worktree_base = None;
         settings.worktree_cwd =
             (automation.workspace_mode == "existing").then(|| automation.worktree_cwd.clone());
         settings.plan = false;

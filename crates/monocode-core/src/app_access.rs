@@ -278,10 +278,13 @@ pub fn launch_settings(
 }
 
 /// Runs on a worker. Only a listed, existing checkout may be selected.
+/// `prompt` names a new managed worktree; `store` is not held while Git runs.
 pub fn launch_checkout(
     input: &Value,
     project: &str,
     session: i64,
+    prompt: &str,
+    store: &std::sync::Mutex<crate::store::Store>,
     settings: &mut Settings,
 ) -> Result<(), String> {
     if let Some(cwd) = optional_text(input, "worktreeCwd", 4096)? {
@@ -296,10 +299,13 @@ pub fn launch_checkout(
         .then_some(selected.path);
     } else if input["workspaceMode"] == "worktree" {
         settings.worktree_cwd = Some(
-            crate::git::create_worktree(
+            crate::worktree_callers::for_session(
                 std::path::Path::new(project),
-                input["worktreeBase"].as_str().unwrap_or("HEAD"),
+                input["worktreeBase"].as_str(),
+                prompt,
                 session,
+                crate::worktree::CreatedBy::Api,
+                store,
             )?
             .to_string_lossy()
             .into_owned(),

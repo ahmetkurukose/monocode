@@ -266,10 +266,15 @@ fn run_turn_using(
             },
         )?;
         if creating_worktree {
-            let path = monocode_core::git::create_worktree(
+            // A managed worktree named from the prompt; the store is not held
+            // while Git runs. No chosen base means the repository's default base.
+            let path = monocode_core::worktree_callers::for_session(
                 std::path::Path::new(&summary.cwd),
-                settings.worktree_base.as_deref().unwrap_or("HEAD"),
+                settings.worktree_base.as_deref(),
+                &user_request,
                 summary.id,
+                monocode_core::worktree::CreatedBy::Composer,
+                &store,
             )?;
             let cwd = path.to_string_lossy().into_owned();
             created_worktree = Some(cwd.clone());

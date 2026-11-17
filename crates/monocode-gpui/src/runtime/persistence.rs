@@ -350,6 +350,15 @@ mod tests {
             );
         }
         let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let workspaces = root.join("workspaces");
+        monocode_core::worktree::meta::save_prefs(
+            &store,
+            &monocode_core::worktree::Prefs {
+                root: Some(workspaces.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut summary = store.create("codex", repo.to_str().unwrap()).unwrap();
         summary.provider = "invalid-test-provider".into();
         let id = summary.id;
@@ -376,6 +385,26 @@ mod tests {
         let created = rx.try_recv().unwrap();
         let cwd = created.worktree_cwd.unwrap();
         assert!(std::path::Path::new(&cwd).is_dir());
+        // A managed worktree under the configured root, named from the prompt.
+        assert_eq!(
+            std::path::Path::new(&cwd),
+            workspaces
+                .canonicalize()
+                .unwrap()
+                .join("repo/create-the-checkout")
+        );
+        let meta = monocode_core::worktree::meta::load(
+            &locked(&store).unwrap(),
+            std::path::Path::new(&cwd),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            meta.created_by,
+            monocode_core::worktree::CreatedBy::Composer
+        );
+        assert_eq!(meta.display_name, "create-the-checkout");
+        assert!(!meta.branch_user_chosen);
         let finished = rx.try_recv().unwrap();
         assert!(finished.finished);
         assert_eq!(finished.worktree_cwd.as_deref(), Some(cwd.as_str()));

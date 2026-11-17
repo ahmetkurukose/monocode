@@ -30,9 +30,10 @@ impl Conversation {
             return;
         };
         let id = self.summary.id;
-        let Some(expected) = naming::temporary_branch(Path::new(&cwd), id) else {
-            return;
-        };
+        // Old sessions: the `mc/native-<session>-<ms>` temporary branch. New ones:
+        // a managed worktree whose generated branch is still unchanged (checked
+        // on the worker, which may read the store).
+        let legacy = naming::temporary_branch(Path::new(&cwd), id);
         let cancel = Arc::new(AtomicBool::new(false));
         self.worktree_name_cancel = Some(cancel.clone());
         let flag = cancel.clone();
@@ -41,10 +42,19 @@ impl Conversation {
         let work_cwd = cwd.clone();
         let work = cx.background_executor().spawn(async move {
             let path = Path::new(&work_cwd);
+            let (expected, prefix) = match legacy {
+                Some(expected) => (expected, None),
+                None => {
+                    let db = locked(&store).ok()?;
+                    let expected = naming::managed_expected(path, &db)?;
+                    let prefs = monocode_core::worktree::meta::prefs(&db).ok()?;
+                    (expected, Some(prefs.branch_prefix))
+                }
+            };
             if git::snapshot(path).ok()?.current.as_deref() != Some(&expected) {
                 return None;
             }
-            let branch = generate(path, flag.clone())?;
+            let generated = generate(path, flag.clone())?;
             if flag.load(Ordering::Relaxed) {
                 return None;
             }
@@ -54,7 +64,13 @@ impl Conversation {
             if retained.get(&id).and_then(Option::as_deref) != Some(work_cwd.as_str()) {
                 return None;
             }
-            naming::rename(Path::new(&root), path, &expected, &branch).ok()
+            match prefix {
+                None => naming::rename(Path::new(&root), path, &expected, &generated).ok(),
+                Some(prefix) => {
+                    let branch = naming::managed_branch(&generated, &prefix, path)?;
+                    naming::rename_managed(Path::new(&root), path, &expected, &branch, &store).ok()
+                }
+            }
         });
         cx.spawn(async move |this, cx| {
             let named = work.await;
@@ -180,5 +196,108 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn managed_worktrees_get_prefixed_names_unless_the_branch_was_chosen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use monocode_core::worktree::{self, CreatedBy, naming::BranchPrefix};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let project = base.join("project");
+        std::fs::create_dir(&project).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Test"],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "-q", "--allow-empty", "-m", "Base"],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&project)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        worktree::meta::save_prefs(
+            &locked(&store).unwrap(),
+            &worktree::Prefs {
+                root: Some(base.join("workspaces")),
+                branch_prefix: BranchPrefix::Custom("team".into()),
+            },
+        )
+        .unwrap();
+        for chosen in [false, true] {
+            let summary = locked(&store)
+                .unwrap()
+                .create("codex", project.to_str().unwrap())
+                .unwrap();
+            let id = summary.id;
+            let path = if chosen {
+                std::path::PathBuf::from(
+                    monocode_core::worktree_callers::named(
+                        &project,
+                        "my-choice",
+                        None,
+                        false,
+                        CreatedBy::Composer,
+                        &store,
+                    )
+                    .unwrap()
+                    .path,
+                )
+            } else {
+                monocode_core::worktree_callers::for_session(
+                    &project,
+                    None,
+                    "Make the sidebar faster",
+                    id,
+                    CreatedBy::Composer,
+                    &store,
+                )
+                .unwrap()
+            };
+            let before = git::snapshot(&path).unwrap().current.unwrap();
+            let settings = Settings {
+                worktree_cwd: Some(path.to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            locked(&store)
+                .unwrap()
+                .save_agent_settings(id, &settings)
+                .unwrap();
+            let view = cx.new(|cx| {
+                let mut view = Conversation::new(summary, store.clone(), cx);
+                view.settings = settings;
+                view
+            });
+            view.update(cx, |view, cx| {
+                view.start_worktree_naming(cx, |_, _| Some("mc/speed-up/sidebar".into()));
+            });
+            cx.run_until_parked();
+            let after = git::snapshot(&path).unwrap().current.unwrap();
+            let meta = worktree::meta::load(&locked(&store).unwrap(), &path)
+                .unwrap()
+                .unwrap();
+            if chosen {
+                assert_eq!(after, "my-choice");
+                assert_eq!(after, before);
+            } else {
+                assert_eq!(before, "team/make-the-sidebar-faster");
+                assert_eq!(after, "team/speed-up-sidebar");
+                assert_eq!(meta.branch_at_create, after);
+                assert!(
+                    path.ends_with("make-the-sidebar-faster"),
+                    "the folder stays"
+                );
+                assert_eq!(
+                    view.read_with(cx, |view, _| view.branch.clone()).as_deref(),
+                    Some(after.as_str())
+                );
+            }
+        }
     }
 }

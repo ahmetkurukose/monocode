@@ -374,7 +374,14 @@ impl Monos {
                         )?;
                         settings.revision = 0;
                         let mut summary = locked(&store)?.create(&provider, &project)?;
-                        app::launch_checkout(&input, &project, summary.id, &mut settings)?;
+                        app::launch_checkout(
+                            &input,
+                            &project,
+                            summary.id,
+                            &prompt,
+                            &store,
+                            &mut settings,
+                        )?;
                         summary.title = app::optional_text(&input, "title", 160)?
                             .unwrap_or_else(|| prompt.chars().take(160).collect());
                         // Worktree creation can run git; do not hold the
@@ -737,7 +744,7 @@ if let Some(schedule)=input.get("schedule"){h.schedule=serde_json::from_value(sc
 if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=enabled;if enabled{h.next_run_at=h.schedule.next(now_ms())?;}}}Ok(json!(h))})?},
                         "notes.list"|"notes.read"|"notes.write"=>app::notes_action(&*locked(&store)?,caller,&request,&action,&input,&projects)?,
                         "worktrees.list"=>json!(monocode_core::git::snapshot(Path::new(&project))?.worktrees.iter().map(|w|json!({"path":w.path,"branch":w.branch,"head":w.head,"main":w.main})).collect::<Vec<_>>()),
-                        "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::git::create_project_worktree(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false))?;json!({"path":tree.path,"branch":tree.branch})},
+                        "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::worktree_callers::named(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false),monocode_core::worktree::CreatedBy::Api,&store)?;json!({"path":tree.path,"branch":tree.branch})},
                         _=>unreachable!(),
                     };Ok((value,Effect::None))
                 },cx);

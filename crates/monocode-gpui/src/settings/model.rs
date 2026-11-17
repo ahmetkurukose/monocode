@@ -259,6 +259,30 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "git branch working copy create delete manage",
     ),
     (
+        "worktree-location",
+        Section::Worktrees,
+        "Worktree location",
+        "folder root directory workspaces where path",
+    ),
+    (
+        "worktree-branch-prefix",
+        Section::Worktrees,
+        "Branch prefix",
+        "git user name custom prefix branch naming",
+    ),
+    (
+        "worktree-default-base",
+        Section::Worktrees,
+        "Default base",
+        "start from origin main branch base worktree",
+    ),
+    (
+        "worktree-show-external",
+        Section::Worktrees,
+        "Show other worktrees",
+        "external claude worktrees outside rail list",
+    ),
+    (
         "update",
         Section::General,
         "Version",

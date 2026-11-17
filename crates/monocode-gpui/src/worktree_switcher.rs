@@ -9,10 +9,7 @@ use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, Role, ScrollHandle, Subscription,
     Window, div, prelude::*, px,
 };
-use monocode_core::{
-    files::path_key,
-    git::{self, Snapshot},
-};
+use monocode_core::{files::path_key, git::Snapshot};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -132,6 +129,7 @@ pub(crate) struct WorktreeSwitcher {
     load_error: Option<String>,
     error: Option<String>,
     tabs: HashMap<String, Tabs>,
+    store: Database,
     _changed: Subscription,
 }
 impl EventEmitter<Event> for WorktreeSwitcher {}
@@ -163,9 +161,14 @@ impl WorktreeSwitcher {
         let state = crate::git_cache::get(&cwd);
         let tabs = tab_stats(&sessions, None, &cwd);
         let folder = cwd.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { crate::git_cache::load(Path::new(&folder)) });
+        let db = store.clone();
+        let work = cx.background_executor().spawn(async move {
+            // Forget metadata of worktrees deleted outside the app.
+            if !folder.starts_with("remote://") {
+                let _ = monocode_core::worktree_callers::reconcile(Path::new(&folder), &db);
+            }
+            crate::git_cache::load(Path::new(&folder))
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -184,6 +187,7 @@ impl WorktreeSwitcher {
         // settings (which restores full desktop transcripts and turn receipts).
         // It must also never hold up the independent Git list.
         if !ids.is_empty() {
+            let store = store.clone();
             let work = cx.background_executor().spawn(async move {
                 let paths = locked(&store)?.session_worktrees()?;
                 Ok::<_, String>(
@@ -219,6 +223,7 @@ impl WorktreeSwitcher {
             load_error: None,
             error: None,
             tabs,
+            store,
             _changed: changed,
         }
     }
@@ -267,9 +272,17 @@ impl WorktreeSwitcher {
         let cwd = self.focused.as_ref().map_or(&self.cwd, |f| &f.path).clone();
         self.creating = true;
         self.error = None;
-        let work = cx
-            .background_executor()
-            .spawn(async move { git::create_named_worktree(Path::new(&cwd), &branch) });
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            monocode_core::worktree_callers::named(
+                Path::new(&cwd),
+                &branch,
+                None,
+                false,
+                monocode_core::worktree::CreatedBy::Switcher,
+                &store,
+            )
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {

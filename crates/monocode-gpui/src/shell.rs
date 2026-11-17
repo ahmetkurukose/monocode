@@ -57,6 +57,7 @@ use terminal_panes::terminal_drag_ghost;
 mod title_tabs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
+mod worktree_create;
 mod worktrees;
 
 use crate::{
@@ -794,6 +795,9 @@ pub(crate) struct Shell {
     session_details: HashMap<i64, monocode_core::store::MobileSessionMetadata>,
     sidebar_hidden_sessions: HashSet<i64>,
     worktree_returns: HashMap<(String, String), i64>,
+    /// Worktrees being created in the background, with their phase or error.
+    pending_worktrees: Vec<worktree_create::PendingWorktree>,
+    worktree_creates: worktree_create::Creates,
     tab_drag: Option<TabDrag>,
     /// Tabs sliding between slots: neighbours making room for a drag and,
     /// after a drop, every tab gliding from where it was drawn into place.
@@ -1211,6 +1215,8 @@ impl Shell {
             session_details: sidebar_metadata.details,
             sidebar_hidden_sessions: sidebar_metadata.sidebar_hidden,
             worktree_returns: HashMap::new(),
+            pending_worktrees: Vec::new(),
+            worktree_creates: Default::default(),
             tab_drag: None,
             tab_shifts: HashMap::new(),
             pane_ticks: HashMap::new(),
@@ -3352,6 +3358,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
         let launch = self.terminal_launch(project, &cwd);
+        self.spawn_terminal_with(cwd, launch, cx)
+    }
+    /// A shell in `cwd` started with `launch`, closing its tab when it exits.
+    fn spawn_terminal_with(
+        &mut self,
+        cwd: String,
+        launch: monocode_core::terminal_setup::Launch,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
         let terminal = cx.new(|cx| Terminal::with_launch(cwd, launch, cx));
         self.observations.push(cx.subscribe(
             &terminal,

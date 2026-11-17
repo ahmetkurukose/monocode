@@ -110,7 +110,12 @@ impl SettingsView {
             body,
             provider,
             scope,
-            base: "HEAD".into(),
+            // Local projects start from the repository's default base (spec §4).
+            base: if self.discovery.worktrees.prefs.is_some() {
+                String::new()
+            } else {
+                "HEAD".into()
+            },
             existing: false,
             delete_sessions: false,
             busy: false,
@@ -244,19 +249,31 @@ impl SettingsView {
             return;
         }
         let generation = self.management_generation;
+        let store = self.ctx.store.clone().map(|s| s.0);
         let work = cx.background_executor().spawn(async move {
             match target {
                 Target::Mcp => monocode_core::mcp::mcp_add(cwd, provider, scope, name, body),
                 Target::Skill => {
                     monocode_core::skills::create_blank(&cwd, &name, scope == "user").map(|_| ())
                 }
-                Target::Worktree => monocode_core::git::create_project_worktree(
-                    std::path::Path::new(&cwd),
-                    &name,
-                    Some(&base),
-                    existing,
-                )
-                .map(|_| ()),
+                Target::Worktree => match &store {
+                    Some(store) => monocode_core::worktree_callers::named(
+                        std::path::Path::new(&cwd),
+                        &name,
+                        Some(&base),
+                        existing,
+                        monocode_core::worktree::CreatedBy::Dialog,
+                        store,
+                    )
+                    .map(|_| ()),
+                    None => monocode_core::git::create_project_worktree(
+                        std::path::Path::new(&cwd),
+                        &name,
+                        Some(&base).filter(|b| !b.is_empty()).map(String::as_str),
+                        existing,
+                    )
+                    .map(|_| ()),
+                },
                 _ => Ok(()),
             }
         });
@@ -531,7 +548,21 @@ impl SettingsView {
                     );
                 } else {
                     rows.push(form_field("New branch name", name, 36.));
-                    let mut options = vec![("HEAD".into(), "Current commit".into(), None)];
+                    let mut options = Vec::new();
+                    if self.discovery.worktrees.prefs.is_some() {
+                        let default = self
+                            .discovery
+                            .worktrees
+                            .repo
+                            .as_ref()
+                            .and_then(|r| r.default_base.clone())
+                            .map_or_else(
+                                || "Default branch".to_owned(),
+                                |b| format!("Default ({b})"),
+                            );
+                        options.push((String::new(), default.into(), None));
+                    }
+                    options.push(("HEAD".into(), "Current commit".into(), None));
                     options.extend(self.discovery.worktrees.branches.iter().map(|b| {
                         let label = b
                             .remote

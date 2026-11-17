@@ -5,10 +5,12 @@ use crate::{
     agent::Settings,
     provider::{self, Kind, Request},
     scm::text::{limit_section, parse_json_object, string_field},
+    store::Store,
+    worktree::{self, naming::BranchPrefix},
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
 /// Recover the original branch from the directory created by `create_worktree`.
@@ -113,20 +115,73 @@ fn request(
 /// A late name may replace only the original temporary branch, never a manual
 /// rename, another checkout, or an existing destination branch.
 pub fn rename(cwd: &Path, path: &Path, expected: &str, branch: &str) -> Result<Snapshot, String> {
+    if !expected.starts_with("mc/native-") {
+        return Err("The worktree no longer uses its temporary branch".into());
+    }
+    rename_checked(cwd, path, expected, branch)
+}
+
+fn rename_checked(
+    cwd: &Path,
+    path: &Path,
+    expected: &str,
+    branch: &str,
+) -> Result<Snapshot, String> {
     valid_branch(cwd, branch)?;
     let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
     let tree = worktrees(cwd)?
         .into_iter()
         .find(|tree| std::fs::canonicalize(&tree.path).ok().as_ref() == Some(&path))
         .ok_or("This path is not a registered worktree of this repository")?;
-    if tree.main || !expected.starts_with("mc/native-") || tree.branch.as_deref() != Some(expected)
-    {
+    if tree.main || tree.branch.as_deref() != Some(expected) {
         return Err("The worktree no longer uses its temporary branch".into());
     }
     // Naming the source explicitly also protects a rename between the check
     // above and Git's ref transaction. `-m` never overwrites a destination.
     git(cwd, &["branch", "-m", expected, branch])?;
     super::snapshot(&path)
+}
+
+/// The branch a managed worktree may still be renamed from: it has metadata, was
+/// made by the composer with a generated name, and still uses that name.
+pub fn managed_expected(path: &Path, store: &Store) -> Option<String> {
+    let meta = worktree::meta::load(store, path).ok()??;
+    if meta.branch_user_chosen
+        || meta.created_by != worktree::CreatedBy::Composer
+        || meta.branch_at_create.is_empty()
+    {
+        return None;
+    }
+    Some(meta.branch_at_create)
+}
+
+/// A generated `mc/<fragment>` name as `<configured prefix>/<slug>` (or `<slug>`).
+pub fn managed_branch(generated: &str, prefix: &BranchPrefix, cwd: &Path) -> Option<String> {
+    let fragment = generated.strip_prefix("mc/").unwrap_or(generated);
+    let slug = worktree::naming::slug(fragment).ok()?;
+    Some(worktree::naming::branch_for(&slug, prefix, cwd))
+}
+
+/// Rename a managed worktree's generated branch (see [`managed_expected`]) and
+/// record the new name in its metadata. The folder keeps its name.
+pub fn rename_managed(
+    cwd: &Path,
+    path: &Path,
+    expected: &str,
+    branch: &str,
+    store: &Mutex<Store>,
+) -> Result<Snapshot, String> {
+    let lock = || store.lock().unwrap_or_else(|e| e.into_inner());
+    if managed_expected(path, &lock()).as_deref() != Some(expected) {
+        return Err("The worktree no longer uses its generated branch".into());
+    }
+    let snapshot = rename_checked(cwd, path, expected, branch)?;
+    let store = lock();
+    if let Some(mut meta) = worktree::meta::load(&store, path)? {
+        meta.branch_at_create = branch.to_owned();
+        worktree::meta::save(&store, &meta)?;
+    }
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -255,5 +310,75 @@ mod tests {
         );
         assert!(rename(&cwd, &cwd, "main", "mc/rename-main").is_err());
         assert!(rename(&cwd, &manual, "mc/my-manual-name", "-invalid").is_err());
+    }
+
+    #[test]
+    fn managed_worktrees_take_the_configured_prefix_and_update_their_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let cwd = base.join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Test"],
+            &["config", "user.email", "test@example.invalid"],
+            &["config", "commit.gpgsign", "false"],
+            &["commit", "-q", "--allow-empty", "-m", "Base"],
+        ] {
+            git(&cwd, args).unwrap();
+        }
+        let store = Mutex::new(Store::open(Path::new(":memory:")).unwrap());
+        worktree::meta::save_prefs(
+            &store.lock().unwrap(),
+            &worktree::Prefs {
+                root: Some(base.join("workspaces")),
+                branch_prefix: BranchPrefix::Custom("me".into()),
+            },
+        )
+        .unwrap();
+        let path = crate::worktree_callers::for_session(
+            &cwd,
+            None,
+            "add dark mode",
+            1,
+            worktree::CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        let expected = managed_expected(&path, &store.lock().unwrap()).unwrap();
+        assert_eq!(expected, "me/add-dark-mode");
+        let branch = managed_branch(
+            "mc/dark-mode/toggle",
+            &BranchPrefix::Custom("me".into()),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(branch, "me/dark-mode-toggle");
+        assert_eq!(
+            managed_branch("mc/x", &BranchPrefix::None, &cwd).as_deref(),
+            Some("x")
+        );
+        let named = rename_managed(&cwd, &path, &expected, &branch, &store).unwrap();
+        assert_eq!(named.current.as_deref(), Some(branch.as_str()));
+        assert!(path.ends_with("add-dark-mode"), "the folder keeps its name");
+        let meta = worktree::meta::load(&store.lock().unwrap(), &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.branch_at_create, branch);
+        // A stale expectation no longer matches.
+        assert!(rename_managed(&cwd, &path, &expected, "me/late", &store).is_err());
+
+        // A user-chosen branch is never renamed.
+        let chosen = crate::worktree_callers::named(
+            &cwd,
+            "my-branch",
+            None,
+            false,
+            worktree::CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        assert!(managed_expected(Path::new(&chosen.path), &store.lock().unwrap()).is_none());
+        assert!(managed_expected(&cwd, &store.lock().unwrap()).is_none());
     }
 }

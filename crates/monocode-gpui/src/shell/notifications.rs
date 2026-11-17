@@ -940,6 +940,7 @@ impl Shell {
     }
 
     pub(super) fn notices_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let worktree_notices = self.worktree_notices(cx);
         let state = &self.notification_state;
         let mono_error = self.monos.as_ref().and_then(|monos| {
             monos
@@ -983,6 +984,7 @@ impl Shell {
                         })),
                 ))
             })
+            .children(worktree_notices)
             .when(state.file_error.read(cx).is_visible(), |stack| {
                 stack.child(state.file_error.clone())
             })

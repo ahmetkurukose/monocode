@@ -1824,16 +1824,32 @@ impl Conversation {
         self.preparing_worktree = true;
         self.status = "Creating worktree…".into();
         let cwd = self.summary.cwd.clone();
+        // No chosen base: local uses the repository's default base, remote keeps
+        // branching from the current branch.
         let base = self
             .settings
             .worktree_base
             .clone()
-            .or(self.branch.clone())
-            .unwrap_or_else(|| "HEAD".into());
+            .or_else(|| self.is_remote().then(|| self.branch.clone()).flatten());
+        let prompt = self
+            .follow_ups
+            .state
+            .messages
+            .first()
+            .map(|m| m.text.clone())
+            .unwrap_or_else(|| self.input.read(cx).content.to_string());
         let id = self.summary.id;
-        let work = cx
-            .background_executor()
-            .spawn(async move { monocode_core::git::create_worktree(Path::new(&cwd), &base, id) });
+        let store = self.store.clone();
+        let work = cx.background_executor().spawn(async move {
+            monocode_core::worktree_callers::for_session(
+                Path::new(&cwd),
+                base.as_deref(),
+                &prompt,
+                id,
+                monocode_core::worktree::CreatedBy::Composer,
+                &store,
+            )
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {

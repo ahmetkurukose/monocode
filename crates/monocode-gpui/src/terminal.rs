@@ -148,6 +148,8 @@ pub(crate) struct Terminal {
     pub cwd: String,
     /// The tab label: the foreground command, else the directory.
     pub title: String,
+    /// A label that stays whatever runs (the worktree "Setup" terminal).
+    pinned_title: Option<String>,
     /// A command other than the shell holds the terminal.
     pub foreground: Option<String>,
     pub exited: bool,
@@ -385,6 +387,7 @@ impl Terminal {
             #[cfg(test)]
             typed: Default::default(),
             title: default_title(&cwd),
+            pinned_title: None,
             cwd,
             foreground: None,
             exited: false,
@@ -450,6 +453,13 @@ impl Terminal {
             TermEvent::Title(_) | TermEvent::ResetTitle | TermEvent::Bell => {}
         }
     }
+    /// Keep `title` on the tab whatever the shell runs.
+    pub(crate) fn pin_title(&mut self, title: String, cx: &mut Context<Self>) {
+        self.title = title.clone();
+        self.pinned_title = Some(title);
+        cx.emit(TerminalEvent::Changed);
+        cx.notify();
+    }
     pub(crate) fn finish(&mut self, clean: bool, cx: &mut Context<Self>) {
         if !self.exited {
             self.exited = true;
@@ -466,7 +476,11 @@ impl Terminal {
         if label == self.foreground {
             return;
         }
-        self.title = label.clone().unwrap_or_else(|| default_title(&self.cwd));
+        self.title = self
+            .pinned_title
+            .clone()
+            .or_else(|| label.clone())
+            .unwrap_or_else(|| default_title(&self.cwd));
         self.foreground = label;
         cx.emit(TerminalEvent::Changed);
     }

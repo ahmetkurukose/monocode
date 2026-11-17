@@ -386,10 +386,12 @@ impl Shell {
                     let mut settings=app::launch_settings(&input,&provider,settings,kind,&models)?;
                     settings.revision=0;
                     let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
-                    let mut store=locked(&store)?;
-                    let (mut summary,fresh)=store.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?;
+                    let db=store.clone();
+                    let (mut summary,fresh)=locked(&db)?.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?;
+                    // Worktree creation runs Git; the store is not held meanwhile.
+                    if fresh && let Err(error)=app::launch_checkout(&input,&project,summary.id,&prompt,&db,&mut settings) {let _=locked(&db)?.delete(summary.id);return Err(error);}
+                    let store=locked(&db)?;
                     if fresh {
-                        if let Err(error)=app::launch_checkout(&input,&project,summary.id,&mut settings) {let _=store.delete(summary.id);return Err(error);}
                         store.title(summary.id,&title)?;summary.title=title;
                         store.configure_agent(summary.id,kind.id(),&settings)?;
                         store.save_started_link(summary.id,caller)?;
@@ -592,7 +594,7 @@ impl Shell {
             "worktrees.list" | "worktrees.create" => {
                 self.app_background(
                     call,
-                    move |_| {
+                    move |store| {
                         let root = std::path::Path::new(&project);
                         let value = if action == "worktrees.list" {
                             let snapshot = monocode_core::git::snapshot(root)?;
@@ -604,11 +606,13 @@ impl Shell {
                             if existing && base.is_some() {
                                 return Err("base cannot be set for an existing branch".into());
                             }
-                            worktree_json(&monocode_core::git::create_project_worktree(
+                            worktree_json(&monocode_core::worktree_callers::named(
                                 root,
                                 &branch,
                                 base.as_deref(),
-                                existing
+                                existing,
+                                monocode_core::worktree::CreatedBy::Api,
+                                &store,
                             )?)
                         };
                         Ok((value, Effect::None))

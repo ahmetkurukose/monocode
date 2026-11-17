@@ -72,11 +72,26 @@ pub(crate) struct SettingsContext {
     pub mobile: Option<monocode_core::mobile::Status>,
     /// The pairing code on show.
     pub mobile_invite: Option<monocode_core::mobile::Invite>,
+    /// The app database, for the Worktrees page's preferences and metadata.
+    pub store: Option<SettingsStore>,
+}
+/// The app database as Settings holds it (compared by identity).
+#[derive(Clone)]
+pub(crate) struct SettingsStore(pub crate::runtime::Database);
+impl std::fmt::Debug for SettingsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SettingsStore")
+    }
 }
 impl PartialEq for SettingsContext {
     fn eq(&self, other: &Self) -> bool {
         match (&self.remote, &other.remote) {
             (Some(a), Some(b)) if !std::sync::Arc::ptr_eq(a, b) => return false,
+            (None, Some(_)) | (Some(_), None) => return false,
+            _ => {}
+        }
+        match (&self.store, &other.store) {
+            (Some(a), Some(b)) if !std::sync::Arc::ptr_eq(&a.0, &b.0) => return false,
             (None, Some(_)) | (Some(_), None) => return false,
             _ => {}
         }
@@ -448,16 +463,18 @@ impl SettingsView {
             });
         }
         let cwd = self.selected_project.clone();
+        let store = self.ctx.store.clone().map(|s| s.0);
         self.discovery_loading = true;
         let work = cx
             .background_executor()
-            .spawn(async move { data::discover(&cwd) });
+            .spawn(async move { data::discover(&cwd, store.as_ref()) });
         self.discovery_task = Some(cx.spawn(async move |this, cx| {
             let data = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.skill_documents.clear();
                 this.discovery = data;
                 this.discovery_loading = false;
+                this.sync_worktree_fields(cx);
                 if this.section == Section::Mcp {
                     this.refresh_mcp_health(cx);
                 }

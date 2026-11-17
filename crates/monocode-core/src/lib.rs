@@ -55,4 +55,5 @@ pub mod cli;
 pub mod mcp;
 
 pub mod worktree;
+pub mod worktree_callers;
 pub mod worktree_management;

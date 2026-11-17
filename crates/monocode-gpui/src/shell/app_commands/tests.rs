@@ -528,6 +528,15 @@ fn operator_creates_selects_and_validates_real_worktrees(cx: &mut TestAppContext
     ]);
     let project = project.to_string_lossy().into_owned();
     let store = Arc::new(Mutex::new(Store::open(&root.join("native.db")).unwrap()));
+    // New worktrees go under the test's own folder.
+    monocode_core::worktree::meta::save_prefs(
+        &locked(&store).unwrap(),
+        &monocode_core::worktree::Prefs {
+            root: Some(root.join("workspaces")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let caller = locked(&store).unwrap().create("codex", &project).unwrap();
     let id = caller.id;
     let window = cx.update(|cx| {
@@ -563,6 +572,10 @@ fn operator_creates_selects_and_validates_real_worktrees(cx: &mut TestAppContext
     .unwrap();
     let path = tree["path"].as_str().unwrap();
     assert!(std::path::Path::new(path).join("README.md").is_file());
+    assert_eq!(tree["branch"], "operator-review");
+    assert!(
+        std::path::Path::new(path).starts_with(root.join("workspaces").canonicalize().unwrap())
+    );
     let listed = call(window, id, "list-trees", "worktrees.list", json!({}), cx).unwrap();
     assert!(
         listed["worktrees"]
