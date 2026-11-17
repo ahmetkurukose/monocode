@@ -31,6 +31,7 @@ mod editor_scrollbar;
 mod editor_syntax;
 mod explorer;
 mod file_editor;
+mod file_history;
 mod file_icons;
 mod fixtures;
 mod fonts;

@@ -170,6 +170,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_file_tab_opens_its_files_history_and_escape_closes_it(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(session, w, cx);
+                // What a file tab's "Git History" leaves for the next frame.
+                shell.pending_file_history =
+                    Some(("/work/monocode".into(), "/work/monocode/a.rs".into()));
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("file-history-card").is_some());
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.pending_file_history.is_none());
+                assert!(shell.file_history.is_some());
+            })
+            .unwrap();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("file-history-card").is_none());
+        window
+            .update(visual, |shell, _, _| assert!(shell.file_history.is_none()))
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn mono_file_link_opens_visible_editor_and_preserves_its_chat(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, session) = window(cx);

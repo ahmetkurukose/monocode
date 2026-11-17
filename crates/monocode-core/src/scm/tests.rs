@@ -1601,3 +1601,84 @@ fn dropping_clearing_and_branching_from_entries() {
     assert!(stash_list(root).unwrap().is_empty());
     assert!(stash_apply(root, "zz", false, false).is_err());
 }
+
+#[test]
+fn a_files_history_follows_it_through_a_rename_and_starts_with_what_is_uncommitted() {
+    let dir = tmp();
+    assert!(init_git(dir.path(), "main"));
+    let write = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
+    let commit = |message: &str| {
+        assert!(git(dir.path(), &["add", "-A"]));
+        assert!(git(dir.path(), &["commit", "-m", message]));
+    };
+    write("old.txt", "one\ntwo\nthree\nfour\nfive\n");
+    write("other.txt", "x\n");
+    commit("add the file");
+    write("other.txt", "y\n");
+    commit("someone else's change");
+    write("old.txt", "one\ntwo\nthree\nfour\nfive\nsix\n");
+    commit("add a line");
+    assert!(git(dir.path(), &["mv", "old.txt", "new name.txt"]));
+    commit("rename it");
+    write("new name.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n");
+
+    // Asked for by its absolute path, as a file tab knows it.
+    let absolute = dir.path().join("new name.txt");
+    let history = file_history(dir.path(), &absolute.to_string_lossy(), 100).unwrap();
+    let seen: Vec<_> = history
+        .iter()
+        .map(|v| (v.subject.as_str(), v.path.as_str(), v.status.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("Uncommitted changes", "new name.txt", "modified"),
+            ("rename it", "new name.txt", "renamed"),
+            ("add a line", "old.txt", "modified"),
+            ("add the file", "old.txt", "added"),
+        ],
+        "the other file's commit is not part of it"
+    );
+    assert!(history[0].sha.is_empty());
+    assert_eq!(history[1].previous_path.as_deref(), Some("old.txt"));
+    assert_eq!(history[2].author, "MonoCode");
+    assert!(history[2].time > 0 && history[2].short_sha.len() >= 7);
+
+    let texts = |version: &FileVersion| {
+        let diff = file_version_diff(dir.path(), version).unwrap();
+        (diff.original, diff.current, diff.status)
+    };
+    // What is on disk against HEAD.
+    let (before, after, _) = texts(&history[0]);
+    assert!(!before.contains("seven") && after.ends_with("seven\n"));
+    // The rename: the old name's text on the left, unchanged.
+    let (before, after, status) = texts(&history[1]);
+    assert_eq!(before, after);
+    assert_eq!(status, "modified");
+    let (before, after, _) = texts(&history[2]);
+    assert!(!before.contains("six") && after.ends_with("six\n"));
+    let (before, after, status) = texts(&history[3]);
+    assert_eq!((before.as_str(), status.as_str()), ("", "added"));
+    assert!(after.starts_with("one\n"));
+
+    // Relative to the folder too, and only as many as asked for.
+    let limited = file_history(dir.path(), "new name.txt", 1).unwrap();
+    assert_eq!(
+        limited.len(),
+        2,
+        "what is uncommitted, and the newest commit"
+    );
+    // Clean again: no uncommitted version.
+    commit("add another line");
+    let clean = file_history(dir.path(), "new name.txt", 100).unwrap();
+    assert_eq!(clean[0].subject, "add another line");
+    // A file git has never seen has only what is on disk.
+    write("fresh.txt", "new\n");
+    let fresh = file_history(dir.path(), "fresh.txt", 100).unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(
+        (fresh[0].path.as_str(), fresh[0].status.as_str()),
+        ("fresh.txt", "added")
+    );
+    assert_eq!(texts(&fresh[0]).1, "new\n");
+}

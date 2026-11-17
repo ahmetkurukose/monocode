@@ -400,6 +400,168 @@ pub fn stage_contents(cwd: &Path, relative: &str, contents: &[u8]) -> Result<(),
     )
 }
 
+/// One version of a file: a commit that changed it, or what is on disk
+/// and not committed yet.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersion {
+    /// Empty for the uncommitted version.
+    pub sha: String,
+    pub short_sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Seconds since the epoch; 0 for the uncommitted version.
+    pub time: u64,
+    /// The file's path in this version, from the repository's root.
+    pub path: String,
+    /// Its path in the version before, when this one renamed it.
+    pub previous_path: Option<String>,
+    pub status: String,
+}
+
+/// The versions of one file, newest first, followed through renames: what
+/// is on disk when it differs from HEAD, then every commit that changed it.
+/// `path` is absolute or relative to `cwd`.
+pub fn file_history(cwd: &Path, path: &str, limit: usize) -> Result<Vec<FileVersion>, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("File history is not available on remote projects.".into());
+    }
+    let cwd = expand_home(cwd);
+    if !git_is_work_tree(&cwd) {
+        return Err("Not a git repository".into());
+    }
+    let root = git_stdout(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(std::path::PathBuf::from)
+        .ok_or("Not a git repository")?;
+    let mut versions = Vec::new();
+    let dirty = git_run(&cwd, &["status", "--porcelain", "-z", "--", path])
+        .is_some_and(|status| !status.trim_matches('\0').is_empty());
+    let log = git_run(
+        &cwd,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--follow",
+            &format!("-n{limit}"),
+            "--name-status",
+            "--format=%x1e%H%x1f%h%x1f%an%x1f%at%x1f%s",
+            "--",
+            path,
+        ],
+    )
+    .unwrap_or_default();
+    for record in log.split('\x1e').filter(|record| !record.trim().is_empty()) {
+        let mut lines = record.lines();
+        let mut fields = lines.next().unwrap_or_default().split('\x1f');
+        let mut field = || fields.next().unwrap_or_default().to_owned();
+        let (sha, short_sha, author, time) = (field(), field(), field(), field());
+        let subject = field();
+        // With --follow the one line after the header is the file's own.
+        let Some(change) = lines.find(|line| !line.trim().is_empty()) else {
+            continue;
+        };
+        let mut parts = change.split('\t');
+        let code = parts.next().unwrap_or_default();
+        let first = parts.next().unwrap_or_default().to_owned();
+        let second = parts.next().map(str::to_owned);
+        let (path, previous_path, status) = match (code.chars().next(), second) {
+            (Some('R'), Some(to)) => (to, Some(first), "renamed"),
+            (Some('C'), Some(to)) => (to, Some(first), "added"),
+            (Some('A'), _) => (first, None, "added"),
+            (Some('D'), _) => (first, None, "deleted"),
+            _ => (first, None, "modified"),
+        };
+        versions.push(FileVersion {
+            sha,
+            short_sha,
+            subject,
+            author,
+            time: time.parse().unwrap_or(0),
+            path,
+            previous_path,
+            status: status.into(),
+        });
+    }
+    if dirty {
+        // The path as the repository knows it: the newest commit's, or the
+        // one asked for when the file was never committed.
+        let relative = versions.first().map(|v| v.path.clone()).or_else(|| {
+            // Both resolved: the root git reports has its links followed.
+            let absolute = cwd.join(path).canonicalize().ok()?;
+            let root = root.canonicalize().ok()?;
+            Some(path_to_js(absolute.strip_prefix(&root).ok()?))
+        });
+        if let Some(path) = relative {
+            versions.insert(
+                0,
+                FileVersion {
+                    sha: String::new(),
+                    short_sha: String::new(),
+                    subject: "Uncommitted changes".into(),
+                    author: String::new(),
+                    time: 0,
+                    status: if versions.is_empty() {
+                        "added"
+                    } else {
+                        "modified"
+                    }
+                    .into(),
+                    path,
+                    previous_path: None,
+                },
+            );
+        }
+    }
+    Ok(versions)
+}
+
+/// What one version changed in the file: the version before it on the
+/// left (under the name it had then), this one on the right.
+pub fn file_version_diff(cwd: &Path, version: &FileVersion) -> Result<FileDiff, String> {
+    if remote_workspace::is_remote(cwd) {
+        return Err("File history is not available on remote projects.".into());
+    }
+    let cwd = expand_home(cwd);
+    let root = git_stdout(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(std::path::PathBuf::from)
+        .ok_or("Not a git repository")?;
+    let relative = resolve_repo_path(&root, &version.path)?;
+    let before = match &version.previous_path {
+        Some(path) => resolve_repo_path(&root, path)?,
+        None => relative.clone(),
+    };
+    let (original, current) = if version.sha.is_empty() {
+        (
+            git_blob(&root, &format!("HEAD:{before}")).unwrap_or_default(),
+            std::fs::read(root.join(&relative)).unwrap_or_default(),
+        )
+    } else {
+        let sha = peel_commit(&root, &version.sha)?;
+        let parent = git_stdout(&root, &["rev-parse", "--verify", &format!("{sha}^")]);
+        (
+            parent
+                .and_then(|parent| git_blob(&root, &format!("{parent}:{before}")))
+                .unwrap_or_default(),
+            git_blob(&root, &format!("{sha}:{relative}")).unwrap_or_default(),
+        )
+    };
+    let status = if original.is_empty() && !current.is_empty() {
+        "added"
+    } else if !original.is_empty() && current.is_empty() {
+        "deleted"
+    } else {
+        "modified"
+    };
+    Ok(text_diff(
+        path_to_js(&root.join(&relative)),
+        relative,
+        status,
+        original,
+        current,
+    ))
+}
+
 pub(super) fn text_diff(
     path: String,
     relative: String,

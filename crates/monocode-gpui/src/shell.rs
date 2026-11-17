@@ -826,6 +826,10 @@ pub(crate) struct Shell {
     /// A file tab asked for its row in the Explorer; shown once a window
     /// is at hand.
     pending_explorer_reveal: Option<String>,
+    /// A file tab asked for its file's versions (folder, path).
+    pending_file_history: Option<(String, String)>,
+    /// The open file history window.
+    file_history: Option<(Entity<crate::file_history::FileHistoryDialog>, Subscription)>,
     /// Text and files on their way to a data source's console, handled on the
     /// next frame (which has the window the Database view needs).
     pending_database_sends: Vec<database_send::DbSend>,
@@ -1229,6 +1233,8 @@ impl Shell {
             pending_composer_focus: None,
             pending_chat_reveal: None,
             pending_explorer_reveal: None,
+            pending_file_history: None,
+            file_history: None,
             pending_database_sends: Vec::new(),
             database_dir: crate::data_dir().join("db"),
             api_state_dir: crate::data_dir().join("api"),
@@ -2103,6 +2109,13 @@ impl Shell {
         self.observations.push(cx.subscribe_in(
             &explorer,
             window,
+            |this, _, event: &crate::explorer::ShowFileHistory, window, cx| {
+                this.open_file_history(event.cwd.clone(), event.path.clone(), window, cx);
+            },
+        ));
+        self.observations.push(cx.subscribe_in(
+            &explorer,
+            window,
             |this, _, event: &crate::explorer::OpenFile, window, cx| {
                 this.open_review(
                     crate::review::ReviewTab::File {
@@ -2371,6 +2384,10 @@ impl Shell {
                     }
                     ReviewEvent::ShowInExplorer(path) => {
                         this.pending_explorer_reveal = Some(path.clone());
+                        cx.notify();
+                    }
+                    ReviewEvent::FileHistory { cwd, path } => {
+                        this.pending_file_history = Some((cwd.clone(), path.clone()));
                         cx.notify();
                     }
                     ReviewEvent::Comment(text) => {
@@ -4452,6 +4469,29 @@ impl Shell {
             let explorer = panel.read(cx).explorer.clone();
             explorer.update(cx, |explorer, cx| explorer.follow(&path, cx));
         }
+    }
+    /// One file's versions, in a window over the app.
+    pub(crate) fn open_file_history(
+        &mut self,
+        cwd: String,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        self.close_preview(cx);
+        let view = cx.new(|cx| crate::file_history::FileHistoryDialog::new(cwd, path, window, cx));
+        let events = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, _: &crate::file_history::Event, window, cx| {
+                this.file_history = None;
+                this.focus_workspace(window, cx);
+                cx.notify();
+            },
+        );
+        self.file_history = Some((view, events));
+        cx.notify();
     }
     /// Opens the Explorer on a file's row.
     fn show_in_explorer(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -9038,6 +9078,9 @@ impl Render for Shell {
         if let Some(path) = self.pending_explorer_reveal.take() {
             self.show_in_explorer(&path, window, cx);
         }
+        if let Some((cwd, path)) = self.pending_file_history.take() {
+            self.open_file_history(cwd, path, window, cx);
+        }
         if let Some(id) = self.pending_chat_reveal.take()
             && self.sessions.contains_key(&id)
             && !(self.workspace.active_tab())
@@ -9846,6 +9889,9 @@ impl Render for Shell {
             .child(self.browser_frame(cx))
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
+            .children((self.file_history.as_ref()).map(|(dialog, _)| {
+                crate::modal::window_overlay(window, dialog.clone()).into_any_element()
+            }))
             .children(self.link_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))

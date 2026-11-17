@@ -20,17 +20,23 @@ pub(crate) struct Memory {
     size: Option<(f32, f32)>,
     /// The height the area above the diff was dragged to.
     top: Option<f32>,
+    /// The width the list beside the diff was dragged to.
+    side: Option<f32>,
 }
 pub(crate) type Remembered = Mutex<Memory>;
 pub(crate) const fn remembered() -> Remembered {
     Mutex::new(Memory {
         size: None,
         top: None,
+        side: None,
     })
 }
 
 /// The least either side of the split keeps.
 const SPLIT_MIN: f32 = 72.;
+/// The least a list beside the diff keeps, and the least it leaves the diff.
+const SIDE_MIN: f32 = 160.;
+const SIDE_REST_MIN: f32 = 240.;
 
 /// The size state of one open dialog.
 pub(crate) struct DialogResize {
@@ -44,6 +50,10 @@ pub(crate) struct DialogResize {
     /// A drag of the line above the diff: where it started, the height the
     /// area above had, and the most it may take.
     splitting: Option<(Point<Pixels>, f32, f32)>,
+    /// The width chosen for a list beside the diff, and a drag of the line
+    /// between them: where it started, the width the list had, the room.
+    side: Option<f32>,
+    siding: Option<(Point<Pixels>, f32, f32)>,
     remembered: &'static Remembered,
     /// The least height of the usual size, before any drag.
     usual_min_height: f32,
@@ -63,6 +73,8 @@ impl DialogResize {
             dragging: None,
             top: memory.top,
             splitting: None,
+            side: memory.side,
+            siding: None,
             remembered,
             usual_min_height: 420.,
         }
@@ -110,6 +122,20 @@ impl DialogResize {
         self.top.unwrap_or(usual).clamp(SPLIT_MIN.min(most), most)
     }
 
+    /// The width of a list beside the diff, of `room` shared by the two:
+    /// the dragged width, else `usual`, leaving both sides something.
+    pub(crate) fn side_width(&self, room: f32, usual: f32) -> f32 {
+        Self::side_clamp(self.side.unwrap_or(usual), room)
+    }
+    fn side_clamp(width: f32, room: f32) -> f32 {
+        let most = (room - SIDE_REST_MIN).max(0.);
+        width.clamp(SIDE_MIN.min(most), most)
+    }
+
+    fn start_side(&mut self, at: Point<Pixels>, from: f32, room: f32) {
+        self.siding = Some((at, from, room));
+    }
+
     fn start_split(&mut self, at: Point<Pixels>, from: f32, room: f32) {
         self.splitting = Some((at, from, room));
     }
@@ -131,6 +157,11 @@ impl DialogResize {
             self.top = Some((from + moved).clamp(SPLIT_MIN.min(most), most));
             return true;
         }
+        if let Some((start, from, room)) = self.siding {
+            let moved = (event.position - start).x.as_f32();
+            self.side = Some(Self::side_clamp(from + moved, room));
+            return true;
+        }
         let Some((start, from)) = self.dragging else {
             return false;
         };
@@ -143,12 +174,16 @@ impl DialogResize {
     }
 
     fn finish(&mut self) -> bool {
-        if self.dragging.take().is_none() & self.splitting.take().is_none() {
+        if self.dragging.take().is_none()
+            & self.splitting.take().is_none()
+            & self.siding.take().is_none()
+        {
             return false;
         }
         *self.remembered.lock().unwrap_or_else(|e| e.into_inner()) = Memory {
             size: self.custom,
             top: self.top,
+            side: self.side,
         };
         true
     }
@@ -259,6 +294,47 @@ pub(crate) fn split_handle<V: Resizable>(
                     MouseButton::Left,
                     cx.listener(move |this: &mut V, event: &gpui::MouseDownEvent, _, cx| {
                         this.dialog_resize().start_split(event.position, top, room);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The line between a list and the diff beside it, dragged left and right.
+/// It takes no width: put it between the two in their row. `width` is the
+/// width the list has, of `room` shared by the two.
+pub(crate) fn side_handle<V: Resizable>(
+    id: &'static str,
+    width: f32,
+    room: f32,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    div()
+        .relative()
+        .w_0()
+        .h_full()
+        .flex_shrink_0()
+        .child(
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .role(gpui::Role::Splitter)
+                .aria_label("Resize the list")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                // Over the list's edge, where the diff painted after it
+                // cannot cover it.
+                .left(px(-6.))
+                .w(px(7.))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .hover(|s| s.bg(content(0.12)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut V, event: &gpui::MouseDownEvent, _, cx| {
+                        this.dialog_resize().start_side(event.position, width, room);
                         cx.stop_propagation();
                         cx.notify();
                     }),

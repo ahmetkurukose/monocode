@@ -237,6 +237,12 @@ pub(crate) struct SendFileToDatabase {
     pub source: String,
 }
 impl EventEmitter<SendFileToDatabase> for Explorer {}
+/// A file's versions were asked for from the menu.
+pub(crate) struct ShowFileHistory {
+    pub cwd: String,
+    pub path: String,
+}
+impl EventEmitter<ShowFileHistory> for Explorer {}
 /// Shared file-action toast state. Name validation remains local to its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileActionError(pub Option<String>);
@@ -1161,6 +1167,9 @@ impl Explorer {
                 .danger()
                 .into(),
             MenuItem::Separator,
+            MenuAction::new("git-history", "Git History")
+                .disabled(target.is_dir)
+                .into(),
             MenuAction::new("reveal", REVEAL_LABEL).into(),
         ];
         if !sources.is_empty() {
@@ -1230,6 +1239,10 @@ impl Explorer {
             "rename" => self.start_rename(target.path, window, cx),
             "delete" => self.delete(target.path, window, cx),
             "reveal" => self.reveal(target.path, window, cx),
+            "git-history" if !target.is_dir => cx.emit(ShowFileHistory {
+                cwd: self.cwd.clone(),
+                path: target.path,
+            }),
             id if id.starts_with("send-db:") => cx.emit(SendFileToDatabase {
                 path: target.path,
                 source: id["send-db:".len()..].to_owned(),

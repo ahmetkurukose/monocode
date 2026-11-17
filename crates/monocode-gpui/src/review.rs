@@ -181,6 +181,11 @@ pub(crate) enum ReviewEvent {
     Empty,
     /// A file's tab asked for its row in the Explorer.
     ShowInExplorer(String),
+    /// A file's tab asked for the file's versions.
+    FileHistory {
+        cwd: String,
+        path: String,
+    },
     WordWrap(bool),
 }
 
@@ -1527,6 +1532,7 @@ impl ReviewPane {
                 MenuAction::new("copy-relative-path", "Copy Relative Path").into(),
                 MenuAction::new("copy-name", "Copy File Name").into(),
                 crate::popover::MenuItem::Separator,
+                MenuAction::new("git-history", "Git History").into(),
                 MenuAction::new("show-in-explorer", "Show in Explorer").into(),
                 MenuAction::new("reveal", REVEAL_LABEL).into(),
             ]);
@@ -1548,6 +1554,10 @@ impl ReviewPane {
                     ("copy-name", Some((_, path))) => {
                         copy(path.rsplit('/').next().unwrap_or(path).to_owned(), cx)
                     }
+                    ("git-history", Some((cwd, path))) => cx.emit(ReviewEvent::FileHistory {
+                        cwd: cwd.clone(),
+                        path: path.clone(),
+                    }),
                     ("show-in-explorer", Some((_, path))) => {
                         cx.emit(ReviewEvent::ShowInExplorer(path.clone()))
                     }
@@ -2069,11 +2079,16 @@ mod tests {
                     cx,
                 );
                 pane.set_visible(true, cx);
-                cx.subscribe(&cx.entity(), move |_, _, event: &ReviewEvent, _| {
-                    if let ReviewEvent::ShowInExplorer(path) = event {
-                        seen.borrow_mut().push(path.clone());
-                    }
-                })
+                cx.subscribe(
+                    &cx.entity(),
+                    move |_, _, event: &ReviewEvent, _| match event {
+                        ReviewEvent::ShowInExplorer(path) => seen.borrow_mut().push(path.clone()),
+                        ReviewEvent::FileHistory { cwd, path } => {
+                            seen.borrow_mut().push(format!("history {cwd} {path}"))
+                        }
+                        _ => {}
+                    },
+                )
             })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
@@ -2097,7 +2112,11 @@ mod tests {
         assert_eq!(pick("copy-relative-path").as_deref(), Some("src/lib.rs"));
         assert_eq!(pick("copy-name").as_deref(), Some("lib.rs"));
         pick("show-in-explorer");
-        assert_eq!(*asked.borrow(), vec![path.clone()]);
+        pick("git-history");
+        assert_eq!(
+            *asked.borrow(),
+            vec![path.clone(), format!("history {cwd} {path}")]
+        );
 
         // A tab that is not one file keeps the two actions it had.
         window

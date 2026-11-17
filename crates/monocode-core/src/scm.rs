@@ -18,7 +18,8 @@ use serde_json::json;
 
 pub use review::{
     commit_file_diff, commit_files, diff_files, file_diff, file_diff_head, file_diff_versions,
-    review_index, stage_contents, FileDiff, FileDiffVersion, MAX_TEXT_FILE_BYTES,
+    file_history, file_version_diff, review_index, stage_contents, FileDiff, FileDiffVersion,
+    FileVersion, MAX_TEXT_FILE_BYTES,
 };
 pub(crate) use shell::{expand_home, path_to_js};
 pub use stash::{
