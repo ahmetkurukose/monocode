@@ -495,6 +495,8 @@ impl Shell {
         });
     }
     pub(super) fn move_dock_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // A run or a feature's view reorders but never leaves the dock.
+        let stays = (self.dock_drag.as_ref()).is_some_and(|d| self.dock_tab_stays(d.from, cx));
         let Some(drag) = self.dock_drag.as_mut() else {
             return;
         };
@@ -503,7 +505,7 @@ impl Shell {
             cx.notify();
             return;
         }
-        if (event.position.y - drag.start.y).abs() > DOCK_PULL {
+        if (event.position.y - drag.start.y).abs() > DOCK_PULL && !stays {
             let (source, start) = (DragSource::DockTerminal(drag.from), drag.start);
             self.dock_drag = None;
             self.dock_skip_click = true;
@@ -673,6 +675,7 @@ impl Shell {
             window.request_animation_frame();
         }
         let move_anchor = self.move_terminal_anchor.clone();
+        let controls = self.dock_tab_controls(dock, cx);
         div()
             .h(px(36.))
             .flex_shrink_0()
@@ -704,7 +707,8 @@ impl Shell {
                             .map(|(ix, terminal)| {
                                 let t = terminal.read(cx);
                                 let label: SharedString = t.title.clone().into();
-                                let agent = t.agent();
+                                // A shell's tile, a run's status dot or a view's icon.
+                                let tile = t.tile(cx);
                                 let description =
                                     SharedString::from(format!("{} — {}", t.title, t.cwd));
                                 let active = ix == dock.active;
@@ -791,7 +795,7 @@ impl Shell {
                                                     d.text_color(content(0.5))
                                                 }
                                             })
-                                            .child(crate::tab_tile::terminal_tile(agent))
+                                            .child(tile)
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -937,6 +941,8 @@ impl Shell {
                         )
                     }),
             )
+            // The selected run's or view's own controls.
+            .children(controls)
             .when(!in_panel, |d| {
                 d.child(
                     div()
@@ -1156,6 +1162,7 @@ impl Shell {
                 192.,
                 MenuStyle::Explorer,
             )),
+            MenuTarget::FooterChip(id) => Some(self.code_chip_menu(id, cx)),
             _ => None,
         }
     }

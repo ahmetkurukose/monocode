@@ -15,6 +15,7 @@ mod branch_popup;
 mod browser;
 mod change_tree;
 mod changes;
+mod code_shell;
 mod commit_dialog;
 mod composer_completion;
 mod composer_motion;
@@ -459,6 +460,7 @@ fn main() {
             diff_view::bind(cx);
             fonts::init(cx);
             terminal::bind(cx);
+            code_shell::register(cx);
             let modifier = if cfg!(target_os = "macos") {
                 "cmd"
             } else {
