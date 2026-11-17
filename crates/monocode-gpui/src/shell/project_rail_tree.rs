@@ -770,6 +770,159 @@ mod tests {
         visual.run_until_parked();
     }
 
+    #[gpui::test]
+    fn the_compact_rails_three_buttons_work_without_a_sessions_column(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| shell.open(session, w, cx))
+            .unwrap();
+        tree(window, visual, &[]);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project_rail_open = false;
+                shell.workspace.right_panel_open = false;
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let click = |visual: &mut VisualTestContext, id: &'static str| {
+            let at = visual.debug_bounds(id).unwrap().center();
+            visual.simulate_click(at, gpui::Modifiers::none());
+            visual.run_until_parked();
+        };
+        let panel = |shell: &Shell, cx: &App| {
+            (shell.workspace.right_panel_open)
+                .then(|| shell.right_panel.as_ref().map(|panel| panel.read(cx).tab()))
+                .flatten()
+        };
+        use crate::right_panel::RightTab;
+        // Explorer and Changes are the right panel's tabs here.
+        click(visual, "rail-workspace-files");
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(panel(shell, cx), Some(RightTab::Files));
+                assert!(!shell.workspace.project_rail_open, "the rail stays compact");
+            })
+            .unwrap();
+        click(visual, "rail-workspace-changes");
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(panel(shell, cx), Some(RightTab::Changes));
+            })
+            .unwrap();
+        // Pressed again, the one that is showing closes the panel.
+        click(visual, "rail-workspace-changes");
+        window
+            .update(visual, |shell, _, cx| assert_eq!(panel(shell, cx), None))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_compact_rail_lists_sessions_as_a_tree_under_the_pointer(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, other, session) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| shell.open(session, w, cx))
+            .unwrap();
+        tree(window, visual, &[]);
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project_rail_open = false;
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let button = visual.debug_bounds("rail-workspace-sessions").unwrap();
+        let rest = |visual: &mut VisualTestContext, millis: u64| {
+            visual
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(millis));
+            visual.run_until_parked();
+        };
+        let open = |visual: &mut VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    shell.menu_open(&MenuTarget::RailSessions)
+                })
+                .unwrap()
+        };
+        // Crossing the button does not open the list; resting on it does,
+        // and the rail stays as small as it was made.
+        visual.simulate_mouse_move(button.center(), None, gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(!open(visual));
+        rest(visual, 250);
+        assert!(open(visual));
+        window
+            .update(visual, |shell, _, _| {
+                assert!(!shell.workspace.project_rail_open)
+            })
+            .unwrap();
+        // Projects are listed closed, as in the tree; a click opens one
+        // and its sessions are listed under it, in the tree too.
+        let project = "/work/another-project";
+        assert!(at(visual, format!("menu-action-rail-session:{other}")).is_none());
+        let row = at(visual, format!("menu-action-rail-project:{project}")).unwrap();
+        visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        visual.simulate_click(row.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(open(visual), "the list stays while projects are opened");
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.project_rail_expanded(project))
+            })
+            .unwrap();
+        let row = at(visual, format!("menu-action-rail-session:{other}")).unwrap();
+        // The pointer on the list keeps it open however long it stays.
+        visual.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        rest(visual, 1000);
+        assert!(open(visual));
+        // A session picked there comes in front and the list goes.
+        visual.simulate_click(row.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(!open(visual));
+        window
+            .update(visual, |shell, _, _| {
+                assert_eq!(shell.workspace.active, Some(other));
+                assert!(!shell.workspace.project_rail_open);
+            })
+            .unwrap();
+        // Opened again and left alone, it closes by itself.
+        rest(visual, 500);
+        let button = visual.debug_bounds("rail-workspace-sessions").unwrap();
+        visual.simulate_mouse_move(
+            gpui::point(px(900.), px(600.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        visual.run_until_parked();
+        visual.simulate_mouse_move(button.center(), None, gpui::Modifiers::none());
+        visual.run_until_parked();
+        rest(visual, 250);
+        assert!(open(visual));
+        visual.simulate_mouse_move(
+            gpui::point(px(900.), px(600.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        rest(visual, 200);
+        assert!(open(visual), "a moment away is forgiven");
+        rest(visual, 400);
+        assert!(!open(visual));
+        // A click opens it without the wait, and closes it again.
+        visual.simulate_click(button.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(open(visual));
+        visual.simulate_click(button.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(!open(visual));
+    }
+
     fn at(visual: &mut VisualTestContext, id: String) -> Option<gpui::Bounds<Pixels>> {
         visual.debug_bounds(Box::leak(id.into_boxed_str()))
     }

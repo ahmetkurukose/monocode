@@ -386,6 +386,8 @@ pub(crate) enum MenuTarget {
     /// The original project rail's local or remote folder menu.
     ProjectRailAdd,
     CompactProjectPicker,
+    /// The compact rail's sessions, as the tree lists them.
+    RailSessions,
     ProjectRailGroup(String),
     SessionFilter,
     SidebarOptions,
@@ -872,6 +874,10 @@ pub(crate) struct Shell {
     dock_tab_scroll: ScrollHandle,
     move_terminal_anchor: AnchorSlot,
     terminal_chip_anchor: AnchorSlot,
+    /// The compact rail's Sessions button, and the wait that opens its
+    /// list under the pointer and closes it once the pointer has left.
+    rail_sessions_anchor: AnchorSlot,
+    rail_sessions_hover: Option<gpui::Task<()>>,
     live_mark: Option<Entity<terminal_dock::LiveMark>>,
     /// The sidebar collapsed itself to make room; it returns with the room.
     sidebar_auto_hidden: bool,
@@ -1257,6 +1263,8 @@ impl Shell {
             dock_tab_scroll: ScrollHandle::new(),
             move_terminal_anchor: AnchorSlot::default(),
             terminal_chip_anchor: AnchorSlot::default(),
+            rail_sessions_anchor: AnchorSlot::default(),
+            rail_sessions_hover: None,
             live_mark: None,
             viewport_width: 1200.,
             viewport_height: 800.,
@@ -5744,6 +5752,21 @@ impl Shell {
                     menu.update(cx, |menu, cx| menu.replace_items(items, cx));
                     return;
                 }
+                // A project row opens or closes its sessions, here and in
+                // the rail's own tree; the menu stays.
+                if let MenuEvent::Picked(id, _) = event
+                    && let Some(project) = id.strip_prefix("rail-project:")
+                    && let Some(open) = this
+                        .menu
+                        .as_ref()
+                        .filter(|m| m.target == MenuTarget::RailSessions)
+                {
+                    let menu = open.menu.clone();
+                    this.toggle_project_rail_expanded(project, cx);
+                    let items = this.rail_sessions_menu_items(cx);
+                    menu.update(cx, |menu, cx| menu.replace_items(items, cx));
+                    return;
+                }
                 if let MenuEvent::Picked(id, _) = event
                     && id != "archived"
                     && let Some(open) = this
@@ -5803,6 +5826,12 @@ impl Shell {
                 "Actions".into(),
                 self.actions_menu(),
                 200.,
+                MenuStyle::Explorer,
+            ),
+            MenuTarget::RailSessions => (
+                "Sessions".into(),
+                self.rail_sessions_menu_items(cx),
+                280.,
                 MenuStyle::Explorer,
             ),
             MenuTarget::NewTab => (
@@ -6320,6 +6349,14 @@ impl Shell {
                 _ => {}
             },
             MenuTarget::CompactProjectPicker => {}
+            MenuTarget::RailSessions => {
+                if let Some(id) = action
+                    .strip_prefix("rail-session:")
+                    .and_then(|id| id.parse::<i64>().ok())
+                {
+                    self.open(id, window, cx);
+                }
+            }
             MenuTarget::ProjectRailGroup(id) => {
                 if action == "delete-project-group" {
                     self.workspace.project_rail_groups.retain(|g| g.id != id);
@@ -9793,6 +9830,9 @@ impl Render for Shell {
                     )
                     .when(point, |p| p.gap(0.))
                     .when(beside, |p| p.side(Side::Right))
+                    .when(open.target == MenuTarget::RailSessions, |p| {
+                        p.side(Side::Right).align(Align::Start).max_height(520.)
+                    })
                     .when(open.target == MenuTarget::SidebarOptions, |p| {
                         p.align(Align::Start)
                     })

@@ -1,5 +1,6 @@
 //! Original project navigation. Its list and shared image cache stay independent
 //! from streamed conversations; Git counters use one visible-project batch.
+use super::classic_sidebar::ClassicSidebarTab;
 use super::*;
 use crate::{
     right_panel::{DIFF_ADD, DIFF_DEL, format_integer, tabular},
@@ -174,7 +175,181 @@ impl Render for ProjectTooltip {
             .child(self.0.clone())
     }
 }
+/// How long the pointer rests on the Sessions button before its list
+/// opens, and how often the open list checks that the pointer is still there.
+const RAIL_SESSIONS_OPEN_MS: u64 = 200;
+const RAIL_SESSIONS_WATCH_MS: u64 = 120;
+
+/// Where the compact rail's Explorer and Changes are when the tree is on.
+fn rail_panel_tab(tab: ClassicSidebarTab) -> Option<crate::right_panel::RightTab> {
+    match tab {
+        ClassicSidebarTab::Sessions => None,
+        ClassicSidebarTab::Files => Some(crate::right_panel::RightTab::Files),
+        ClassicSidebarTab::Changes => Some(crate::right_panel::RightTab::Changes),
+    }
+}
 impl Shell {
+    fn open_rail_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let anchor = Anchor::Slot(self.rail_sessions_anchor.clone());
+        self.open_menu(MenuTarget::RailSessions, anchor, window, cx);
+    }
+    /// The pointer came to rest on the Sessions button, or left it. The
+    /// list opens after a moment, so that crossing the rail does not flash
+    /// it, and closes once the pointer has left both the button and the list.
+    fn hover_rail_sessions(&mut self, hovering: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !hovering {
+            if !self.menu_open(&MenuTarget::RailSessions) {
+                self.rail_sessions_hover = None;
+            }
+            return;
+        }
+        if self.rail_sessions_hover.is_some() || self.menu.is_some() {
+            return;
+        }
+        self.rail_sessions_hover = Some(cx.spawn_in(window, async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let wait = |millis: u64| executor.timer(std::time::Duration::from_millis(millis));
+            wait(RAIL_SESSIONS_OPEN_MS).await;
+            let opened = this.update_in(cx, |this, window, cx| {
+                if this.menu.is_none() {
+                    this.open_rail_sessions(window, cx);
+                }
+                this.menu_open(&MenuTarget::RailSessions)
+            });
+            let mut away = 0;
+            while matches!(opened, Ok(true)) && away < 3 {
+                wait(RAIL_SESSIONS_WATCH_MS).await;
+                let Ok(over) = this.update_in(cx, |this, window, cx| {
+                    this.rail_sessions_under(window.mouse_position(), cx)
+                }) else {
+                    return;
+                };
+                match over {
+                    // Closed some other way: nothing left to watch.
+                    None => break,
+                    Some(true) => away = 0,
+                    Some(false) => away += 1,
+                }
+            }
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.rail_sessions_hover = None;
+                if away >= 3 && this.menu_open(&MenuTarget::RailSessions) {
+                    this.close_menu(cx);
+                }
+            });
+        }));
+    }
+    /// Whether the pointer is on the Sessions button or its open list;
+    /// `None` when the list is not open.
+    fn rail_sessions_under(&self, at: Point<Pixels>, cx: &App) -> Option<bool> {
+        let open = (self.menu.as_ref()).filter(|m| m.target == MenuTarget::RailSessions)?;
+        // A little slack, for the gap between the button and the list.
+        let near = |bounds: Option<Bounds<Pixels>>| {
+            bounds.is_some_and(|bounds| bounds.dilate(px(10.)).contains(&at))
+        };
+        Some(
+            near(self.rail_sessions_anchor.get())
+                || near(open.menu.read(cx).surface_region().get()),
+        )
+    }
+    /// The sessions the tree lists, as a list to pick from: each project
+    /// with its sessions under it, opened and closed like the tree's.
+    pub(super) fn rail_sessions_menu_items(&self, cx: &App) -> Vec<MenuItem> {
+        let pinned = &self.workspace.project_rail_pinned;
+        let projects = &self.workspace.projects;
+        let ordered = (projects.iter().filter(|p| pinned.contains(*p)))
+            .chain(projects.iter().filter(|p| !pinned.contains(*p)))
+            .filter(|p| !self.workspace.archived_projects.contains(*p));
+        let mut items: Vec<MenuItem> = Vec::new();
+        for project in ordered {
+            let expanded = self.project_rail_expanded(project);
+            items.push(
+                MenuAction::new(
+                    format!("rail-project:{project}"),
+                    self.project_label(project),
+                )
+                .icon(if expanded {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                })
+                .keep_open()
+                .into(),
+            );
+            if !expanded {
+                continue;
+            }
+            let mut sessions = 0;
+            for row in self.project_rail_children(project, cx) {
+                match row {
+                    ProjectRailRow::Session { id, .. } => {
+                        sessions += 1;
+                        let meta = self.session_metadata(id, cx);
+                        let provider =
+                            monocode_core::provider::Kind::from_id(&meta.summary.provider);
+                        items.push(
+                            MenuAction::new(format!("rail-session:{id}"), meta.display_title())
+                                .image(provider.id())
+                                .indent(16.)
+                                .checked(self.workspace.active == Some(id))
+                                .into(),
+                        );
+                    }
+                    ProjectRailRow::More { hidden, .. } => items.push(
+                        MenuAction::new("rail-more", format!("{hidden} more in the tree"))
+                            .indent(16.)
+                            .disabled(true)
+                            .into(),
+                    ),
+                    _ => {}
+                }
+            }
+            if sessions == 0 {
+                items.push(
+                    MenuAction::new("rail-empty", "No sessions")
+                        .indent(16.)
+                        .disabled(true)
+                        .into(),
+                );
+            }
+        }
+        if items.is_empty() {
+            items.push(MenuItem::Note("No projects yet.".into()));
+        }
+        items
+    }
+    /// The compact rail's three buttons with the tree on. There is no
+    /// sessions column to switch then: Sessions lists them in a menu of
+    /// its own, and the other two show (or, when already shown, close)
+    /// their tab of the right panel.
+    fn open_rail_tab_with_tree(
+        &mut self,
+        tab: ClassicSidebarTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel_tab) = rail_panel_tab(tab) else {
+            self.rail_sessions_hover = None;
+            if self.menu_open(&MenuTarget::RailSessions) {
+                self.close_menu(cx);
+            } else {
+                self.open_rail_sessions(window, cx);
+            }
+            return;
+        };
+        self.ensure_right_panel(window, cx);
+        let Some(panel) = self.right_panel.clone() else {
+            return;
+        };
+        if self.workspace.right_panel_open && panel.read(cx).tab() == panel_tab {
+            self.set_right_panel_open(false, window, cx);
+        } else {
+            panel.update(cx, |panel, cx| panel.select(panel_tab, cx));
+            self.set_right_panel_open(true, window, cx);
+        }
+        self.persist(cx);
+        cx.notify();
+    }
     pub(super) fn project_rail_drawn_width(&self) -> f32 {
         if !self.workspace.classic_layout {
             0.
@@ -860,9 +1035,20 @@ impl Shell {
                     ClassicSidebarTab::Files => ("Explorer", "file-script"),
                     ClassicSidebarTab::Changes => ("Changes", "git-branch"),
                 };
-                let selected = workspace_active
-                    && self.workspace.sidebar_visible
-                    && self.classic_sidebar_tab == tab;
+                // With the tree the sessions column is gone: Explorer and
+                // Changes are the right panel's, and are lit while it shows them.
+                let selected = if self.project_rail_tree_on() {
+                    workspace_active
+                        && self.workspace.right_panel_open
+                        && self
+                            .right_panel
+                            .as_ref()
+                            .is_some_and(|panel| Some(panel.read(cx).tab()) == rail_panel_tab(tab))
+                } else {
+                    workspace_active
+                        && self.workspace.sidebar_visible
+                        && self.classic_sidebar_tab == tab
+                };
                 let changed = tab == ClassicSidebarTab::Changes
                     && self
                         .git
@@ -885,6 +1071,18 @@ impl Shell {
                 .size(px(32.))
                 .relative()
                 .when(selected, |d| d.bg(content(0.1)))
+                .when(
+                    tab == ClassicSidebarTab::Sessions && self.project_rail_tree_on(),
+                    |d| {
+                        d.child(self.rail_sessions_anchor.probe())
+                            .when(self.menu_open(&MenuTarget::RailSessions), |d| {
+                                d.bg(content(0.1))
+                            })
+                            .on_hover(cx.listener(|this, hovering: &bool, w, cx| {
+                                this.hover_rail_sessions(*hovering, w, cx)
+                            }))
+                    },
+                )
                 .when(changed, |d| {
                     d.child(
                         div()
@@ -902,7 +1100,11 @@ impl Shell {
                     if let Some(m) = &this.monos {
                         m.update(cx, |m, cx| m.close(cx));
                     }
-                    this.select_classic_sidebar_tab(tab, w, cx);
+                    if this.project_rail_tree_on() {
+                        this.open_rail_tab_with_tree(tab, w, cx);
+                    } else {
+                        this.select_classic_sidebar_tab(tab, w, cx);
+                    }
                     this.projects_frame.update(cx, |_, cx| cx.notify());
                 }))
             }))

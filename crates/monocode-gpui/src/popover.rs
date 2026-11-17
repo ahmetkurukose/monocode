@@ -811,6 +811,8 @@ pub(crate) struct MenuAction {
     pub switch: bool,
     /// Checkbox-style actions can update their owner without dismissing the menu.
     pub keep_open: bool,
+    /// Extra space before the row, for a row listed under another.
+    pub indent: f32,
     pub submenu: Vec<MenuAction>,
     pub flyout: Option<Flyout>,
 }
@@ -875,6 +877,10 @@ impl MenuAction {
         self.checked = on;
         self.switch = true;
         self.keep_open = true;
+        self
+    }
+    pub(crate) fn indent(mut self, indent: f32) -> Self {
+        self.indent = indent;
         self
     }
     pub(crate) fn keep_open(mut self) -> Self {
@@ -1288,6 +1294,7 @@ impl Menu {
             .w_full()
             .flex()
             .px_2()
+            .when(action.indent > 0., |d| d.pl(px(8. + action.indent)))
             .text_size(px(if style == MenuStyle::Git { 12. } else { 13. }))
             .text_color(ink)
             .when(dim, |d| d.opacity(0.4))
