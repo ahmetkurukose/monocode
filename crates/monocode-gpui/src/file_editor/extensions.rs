@@ -315,6 +315,22 @@ impl FileEditor {
         });
         cx.notify();
     }
+    /// A menu at `position` for a feature that has no view of its own to
+    /// hang one from: a gutter marker's tasks.
+    pub(crate) fn open_menu_at(
+        &mut self,
+        label: &'static str,
+        items: Vec<MenuItem>,
+        position: Point<Pixels>,
+        on_pick: impl Fn(&str, &mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_pick = move |_: &mut Self, id: &str, window: &mut Window, cx: &mut Context<Self>| {
+            on_pick(id, window, cx)
+        };
+        self.open_header_menu(label, items, position, on_pick, window, cx);
+    }
     pub(super) fn header_menu(&self, cx: &App) -> Option<AnyElement> {
         self.extensions.menu.as_ref().map(|state| {
             menu_popover(&state.menu, Anchor::Point(state.position), cx)

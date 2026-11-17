@@ -246,3 +246,17 @@ pub(crate) fn open_url(url: &str, window: &mut Window, cx: &mut App) -> bool {
     })
     .unwrap_or(false)
 }
+
+/// Shows the user a sentence: why something a feature was asked for did not
+/// happen. False before the window has drawn.
+pub(crate) fn notice(text: impl Into<String>, window: &mut Window, cx: &mut App) -> bool {
+    let text = text.into();
+    super::with_shell(window, cx, |shell, _, cx| shell.code_notice(text, cx)).is_some()
+}
+
+/// An agent session's title, for saying who started something. Reads the
+/// shell, so not from inside a closure the shell calls while it draws.
+pub(crate) fn session_title(session: i64, cx: &App) -> Option<String> {
+    let shell = cx.try_global::<super::Host>()?.shell.upgrade()?;
+    shell.read(cx).code_session_title(session)
+}

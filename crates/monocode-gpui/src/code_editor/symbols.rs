@@ -56,7 +56,8 @@ pub(crate) enum RunnableKind {
 pub(crate) struct Runnable {
     pub kind: RunnableKind,
     pub name: String,
-    /// The class of a test method.
+    /// The classes around a test method or a nested test class, outermost
+    /// first and joined with `::`.
     pub class_name: Option<String>,
     /// Zero-based row of the `def`, `class` or `if` line.
     pub row: usize,
@@ -296,6 +297,68 @@ fn undecorated(node: Node) -> Node {
     }
 }
 
+/// A test class and what it holds: its test methods, and the test classes
+/// nested in it. `outer` is the classes around it, outermost first.
+fn python_test_class(node: Node, text: &str, outer: &[&str], runnables: &mut Vec<Runnable>) {
+    let Some(class) = node
+        .child_by_field_name("name")
+        .map(|name| text_of(name, text))
+    else {
+        return;
+    };
+    let unittest = node
+        .child_by_field_name("superclasses")
+        .is_some_and(|bases| {
+            let mut cursor = bases.walk();
+            bases
+                .named_children(&mut cursor)
+                .any(|base| text_of(base, text).ends_with("TestCase"))
+        });
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    let members: Vec<(Node, &str)> = body
+        .named_children(&mut cursor)
+        .map(undecorated)
+        .filter_map(|member| {
+            let name = member.child_by_field_name("name")?;
+            Some((member, text_of(name, text)))
+        })
+        .collect();
+    let method = |member: &(Node, &str)| member.0.kind() == "function_definition";
+    // pytest skips a Test* class that has a constructor.
+    let pytest = class.starts_with("Test")
+        && !members
+            .iter()
+            .any(|member| method(member) && member.1 == "__init__");
+    if !unittest && !pytest {
+        return;
+    }
+    let joined = |classes: &[&str]| (!classes.is_empty()).then(|| classes.join("::"));
+    runnables.push(Runnable {
+        kind: RunnableKind::TestClass,
+        name: class.to_owned(),
+        class_name: joined(outer),
+        row: node.start_position().row,
+    });
+    let chain: Vec<&str> = outer.iter().copied().chain([class]).collect();
+    for member in members {
+        if method(&member) {
+            if member.1.starts_with("test") {
+                runnables.push(Runnable {
+                    kind: RunnableKind::TestMethod,
+                    name: member.1.to_owned(),
+                    class_name: joined(&chain),
+                    row: member.0.start_position().row,
+                });
+            }
+        } else if member.0.kind() == "class_definition" {
+            python_test_class(member.0, text, &chain, runnables);
+        }
+    }
+}
+
 fn python_runnables_in(tree: &Tree, text: &str) -> Vec<Runnable> {
     let mut runnables = Vec::new();
     let root = tree.root_node();
@@ -306,7 +369,9 @@ fn python_runnables_in(tree: &Tree, text: &str) -> Vec<Runnable> {
             .child_by_field_name("name")
             .map(|name| text_of(name, text));
         match (node.kind(), name) {
-            ("function_definition", Some(name)) if name.starts_with("test_") => {
+            // pytest's default `python_functions` and unittest's loader both
+            // go by the bare prefix.
+            ("function_definition", Some(name)) if name.starts_with("test") => {
                 runnables.push(Runnable {
                     kind: RunnableKind::TestFunction,
                     name: name.to_owned(),
@@ -314,53 +379,7 @@ fn python_runnables_in(tree: &Tree, text: &str) -> Vec<Runnable> {
                     row: node.start_position().row,
                 });
             }
-            ("class_definition", Some(class)) => {
-                let unittest = node
-                    .child_by_field_name("superclasses")
-                    .is_some_and(|bases| {
-                        let mut cursor = bases.walk();
-                        bases
-                            .named_children(&mut cursor)
-                            .any(|base| text_of(base, text).ends_with("TestCase"))
-                    });
-                let Some(body) = node.child_by_field_name("body") else {
-                    continue;
-                };
-                let mut cursor = body.walk();
-                let methods: Vec<(Node, &str)> = body
-                    .named_children(&mut cursor)
-                    .map(undecorated)
-                    .filter(|method| method.kind() == "function_definition")
-                    .filter_map(|method| {
-                        let name = method.child_by_field_name("name")?;
-                        Some((method, text_of(name, text)))
-                    })
-                    .collect();
-                // pytest skips a Test* class that has a constructor.
-                let pytest = class.starts_with("Test")
-                    && !methods.iter().any(|(_, name)| *name == "__init__");
-                if !unittest && !pytest {
-                    continue;
-                }
-                runnables.push(Runnable {
-                    kind: RunnableKind::TestClass,
-                    name: class.to_owned(),
-                    class_name: None,
-                    row: node.start_position().row,
-                });
-                // unittest collects every method named test*.
-                let prefix = if unittest { "test" } else { "test_" };
-                for (method, name) in methods {
-                    if name.starts_with(prefix) {
-                        runnables.push(Runnable {
-                            kind: RunnableKind::TestMethod,
-                            name: name.to_owned(),
-                            class_name: Some(class.to_owned()),
-                            row: method.start_position().row,
-                        });
-                    }
-                }
-            }
+            ("class_definition", Some(_)) => python_test_class(node, text, &[], &mut runnables),
             ("if_statement", _) => {
                 let guard: String = node
                     .child_by_field_name("condition")
@@ -521,6 +540,31 @@ if __name__ == '__main__':
                     row("def testOld")
                 ),
                 (Main, "__main__".into(), None, row("if __name__")),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_runnables_take_the_bare_prefix_and_nested_test_classes() {
+        let text = "def testplain():\n    pass\n\nclass TestOuter:\n    def testcamel(self):\n        pass\n\n    class TestInner:\n        def test_deep(self):\n            pass\n\n    class Helper:\n        def test_not_collected(self):\n            pass\n";
+        let found: Vec<_> = python_runnables(text)
+            .into_iter()
+            .map(|r| (r.kind, r.name, r.class_name))
+            .collect();
+        use RunnableKind::*;
+        let class = |name: &str| Some(name.to_owned());
+        assert_eq!(
+            found,
+            [
+                (TestFunction, "testplain".into(), None),
+                (TestClass, "TestOuter".into(), None),
+                (TestMethod, "testcamel".into(), class("TestOuter")),
+                (TestClass, "TestInner".into(), class("TestOuter")),
+                (
+                    TestMethod,
+                    "test_deep".into(),
+                    class("TestOuter::TestInner")
+                ),
             ]
         );
     }
