@@ -294,6 +294,9 @@ top-level session ends.
 `start_request`, `restart(id)` (ends the session and starts its request again in the same
 slot, new id; debugpy has no in-place restart), `sessions()`, `get(id)`, `remove(id)`,
 `stop_all()`, and `stop_all` on drop. `start` and `restart` block for the adapter's start.
+`subscribe()` gives an `async_channel::Receiver<ManagerEvent>` of `Added(id)` / `Removed(id)`
+for top-level sessions, whoever starts or ends them (a restart is `Removed` then `Added`;
+nothing is replayed, so read `sessions()` once after subscribing).
 Ending a session sends `disconnect`, kills the adapter's process group and, for a debuggee
 the adapter started itself, the debuggee's group. `Actor::{User, Agent(id)}`:
 `session.origin()` is who started it, `driver()` who steers it, `take_over(actor)` changes
@@ -333,7 +336,7 @@ installs itself with one line in `code_shell::register`, called once from `main.
 | `commands` | `register_commands(id, source, cx)` for the `>` palette; `register_mode(Mode, cx)` for a prefix mode (`@`) with asynchronous rows. |
 | `settings` | `register(SettingsPage, cx)`: a row in the project menu opening the feature's form in the project dialog; `PageHost::save` stores a JSON value per project and page, `settings::value` reads it. |
 | `context` | `focused_checkout`, `focused_file`, `checkout_for_path`, `checkout_for_pane`, `terminal_setup`, `toolchain`, `open_file`, `open_url`; `events(cx)` emits `CodeEvent::{ProjectOpened, ProjectClosed, CheckoutAdded, CheckoutRemoved, FocusedFileChanged}`; `on_quit(cx, f)`. |
-| `rail` | `set_status(session, text, cx)`, `clear_status(session, cx)`: a status on the session's rail row in place of its age. |
+| `rail` | `set_status(session, text, cx)`, `clear_status(session, cx)`: a status on the session's rail row in place of its age. `session_label(session, cx)`: the session's title as the rail shows it. |
 
 How it is built:
 
@@ -398,7 +401,7 @@ and features meet.
 | `signature` | `SignatureProvider` | on `(` and `,`, then at every caret move until it answers `None`; Cmd+Shift+Space |
 | `links` | `LinkProvider` | Cmd-hover (underline), Cmd-click, F12, context menu |
 | `references` | `ReferencesProvider` | Shift+F12, context menu |
-| `breakpoints`, `run_markers` | `GutterProvider` | a press in its gutter column; an edit moved its marks |
+| `breakpoints`, `run_markers` | `GutterProvider` | a press in its gutter column (`menu` first: a `GutterMenu` the editor opens at the press, else `click`); an edit moved its marks |
 | `header` | `HeaderProvider` | every draw of the header: buttons, optional crumbs |
 
 The built-in completers (QuickJS, the SQL console's) still answer when no provider is
@@ -416,6 +419,79 @@ file name followed by the crumbs of the caret's enclosing symbols, the problem c
 `chain_at(&outline, offset)`, `enclosing(path, text, offset)` for Python, JavaScript,
 TypeScript, Rust, Go, Java, C/C++ and Ruby, and `python_runnables(text)` with pytest and
 unittest rules plus the `__main__` guard. `FileEditor::outline()` is the open file's.
+
+### Debug in the interface
+
+`crates/monocode-gpui/src/debug_ui/` draws the debugger of §5 and owns no debugger state
+of its own: it reads `services().dap()` and `services().breakpoints()`, the instances the
+agents' tools use, so either side sees what the other does.
+
+| File | Holds |
+| --- | --- |
+| `breakpoints.rs` | the gutter column of Python files, the breakpoint menu and form, persistence |
+| `sessions.rs` | `Debugger`: every top-level session of the manager, one model and dock tab each |
+| `model.rs` | `Model`: one session and its subprocesses as the tab shows them, and what a stop does outside the tab |
+| `tab.rs`, `columns.rs` | the dock tab: header controls, the three columns |
+| `launch.rs` | the launcher behind `code_shell::launch::debug`, the notice when a start fails |
+| `hover.rs`, `values.rs` | the hover wrapper, inline values, the expression under the mouse |
+| `keys.rs` | key commands and quick open commands |
+
+**Breakpoints.** A left press in the column toggles a line breakpoint; a right press
+opens a menu with the condition, hit count and log message as a form (stored on Enter and
+when the menu closes), Enable / Disable and Remove; on an empty row it sets one first. Marks
+are drawn from the store on every change of it, at the adapter's verified line when it
+moved one: enabled, disabled, conditional (any of the three texts), unverified (rejected).
+When an edit moves marks, the editor's rows are written back to the store as one
+replacement of the file's list, and the store's echo of that write is not drawn again, so
+typing never fights the marks. Each project's breakpoints (its folder and its worktrees)
+and the exception filters are saved 400 ms after a change as the project's code setting
+`debug-breakpoints` (`BreakpointStore::to_json`) and loaded on `ProjectOpened`.
+
+**Sessions.** `Debugger` follows `dap::Manager::subscribe()`. Each top-level session gets
+a `Model` and a dock tab in the checkout its `cwd` is in; a session an agent started gets
+its tab without the dock being raised. The same request started again (a restart, a second
+run of the same program) takes the tab its ended run left. Closing the tab removes the
+session from the manager and stops the debuggee's terminal.
+
+**The tab.** Header: continue or pause, step over, into, out, restart, stop, enabled by
+the selected session's state; while an agent is the driver they are off except Stop, and
+"driven by <session title>" with **Take over** (`Session::take_over(Actor::User)`) is
+shown. Body, three resizable columns, stacked when `DockPlacement::narrow()`: the stack
+(processes when there are subprocesses, threads when there are several, frames; library
+frames and files outside the checkout dimmed) over the project's breakpoints and the two
+exception filters; the variables of the selected frame as a tree that stays open across
+steps (kept by name path), cheap scopes open, a sequence with more than 100 indexed
+children listed 100 at a time behind "Show more", copy and (with `supportsSetVariable`)
+edit on hover; the console with the adapter's output, evaluation in the selected frame
+(`Repl`) and its history on the arrow keys. The lists are `uniform_list`s over rows the
+model rebuilds from the session's caches on each event; nothing waits on the UI thread.
+
+**A stop.** The stopped line gets `LineStyle::Execution` with the arrow, a selected frame
+that is another line `LineStyle::Frame`; the file opens at the stop with a history jump
+and the tab is revealed. For a session an agent drives the keyboard is given back to where
+it was, an open file is only scrolled, and nothing is revealed unless the session's project
+is in front. An exception's text is shown across the top of the tab. The selected frame's
+locals are written after the lines of its function that name them (from the `def` to the
+stop; text only, values over 48 characters cut). `SystemExit` under the uncaught filter is
+continued automatically unless "raised" is on or an agent drives. The agent's rail row
+says "debugging" or "paused at file:line" until the session ends or is taken over.
+
+**The debuggee's terminal.** `SessionEvent::RunInTerminal` starts `request.spawn` with
+`code_shell::dock::run` and answers `started(pid)` or `failed(reason)`.
+
+**Hover.** Registered after code insight, the provider wraps the one in `Providers.hover`:
+in the file of the selected frame of a paused session the name under the mouse, with its
+owners (`self.items`), is evaluated (`EvaluateContext::Hover`) and shown above the wrapped
+provider's text; anywhere else the wrapped provider answers alone.
+
+**Keys.** F5 continue / pause, F10 step over, F11 step into, Shift+F11 step out, Shift+F5
+stop, Cmd/Ctrl+Shift+F5 restart, bound everywhere and passed on when no session takes
+them; F9 toggles a breakpoint at the caret in a file editor. Quick open: `Debug: <file>`
+for the focused Python file, the controls that apply, Take Over, Remove All Breakpoints.
+
+**Not there.** A selected expression is not evaluated on hover (the hover seam carries
+no selection); watch expressions; data and function breakpoints; attach to a process from
+the interface; F5 does not start a session; the step buttons reuse existing icons.
 
 ## 7. Agents (MCP)
 
@@ -510,3 +586,21 @@ opened a second time by a tool rather than joined.
 ## 8. Verification
 
 _To be filled in: what was run, by hand and by test._
+
+**Debug in the interface.** By test only; the app was not launched. `debug_ui/tests.rs`
+drives a real shell and real file editors against the core's scripted adapter
+(`dap::fake`, behind the core's `test-support` feature, through
+`Manager::start_scripted`): a gutter press toggling the store and the marks, an agent's
+breakpoint appearing, edits above moving breakpoints, the right-press menu and its form,
+the per-project save and reload; a session from its first stop to its end (tab, title,
+arrow on the stopped row, file opened, stack with dimmed library frames, variables, a
+paged list, inline values, console evaluation, set variable, hover while paused and
+after, a step, a selected frame, F5 to the end, marks cleared); the `runInTerminal`
+request answered with the pid of a real dock run and that run stopped by closing the tab;
+an agent's session (tab not raised, rail status, controls off, Take over); the
+`SystemExit` rule both ways; the notice for a program that is not Python.
+`debug_ui/real_tests.rs`, with `MONOCODE_TEST_PYTHON`, starts a script through
+`code_shell::launch::debug` under the real debugpy with its debuggee in a dock terminal:
+breakpoint, locals, step, restart in the same tab, run to exit code 0. What tests cannot
+show is how the tab looks: column proportions, colours, the icons chosen for the step
+buttons and the drag of the dividers were never seen.
