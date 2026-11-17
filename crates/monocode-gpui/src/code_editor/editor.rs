@@ -26,6 +26,9 @@ pub(super) struct Ext {
     seen: Option<(usize, usize, Pixels)>,
     completion_doc: Option<(usize, Document)>,
     completion_resolve: Option<Task<()>>,
+    /// The list an edit just closed, with the text and caret it was for,
+    /// until the provider is asked again and it can be carried over.
+    completion_kept: Option<(SharedString, usize, Vec<CompletionItem>)>,
     pub(super) hover: Option<popups::HoverPopup>,
     pub(super) hover_probe: Option<Range<usize>>,
     /// The hover was asked for at the caret, not by resting the mouse.
@@ -52,6 +55,34 @@ impl Code {
     }
     pub(super) fn decor_mut(&mut self) -> &mut Decor {
         Rc::make_mut(self.decor.get_or_insert_with(Default::default))
+    }
+    /// The buffer is changing: sets the provider's list aside before it
+    /// is cleared.
+    pub(super) fn keep_completions(&mut self) {
+        let Some(ext) = &mut self.ext else {
+            return;
+        };
+        ext.completion_kept = None;
+        if ext.providers.completion.is_some()
+            && !self.completions.is_empty()
+            && let Some((source, at)) = self.completion_source.take()
+        {
+            ext.completion_kept = Some((source, at, std::mem::take(&mut self.completions)));
+        }
+    }
+    /// A request for `(source, at)` is on its way: when a provider answers
+    /// it, what the list before it still has to offer shows meanwhile.
+    pub(super) fn carry_completions(&mut self, provider: bool, source: &str, at: usize) {
+        let Some(ext) = &mut self.ext else {
+            return;
+        };
+        let Some((old, old_at, items)) = ext.completion_kept.take().filter(|_| provider) else {
+            return;
+        };
+        ext.completion_doc = None;
+        ext.completion_resolve = None;
+        self.completions = crate::code_editor::carry_completions(items, &old, old_at, source, at);
+        self.completion_index = 0;
     }
     pub(super) fn document(&self) -> Rc<DocumentInfo> {
         self.ext

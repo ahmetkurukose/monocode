@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes the scripted language server so the interface's tests can use it.
+test-support = []
+
 [dependencies]
 serde.workspace = true
 # Stored floats must reload exactly, or saved revisions stop matching.

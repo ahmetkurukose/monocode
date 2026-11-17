@@ -1030,3 +1030,157 @@ fn dropping_the_manager_ends_its_servers() {
     drop(rig);
     wait_until(|| pyright.exited() && ruff.exited());
 }
+
+#[test]
+fn diagnostics_are_told_per_server_with_the_version_they_are_about() {
+    let rig = Rig::pyright_only(ManagerOptions::default());
+    let a = rig.open("a.py", "x = 1\n");
+    let pyright = rig.pyright();
+    pyright.wait_for("textDocument/didOpen");
+    rig.wait_ready("basedpyright");
+    let before = rig.manager.document_diagnostics(&a).unwrap();
+    assert_eq!(before.version, 1);
+    assert_eq!(before.servers[0].version, None, "nothing reported yet");
+    let report = |version: i64| {
+        pyright.notify(
+            "textDocument/publishDiagnostics",
+            json!({ "uri": uri(&a), "version": version, "diagnostics": [{
+                "range": range(0, 0, 0, 1), "message": "m",
+            }] }),
+        );
+    };
+    let reported = |version: i64| {
+        wait_until(|| {
+            let found = rig.manager.document_diagnostics(&a).unwrap();
+            found.servers[0].version == Some(version)
+        });
+    };
+    report(1);
+    reported(1);
+    rig.drain();
+    // The same report on a newer text is still announced: its positions
+    // are the new text's.
+    rig.manager.change(&a, "x = 12\n");
+    let stale = rig.manager.document_diagnostics(&a).unwrap();
+    assert_eq!((stale.version, stale.servers[0].version), (2, Some(1)));
+    report(2);
+    reported(2);
+    assert!(rig
+        .drain()
+        .contains(&LspEvent::DiagnosticsChanged { path: a.clone() }));
+    // And said again for the same text, it is not.
+    report(2);
+    pyright.notify(
+        "$/progress",
+        json!({ "token": "t", "value": { "kind": "begin" } }),
+    );
+    rig.wait_state("basedpyright", |state| {
+        matches!(state, ServerState::Indexing { .. })
+    });
+    assert!(!rig
+        .drain()
+        .contains(&LspEvent::DiagnosticsChanged { path: a.clone() }));
+    // A server that is gone has nothing to say about the current text.
+    pyright.crash();
+    rig.wait_state("basedpyright", |state| {
+        matches!(state, ServerState::Failed { .. })
+    });
+    let after = rig.manager.document_diagnostics(&a).unwrap();
+    assert_eq!(after.servers[0].version, Some(2));
+    assert!(after.servers[0].items.is_empty());
+    assert!(rig
+        .manager
+        .document_diagnostics(&rig.file("b.py"))
+        .is_none());
+}
+
+#[test]
+fn a_projects_settings_switch_servers_off_and_name_their_executables() {
+    use super::manager::ProjectSettings;
+    let rig = Rig::new();
+    let project = rig.checkout.clone();
+    // One server off: the other still serves the document.
+    rig.manager.set_project_settings(
+        &project,
+        ProjectSettings {
+            disabled_servers: ["ruff".to_string()].into(),
+            ..Default::default()
+        },
+    );
+    let a = rig.open("a.py", "x = 1\n");
+    rig.wait_ready("basedpyright");
+    assert!(rig.status("ruff").is_none());
+    rig.manager.close(&a);
+
+    // An executable set for the project is that or nothing.
+    rig.manager.stop_all();
+    rig.manager.set_project_settings(
+        &project,
+        ProjectSettings {
+            tool_paths: [("ruff".to_string(), rig.root.join("bin/missing"))].into(),
+            ..Default::default()
+        },
+    );
+    rig.open("a.py", "x = 1\n");
+    rig.wait_state("ruff", |state| {
+        matches!(state, ServerState::ToolNotFound { .. })
+    });
+    rig.manager.close(&a);
+
+    // The whole project off: nothing is opened, so nothing needs closing.
+    rig.manager.stop_all();
+    rig.manager.set_project_settings(
+        &project,
+        ProjectSettings {
+            disabled: true,
+            ..Default::default()
+        },
+    );
+    let launched = rig.launcher.count();
+    rig.open("a.py", "x = 1\n");
+    assert!(!rig.manager.is_open(&a));
+    assert_eq!(rig.launcher.count(), launched);
+    rig.manager.close(&a);
+
+    // Back to the defaults, and the cap can be changed while running.
+    rig.manager
+        .set_project_settings(&project, ProjectSettings::default());
+    assert_eq!(
+        rig.manager.project_settings(&project),
+        ProjectSettings::default()
+    );
+    rig.open("a.py", "x = 1\n");
+    rig.wait_ready("basedpyright");
+    rig.wait_ready("ruff");
+    rig.manager.close(&a);
+    assert_eq!(rig.live(), 2);
+    rig.manager.set_limits(Some((Duration::from_secs(60), 1)));
+    assert_eq!(rig.live(), 1, "the idle server over the cap is stopped");
+    rig.advance(Duration::from_secs(61));
+    rig.manager.sweep();
+    assert_eq!(rig.live(), 0);
+}
+
+#[test]
+fn a_library_in_the_checkouts_virtual_environment_joins_the_checkouts_server() {
+    let rig = Rig::pyright_only(ManagerOptions::default());
+    let venv = rig.checkout.join(".venv");
+    let library = venv.join("lib/site-packages/pkg/mod.py");
+    // A marker beside the library would otherwise make its folder a root.
+    touch(&venv.join("lib/site-packages/pkg/setup.py"));
+    let context = DocumentContext {
+        toolchain: Toolchain {
+            venv: Some(venv),
+            ..rig.context.toolchain.clone()
+        },
+        ..rig.context.clone()
+    };
+    let a = rig.file("a.py");
+    rig.manager.open(&a, "import pkg.mod\n", &context);
+    rig.wait_ready("basedpyright");
+    rig.manager.open(&library, "x = 1\n", &context);
+    let statuses = rig.manager.statuses();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].root, rig.checkout);
+    assert_eq!(statuses[0].open_documents, 2);
+}

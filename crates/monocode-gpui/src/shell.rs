@@ -12,6 +12,9 @@ mod classic_surface_tests;
 mod classic_surfaces;
 mod code_shell;
 #[cfg(test)]
+#[path = "code_insight/shell_tests.rs"]
+mod code_insight_tests;
+#[cfg(test)]
 mod code_shell_tests;
 mod database_send;
 mod file_panes;

@@ -68,6 +68,36 @@ impl Default for ManagerOptions {
     }
 }
 
+/// What the user set for one project, changeable while the app runs. It
+/// takes effect for documents opened and servers started afterwards.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProjectSettings {
+    /// No server is started for the project's documents.
+    pub disabled: bool,
+    /// Registry ids of servers the project does without.
+    pub disabled_servers: HashSet<String>,
+    /// Executables by registry id; they win over `ManagerOptions::tool_paths`.
+    pub tool_paths: HashMap<String, PathBuf>,
+}
+
+/// What one server says about a document, and for which of its versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerDiagnostics {
+    /// The registry id, e.g. `ruff`.
+    pub server: String,
+    /// The document version the report is about; `None` before the first.
+    pub version: Option<i64>,
+    pub items: Vec<Diagnostic>,
+}
+
+/// An open document's diagnostics, kept apart by server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentDiagnostics {
+    /// The document's version now: 1 when opened, one more per changed text.
+    pub version: i64,
+    pub servers: Vec<ServerDiagnostics>,
+}
+
 /// Where a document lives, which decides the servers it gets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentContext {
@@ -98,6 +128,8 @@ enum Phase {
 
 struct Entry {
     key: ServerKey,
+    /// The project whose settings it is started under.
+    project: PathBuf,
     spec: ServerSpec,
     phase: Phase,
     /// Bumped on every start and stop, so late news from an earlier process
@@ -183,6 +215,9 @@ struct State {
     reached: HashMap<PathBuf, Vec<ServerId>>,
     subscribers: Vec<async_channel::Sender<LspEvent>>,
     next_id: u64,
+    projects: HashMap<PathBuf, ProjectSettings>,
+    /// The idle period and server cap, once changed from the options.
+    limits: Option<(Duration, usize)>,
 }
 
 impl State {
@@ -330,7 +365,14 @@ impl Shared {
         context: &DocumentContext,
         now: Instant,
     ) -> ServerId {
-        if !path.starts_with(&context.checkout) {
+        // A virtual environment inside the checkout holds libraries too.
+        let library = !path.starts_with(&context.checkout)
+            || context
+                .toolchain
+                .venv
+                .as_ref()
+                .is_some_and(|venv| path.starts_with(venv));
+        if library {
             // A file reached by navigation (a library, say): the server that
             // pointed at it, else the checkout's most recently used one.
             let same = |id: &ServerId| {
@@ -374,6 +416,7 @@ impl Shared {
                     id,
                     Entry {
                         key,
+                        project: context.project.clone(),
                         spec: spec.clone(),
                         phase: Phase::Stopped,
                         generation: 0,
@@ -403,13 +446,20 @@ impl Shared {
     }
 
     fn start(self: &Arc<Self>, state: &mut State, id: ServerId) {
+        let explicit = state.entries.get(&id).and_then(|entry| {
+            state
+                .projects
+                .get(&entry.project)
+                .and_then(|settings| settings.tool_paths.get(entry.spec.id))
+                .or_else(|| self.options.tool_paths.get(entry.spec.id))
+                .cloned()
+        });
         let Some(entry) = state.entries.get_mut(&id) else {
             return;
         };
-        let explicit = self.options.tool_paths.get(entry.spec.id);
         let found = entry
             .spec
-            .resolve(&entry.key.toolchain, explicit.map(PathBuf::as_path));
+            .resolve(&entry.key.toolchain, explicit.as_deref());
         let Some((program, args)) = found else {
             entry.phase = Phase::ToolNotFound;
             state.status_changed(id);
@@ -694,10 +744,13 @@ impl Shared {
         if matches!((open, version), (Some(open), Some(version)) if version < open) {
             return;
         }
+        // A report on a newer text is news even when it says the same:
+        // its positions are that text's.
+        let mut advanced = false;
         if let (Some(open), Some(entry)) = (open, state.entries.get_mut(&id)) {
-            entry.reported.insert(path.clone(), open);
+            advanced = entry.reported.insert(path.clone(), open) != Some(open);
         }
-        if state.set_diagnostics(&path, id, found) {
+        if state.set_diagnostics(&path, id, found) || advanced {
             state.emit(LspEvent::DiagnosticsChanged { path });
         }
         self.changed.notify_all();
@@ -713,7 +766,12 @@ impl Shared {
             .filter(|entry| entry.generation == generation);
         if let (Some(open), Some(entry)) = (open, entry) {
             if version >= open {
-                entry.reported.insert(path.to_path_buf(), open);
+                let advanced = entry.reported.insert(path.to_path_buf(), open) != Some(open);
+                if advanced {
+                    state.emit(LspEvent::DiagnosticsChanged {
+                        path: path.to_path_buf(),
+                    });
+                }
                 self.changed.notify_all();
             }
         }
@@ -755,7 +813,10 @@ impl Shared {
     fn enforce_cap(&self, state: &mut State, keep: Option<ServerId>) {
         loop {
             let live = state.entries.values().filter(|entry| entry.live()).count();
-            if live <= self.options.max_servers {
+            let cap = state
+                .limits
+                .map_or(self.options.max_servers, |(_, cap)| cap);
+            if live <= cap {
                 return;
             }
             let victim = state
@@ -776,6 +837,9 @@ impl Shared {
     fn sweep(&self) {
         let now = (self.clock)();
         let mut state = self.state();
+        let period = state
+            .limits
+            .map_or(self.options.idle_period, |(period, _)| period);
         let idle: Vec<ServerId> = state
             .entries
             .iter()
@@ -784,7 +848,7 @@ impl Shared {
                     && entry.documents.is_empty()
                     && entry
                         .idle_since
-                        .is_some_and(|since| now.duration_since(since) >= self.options.idle_period)
+                        .is_some_and(|since| now.duration_since(since) >= period)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -964,4 +1028,5 @@ fn pull_loop(weak: &Weak<Shared>, id: ServerId, generation: u64, queue: &mpsc::R
 }
 
 mod api;
+mod settings;
 pub use api::Manager;

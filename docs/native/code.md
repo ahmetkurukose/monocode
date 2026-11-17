@@ -214,10 +214,23 @@ servers of a document are merged in document order, each with `server` (`basedpy
 `ruff`) and the server's own `source` and `code`. Completion items come with snippet
 syntax already reduced to plain text, since snippets are declined in the handshake.
 
+**For the interface.** `document_diagnostics(path)` gives an open document's diagnostics
+per server with the document version each report is about, and a report on a newer text
+is announced (`DiagnosticsChanged`) even when it says the same as the last, so the editor
+never lays a report over a text it was not made for. `set_project_settings(project,
+ProjectSettings { disabled, disabled_servers, tool_paths })` and `set_limits(Some((idle,
+max_servers)))` change a running manager: a disabled project's documents are not opened at
+all (by the editor or by an agent's tool), a server switched off is left out, and a
+project's executable wins over `ManagerOptions::tool_paths`. Both apply to documents
+opened and servers started afterwards. A file inside the checkout's own virtual
+environment counts as a library: it joins the server that pointed at it, or the
+checkout's most recent one, like a file outside the checkout. The scripted server
+(`lsp::fake`) is public behind the `test-support` feature for the interface's tests.
+
 **Not there:** incremental sync (the whole text is sent per change), `didSave`, file
 watching, workspace symbols, rename, code actions, formatting, semantic tokens, and
-`workspace/applyEdit` (refused). Changing `tool_paths` or the toolchain needs the
-documents reopened.
+`workspace/applyEdit` (refused). Changing the settings or the toolchain needs the
+documents reopened and the servers stopped, which the interface does.
 
 ## 5. Debug
 
@@ -490,6 +503,68 @@ Not there: dragging to reorder configurations, a "running" state on the header b
 "Open in browser" control on the run tab's own header (it is on the chip's row), and
 markers for Go, Rust and JavaScript (their file tasks are in the header menu).
 
+### Code insight
+
+`code_insight/` is the language servers' face, built only on the extension points above.
+`init` uses `services().lsp()`; `init_with(manager)` is the same over any manager (tests).
+
+- **Documents** (`sync.rs`). The hub's `Opened` / `Changed` / `Closed` become the
+  manager's `open` / `change` / `close`, one `open` per hub document however many panes
+  show it. Only files the registry has a server for, up to the editor's lint limit
+  (512 KiB) and with no line over 20,000 bytes. The `DocumentContext` comes from
+  `services().context(path).document()`, built on a background thread and kept per
+  checkout until the project's terminal setup changes. A file outside every checkout is
+  opened under the checkout its pane came from, so a library reached by "Go to
+  Definition" is served by the server that pointed at it.
+- **Diagnostics.** On `DiagnosticsChanged` each server's list is converted with
+  `LineIndex` against the text of the version it is about and stored in the hub under the
+  server's id (`basedpyright`, `ruff`); a list about an older version is skipped. The
+  message carries the rule code: `` `os` imported but unused (F401) ``.
+- **Providers** (`providers.rs`), installed for every file with a server: completion
+  (trigger characters from the manager; kind, detail, replace range, filter and sort
+  keys, extra edits such as an import; documentation through `resolve_completion` when
+  an item is selected), hover, signature help, definition (`navigable` asks for the
+  definition) and usages. Each request is one blocking call on the background executor
+  with a `CancelToken` cancelled when the editor drops the task. While a file's server is
+  still starting, the requests the editor makes unprompted answer nothing at once
+  instead of waiting. Paths in answers are respelled the editors' way when the server
+  resolved a link in the checkout's path (`/private/var` for `/var`).
+- **Completion while typing.** `code_editor::carry_completions`: the list an edit closes
+  is kept and, when the edit was a word character typed or deleted at the caret, shown
+  narrowed with its ranges moved until the provider's new answer replaces it.
+- **Usages tab** (`usages.rs`, panel tab `code-usages`). The hub's references handler
+  takes results of more than 6 places: grouped by file, line number and line text with
+  the symbol marked, the symbol and counts in its header, Up / Down / Enter, a close
+  button. A row opens through `code_editor::open_location` and records a history jump.
+  Smaller results stay in the editor's own list.
+- **Outline tab** (`outline.rs`, `code-outline`, always there). The focused file's
+  `FileEditor::outline()` (Tree-sitter): follows `FocusedFileChanged`, marks the caret's
+  innermost symbol, filters by substring keeping enclosing symbols, a row or Enter
+  jumps. The header crumbs are the file pane's own; nothing is added to them.
+- **Symbol search** (`symbol_search.rs`). Quick open's `@`: the focused file's symbols,
+  then, once something is typed, those of the checkout's other files of the same
+  language: a breadth-first walk skipping dot folders and vendored ones, at most 1,500
+  files of 512 KiB and 700 ms. Prefix matches first, then inside the name, then letters
+  in order.
+- **Chip** (`chip.rs`, `code-servers`). The servers of the checkout in front and of the
+  file in front: hidden with none, quiet when ready (`2 servers`), busy while starting or
+  indexing, a warning for a missing tool or a failed server. Its list has a row per
+  server (name, root, state, open files, memory summed over the server's process group
+  every 10 s) with Restart and Stop; a missing tool adds what was looked for and the
+  install hint, a failed one its message, both copyable, and "Set its path…" opens the
+  settings. "Look again" on either rebuilds the checkout's context from disk first.
+  Running servers are registered with `code_shell::processes`.
+- **Settings** (`settings.rs`, page `code-insight`). Per project: on or off, each server
+  on or off, an executable per server. Saving applies it: the project's documents are
+  closed, its servers stopped, and what may be open is opened again. The idle minutes
+  and the server cap are the app's; saving them writes them to every open project.
+- **Lifecycle.** `CheckoutRemoved` and `ProjectClosed` close the checkout's documents
+  with the manager and stop its servers; the editors stay.
+
+Not there: no `@` search without a focused file; hover, completion and navigation in a
+project with code insight off fall back to the editor's own; unused and deprecated code
+is not drawn differently; the usages list is not updated when files change.
+
 ## 7. Agents (MCP)
 
 **Shared services.** `code::services` is the one home of the instances the panes and the
@@ -597,3 +672,31 @@ in the running app: the page's and the output tab's layout, the right-click menu
 marker and opening a detected address in the browser pane are untested beyond compiling.
 
 _To be filled in: what was run, by hand and by test._
+
+### Code insight
+
+Nothing here was looked at in the running app; all of it is GPUI tests (state, and
+headless paints where noted).
+
+- `code_insight/tests.rs`, a file pane over scripted servers (`lsp::fake`): diagnostics
+  of two servers land under their own source on the right bytes of a text with
+  non-ASCII characters, follow typing before any server hears of it, a late report on
+  the old text is not shown, and closing the pane closes the document and clears them;
+  completion narrowed and ordered, documentation resolved on selection, the list kept
+  while one more letter is typed, the import applied with the item; hover and
+  signature help; two usages stay in the editor's list, eight open the Usages tab (which
+  paints), and a row is a jump Back returns from.
+- `code_insight/shell_tests.rs`, a whole shell: go to definition into another file the
+  server names by its resolved path opens it in a pane under the editors' spelling and
+  is served by the same server, Back returns, usages reveal the tab in the right panel
+  and a row opens its file; the Outline follows the pane in front, marks the caret's
+  symbol, filters, jumps and paints, and `@` lists the file's and the checkout's
+  symbols; the chip is hidden, quiet, busy, warns for a missing tool (hint copied) and
+  for a failed start; the settings page sets a path, disables the project (no document
+  open, no server, none started later), enables it again; removing the project closes
+  its documents and stops its servers.
+- With `MONOCODE_TEST_PYTHON`: the real basedpyright through the real manager marks a
+  type error in a pane, its processes are listed as running work and measured, and
+  go to definition opens the other file at the definition.
+- Core: `code::lsp::manager_tests` cover the per-server versions, the project settings
+  and limits, and the virtual environment's libraries.

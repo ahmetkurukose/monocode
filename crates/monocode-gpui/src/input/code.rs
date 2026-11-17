@@ -314,6 +314,7 @@ impl Input {
         let path = code.path.clone();
         let completer = code.completer.clone();
         code.completion_source = Some((source.clone(), at));
+        code.carry_completions(asked.is_some(), &source, at);
         code.completion_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(if explicit {
@@ -796,6 +797,7 @@ impl Input {
     }
     pub(super) fn code_changed(&mut self) {
         if let Some(code) = &mut self.code {
+            code.keep_completions();
             code.completions.clear();
             code.completion_task = None;
             code.completion_source = None;
