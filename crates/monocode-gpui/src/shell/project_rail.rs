@@ -1,13 +1,9 @@
 //! Original project navigation. Its list and shared image cache stay independent
-//! from streamed conversations; Git counters use one visible-project batch.
+//! from streamed conversations.
 use super::classic_sidebar::ClassicSidebarTab;
 use super::*;
-use crate::{
-    right_panel::{DIFF_ADD, DIFF_DEL, format_integer, tabular},
-    workspace,
-};
+use crate::workspace;
 use gpui::{ListAlignment, ListState, list};
-use monocode_core::scm::DiffStats;
 
 const ICON_RAIL_WIDTH: f32 = 48.;
 
@@ -119,13 +115,6 @@ impl ProjectRailList {
             self.state.remeasure_items(0..1);
         }
     }
-}
-#[derive(Default)]
-pub(super) struct ProjectRailStats {
-    values: HashMap<String, Option<DiffStats>>,
-    queued: HashSet<String>,
-    loading: bool,
-    deferred: bool,
 }
 pub(super) struct ProjectRailDrag {
     path: String,
@@ -1489,15 +1478,6 @@ impl Shell {
             .entry(path.clone())
             .or_default()
             .clone();
-        if !compact {
-            self.queue_project_rail_stats(&path, cx);
-        }
-        let stats = self
-            .project_rail_stats
-            .values
-            .get(&path)
-            .and_then(Option::as_ref)
-            .cloned();
         let appearance = self.appearance(&path);
         let seed = workspace::project_name(&path);
         let mark = if appearance.logo.is_some() {
@@ -1620,41 +1600,6 @@ impl Shell {
                                 })
                                 .child(icons),
                         )
-                    })
-                    .when(!compact, |d| {
-                        d.when_some(stats, |d, stats| {
-                            d.child(
-                                div()
-                                    .id(("rail-project-stats", ix))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .gap_1()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .font_features(tabular())
-                                    // Hidden, not just invisible, so the space
-                                    // it held goes to the options button.
-                                    .when(!reordering, |d| {
-                                        d.group_hover("project-rail-row", |s| s.hidden())
-                                    })
-                                    .when(stats.additions > 0, |d| {
-                                        d.child(
-                                            div().text_color(rgb(DIFF_ADD)).child(format!(
-                                                "+{}",
-                                                format_integer(stats.additions)
-                                            )),
-                                        )
-                                    })
-                                    .when(stats.deletions > 0, |d| {
-                                        d.child(
-                                            div().text_color(rgb(DIFF_DEL)).child(format!(
-                                                "-{}",
-                                                format_integer(stats.deletions)
-                                            )),
-                                        )
-                                    }),
-                            )
-                        })
                     })
                     .when(!compact && !reordering, |d| {
                         d.child(
@@ -2119,62 +2064,6 @@ impl Shell {
             self.projects_frame.update(cx, |_, cx| cx.notify());
         }
         true
-    }
-    fn queue_project_rail_stats(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.project_rail_stats.values.contains_key(path)
-            || path == "~"
-            || path.starts_with("remote://")
-        {
-            return;
-        }
-        self.project_rail_stats.queued.insert(path.into());
-        if self.project_rail_stats.deferred || self.project_rail_stats.loading {
-            return;
-        }
-        self.project_rail_stats.deferred = true;
-        let owner = cx.weak_entity();
-        cx.defer(move |cx| {
-            let _ = owner.update(cx, |this, cx| {
-                this.project_rail_stats.deferred = false;
-                this.load_project_rail_stats(cx);
-            });
-        });
-    }
-    fn load_project_rail_stats(&mut self, cx: &mut Context<Self>) {
-        if self.project_rail_stats.loading || self.project_rail_stats.queued.is_empty() {
-            return;
-        }
-        let paths: Vec<_> = self.project_rail_stats.queued.drain().collect();
-        self.project_rail_stats.loading = true;
-        let work = cx.background_executor().spawn(async move {
-            paths
-                .into_iter()
-                .map(|path| {
-                    let stats = monocode_core::scm::diff_stats(std::path::Path::new(&path)).ok();
-                    (path, stats)
-                })
-                .collect::<Vec<_>>()
-        });
-        cx.spawn(async move |this, cx| {
-            let values = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.project_rail_stats.loading = false;
-                this.project_rail_stats.values.extend(values);
-                this.projects_frame.update(cx, |_, cx| cx.notify());
-                this.load_project_rail_stats(cx);
-            });
-        })
-        .detach();
-    }
-    pub(super) fn sync_project_rail_git_stats(&mut self, cx: &mut Context<Self>) {
-        if let Some(stats) = self.git.read(cx).stats.clone() {
-            self.project_rail_stats
-                .values
-                .insert(self.workspace.project.clone(), Some(stats));
-            if self.workspace.classic_layout {
-                self.projects_frame.update(cx, |_, cx| cx.notify());
-            }
-        }
     }
 }
 

@@ -646,7 +646,6 @@ pub(crate) struct Shell {
     project_rail_list: project_rail::ProjectRailList,
     project_rail_drag: Option<project_rail::ProjectRailDrag>,
     space_reorder: space_reorder::SpaceReorder,
-    project_rail_stats: project_rail::ProjectRailStats,
     project_resize: Option<(Pixels, f32)>,
     classic_sidebar_tab: classic_sidebar::ClassicSidebarTab,
     classic_tabs: classic_sidebar::WorkspaceTabs,
@@ -1033,7 +1032,6 @@ impl Shell {
                 }
             }
             // The title bar's dot and the panel's tab label follow its stats.
-            this.sync_project_rail_git_stats(cx);
             if this.workspace.classic_layout {
                 this.sidebar_frame.update(cx, |_, cx| cx.notify());
             }
@@ -1091,7 +1089,6 @@ impl Shell {
             project_rail_list: project_rail::ProjectRailList::new(cx),
             project_rail_drag: None,
             space_reorder: Default::default(),
-            project_rail_stats: Default::default(),
             project_resize: None,
             classic_sidebar_tab,
             classic_tabs: Default::default(),
