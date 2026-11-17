@@ -3,9 +3,10 @@
 //! behind, its web pages and the chats' loaded transcripts. What is needed to
 //! pick it up again stays: the chats themselves (composer text, queued
 //! messages, model and permission choices), their tabs, the terminal
-//! folders and page addresses. Opening the project, one of its chats or a
-//! terminal wakes it, and so does any turn starting there; each chat then
-//! reloads its history and its next turn resumes the provider session cold.
+//! folders and page addresses. Selecting the project, or one of its chats,
+//! shows its sleep screen; only Wake wakes it, along with what starts work
+//! there: a new chat, a terminal, or a turn. Each chat shown then reloads its
+//! history, and its next turn resumes the provider session cold.
 //!
 //! The project to sleep must be settled: a chat that is still answering or
 //! waiting for an approval keeps the whole project awake.
@@ -170,7 +171,7 @@ impl Shell {
         let more = jobs.len().saturating_sub(8);
         let detail = format!(
             "{} will stop:\n{list}{}\n\nChats, tabs and terminal folders are kept. \
-             Opening the project wakes it with fresh shells.",
+             Waking the project opens fresh shells.",
             if jobs.len() == 1 {
                 "This terminal job"
             } else {
@@ -336,18 +337,6 @@ impl Shell {
         cx.notify();
         true
     }
-    /// Wake the project a chat, file, terminal or page pane belongs to.
-    pub(super) fn wake_project_of(&mut self, pane: i64, cx: &mut Context<Self>) {
-        let owner = self.workspace.session_for_pane(pane);
-        if let Some(project) = self
-            .session_summaries
-            .get(&owner)
-            .map(|summary| summary.cwd.clone())
-            .filter(|project| self.project_asleep(project))
-        {
-            self.wake_project(&project, cx);
-        }
-    }
     /// Forget a project that leaves the rail.
     pub(super) fn forget_project_sleep(&mut self, path: &str) {
         self.workspace.slept_projects.remove(path);
@@ -427,7 +416,7 @@ impl Shell {
             items.push(
                 match self.sleep_blocker(path, cx) {
                     Some(reason) => action.description(reason).disabled(true),
-                    None => action.description("Free its memory until you open it"),
+                    None => action.description("Free its memory until you wake it"),
                 }
                 .into(),
             );
@@ -691,6 +680,7 @@ impl Shell {
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open(id, window, cx);
+                                    this.wake_current_project(window, cx);
                                 }))
                         }),
                 )
@@ -1047,7 +1037,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_group_sleeps_and_wakes_together_and_opening_one_wakes_it(cx: &mut TestAppContext) {
+    fn a_group_sleeps_and_wakes_together_and_each_wakes_on_its_own(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
         let (mut visual, _) = busy_project(window, a, cx);
         let group = window
@@ -1082,15 +1072,91 @@ mod tests {
             let badge: &'static str = format!("project-asleep-badge-{path}").leak();
             assert!(visual.debug_bounds(badge).is_some(), "{badge}");
         }
-        // Opening one wakes only that one.
+        // Selecting one only shows it; its Wake wakes only that one.
         window
             .update(&mut visual, |shell, w, cx| {
                 shell.select_project(MONOCODE.into(), w, cx);
+                assert!(shell.project_asleep(MONOCODE));
+                let target = MenuTarget::Project {
+                    path: MONOCODE.into(),
+                    rail: true,
+                };
+                shell.run_menu(target, "project-wake", None, w, cx);
                 assert!(!shell.project_asleep(MONOCODE));
                 assert!(shell.project_asleep(ANOTHER));
                 let target = MenuTarget::ProjectRailGroup(group.clone());
                 shell.run_menu(target, "group-wake", None, w, cx);
                 assert!(!shell.project_asleep(ANOTHER));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_tree_shows_a_sleeping_project_and_its_chat_until_wake_is_pressed(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, a, b) = window(cx);
+        let (mut visual, _) = busy_project(window, a, cx);
+        window
+            .update(&mut visual, |shell, w, cx| {
+                shell.workspace.classic_layout = true;
+                shell.workspace.project_rail_open = true;
+                shell.workspace.preferences.project_rail_view = "tree".into();
+                shell.workspace.project_rail_expanded.insert(ANOTHER.into());
+                // Sleep this project from the other one.
+                shell.select_project(MONOCODE.into(), w, cx);
+                shell.open(b, w, cx);
+                shell.request_sleep_projects(vec![ANOTHER.into()], w, cx);
+                assert!(shell.project_asleep(ANOTHER));
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let ix = window
+            .update(&mut visual, |shell, _, _| {
+                shell.workspace.projects.iter().position(|p| p == ANOTHER)
+            })
+            .unwrap()
+            .unwrap();
+        let selector: &'static str = format!("rail-project-button-{ix}").leak();
+        // Clicking its row selects it behind the sleep screen.
+        let row = visual.debug_bounds(selector).unwrap();
+        // On its name, clear of the app icons at the row's end.
+        let at = gpui::point(row.left() + gpui::px(40.), row.center().y);
+        visual.simulate_click(at, Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("project-sleep-screen").is_some());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert_eq!(shell.workspace.project, ANOTHER);
+                assert!(shell.project_asleep(ANOTHER));
+                assert!(!shell.terminals.contains_key(ANOTHER));
+            })
+            .unwrap();
+        // So does its chat in the tree, without loading the chat's history.
+        let selector: &'static str = format!("rail-session-{a}").leak();
+        let chat = visual.debug_bounds(selector).unwrap();
+        visual.simulate_click(chat.center(), Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("project-sleep-screen").is_some());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                assert!(shell.project_asleep(ANOTHER));
+                assert_eq!(shell.workspace.active, Some(a));
+                assert!(!shell.sessions[&a].read(cx).history_loaded());
+            })
+            .unwrap();
+        // Wake shows that chat with its history, and the dock's shell again.
+        let wake = visual.debug_bounds("project-wake").unwrap();
+        visual.simulate_click(wake.center(), Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("project-sleep-screen").is_none());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                assert!(!shell.project_asleep(ANOTHER));
+                assert_eq!(shell.workspace.active, Some(a));
+                assert!(shell.sessions[&a].read(cx).history_loaded());
+                assert_eq!(shell.terminals[ANOTHER].len(), 1);
             })
             .unwrap();
     }

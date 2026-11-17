@@ -57,7 +57,8 @@ see [verification](verification.md).
 
 Right-click a project, or a rail group's header, and choose **Sleep** to stop
 its shells, warm agents and pages and release its loaded chats. Its chats,
-tabs and settings stay, and opening it wakes it. See
+tabs and settings stay, and **Wake project** on its sleep screen brings it
+back. See
 [Sleeping projects](project-sleep.md).
 
 ## Develop

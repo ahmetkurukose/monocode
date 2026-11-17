@@ -4745,7 +4745,6 @@ impl Shell {
         }
     }
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        self.wake_project_of(id, cx);
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -4779,7 +4778,11 @@ impl Shell {
             .project_focus
             .insert(self.workspace.project.clone(), id);
         self.workspace.collapsed.remove(&self.workspace.project);
-        view.update(cx, |v, cx| v.load(cx));
+        // A chat opened in a sleeping project waits behind its sleep screen;
+        // Wake shows it and loads its history then.
+        if !self.project_asleep(&self.workspace.project) {
+            view.update(cx, |v, cx| v.load(cx));
+        }
         self.record_worktree_session(id, cx);
         self.remember_title_tab(TitleTab::Session(self.workspace.tab_of(id).unwrap()));
         self.reveal_active_tab(cx);
@@ -4911,7 +4914,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.wake_project(&path, cx);
         self.selected_sessions.clear();
         self.selection_anchor = None;
         self.sidebar_target = None;
@@ -5083,6 +5085,9 @@ impl Shell {
     ) {
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
+        // Only an explicit new chat gets here while asleep: placing a blank
+        // one stays off for sleeping projects.
+        self.wake_project(&cwd, cx);
         let focus = self.worktree_focus.get(&cwd).cloned();
         // The project folder as a selected checkout is not a separate worktree.
         let copy = focus.clone().filter(|f| {

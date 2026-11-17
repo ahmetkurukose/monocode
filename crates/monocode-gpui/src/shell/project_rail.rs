@@ -1507,7 +1507,7 @@ impl Shell {
                     .group("project-rail-row")
                     .role(Role::Button)
                     .aria_label(if asleep {
-                        format!("Wake and switch to project, {label}, asleep")
+                        format!("Switch project, {label}, asleep")
                     } else {
                         format!("Switch project, {label}")
                     })

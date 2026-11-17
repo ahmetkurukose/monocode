@@ -2,7 +2,7 @@
 
 A project you are not working on can be put to **sleep** to give back the
 memory and CPU it still holds. Nothing you need to pick it up again is lost,
-and opening it wakes it.
+and **Wake project** brings it back.
 
 ## Where
 
@@ -50,10 +50,16 @@ and lists what will stop. Idle shells close without a question.
 
 ## What wakes a project
 
-Selecting it in the rail or title bar, opening one of its chats, files,
-terminals or pages (from the sidebar, a tab, search or the tree view), opening
-or toggling a terminal, **Wake project** / **Wake group**, and any turn that
-starts in it (an automation, a Mono, the phone).
+**Wake project** on its sleep screen or in its menu, **Wake group**, and
+whatever starts work in it: a new chat, opening or toggling a terminal, or any
+turn that starts there (an automation, a Mono, the phone).
+
+Selecting a sleeping project, in the rail (list or tree), the title bar or with
+Project: Next/Previous, only shows its sleep screen. So does opening one of its
+chats, files, terminals or pages from the tree, the sidebar, a tab or search:
+the chat waits behind the sleep screen without loading its history, and
+**Wake project** shows it. A chat clicked on the sleep screen itself wakes the
+project and opens.
 
 ## Persistence
 
