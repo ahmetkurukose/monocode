@@ -66,6 +66,12 @@ Create worktree**, or the composer's "New worktree".
   Worktrees → Location**; the `MONOCODE_WORKTREE_ROOT` environment variable,
   when set, replaces the default. The same page sets a branch prefix, each
   project's default base and whether other worktrees are shown.
+- **Names and bases.** A worktree is named from the name you type (or the
+  branch an API call gives) or, when a session makes it on its first send
+  (composer, automations, API launches), from the first prompt. The composer
+  starts it from the base shown in its picker (the session's branch unless you
+  chose another), automations and the API from `HEAD`, and the dialog, the
+  switcher and Settings from the project's default base.
 - **Create dialog.** Pick a name (the folder and branch follow it), where to
   start from (the project's default base, a local or remote branch, or a
   commit), and optionally make that base the project's default. **Advanced**
@@ -79,7 +85,9 @@ Create worktree**, or the composer's "New worktree".
   `node_modules`) linked from the main checkout instead of copied, and
   `scripts.setup` is a script run in a **Setup** terminal in the new worktree.
   A new or changed setup script is shown in the dialog and runs only once you
-  choose **Run setup**, which trusts that version for the repository.
+  choose **Run setup**, which trusts that version for the repository. If the
+  branch you start from has a different script than the one shown, it is not
+  run and the creation says so.
 - **`.worktreeinclude`** at the repository root lists ignored files (one
   relative path per line, such as `.env`) copied into each new worktree.
 - **Rail tree.** With **Project list: Tree** (Classic layout), an open project
@@ -97,7 +105,8 @@ Create worktree**, or the composer's "New worktree".
   project (`<project>-worktrees/`) stay where they are, keep working and are
   listed as legacy; their branches are never deleted with them.
 - **Remote (SSH) projects** create worktrees on their host from a reduced
-  dialog (branch, start from, existing branch), without shared folders,
+  dialog (branch, start from, existing branch), opened from the worktree
+  switcher's or the rail menu's **New worktree…**, without shared folders,
   included files or setup.
 
 Design notes: [worktrees.md](worktrees.md).

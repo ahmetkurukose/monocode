@@ -59,6 +59,7 @@ mod title_tabs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktree_create;
+pub(crate) use worktree_create::SetupChoice;
 mod worktree_delete;
 mod worktree_dialog;
 mod worktrees;
@@ -806,6 +807,9 @@ pub(crate) struct Shell {
     /// Worktrees being created in the background, with their phase or error.
     pending_worktrees: Vec<worktree_create::PendingWorktree>,
     worktree_creates: worktree_create::Creates,
+    /// Worktrees being removed, by path: new turns, terminals and launches there are
+    /// refused until the removal finishes (the guards unmark them on drop).
+    removing_worktrees: HashMap<String, monocode_core::worktree::remove::Removing>,
     /// The Create/Delete Worktree dialogs, kept-branch cards and open switchers.
     worktree_ui: worktree_dialog::WorktreeUi,
     /// Each open rail project's worktrees, read in the background.
@@ -1232,6 +1236,7 @@ impl Shell {
             worktree_returns: HashMap::new(),
             pending_worktrees: Vec::new(),
             worktree_creates: Default::default(),
+            removing_worktrees: HashMap::new(),
             worktree_ui: Default::default(),
             rail_worktrees: Default::default(),
             tab_drag: None,
@@ -1518,8 +1523,16 @@ impl Shell {
                 let Some(view) = this.sessions.get(&id) else {
                     return;
                 };
-                this.session_worktrees
-                    .insert(id, view.read(cx).settings.worktree_cwd.clone());
+                let worktree = view.read(cx).settings.worktree_cwd.clone();
+                // A session moved to (or off) a worktree the rail may not list yet.
+                if this
+                    .session_worktrees
+                    .insert(id, worktree.clone())
+                    .flatten()
+                    != worktree
+                {
+                    this.invalidate_rail_worktrees(cx);
+                }
                 // A finished turn may have edited files or moved to a worktree.
                 if this.workspace.active == Some(id) {
                     this.sync_git(cx);
@@ -3363,6 +3376,16 @@ impl Shell {
             })
             .unwrap_or_else(|| self.working_copy().to_owned())
     }
+    /// The window became active or inactive.
+    fn window_activation_changed(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.window_active = active;
+        // Worktrees may have been added or removed outside the app meanwhile.
+        if active {
+            self.invalidate_rail_worktrees(cx);
+        }
+        self.refresh_notification_permission();
+        cx.notify();
+    }
     fn spawn_terminal(&mut self, cwd: String, cx: &mut Context<Self>) -> Entity<Terminal> {
         let project = self.workspace.project.clone();
         self.spawn_terminal_in(&project, cwd, cx)
@@ -3454,6 +3477,9 @@ impl Shell {
         if self.workspace.project.starts_with("remote://") {
             self.error = Some("Terminals are not available on remote projects.".into());
             cx.notify();
+            return;
+        }
+        if self.refuse_terminal_in_removed_worktree(&self.terminal_cwd(cx), cx) {
             return;
         }
         // The dock is not drawn under an app view: go back to the session
@@ -9307,9 +9333,7 @@ impl Render for Shell {
             self.window_active = window.is_window_active();
             self.observations
                 .push(cx.observe_window_activation(window, |this, window, cx| {
-                    this.window_active = window.is_window_active();
-                    this.refresh_notification_permission();
-                    cx.notify();
+                    this.window_activation_changed(window.is_window_active(), cx);
                 }));
             self.start_native_notifications(cx);
             self.check_github_star(false, cx);

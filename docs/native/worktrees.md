@@ -27,8 +27,11 @@ session setting. Git is the source of truth for structure (`git worktree list
 - **WorktreeMeta** (native settings, key `worktree:<path_key>`, JSON):
   `path, repo (main checkout path), display_name, branch_at_create, base_ref,
   start_kind (base|branch|commit|remote), created_at, created_by ("dialog"|"composer"|
-  "automation"|"api"|"switcher"), branch_user_chosen, preserve_branch_on_delete,
-  pinned, comment, parent (path or None)`.
+  "automation"|"api"|"switcher"|"mobile"|"quick"; unknown values read as "api"),
+  branch_user_chosen, preserve_branch_on_delete, pinned, comment, parent (path or None)`.
+  A session's first-send worktree takes its `created_by` from the session settings'
+  `worktree_origin` (absent = composer): automations, the phone and the quick composer
+  set it.
 - **Ownership** (never inferred from path shape alone):
   - `Managed` — has a WorktreeMeta.
   - `Legacy` — no meta, path under the old sibling root `<main>-worktrees/`.
@@ -78,12 +81,20 @@ meta::{load, save, delete, all}(store, ...)
   never gets a suffix (error instead), but its folder may be suffixed.
 - Composer "New worktree" with no name: slug from the first ~6 words of the first prompt
   (fallback `worktree`). The existing provider-naming step may later rename the **branch**
-  only (folder stays), applying the configured prefix instead of a hardcoded `mc/`; it is
-  skipped when `branch_user_chosen`.
+  only (folder stays), applying the configured prefix instead of a hardcoded `mc/`, for any
+  session-made worktree (`composer`, `quick`, `automation`, `mobile`, `api`); it is skipped
+  for `dialog`/`switcher` worktrees and when `branch_user_chosen`.
+- API `worktrees.create` keeps its old contract: the branch must be valid
+  (`Enter a valid branch name` for an empty or `-`/`@` name, Git's message otherwise), and an
+  explicit branch that exists only as `origin/<b>` is created as a new local branch without
+  tracking (`CreateRequest.allow_remote_name_clash`; the dialog still refuses it).
 
 ## 4. Creation pipeline
 
 1. Resolve base: explicit start-from → repo `default_base` → `detect_default` → `HEAD`.
+   Callers pass their own start-from: the composer the base its picker shows (the chosen
+   one, else the session's branch); automations, the phone and the API `HEAD` when none
+   is given; the dialog, switcher and Settings leave it to the repo default.
    Qualify: name with `/` tries `refs/remotes/X` then `refs/heads/X`; else `refs/heads/X`,
    then any commit-ish (SHA) via `rev-parse --verify --end-of-options X^{commit}`.
 2. If the base is a remote-tracking ref: `git fetch --no-tags <remote> <branch>` with a 60 s
@@ -120,8 +131,11 @@ call just created, delete meta; never touch pre-existing branches.
   and be ignored. Copied (never overwrite); macOS tries APFS clone `cp -c -R`, else plain copy.
   Budget 2 GiB / 50 000 entries, overflow skipped with warning. Paths already shared are skipped.
 - Setup script: `scripts.setup` from the **new worktree's** config (falls back to main). Trust:
-  sha256 of the trimmed script vs repo `setup_approved_hash`. The create dialog shows the script
-  when it is new/changed; choosing "Run setup" approves the hash. Runner written to
+  sha256 of the trimmed script vs repo `setup_approved_hash`. The create dialog shows the main
+  checkout's script when it is new/changed and submits its hash; choosing "Run setup" runs and
+  approves the new worktree's script only when its hash is the one shown or already approved.
+  Otherwise it is not run and the creation warns "The setup script in the new worktree differs
+  from the one shown; it was not run." Runner written to
   `$(git rev-parse --git-path monocode/setup-runner.sh)` (`#!/usr/bin/env bash`, `set -e`, chmod 755),
   run in a dock terminal titled "Setup" in the new worktree, with env `MONOCODE_ROOT_PATH`,
   `MONOCODE_WORKTREE_PATH`, `MONOCODE_WORKSPACE_NAME` plus Orca aliases `ORCA_ROOT_PATH`,
@@ -148,8 +162,11 @@ call just created, delete meta; never touch pre-existing branches.
    default base, local branches, remote branches, SHA text), "Set as default" for the base,
    Advanced: branch name override, "Use existing branch" when the typed branch exists,
    Setup: Run / Skip (shown only when a script exists; shows the script if not yet approved).
-   Entry points: worktree switcher "New worktree…", rail project context menu "New worktree…",
-   Settings → Worktrees "Create". Submit closes the dialog; creation runs in the background.
+   The "Start from" placeholder names the saved default base only while it still resolves,
+   else the detected one. Entry points: worktree switcher "New worktree…", rail project
+   context menu "New worktree…" (both also for remote Git projects, which get the reduced
+   form), Settings → Worktrees "Create". Submit closes the dialog; creation runs in the
+   background.
 2. **Pending creation**: a row under the project in the rail tree and in the switcher with the
    phase text / percent; failure → toast with Retry. Success → the worktree becomes the
    project's focus (`select_worktree`) and the setup terminal opens when chosen.
@@ -159,16 +176,30 @@ call just created, delete meta; never touch pre-existing branches.
    branch, session count; context menu: Open, New session here, Copy path, Reveal, Delete…
    (`shell/project_rail_worktrees.rs`). The list is read with `catalog::list_in` in the
    background only for an open project whose row is drawn, cached per project, and marked
-   stale after a create, a delete, a switcher metadata change or a Settings worktree pref
-   change. Open worktrees persist in `Workspace.project_rail_worktrees_expanded`.
+   stale after a create (dialog, also one dismissed while running, or the app/Mono API),
+   a delete, a session moving to another worktree, the window becoming active, a switcher
+   metadata change or a Settings worktree pref change. An open worktree lists at most 8
+   sessions, then an "N more…" row that opens the worktree. Open worktrees persist in
+   `Workspace.project_rail_worktrees_expanded`.
 4. **Delete Worktree dialog**: preflight summary (dirty count, at-risk files sample, unpushed),
    "Also delete its sessions", Delete / Force delete; preserved-branch toast with "Delete branch".
+   From the in-use recheck until it finishes, the path is marked as being removed
+   (`remove::mark_removing`): new turns, terminals, actions and API launches there are refused.
+   A failed removal reads the preflight again (so Force appears when the tree became dirty);
+   failing to detach its sessions after a successful removal is a warning.
 5. **Composer "New worktree"**: unchanged UX, now uses `worktree::create` with
-   `created_by=composer`, default base from §4, name from the prompt.
+   `created_by=composer` (or the session's `worktree_origin`), the base its picker shows
+   (§4), name from the prompt. Creation warnings (e.g. "Started from the local copy of
+   origin/main; fetch failed") show as a dismissible notice above the composer.
 6. **Settings → Worktrees**: Location (root), Branch prefix, per-project default base and
    "Show other worktrees"; list gains ownership label and uses the new Delete dialog.
 7. All other create callers (`app_access`, monos host `worktrees.create`, app commands,
    automations "Fresh worktree", quick composer, mobile host) go through `worktree::create`.
+   Automations and the phone start from `HEAD` and are tagged `automation`/`mobile`, the quick
+   composer `quick`, the API `api` (from `HEAD` when no base is given). App `sessions.start`
+   holds a per-request guard while it makes the session and its worktree, so a retry with
+   the same request id waits for the finished session instead of a half-made one; the
+   database lock is not held while Git runs.
 
 ## 8. Test isolation
 

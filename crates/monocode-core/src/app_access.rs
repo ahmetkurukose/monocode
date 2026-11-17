@@ -294,6 +294,7 @@ pub fn launch_checkout(
             .into_iter()
             .find(|w| !w.missing && crate::files::path_key(&w.path) == crate::files::path_key(&cwd))
             .ok_or("Worktree is unavailable in this project; run worktrees.list")?;
+        crate::worktree::remove::ensure_not_being_removed(&selected.path)?;
         settings.worktree_cwd = (crate::files::path_key(&selected.path)
             != crate::files::path_key(project))
         .then_some(selected.path);
@@ -307,6 +308,7 @@ pub fn launch_checkout(
                 crate::worktree::CreatedBy::Api,
                 store,
             )?
+            .path
             .to_string_lossy()
             .into_owned(),
         );

@@ -8,6 +8,7 @@
 use crate::{
     input::{self, Input},
     runtime::{Database, locked},
+    shell::SetupChoice,
     theme::*,
 };
 use gpui::{
@@ -26,7 +27,8 @@ const SUGGESTIONS: usize = 6;
 pub(crate) enum DialogEvent {
     Submit {
         request: Box<CreateRequest>,
-        run_setup: bool,
+        /// Run setup, and the hash of the script the dialog showed.
+        setup: SetupChoice,
         /// Save this base as the repository's default (`main checkout`, base).
         default_base: Option<(PathBuf, String)>,
     },
@@ -37,7 +39,7 @@ pub(crate) enum DialogEvent {
 #[derive(Clone, Debug)]
 struct Loaded {
     main: PathBuf,
-    /// The repository's saved default base.
+    /// The repository's saved default base, when it still resolves.
     saved_default: Option<String>,
     /// `base::detect_default`, used when nothing is saved.
     detected: Option<String>,
@@ -54,7 +56,12 @@ fn load(cwd: &Path, store: &Database) -> Result<Loaded, String> {
     Ok(Loaded {
         detected: worktree::base::detect_default(&main),
         setup: worktree::setup::plan(&main, &main, "", prefs.setup_approved_hash.as_deref()),
-        saved_default: prefs.default_base.filter(|b| !b.trim().is_empty()),
+        // A saved default that no longer exists is skipped when creating; the
+        // placeholder shows what will be used instead.
+        saved_default: prefs
+            .default_base
+            .filter(|b| !b.trim().is_empty())
+            .filter(|b| worktree::base::resolve(&main, Some(b), None).is_ok()),
         branches,
         main,
     })
@@ -94,6 +101,8 @@ pub(crate) struct CreateWorktreeDialog {
     advanced: bool,
     use_existing: bool,
     pub(crate) run_setup: bool,
+    /// The default base the "Start from" placeholder names, once read.
+    pub(crate) default_base: Option<String>,
     /// The live check of the branch override: `(text, valid?)`.
     branch_check: Option<(String, Result<(), String>)>,
     /// Submit was tried; required-field errors show from now on.
@@ -168,6 +177,7 @@ impl CreateWorktreeDialog {
                         this.base.update(cx, |input, cx| {
                             input.set_placeholder(format!("Default · {default}"), cx)
                         });
+                        this.default_base = Some(default);
                         // An approved script runs by default; a new one waits for a yes.
                         this.run_setup = loaded.setup.as_ref().is_some_and(|p| p.approved);
                     }
@@ -189,6 +199,7 @@ impl CreateWorktreeDialog {
             advanced: false,
             use_existing: false,
             run_setup: false,
+            default_base: None,
             branch_check: None,
             attempted: false,
             focus: cx.focus_handle(),
@@ -340,7 +351,7 @@ impl CreateWorktreeDialog {
             };
             cx.emit(DialogEvent::Submit {
                 request: Box::new(request),
-                run_setup: false,
+                setup: SetupChoice::skip(),
                 default_base: None,
             });
             return;
@@ -356,9 +367,13 @@ impl CreateWorktreeDialog {
         };
         let default_base = (self.set_default && !base.is_empty() && !existing)
             .then(|| (loaded.main.clone(), base));
+        let setup = match &loaded.setup {
+            Some(plan) if self.run_setup => SetupChoice::run(Some(plan.hash.clone())),
+            _ => SetupChoice::skip(),
+        };
         cx.emit(DialogEvent::Submit {
             request: Box::new(request),
-            run_setup: self.run_setup && loaded.setup.is_some(),
+            setup,
             default_base,
         });
     }

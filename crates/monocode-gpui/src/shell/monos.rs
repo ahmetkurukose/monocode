@@ -22,6 +22,9 @@ impl Shell {
     ) {
         let id = summary.id;
         self.draft_sessions.insert(id);
+        if settings.worktree_cwd.is_some() {
+            self.invalidate_rail_worktrees(cx);
+        }
         self.session_worktrees
             .insert(id, settings.worktree_cwd.clone());
         self.add_loaded(summary, cx);

@@ -12,11 +12,49 @@ use serde_json::{Value, json};
 mod tests;
 
 type Placement = Option<(i64, Edge)>;
+
+/// `sessions.start` requests still making their session, by `(caller, request id)`.
+/// A retry of the same request waits here until the first finishes, so it never sees
+/// a session whose worktree is still being created, and a failed start deletes a
+/// session nobody else was handed.
+#[derive(Default)]
+struct Starting {
+    keys: std::sync::Mutex<std::collections::HashSet<(i64, String)>>,
+    done: std::sync::Condvar,
+}
+static STARTING: std::sync::LazyLock<Starting> = std::sync::LazyLock::new(Default::default);
+
+/// Held while one request makes its session; see [`Starting`].
+struct StartGuard((i64, String));
+impl StartGuard {
+    /// Blocks (on a worker) while the same request is starting elsewhere.
+    fn claim(caller: i64, request: &str) -> Self {
+        let key = (caller, request.to_owned());
+        let mut keys = STARTING.keys.lock().unwrap_or_else(|e| e.into_inner());
+        while keys.contains(&key) {
+            keys = STARTING.done.wait(keys).unwrap_or_else(|e| e.into_inner());
+        }
+        keys.insert(key.clone());
+        Self(key)
+    }
+}
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        STARTING
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+        STARTING.done.notify_all();
+    }
+}
 enum Effect {
     None,
     Start(Box<(Session, Settings, bool, bool, Placement)>),
     Groups(String, monocode_core::session_groups::Groups),
     Archive(i64),
+    /// A worktree was created: the rail and Settings read their lists again.
+    Worktrees,
 }
 impl Shell {
     pub(super) fn init_app_bridge(&mut self, cx: &mut Context<Self>) {
@@ -99,6 +137,9 @@ impl Shell {
                             let id = summary.id;
                             this.draft_sessions.insert(id);
                             this.sidebar_hidden_sessions.remove(&id);
+                            if settings.worktree_cwd.is_some() {
+                                this.invalidate_rail_worktrees(cx);
+                            }
                             this.session_worktrees
                                 .insert(id, settings.worktree_cwd.clone());
                             this.add(summary, cx);
@@ -111,6 +152,7 @@ impl Shell {
                         Effect::Groups(project, groups) => {
                             this.groups.insert(project, groups);
                         }
+                        Effect::Worktrees => this.worktrees_changed_elsewhere(cx),
                         Effect::Archive(id) => {
                             if let Some(summary) = this.session_summaries.get_mut(&id) {
                                 summary.archived = true;
@@ -387,6 +429,8 @@ impl Shell {
                     settings.revision=0;
                     let title=app::optional_text(&input,"title",160)?.unwrap_or_else(||prompt.chars().take(160).collect());
                     let db=store.clone();
+                    // A retry of this request waits until the session is fully made.
+                    let _starting=StartGuard::claim(caller,&request);
                     let (mut summary,fresh)=locked(&db)?.create_app_session(caller,&request,&fingerprint,kind.id(),&project)?;
                     // Worktree creation runs Git; the store is not held meanwhile.
                     if fresh && let Err(error)=app::launch_checkout(&input,&project,summary.id,&prompt,&db,&mut settings) {let _=locked(&db)?.delete(summary.id);return Err(error);}
@@ -596,9 +640,9 @@ impl Shell {
                     call,
                     move |store| {
                         let root = std::path::Path::new(&project);
-                        let value = if action == "worktrees.list" {
+                        if action == "worktrees.list" {
                             let snapshot = monocode_core::git::snapshot(root)?;
-                            json!({"worktrees":snapshot.worktrees.iter().map(worktree_json).collect::<Vec<_>>(),"branches":snapshot.branches.iter().map(|b|json!({"name":b.name,"remote":b.remote})).collect::<Vec<_>>()})
+                            Ok((json!({"worktrees":snapshot.worktrees.iter().map(worktree_json).collect::<Vec<_>>(),"branches":snapshot.branches.iter().map(|b|json!({"name":b.name,"remote":b.remote})).collect::<Vec<_>>()}), Effect::None))
                         } else {
                             let branch = app::text(&input, "branch", 400)?;
                             let base = app::optional_text(&input, "base", 400)?;
@@ -606,16 +650,16 @@ impl Shell {
                             if existing && base.is_some() {
                                 return Err("base cannot be set for an existing branch".into());
                             }
-                            worktree_json(&monocode_core::worktree_callers::named(
+                            let tree = monocode_core::worktree_callers::named(
                                 root,
                                 &branch,
                                 base.as_deref(),
                                 existing,
                                 monocode_core::worktree::CreatedBy::Api,
                                 &store,
-                            )?)
-                        };
-                        Ok((value, Effect::None))
+                            )?;
+                            Ok((worktree_json(&tree), Effect::Worktrees))
+                        }
                     },
                     cx,
                 );

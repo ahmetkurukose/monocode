@@ -1579,8 +1579,15 @@ impl Shell {
             }
             settings.model_settings.extend(chosen_settings);
             settings.worktree_cwd = worktree;
-            // A new managed worktree is made on the first send, as automations do.
-            settings.new_worktree = params["workspaceMode"] == "worktree";
+            // A new managed worktree off HEAD is made on the first send, as
+            // automations do, tagged as the phone's.
+            settings.new_worktree = false;
+            if params["workspaceMode"] == "worktree" {
+                super::worktree_create::fresh_worktree_from_head(
+                    &mut settings,
+                    monocode_core::worktree::CreatedBy::Mobile,
+                );
+            }
             store.save_agent_settings(summary.id, &settings)?;
             Ok::<_, String>((summary, settings, attachments))
         });

@@ -301,3 +301,86 @@ fn stopping_before_the_worker_runs_keeps_the_optimistic_message(cx: &mut TestApp
             .unwrap();
     }
 }
+
+#[gpui::test]
+fn a_new_worktrees_creation_warnings_show_above_the_composer(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let repo = base.join("project");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "Base"]);
+    // origin/main exists locally, but origin cannot be reached.
+    let missing = base.join("no-such-remote");
+    git(&["remote", "add", "origin", &missing.to_string_lossy()]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    monocode_core::worktree::meta::save_prefs(
+        &store,
+        &monocode_core::worktree::Prefs {
+            root: Some(base.join("workspaces")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut summary = store.create("codex", repo.to_str().unwrap()).unwrap();
+    // The send that follows never launches a real provider.
+    summary.provider = "fixture".into();
+    let window = cx.update(|cx| {
+        input::bind(cx);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                let mut view = Conversation::new(summary, Arc::new(Mutex::new(store)), cx);
+                view.loaded = true;
+                view
+            })
+        })
+        .unwrap()
+    });
+    window
+        .update(cx, |view, _, cx| {
+            view.settings.new_worktree = true;
+            // The picker's base: origin/main, which cannot be refreshed.
+            view.settings.worktree_base = Some("origin/main".into());
+            view.prepare_worktree(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let notice = window
+        .update(cx, |view, _, _| {
+            assert!(
+                view.settings.worktree_cwd.is_some(),
+                "the worktree was made"
+            );
+            view.worktree_notice.clone()
+        })
+        .unwrap()
+        .expect("the warning is shown");
+    assert!(
+        notice.contains("Started from the local copy of origin/main; fetch failed"),
+        "{notice}"
+    );
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let dismiss = visual
+        .debug_bounds("worktree-notice-dismiss")
+        .expect("the notice is above the composer");
+    visual.simulate_click(dismiss.center(), Default::default());
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("worktree-notice").is_none());
+}

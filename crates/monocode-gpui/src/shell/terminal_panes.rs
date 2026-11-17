@@ -233,6 +233,9 @@ impl Shell {
             return;
         };
         let cwd = self.terminal_cwd(cx);
+        if self.refuse_terminal_in_removed_worktree(&cwd, cx) {
+            return;
+        }
         let terminal = self.spawn_terminal(cwd.clone(), cx);
         let pane = self.workspace.next_pane_id();
         self.workspace
@@ -260,6 +263,9 @@ impl Shell {
             return;
         };
         let cwd = self.terminal_cwd(cx);
+        if self.refuse_terminal_in_removed_worktree(&cwd, cx) {
+            return;
+        }
         let terminal = self.spawn_terminal(cwd.clone(), cx);
         let pane = self.workspace.next_pane_id();
         self.workspace

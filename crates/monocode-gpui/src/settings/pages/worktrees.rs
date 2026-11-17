@@ -76,6 +76,8 @@ impl SettingsView {
             .filter(|_| self.discovery.worktrees.prefs.is_some())
     }
 
+    /// Apply `change` to the saved global preferences, read again under the lock (the
+    /// page's copy may be stale), and show what was saved.
     pub(in crate::settings) fn save_worktree_prefs(
         &mut self,
         change: impl FnOnce(&mut worktree::Prefs),
@@ -84,19 +86,28 @@ impl SettingsView {
         let Some(store) = self.worktree_store() else {
             return;
         };
-        let Some(prefs) = self.discovery.worktrees.prefs.as_mut() else {
-            return;
-        };
-        change(prefs);
-        let result =
-            crate::runtime::locked(&store).and_then(|db| worktree::meta::save_prefs(&db, prefs));
-        let main = std::path::Path::new(&self.discovery.worktrees.main);
-        self.discovery.worktrees.default_root =
-            worktree::layout::repo_dir(&prefs.root_or_default(), main);
-        self.discovery.worktrees.error = result.err();
+        let result = crate::runtime::locked(&store).and_then(|db| {
+            let mut prefs = worktree::meta::prefs(&db)?;
+            change(&mut prefs);
+            worktree::meta::save_prefs(&db, &prefs)?;
+            Ok(prefs)
+        });
+        match result {
+            Ok(prefs) => {
+                let main = std::path::Path::new(&self.discovery.worktrees.main);
+                self.discovery.worktrees.default_root =
+                    worktree::layout::repo_dir(&prefs.root_or_default(), main);
+                self.discovery.worktrees.prefs = Some(prefs);
+                self.discovery.worktrees.error = None;
+            }
+            Err(error) => self.discovery.worktrees.error = Some(error),
+        }
         cx.notify();
     }
 
+    /// Apply `change` to this project's saved preferences, read again under the lock
+    /// (the create dialog may have approved a setup script or saved a default base
+    /// meanwhile), and show what was saved.
     pub(in crate::settings) fn save_repo_worktree_prefs(
         &mut self,
         change: impl FnOnce(&mut worktree::RepoPrefs),
@@ -105,12 +116,20 @@ impl SettingsView {
         let Some(store) = self.worktree_store() else {
             return;
         };
-        let repo = self.discovery.worktrees.repo.get_or_insert_default();
-        change(repo);
-        let main = std::path::Path::new(&self.discovery.worktrees.main);
-        let result = crate::runtime::locked(&store)
-            .and_then(|db| worktree::meta::save_repo_prefs(&db, main, repo));
-        self.discovery.worktrees.error = result.err();
+        let main = std::path::PathBuf::from(&self.discovery.worktrees.main);
+        let result = crate::runtime::locked(&store).and_then(|db| {
+            let mut repo = worktree::meta::repo_prefs(&db, &main)?;
+            change(&mut repo);
+            worktree::meta::save_repo_prefs(&db, &main, &repo)?;
+            Ok(repo)
+        });
+        match result {
+            Ok(repo) => {
+                self.discovery.worktrees.repo = Some(repo);
+                self.discovery.worktrees.error = None;
+            }
+            Err(error) => self.discovery.worktrees.error = Some(error),
+        }
         // The rail tree lists external worktrees only when this says so.
         cx.emit(SettingsEvent::WorktreesChanged);
         cx.notify();
@@ -541,5 +560,87 @@ impl SettingsView {
             }
         }
         page
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::settings::{Preferences, Section, SettingsContext, SettingsStore, SettingsView};
+    use gpui::{AppContext as _, TestAppContext};
+    use monocode_core::worktree::{self, naming::BranchPrefix};
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
+
+    #[gpui::test]
+    fn saving_a_preference_keeps_what_others_saved_meanwhile(cx: &mut TestAppContext) {
+        let store: crate::runtime::Database = Arc::new(Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let main = "/tmp/settings-prefs-project";
+        let view = cx.new(|cx| {
+            let mut view = SettingsView::new(
+                Section::Worktrees,
+                Preferences::default(),
+                SettingsContext {
+                    store: Some(SettingsStore(store.clone())),
+                    ..Default::default()
+                },
+                cx,
+            );
+            view.discovery_task = None;
+            view.discovery_loading = false;
+            // What the page read when it opened.
+            view.discovery.worktrees.main = main.into();
+            view.discovery.worktrees.prefs = Some(worktree::Prefs::default());
+            view.discovery.worktrees.repo = Some(worktree::RepoPrefs::default());
+            view
+        });
+        // Meanwhile the dialog approved a setup script and saved a default base, and a
+        // prefix was chosen elsewhere.
+        {
+            let db = crate::runtime::locked(&store).unwrap();
+            worktree::meta::save_repo_prefs(
+                &db,
+                Path::new(main),
+                &worktree::RepoPrefs {
+                    default_base: Some("develop".into()),
+                    setup_approved_hash: Some("abc".into()),
+                    show_external: false,
+                },
+            )
+            .unwrap();
+            worktree::meta::save_prefs(
+                &db,
+                &worktree::Prefs {
+                    branch_prefix: BranchPrefix::GitUsername,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        view.update(cx, |view, cx| {
+            view.save_repo_worktree_prefs(|r| r.show_external = true, cx);
+            view.save_worktree_prefs(|p| p.root = Some("/tmp/elsewhere".into()), cx);
+        });
+        let db = crate::runtime::locked(&store).unwrap();
+        let repo = worktree::meta::repo_prefs(&db, Path::new(main)).unwrap();
+        assert_eq!(
+            repo,
+            worktree::RepoPrefs {
+                default_base: Some("develop".into()),
+                setup_approved_hash: Some("abc".into()),
+                show_external: true,
+            }
+        );
+        let prefs = worktree::meta::prefs(&db).unwrap();
+        assert_eq!(prefs.branch_prefix, BranchPrefix::GitUsername);
+        assert_eq!(prefs.root.as_deref(), Some(Path::new("/tmp/elsewhere")));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.discovery.worktrees.repo.as_ref(), Some(&repo));
+            assert_eq!(view.discovery.worktrees.prefs.as_ref(), Some(&prefs));
+            assert!(view.discovery.worktrees.error.is_none());
+        });
     }
 }

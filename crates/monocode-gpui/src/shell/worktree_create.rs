@@ -20,6 +20,30 @@ pub(crate) enum WorktreeOrigin {
     Settings,
 }
 
+/// Whether to run the repository's setup script once the worktree exists, and which
+/// script the user was shown (its hash). Only that script, or one already approved,
+/// runs; a different script in the new worktree is not run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SetupChoice {
+    pub run: bool,
+    pub shown_hash: Option<String>,
+}
+impl SetupChoice {
+    pub(crate) fn skip() -> Self {
+        Self::default()
+    }
+    pub(crate) fn run(shown_hash: Option<String>) -> Self {
+        Self {
+            run: true,
+            shown_hash,
+        }
+    }
+}
+
+/// The warning when the new worktree's setup script is not the one the dialog showed.
+pub(crate) const SETUP_CHANGED: &str =
+    "The setup script in the new worktree differs from the one shown; it was not run.";
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingWorktree {
     pub id: u64,
@@ -29,7 +53,7 @@ pub(crate) struct PendingWorktree {
     pub phase: Phase,
     pub error: Option<String>,
     pub request: CreateRequest,
-    pub run_setup: bool,
+    pub setup: SetupChoice,
     /// Every surface lists every pending row; a creation started from the rail
     /// also opens its project, and then its new worktree, in the rail tree.
     pub origin: WorktreeOrigin,
@@ -97,7 +121,7 @@ pub(super) type RemoteCreate<'a> =
 /// the branch is the request's branch, else its name; no meta, content paths or setup.
 pub(super) fn create_routed(
     request: &CreateRequest,
-    run_setup: bool,
+    setup: &SetupChoice,
     store: &Database,
     progress: &dyn Fn(Phase),
     remote: &RemoteCreate<'_>,
@@ -126,8 +150,16 @@ pub(super) fn create_routed(
             runner: None,
         });
     }
-    let created = worktree::create::create(request, store, progress)?;
-    let runner = match (&created.setup, run_setup) {
+    let mut created = worktree::create::create(request, store, progress)?;
+    // The new worktree's script may differ from the main checkout's that the dialog
+    // showed: run only what the user saw, or what this repository already trusts.
+    let trusted = created.setup.as_ref().is_some_and(|plan| {
+        plan.approved || setup.shown_hash.as_deref() == Some(plan.hash.as_str())
+    });
+    if setup.run && created.setup.is_some() && !trusted {
+        created.warnings.push(SETUP_CHANGED.into());
+    }
+    let runner = match (&created.setup, setup.run && trusted) {
         (Some(plan), true) => {
             let main = PathBuf::from(&created.meta.repo);
             if let Ok(db) = locked(store) {
@@ -142,6 +174,18 @@ pub(super) fn create_routed(
         _ => None,
     };
     Ok(Made::local(created, runner))
+}
+
+/// A session whose first send makes a fresh worktree off `HEAD`, as automations and
+/// the phone always did, recorded as made by `origin`. The composer's send keeps an
+/// explicit base like this one (it only fills in the session's branch when none is set).
+pub(super) fn fresh_worktree_from_head(
+    settings: &mut monocode_core::agent::Settings,
+    origin: worktree::CreatedBy,
+) {
+    settings.new_worktree = true;
+    settings.worktree_base = Some("HEAD".into());
+    settings.worktree_origin = Some(origin);
 }
 
 fn quote(text: &str) -> String {
@@ -159,13 +203,13 @@ impl Shell {
     }
 
     /// Start creating a worktree of `project_main` in the background. Returns the
-    /// pending row's id. `run_setup` runs the repository's setup script (and
-    /// approves its hash) once the worktree exists.
+    /// pending row's id. `setup` may run the repository's setup script (and approve
+    /// its hash) once the worktree exists.
     pub(crate) fn start_worktree_create(
         &mut self,
         project_main: String,
         request: CreateRequest,
-        run_setup: bool,
+        setup: SetupChoice,
         origin: WorktreeOrigin,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -192,7 +236,7 @@ impl Shell {
             phase: Phase::Resolving,
             error: None,
             request,
-            run_setup,
+            setup,
             origin,
         });
         self.run_pending_worktree(id, window, cx);
@@ -236,7 +280,7 @@ impl Shell {
             return;
         };
         let request = pending.request.clone();
-        let run_setup = pending.run_setup;
+        let setup = pending.setup.clone();
         let store = self.store.clone();
         let (tx, rx) = async_channel::unbounded::<Phase>();
         let work = cx.background_executor().spawn(async move {
@@ -245,7 +289,7 @@ impl Shell {
             };
             create_routed(
                 &request,
-                run_setup,
+                &setup,
                 &store,
                 &progress,
                 &monocode_core::git::create_project_worktree,
@@ -280,7 +324,11 @@ impl Shell {
     ) {
         self.worktree_creates.tasks.remove(&id);
         let Some(ix) = self.pending_worktrees.iter().position(|p| p.id == id) else {
-            // Dismissed while running.
+            // Dismissed while running: the focus stays, but a worktree it made still
+            // shows in the rail and Settings.
+            if outcome.is_ok() {
+                self.worktrees_changed_elsewhere(cx);
+            }
             return;
         };
         let made = match outcome {
@@ -514,7 +562,7 @@ mod tests {
                 shell.start_worktree_create(
                     main.clone(),
                     request,
-                    false,
+                    SetupChoice::skip(),
                     WorktreeOrigin::Settings,
                     w,
                     cx,
@@ -554,7 +602,7 @@ mod tests {
                 shell.start_worktree_create(
                     main.clone(),
                     request,
-                    false,
+                    SetupChoice::skip(),
                     WorktreeOrigin::Rail,
                     w,
                     cx,
@@ -602,7 +650,7 @@ mod tests {
                 shell.start_worktree_create(
                     main.clone(),
                     request,
-                    false,
+                    SetupChoice::skip(),
                     WorktreeOrigin::Switcher,
                     w,
                     cx,
@@ -644,7 +692,14 @@ mod tests {
             base: Some("origin/main".into()),
             ..CreateRequest::new(Path::new("remote://host/project"), "feature")
         };
-        let made = create_routed(&request, true, &store, &progress, &remote).unwrap();
+        let made = create_routed(
+            &request,
+            &SetupChoice::run(None),
+            &store,
+            &progress,
+            &remote,
+        )
+        .unwrap();
         assert_eq!(
             calls.borrow().as_slice(),
             [(
@@ -671,11 +726,11 @@ mod tests {
             existing_branch: true,
             ..CreateRequest::new(Path::new("remote://host/project"), "ignored")
         };
-        create_routed(&request, false, &store, &progress, &remote).unwrap();
+        create_routed(&request, &SetupChoice::skip(), &store, &progress, &remote).unwrap();
         assert_eq!(calls.borrow()[1].1, "feature/x");
         assert!(calls.borrow()[1].3);
         let empty = CreateRequest::new(Path::new("remote://host/project"), " ");
-        assert!(create_routed(&empty, false, &store, &progress, &remote).is_err());
+        assert!(create_routed(&empty, &SetupChoice::skip(), &store, &progress, &remote).is_err());
 
         // Local repositories never reach the old path.
         let (_temp, main, root) = repo();
@@ -692,7 +747,7 @@ mod tests {
             .unwrap();
         let made = create_routed(
             &CreateRequest::new(Path::new(&main), "local-one"),
-            false,
+            &SetupChoice::skip(),
             &store,
             &progress,
             &remote,
@@ -700,6 +755,113 @@ mod tests {
         .unwrap();
         assert_eq!(calls.borrow().len(), 2);
         assert!(made.path.starts_with(&root));
+    }
+
+    #[test]
+    fn automations_and_the_phone_start_fresh_worktrees_from_head_as_their_own() {
+        for origin in [worktree::CreatedBy::Automation, worktree::CreatedBy::Mobile] {
+            let mut settings = monocode_core::agent::Settings::default();
+            fresh_worktree_from_head(&mut settings, origin);
+            assert!(settings.new_worktree);
+            assert_eq!(settings.worktree_base.as_deref(), Some("HEAD"));
+            assert_eq!(settings.worktree_origin, Some(origin));
+            // Persisted settings keep the origin; older rows without it read as None.
+            let saved = serde_json::to_string(&settings).unwrap();
+            let read: monocode_core::agent::Settings = serde_json::from_str(&saved).unwrap();
+            assert_eq!(read.worktree_origin, Some(origin));
+        }
+        let old: monocode_core::agent::Settings =
+            serde_json::from_str(r#"{"new_worktree":true}"#).unwrap();
+        assert_eq!(old.worktree_origin, None);
+    }
+
+    #[test]
+    fn setup_runs_only_the_script_the_dialog_showed_or_an_approved_one() {
+        let (_temp, main, root) = repo();
+        let main_path = Path::new(&main);
+        // main's script is what the dialog shows; the `other` branch has its own.
+        std::fs::write(
+            main_path.join("monocode.yaml"),
+            "scripts:\n  setup: echo main\n",
+        )
+        .unwrap();
+        git(main_path, &["add", "monocode.yaml"]);
+        git(main_path, &["commit", "-q", "-m", "Setup"]);
+        git(main_path, &["switch", "-q", "-c", "other"]);
+        std::fs::write(
+            main_path.join("monocode.yaml"),
+            "scripts:\n  setup: echo other\n",
+        )
+        .unwrap();
+        git(main_path, &["commit", "-q", "-am", "Other setup"]);
+        git(main_path, &["switch", "-q", "main"]);
+        let store: Database = Arc::new(Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        locked(&store)
+            .and_then(|db| {
+                worktree::meta::save_prefs(
+                    &db,
+                    &worktree::Prefs {
+                        root: Some(root.clone()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let approved = || {
+            worktree::meta::repo_prefs(&locked(&store).unwrap(), main_path)
+                .unwrap()
+                .setup_approved_hash
+        };
+        let shown = SetupChoice::run(Some(worktree::setup::hash("echo main")));
+        let remote = |_: &Path, _: &str, _: Option<&str>, _: bool| -> Result<_, String> {
+            unreachable!("local")
+        };
+
+        // A different script on the base branch is not run nor approved.
+        let request = CreateRequest {
+            base: Some("other".into()),
+            ..CreateRequest::new(main_path, "from-other")
+        };
+        let made = create_routed(&request, &shown, &store, &|_| {}, &remote).unwrap();
+        assert_eq!(made.setup.as_ref().unwrap().script, "echo other");
+        assert!(made.runner.is_none(), "the unseen script does not run");
+        assert!(made.warnings.iter().any(|w| w == SETUP_CHANGED));
+        assert_eq!(approved(), None);
+
+        // The script that was shown runs and is approved.
+        let request = CreateRequest {
+            base: Some("main".into()),
+            ..CreateRequest::new(main_path, "from-main")
+        };
+        let made = create_routed(&request, &shown, &store, &|_| {}, &remote).unwrap();
+        assert!(matches!(made.runner, Some(Ok(_))));
+        assert!(!made.warnings.iter().any(|w| w == SETUP_CHANGED));
+        assert_eq!(approved(), Some(worktree::setup::hash("echo main")));
+
+        // A script this repository already trusts runs even though it was not shown.
+        {
+            let db = locked(&store).unwrap();
+            let mut prefs = worktree::meta::repo_prefs(&db, main_path).unwrap();
+            prefs.setup_approved_hash = Some(worktree::setup::hash("echo other"));
+            worktree::meta::save_repo_prefs(&db, main_path, &prefs).unwrap();
+        }
+        let request = CreateRequest {
+            base: Some("other".into()),
+            ..CreateRequest::new(main_path, "trusted-other")
+        };
+        let made = create_routed(&request, &shown, &store, &|_| {}, &remote).unwrap();
+        assert!(matches!(made.runner, Some(Ok(_))));
+        assert!(made.warnings.is_empty(), "{:?}", made.warnings);
+
+        // Skipping never runs or warns.
+        let request = CreateRequest {
+            base: Some("main".into()),
+            ..CreateRequest::new(main_path, "skipped")
+        };
+        let made = create_routed(&request, &SetupChoice::skip(), &store, &|_| {}, &remote).unwrap();
+        assert!(made.runner.is_none() && made.warnings.is_empty());
     }
 
     #[gpui::test]
@@ -727,7 +889,7 @@ mod tests {
                 shell.start_worktree_create(
                     main.clone(),
                     request,
-                    true,
+                    SetupChoice::run(Some(worktree::setup::hash("echo ready"))),
                     WorktreeOrigin::Settings,
                     w,
                     cx,

@@ -137,6 +137,9 @@ pub struct Settings {
     pub orchestrator: bool,
     pub new_worktree: bool,
     pub worktree_base: Option<String>,
+    /// Who asked for the first send's new worktree (recorded in its meta); `None` is
+    /// the composer.
+    pub worktree_origin: Option<crate::worktree::CreatedBy>,
     pub worktree_cwd: Option<String>,
     pub worktree_removed: bool,
     pub handoff: Option<Handoff>,

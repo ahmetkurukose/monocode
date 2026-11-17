@@ -250,10 +250,9 @@ impl WorktreeSwitcher {
             cx.notify();
         }
     }
+    /// Remote projects too: the dialog offers them its reduced remote form.
     fn can_create(&self) -> bool {
-        self.state.is_some()
-            && self.load_error.is_none()
-            && !monocode_core::files::remote::is_remote(Path::new(&self.cwd))
+        self.state.is_some() && self.load_error.is_none()
     }
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = rows(&self.cwd, self.state.as_ref(), &self.query(cx)).len();
@@ -861,5 +860,55 @@ mod tests {
         visual.simulate_input("new-copy");
         visual.run_until_parked();
         assert!(visual.debug_bounds("create-sidebar-worktree").is_some());
+    }
+    #[gpui::test]
+    fn remote_projects_still_offer_new_worktree(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    WorktreeSwitcher::new(
+                        "remote://host/project".into(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        store,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let target = asked.clone();
+        let entity = window
+            .update(cx, |view, w, cx| {
+                w.focus(&view.focus(cx), cx);
+                cx.entity()
+            })
+            .unwrap();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&entity, move |_, event, _| {
+                if let Event::NewWorktree(name) = event {
+                    target.borrow_mut().push(name.clone());
+                }
+            })
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                view.state = Some(snapshot());
+                view.load_error = None;
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_input("feature/remote");
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("create-sidebar-worktree").is_some());
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(asked.borrow().as_slice(), ["feature/remote".to_owned()]);
     }
 }

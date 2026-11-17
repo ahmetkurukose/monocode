@@ -259,6 +259,7 @@ mod tests {
                     &store,
                 )
                 .unwrap()
+                .path
             };
             let before = git::snapshot(&path).unwrap().current.unwrap();
             let settings = Settings {

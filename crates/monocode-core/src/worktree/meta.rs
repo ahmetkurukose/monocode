@@ -28,6 +28,10 @@ pub enum CreatedBy {
     Composer,
     Automation,
     Switcher,
+    /// A session started from the phone.
+    Mobile,
+    /// A session started from the quick composer.
+    Quick,
     /// Also what unknown future values read as.
     #[default]
     #[serde(other)]
@@ -181,6 +185,14 @@ mod tests {
             (StartKind::Base, CreatedBy::Api)
         );
         assert_eq!(all(&store).unwrap().len(), 2);
+        for (by, text) in [
+            (CreatedBy::Automation, "\"automation\""),
+            (CreatedBy::Mobile, "\"mobile\""),
+            (CreatedBy::Quick, "\"quick\""),
+        ] {
+            assert_eq!(serde_json::to_string(&by).unwrap(), text);
+            assert_eq!(serde_json::from_str::<CreatedBy>(text).unwrap(), by);
+        }
         // Other prefixes are not listed.
         save_prefs(&store, &Prefs::default()).unwrap();
         save_repo_prefs(&store, Path::new("/repo"), &RepoPrefs::default()).unwrap();

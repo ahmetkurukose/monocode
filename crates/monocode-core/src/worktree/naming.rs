@@ -145,6 +145,9 @@ pub struct PickRequest<'a> {
     pub branch: Option<&'a str>,
     /// The explicit branch is an existing one to check out.
     pub existing: bool,
+    /// An explicit new branch may share its name with `origin/<branch>` (the API's old
+    /// behaviour: a new local branch, not tracking it).
+    pub allow_remote_name_clash: bool,
 }
 
 #[derive(Debug)]
@@ -201,7 +204,7 @@ pub fn pick(req: &PickRequest) -> Result<Picked, String> {
                 "A branch named {branch} already exists. Use the existing branch or choose another name."
             ));
         }
-        if !req.existing && origin_branch_exists(req.cwd, branch) {
+        if !req.existing && !req.allow_remote_name_clash && origin_branch_exists(req.cwd, branch) {
             return Err(format!(
                 "origin/{branch} already exists. Use the existing branch or choose another name."
             ));
@@ -340,6 +343,7 @@ mod tests {
             prefix: None,
             branch: None,
             existing: false,
+            allow_remote_name_clash: false,
         };
         // Local branch exists.
         run(&main, &["branch", "taken"]);
@@ -382,6 +386,22 @@ mod tests {
         })
         .unwrap_err()
         .contains("origin/feature"));
+        // The API may still name a new local branch like a remote-only one.
+        let p = pick(&PickRequest {
+            branch: Some("feature"),
+            allow_remote_name_clash: true,
+            ..req("x")
+        })
+        .unwrap();
+        assert_eq!(p.branch, "feature");
+        drop(p);
+        // A local branch of that name is still refused.
+        assert!(pick(&PickRequest {
+            branch: Some("taken"),
+            allow_remote_name_clash: true,
+            ..req("x")
+        })
+        .is_err());
         let p = pick(&PickRequest {
             branch: Some("brand/new"),
             ..req("dir")

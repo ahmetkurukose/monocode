@@ -422,4 +422,117 @@ mod tests {
         assert_eq!(rows[0].text, "Create the checkout");
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn a_turn_does_not_start_in_a_worktree_being_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut summary = store.create("codex", tree.to_str().unwrap()).unwrap();
+        summary.provider = "invalid-test-provider".into();
+        let store = Arc::new(Mutex::new(store));
+        let removing = monocode_core::worktree::remove::mark_removing(&tree);
+        let (tx, rx) = async_channel::bounded(8);
+        let (_control, controls) = std::sync::mpsc::channel();
+        run_turn(
+            summary,
+            "Do the work".into(),
+            Settings::default(),
+            controls,
+            store,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        drop(removing);
+        let mut statuses = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            statuses.push(update.status);
+        }
+        assert!(
+            statuses
+                .iter()
+                .any(|s| s.contains(monocode_core::worktree::remove::BEING_REMOVED)),
+            "{statuses:?}"
+        );
+    }
+
+    #[test]
+    fn an_automation_worktree_starts_from_head_and_is_tagged_as_the_automations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "Base"]);
+        git(&["switch", "-q", "-c", "topic"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "Topic"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        monocode_core::worktree::meta::save_prefs(
+            &store,
+            &monocode_core::worktree::Prefs {
+                root: Some(root.join("workspaces")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut summary = store.create("codex", repo.to_str().unwrap()).unwrap();
+        summary.provider = "invalid-test-provider".into();
+        let store = Arc::new(Mutex::new(store));
+        let (tx, rx) = async_channel::bounded(8);
+        let (_control, controls) = std::sync::mpsc::channel();
+        run_turn(
+            summary,
+            "Nightly cleanup".into(),
+            Settings {
+                new_worktree: true,
+                worktree_base: Some("HEAD".into()),
+                worktree_origin: Some(monocode_core::worktree::CreatedBy::Automation),
+                ..Default::default()
+            },
+            controls,
+            store.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let mut cwd = None;
+        while let Ok(update) = rx.try_recv() {
+            cwd = cwd.or(update.worktree_cwd);
+        }
+        let cwd = cwd.expect("the worktree was created");
+        let meta = monocode_core::worktree::meta::load(
+            &locked(&store).unwrap(),
+            std::path::Path::new(&cwd),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            meta.created_by,
+            monocode_core::worktree::CreatedBy::Automation
+        );
+        assert_eq!(meta.base_ref, "HEAD");
+        let made = std::process::Command::new("git")
+            .current_dir(&cwd)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&made.stdout).trim(), head);
+    }
 }

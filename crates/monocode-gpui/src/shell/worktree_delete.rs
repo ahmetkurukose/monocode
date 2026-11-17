@@ -59,6 +59,23 @@ fn inspect(cwd: &Path, path: &Path, store: &Database) -> Result<DeleteInfo, Stri
     })
 }
 
+/// Tests make the sessions' detach fail after a successful removal.
+#[cfg(test)]
+static FAIL_DETACH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Move the sessions using `path` (removed) to the main checkout, marked removed.
+fn detach_sessions(
+    store: &Database,
+    path: &str,
+    main: &Path,
+) -> Result<Vec<(Session, monocode_core::agent::Settings)>, String> {
+    #[cfg(test)]
+    if FAIL_DETACH.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("database is locked".into());
+    }
+    locked(store)?.detach_worktree(path, &main.to_string_lossy())
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -73,20 +90,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_menu(cx);
-        let store = self.store.clone();
-        let (cwd, target) = (project.clone(), path.clone());
-        let work = cx
-            .background_executor()
-            .spawn(async move { inspect(Path::new(&cwd), Path::new(&target), &store) });
-        let load = cx.spawn(async move |this, cx| {
-            let info = work.await;
-            let _ = this.update(cx, |this, cx| {
-                if let Some(dialog) = &mut this.worktree_ui.delete {
-                    dialog.info = Some(info);
-                    cx.notify();
-                }
-            });
-        });
+        let load = self.inspect_for_delete_dialog(&project, &path, cx);
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         self.worktree_ui.delete = Some(DeleteDialog {
@@ -100,6 +104,56 @@ impl Shell {
             _load: load,
         });
         cx.notify();
+    }
+
+    /// Read the worktree's preflight in the background into the open dialog for `path`.
+    fn inspect_for_delete_dialog(
+        &self,
+        project: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        let store = self.store.clone();
+        let (cwd, target) = (project.to_owned(), path.to_owned());
+        let work = cx
+            .background_executor()
+            .spawn(async move { inspect(Path::new(&cwd), Path::new(&target), &store) });
+        let path = path.to_owned();
+        cx.spawn(async move |this, cx| {
+            let info = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(dialog) = &mut this.worktree_ui.delete
+                    && dialog.path == path
+                {
+                    dialog.info = Some(info);
+                    cx.notify();
+                }
+            });
+        })
+    }
+
+    /// A new terminal (or action) would start in a worktree being removed: say why and
+    /// refuse. Returns whether it was refused.
+    pub(super) fn refuse_terminal_in_removed_worktree(
+        &mut self,
+        cwd: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.worktree_being_removed(cwd) {
+            return false;
+        }
+        self.error = Some(worktree::remove::BEING_REMOVED.into());
+        cx.notify();
+        true
+    }
+
+    /// `cwd` is (inside) a worktree this window is removing, or one being removed
+    /// elsewhere in the app.
+    pub(super) fn worktree_being_removed(&self, cwd: &str) -> bool {
+        self.removing_worktrees
+            .keys()
+            .any(|path| is_equal_or_inside(cwd, path))
+            || worktree::remove::is_being_removed(cwd)
     }
 
     fn close_delete_worktree_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -215,6 +269,11 @@ impl Shell {
                 if let Some(error) = this.worktree_in_use(&path, &ids, cx) {
                     return Err(format!("This worktree is now in use. {error}"));
                 }
+                // From here until it finishes, nothing new may start there.
+                this.removing_worktrees.insert(
+                    path.clone(),
+                    worktree::remove::mark_removing(Path::new(&path)),
+                );
                 if delete_sessions {
                     for id in &ids {
                         this.delete_session(*id, window, cx);
@@ -261,8 +320,18 @@ impl Shell {
                     &opts,
                     &store,
                 )?;
-                let detached =
-                    locked(&store)?.detach_worktree(&worker_path, &main.to_string_lossy())?;
+                let mut removed = removed;
+                // The worktree is gone either way; failing to move its sessions off it
+                // is reported, not a failed removal.
+                let detached = match detach_sessions(&store, &worker_path, &main) {
+                    Ok(detached) => detached,
+                    Err(error) => {
+                        removed.warnings.push(format!(
+                            "The worktree was deleted, but its sessions could not be updated: {error}"
+                        ));
+                        Vec::new()
+                    }
+                };
                 Ok::<_, String>((removed, detached, main))
             });
             let result = work.await;
@@ -292,6 +361,7 @@ impl Shell {
         result: Result<(Removed, std::path::PathBuf), String>,
         cx: &mut Context<Self>,
     ) {
+        self.removing_worktrees.remove(path);
         match result {
             Ok((removed, main)) => {
                 self.worktree_ui.delete = None;
@@ -317,6 +387,15 @@ impl Shell {
                 Some(dialog) => {
                     dialog.busy = false;
                     dialog.error = Some(error);
+                    // The tree may have changed since the dialog read it (e.g. new
+                    // uncommitted changes): read it again, so Force shows when needed.
+                    if dialog.path == path {
+                        let project = dialog.project.clone();
+                        let task = self.inspect_for_delete_dialog(&project, path, cx);
+                        if let Some(dialog) = &mut self.worktree_ui.delete {
+                            dialog._load = task;
+                        }
+                    }
                 }
                 None => self.error = Some(error),
             },
@@ -1035,6 +1114,108 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert!(settings.worktree_removed);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_tree_that_changed_since_the_dialog_opened_offers_force_after_delete_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temp, main, root) = repo();
+        let (window, paths, _) = shell(cx, &main, &root, &["late"], &[]);
+        let wt = &paths[0];
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        open(window, visual, &main, wt);
+        assert!(!info(window, visual).preflight.needs_force());
+        assert!(visual.debug_bounds("worktree-delete-force").is_none());
+        // Changed after the dialog read it: Delete refuses, and the dialog reads again.
+        std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+        click(visual, "worktree-delete-confirm");
+        assert!(open_dialog(window, visual));
+        assert!(wt.is_dir());
+        assert!(visual.debug_bounds("worktree-delete-failed").is_some());
+        assert_eq!(info(window, visual).preflight.dirty.len(), 1);
+        assert!(
+            visual.debug_bounds("worktree-delete-force").is_some(),
+            "Force delete is offered now"
+        );
+        click(visual, "worktree-delete-force");
+        assert!(!open_dialog(window, visual));
+        assert!(!wt.exists());
+    }
+
+    #[gpui::test]
+    fn a_worktree_being_removed_refuses_new_terminals_and_turns_until_it_finishes(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temp, main, root) = repo();
+        let (window, paths, _) = shell(cx, &main, &root, &["going"], &[]);
+        let path = paths[0].to_string_lossy().into_owned();
+        let inside = paths[0].join("src").to_string_lossy().into_owned();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| {
+                shell.select_worktree(
+                    Some(crate::worktree_switcher::WorktreeFocus {
+                        path: path.clone(),
+                        branch: None,
+                    }),
+                    w,
+                    cx,
+                );
+                // What the removal's recheck does.
+                shell
+                    .removing_worktrees
+                    .insert(path.clone(), worktree::remove::mark_removing(&paths[0]));
+                assert!(shell.worktree_being_removed(&inside));
+                assert!(worktree::remove::is_being_removed(&inside));
+                let before = shell.terminals.get(&main).map_or(0, Vec::len);
+                shell.new_terminal(w, cx);
+                assert_eq!(shell.terminals.get(&main).map_or(0, Vec::len), before);
+                assert_eq!(
+                    shell.error.as_deref(),
+                    Some(worktree::remove::BEING_REMOVED)
+                );
+                // A failed removal lets them start again.
+                shell.finish_worktree_removal(&path, Err("refused".into()), cx);
+                assert!(shell.removing_worktrees.is_empty());
+                assert!(!shell.worktree_being_removed(&inside));
+                assert!(!worktree::remove::is_being_removed(&inside));
+            })
+            .unwrap();
+
+        // A real removal clears its mark when it succeeds.
+        open(window, visual, &main, &paths[0]);
+        click(visual, "worktree-delete-confirm");
+        assert!(!paths[0].exists());
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.removing_worktrees.is_empty());
+                assert!(!worktree::remove::is_being_removed(&path));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn sessions_that_cannot_be_detached_after_removal_are_a_warning(cx: &mut TestAppContext) {
+        let (_temp, main, root) = repo();
+        let (window, paths, _) = shell(cx, &main, &root, &["gone"], &[0]);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        open(window, visual, &main, &paths[0]);
+        FAIL_DETACH.store(true, std::sync::atomic::Ordering::Relaxed);
+        click(visual, "worktree-delete-confirm");
+        FAIL_DETACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!paths[0].exists());
+        assert!(!open_dialog(window, visual), "the removal still finishes");
+        window
+            .update(visual, |shell, _, _| {
+                let error = shell.error.clone().unwrap_or_default();
+                assert!(
+                    error.contains("its sessions could not be updated: database is locked"),
+                    "{error}"
+                );
+                assert!(shell.removing_worktrees.is_empty());
             })
             .unwrap();
     }

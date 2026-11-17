@@ -14,6 +14,7 @@ use std::{
 fn update(status: impl Into<String>, finished: bool) -> Update {
     Update {
         worktree_cwd: None,
+        worktree_warnings: Vec::new(),
         commands: None,
         provider_turn_id: None,
         turn_ready: false,

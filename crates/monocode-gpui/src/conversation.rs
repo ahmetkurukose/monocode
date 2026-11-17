@@ -206,6 +206,9 @@ pub(crate) struct Conversation {
     git_picker: Option<Entity<GitPicker>>,
     git_events: Option<Subscription>,
     preparing_worktree: bool,
+    /// Problems met creating this session's worktree (e.g. a failed fetch), shown
+    /// above the composer until dismissed.
+    pub(crate) worktree_notice: Option<String>,
     context: Option<monocode_core::context::Usage>,
     context_hovered: bool,
     /// The submit button's morph between square and labelled pill.
@@ -665,6 +668,7 @@ impl Conversation {
             git_picker: None,
             git_events: None,
             preparing_worktree: false,
+            worktree_notice: None,
             context: None,
             context_hovered: false,
             send_morph: Default::default(),
@@ -1172,6 +1176,8 @@ impl Conversation {
         }
         self.preparing_worktree = settings.new_worktree && settings.worktree_cwd.is_none();
         if self.preparing_worktree {
+            // The base the composer's picker shows: an explicit one (automations and
+            // the phone choose HEAD) stays; otherwise the session's branch.
             settings.worktree_base = settings.worktree_base.or(self.branch.clone());
             self.status = "Creating worktree…".into();
         }
@@ -1245,9 +1251,12 @@ impl Conversation {
                             this.preparing_worktree = false;
                             this.settings.worktree_cwd = Some(cwd);
                             this.settings.new_worktree = false;
+                            this.set_worktree_warnings(&update.worktree_warnings);
                             this.save_settings(cx);
                             this.generate_worktree_branch(&worktree_message, cx);
                             this.refresh_git(cx);
+                            // The rail lists the session under its new worktree.
+                            cx.emit(SessionChanged);
                         }
                         // The host renamed the conversation; it is not sent back.
                         if let Some(title) = update.title
@@ -1824,13 +1833,13 @@ impl Conversation {
         self.preparing_worktree = true;
         self.status = "Creating worktree…".into();
         let cwd = self.summary.cwd.clone();
-        // No chosen base: local uses the repository's default base, remote keeps
-        // branching from the current branch.
-        let base = self
+        // The base shown in the composer's picker: the chosen one, else the
+        // session's branch (an automation or the phone chose HEAD explicitly).
+        let base = self.settings.worktree_base.clone().or(self.branch.clone());
+        let origin = self
             .settings
-            .worktree_base
-            .clone()
-            .or_else(|| self.is_remote().then(|| self.branch.clone()).flatten());
+            .worktree_origin
+            .unwrap_or(monocode_core::worktree::CreatedBy::Composer);
         let prompt = self
             .follow_ups
             .state
@@ -1846,7 +1855,7 @@ impl Conversation {
                 base.as_deref(),
                 &prompt,
                 id,
-                monocode_core::worktree::CreatedBy::Composer,
+                origin,
                 &store,
             )
         });
@@ -1855,11 +1864,14 @@ impl Conversation {
             let _ = this.update(cx, |this, cx| {
                 this.preparing_worktree = false;
                 match result {
-                    Ok(path) => {
-                        this.settings.worktree_cwd = Some(path.to_string_lossy().into_owned());
+                    Ok(made) => {
+                        this.settings.worktree_cwd = Some(made.path.to_string_lossy().into_owned());
                         this.settings.new_worktree = false;
+                        this.set_worktree_warnings(&made.warnings);
                         this.save_settings(cx);
                         this.refresh_git(cx);
+                        // The rail lists the session under its new worktree.
+                        cx.emit(SessionChanged);
                         if this.follow_ups.state.messages.is_empty() {
                             this.send(cx);
                         } else {
@@ -1879,6 +1891,39 @@ impl Conversation {
         })
         .detach();
         cx.notify();
+    }
+    /// Show what went wrong (but not fatally) making this session's worktree.
+    fn set_worktree_warnings(&mut self, warnings: &[String]) {
+        self.worktree_notice = (!warnings.is_empty()).then(|| warnings.join("\n"));
+    }
+    fn worktree_notice_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notice = self.worktree_notice.clone()?;
+        Some(
+            div()
+                .id("worktree-notice")
+                .debug_selector(|| "worktree-notice".into())
+                .role(gpui::Role::Status)
+                .mb_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(content(0.1))
+                .flex()
+                .items_start()
+                .gap_3()
+                .text_size(px(12.))
+                .child(icon("triangle-alert", 14.).text_color(gpui::rgb(0xfbbf24)))
+                .child(div().flex_1().min_w_0().child(notice))
+                .child(
+                    icon_button("worktree-notice-dismiss", "Dismiss", "close")
+                        .debug_selector(|| "worktree-notice-dismiss".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.worktree_notice = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
     fn open_git(&mut self, mode: GitMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.preparing_worktree {
@@ -2880,6 +2925,7 @@ impl Conversation {
             .child(self.background_shelf(window, cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
+            .children(self.worktree_notice_card(cx))
             .when(self.settings.worktree_removed,|d|d.child(div().mb_2().p_3().rounded_lg().border_1().border_color(content(0.1)).flex().items_center().gap_3().text_size(px(12.)).child(div().flex_1().child("Worktree deleted. Select a branch or worktree to continue this conversation.")).child(tool_pill("reattach-worktree","Select worktree").child("Select worktree").on_click(cx.listener(|this,_,window,cx|this.open_git(GitMode::Worktree,window,cx))))))
             .when_some(self.settings.handoff.clone(), |d, handoff| {
                 d.child(

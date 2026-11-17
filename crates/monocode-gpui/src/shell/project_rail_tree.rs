@@ -12,7 +12,7 @@ use gpui::Div;
 const MAX_SESSIONS: usize = 8;
 const CHILD_HEIGHT: f32 = 30.;
 /// How far in a worktree's own sessions sit, against the project's 22px.
-const NESTED_INDENT: f32 = 38.;
+pub(super) const NESTED_INDENT: f32 = 38.;
 /// The space between two projects' cards.
 pub(super) const CARD_GAP: f32 = 6.;
 /// The apps a project's row offers, in order: preference name, view, icon.
@@ -158,6 +158,7 @@ impl Shell {
             rows.push(ProjectRailRow::More {
                 project: project.clone(),
                 hidden,
+                worktree: None,
                 last: last(rows.len()),
             });
         }
@@ -480,6 +481,13 @@ impl Shell {
             ProjectRailRow::More {
                 project,
                 hidden,
+                worktree: Some(path),
+                last,
+            } => self.project_rail_worktree_more_row(project, path, hidden, last, cx),
+            ProjectRailRow::More {
+                project,
+                hidden,
+                worktree: None,
                 last,
             } => {
                 let target = project.clone();

@@ -151,6 +151,9 @@ impl Shell {
                 fast: choice.fast,
                 new_worktree: choice.new_worktree,
                 worktree_base: choice.worktree_base,
+                worktree_origin: choice
+                    .new_worktree
+                    .then_some(monocode_core::worktree::CreatedBy::Quick),
                 worktree_cwd: choice.worktree_cwd,
                 ..Default::default()
             };

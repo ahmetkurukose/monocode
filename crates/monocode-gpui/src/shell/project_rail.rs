@@ -28,9 +28,12 @@ pub(super) enum ProjectRailRow {
         source: RailTerminal,
         last: bool,
     },
+    /// "N more…": the project's sessions past the tree's limit, or (with
+    /// `worktree`) those of an open worktree.
     More {
         project: String,
         hidden: usize,
+        worktree: Option<String>,
         last: bool,
     },
     // The project's worktrees (project_rail_worktrees.rs): a worktree, a
@@ -302,7 +305,11 @@ impl Shell {
                                 .into(),
                         );
                     }
-                    ProjectRailRow::More { hidden, .. } => items.push(
+                    ProjectRailRow::More {
+                        hidden,
+                        worktree: None,
+                        ..
+                    } => items.push(
                         MenuAction::new("rail-more", format!("{hidden} more in the tree"))
                             .indent(16.)
                             .disabled(true)

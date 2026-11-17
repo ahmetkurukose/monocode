@@ -43,6 +43,9 @@ impl Shell {
         let Some(action) = self.project_actions().iter().find(|a| a.id == id).cloned() else {
             return;
         };
+        if self.refuse_terminal_in_removed_worktree(&self.terminal_cwd(cx), cx) {
+            return;
+        }
         self.workspace
             .last_actions
             .insert(project.clone(), action.id.clone());

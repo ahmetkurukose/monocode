@@ -63,7 +63,7 @@ impl Shell {
         };
         if let DialogEvent::Submit {
             request,
-            run_setup,
+            setup,
             default_base,
         } = event
         {
@@ -79,7 +79,7 @@ impl Shell {
             self.start_worktree_create(
                 open.project,
                 (**request).clone(),
-                *run_setup,
+                setup.clone(),
                 open.origin,
                 window,
                 cx,
@@ -199,11 +199,12 @@ impl Shell {
         }
     }
 
-    /// The rail project menu offers "New worktree…" for local Git projects.
+    /// The rail project menu offers "New worktree…" for Git projects: local ones, and
+    /// remote ones the app has read as repositories (the dialog's reduced remote form).
     pub(super) fn offers_new_worktree(&self, project: &str) -> bool {
-        !monocode_core::files::remote::is_remote(std::path::Path::new(project))
-            && (crate::git_cache::get(project).is_some_and(|s| !s.worktrees.is_empty())
-                || std::path::Path::new(project).join(".git").exists())
+        crate::git_cache::get(project).is_some_and(|s| !s.worktrees.is_empty())
+            || (!monocode_core::files::remote::is_remote(std::path::Path::new(project))
+                && std::path::Path::new(project).join(".git").exists())
     }
 }
 
@@ -527,6 +528,44 @@ pub(super) mod tests {
     }
 
     #[gpui::test]
+    fn a_saved_default_base_that_is_gone_is_not_shown_as_the_default(cx: &mut TestAppContext) {
+        let (_temp, main, root) = repo();
+        git(Path::new(&main), &["branch", "develop"]);
+        let window = shell(cx, &main, &root);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let save = |window: WindowHandle<Shell>, cx: &mut VisualTestContext, base: &str| {
+            window
+                .update(cx, |shell, _, _| {
+                    let db = locked(&shell.store).unwrap();
+                    let mut prefs = worktree::meta::repo_prefs(&db, Path::new(&main)).unwrap();
+                    prefs.default_base = Some(base.into());
+                    worktree::meta::save_repo_prefs(&db, Path::new(&main), &prefs).unwrap();
+                })
+                .unwrap();
+        };
+        save(window, visual, "develop");
+        open(window, visual, &main, "a");
+        let view = dialog(window, visual).unwrap();
+        assert_eq!(
+            view.read_with(visual, |v, _| v.default_base.clone())
+                .as_deref(),
+            Some("develop")
+        );
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+
+        save(window, visual, "deleted-branch");
+        open(window, visual, &main, "b");
+        let view = dialog(window, visual).unwrap();
+        assert_eq!(
+            view.read_with(visual, |v, _| v.default_base.clone())
+                .as_deref(),
+            Some("main"),
+            "the detected default, which creation will use"
+        );
+    }
+
+    #[gpui::test]
     fn the_setup_row_needs_a_script_and_shows_one_not_yet_approved(cx: &mut TestAppContext) {
         let (_temp, main, root) = repo();
         let window = shell(cx, &main, &root);
@@ -574,6 +613,23 @@ pub(super) mod tests {
             view.read_with(visual, |v, _| v.run_setup),
             "an approved script runs"
         );
+        // Submitting carries the hash of the script shown, so a different one in
+        // the new worktree is not run.
+        window
+            .update(visual, |_, _, cx| view.update(cx, |v, cx| v.submit(cx)))
+            .unwrap();
+        window
+            .update(visual, |shell, _, _| {
+                let pending = shell.pending_worktrees_for(&main);
+                assert_eq!(
+                    pending[0].setup,
+                    super::super::worktree_create::SetupChoice::run(Some(worktree::setup::hash(
+                        "echo ready"
+                    )))
+                );
+            })
+            .unwrap();
+        visual.run_until_parked();
     }
 
     #[gpui::test]
@@ -589,7 +645,7 @@ pub(super) mod tests {
                 let id = shell.start_worktree_create(
                     main.clone(),
                     request,
-                    false,
+                    super::super::worktree_create::SetupChoice::skip(),
                     WorktreeOrigin::Switcher,
                     w,
                     cx,
@@ -641,7 +697,7 @@ pub(super) mod tests {
                 shell.start_worktree_create(
                     main.clone(),
                     request,
-                    false,
+                    super::super::worktree_create::SetupChoice::skip(),
                     WorktreeOrigin::Switcher,
                     w,
                     cx,
@@ -730,6 +786,36 @@ pub(super) mod tests {
                 ..Default::default()
             },
         );
+        // A remote Git project's rail menu offers it.
+        window
+            .update(visual, |shell, _, _| {
+                assert!(
+                    !shell.offers_new_worktree(project),
+                    "not read as a repository yet"
+                );
+            })
+            .unwrap();
+        crate::git_cache::remember(
+            project,
+            &monocode_core::git::Snapshot {
+                worktrees: vec![monocode_core::git::Worktree {
+                    path: project.into(),
+                    branch: Some("main".into()),
+                    main: true,
+                    ..Default::default()
+                }],
+                branches: vec![monocode_core::git::Branch {
+                    name: "feature/old".into(),
+                    remote: None,
+                }],
+                ..Default::default()
+            },
+        );
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.offers_new_worktree(project))
+            })
+            .unwrap();
         open(window, visual, project, "feature/new");
         let view = dialog(window, visual).unwrap();
         assert_eq!(view.read_with(visual, |v, cx| v.problem(cx)), None);
@@ -766,7 +852,7 @@ pub(super) mod tests {
                 let request = &pending[0].request;
                 assert_eq!(request.branch.as_deref(), Some("feature/old"));
                 assert!(request.existing_branch);
-                assert!(!pending[0].run_setup);
+                assert!(!pending[0].setup.run);
             })
             .unwrap();
         visual.run_until_parked();

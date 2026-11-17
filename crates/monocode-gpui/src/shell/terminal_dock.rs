@@ -223,6 +223,9 @@ impl Shell {
             return;
         }
         let cwd = self.terminal_cwd(cx);
+        if self.refuse_terminal_in_removed_worktree(&cwd, cx) {
+            return;
+        }
         let dock = self.workspace.docks.entry(project.clone()).or_default();
         dock.add(cwd.clone());
         // The dock stays shut until the terminal moves back out of the panel.

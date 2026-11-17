@@ -29,6 +29,10 @@ pub struct CreateRequest {
     /// Check out the existing local branch `branch` (or create a tracking branch for
     /// `origin/<branch>` when only the remote has it) instead of creating one.
     pub existing_branch: bool,
+    /// A new explicit `branch` may share its name with `origin/<branch>`; it is created
+    /// locally without tracking it (the external API's old behaviour). The dialog keeps
+    /// refusing such names.
+    pub allow_remote_name_clash: bool,
     /// `None` → `worktree-prefs.root` → `~/monocode/workspaces`.
     pub root: Option<PathBuf>,
     /// `None` → `worktree-prefs.branch_prefix`.
@@ -48,6 +52,7 @@ impl CreateRequest {
             base: None,
             branch: None,
             existing_branch: false,
+            allow_remote_name_clash: false,
             root: None,
             prefix: None,
             created_by: CreatedBy::Api,
@@ -203,7 +208,7 @@ pub fn create(
                 progress(Phase::Fetching);
                 if let Err(e) = base::fetch(&main, "origin", branch, req.fetch_timeout) {
                     warnings.push(format!(
-                        "Could not refresh origin/{branch} ({e}); using the last fetched copy."
+                        "Started from the local copy of origin/{branch}; fetch failed ({e})."
                     ));
                 }
             }
@@ -218,7 +223,7 @@ pub fn create(
             progress(Phase::Fetching);
             if let Err(e) = base::fetch(&main, remote, branch, req.fetch_timeout) {
                 warnings.push(format!(
-                    "Could not refresh {} ({e}); using the last fetched copy.",
+                    "Started from the local copy of {}; fetch failed ({e}).",
                     resolved.reference
                 ));
             }
@@ -254,6 +259,7 @@ pub fn create(
         prefix: prefix.as_deref(),
         branch: explicit,
         existing: req.existing_branch,
+        allow_remote_name_clash: req.allow_remote_name_clash,
     })?;
     let branch = picked.branch.clone();
     let path = picked.path.clone();
@@ -561,7 +567,8 @@ mod tests {
         let created = create(&request(&main, &root, "offline"), &store, &|_| {}).unwrap();
         assert_eq!(created.base, "origin/main");
         assert_eq!(created.warnings.len(), 1, "{:?}", created.warnings);
-        assert!(created.warnings[0].contains("Could not refresh origin/main"));
+        assert!(created.warnings[0]
+            .contains("Started from the local copy of origin/main; fetch failed"));
     }
 
     #[test]

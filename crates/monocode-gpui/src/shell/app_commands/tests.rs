@@ -561,6 +561,9 @@ fn operator_creates_selects_and_validates_real_worktrees(cx: &mut TestAppContext
         })
         .unwrap();
     cx.run_until_parked();
+    let before = window
+        .update(cx, |shell, _, _| shell.rail_worktrees.invalidations)
+        .unwrap();
     let tree = call(
         window,
         id,
@@ -576,6 +579,40 @@ fn operator_creates_selects_and_validates_real_worktrees(cx: &mut TestAppContext
     assert!(
         std::path::Path::new(path).starts_with(root.join("workspaces").canonicalize().unwrap())
     );
+    // The rail and Settings read their lists again after an API create.
+    let invalidations = window
+        .update(cx, |shell, _, _| shell.rail_worktrees.invalidations)
+        .unwrap();
+    assert!(
+        invalidations > before,
+        "worktrees.create marks the rail lists stale"
+    );
+    // An invalid branch fails as it always did, instead of being renamed.
+    assert_eq!(
+        call(
+            window,
+            id,
+            "bad-tree",
+            "worktrees.create",
+            json!({"branch":"-bad"}),
+            cx
+        )
+        .unwrap_err(),
+        "Enter a valid branch name"
+    );
+    // A branch only origin has becomes a new local branch, from HEAD, as before.
+    git(&["update-ref", "refs/remotes/origin/shared-name", "HEAD"]);
+    let shared = call(
+        window,
+        id,
+        "shared-tree",
+        "worktrees.create",
+        json!({"branch":"shared-name"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(shared["branch"], "shared-name");
+    assert!(std::path::Path::new(shared["path"].as_str().unwrap()).is_dir());
     let listed = call(window, id, "list-trees", "worktrees.list", json!({}), cx).unwrap();
     assert!(
         listed["worktrees"]
@@ -710,4 +747,28 @@ fn operator_api_actions_are_gated_like_the_others_and_report_a_missing_collectio
     )
     .unwrap_err();
     assert!(error.contains("this thread's project"), "{error}");
+}
+
+#[test]
+fn a_repeated_start_request_waits_for_the_first_to_finish() {
+    let first = StartGuard::claim(1, "same-request");
+    let (done, finished) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _second = StartGuard::claim(1, "same-request");
+        done.send(()).unwrap();
+    });
+    // Another request (or caller) is never held up.
+    drop(StartGuard::claim(1, "other-request"));
+    drop(StartGuard::claim(2, "same-request"));
+    assert!(
+        finished
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "the retry waits while the first is still starting"
+    );
+    drop(first);
+    finished
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the retry proceeds once the first finished");
+    waiter.join().unwrap();
 }

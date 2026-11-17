@@ -15,6 +15,8 @@ enum Effect {
         Option<(i64, crate::pane_layout::Edge)>,
     ),
     Groups(String, Groups),
+    /// A worktree was created: the Shell's rail and Settings read their lists again.
+    Worktrees,
 }
 fn text(v: &Value, key: &str, max: usize) -> Result<String, String> {
     v.get(key)
@@ -111,6 +113,11 @@ impl Monos {
                             let _ = this.owner.update(cx, |owner, cx| {
                                 owner.mono_apply_groups(project, groups, cx)
                             });
+                        }
+                        Effect::Worktrees => {
+                            let _ = this
+                                .owner
+                                .update(cx, |owner, cx| owner.worktrees_changed_elsewhere(cx));
                         }
                         Effect::Start(summary, settings, _prompt, draft, placement) => {
                             let id = summary.id;
@@ -746,7 +753,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.enabled=ena
                         "worktrees.list"=>json!(monocode_core::git::snapshot(Path::new(&project))?.worktrees.iter().map(|w|json!({"path":w.path,"branch":w.branch,"head":w.head,"main":w.main})).collect::<Vec<_>>()),
                         "worktrees.create"=>{let branch=text(&input,"branch",240)?;let tree=monocode_core::worktree_callers::named(Path::new(&project),&branch,input.get("base").and_then(Value::as_str),flag(&input,"existing",false),monocode_core::worktree::CreatedBy::Api,&store)?;json!({"path":tree.path,"branch":tree.branch})},
                         _=>unreachable!(),
-                    };Ok((value,Effect::None))
+                    };let effect=if action=="worktrees.create"{Effect::Worktrees}else{Effect::None};Ok((value,effect))
                 },cx);
                 return;
             }

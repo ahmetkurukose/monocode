@@ -328,6 +328,66 @@ pub fn force_delete_branch(cwd: &Path, branch: &str) -> Result<(), String> {
     git(cwd, &["branch", "-D", "--", branch]).map(|_| ())
 }
 
+/// What a turn, terminal or session launch is told while its worktree is being removed.
+pub const BEING_REMOVED: &str = "This worktree is being deleted.";
+
+/// Each live mark: its id and the spellings of the path it covers.
+type Marks = Vec<(u64, Vec<String>)>;
+static REMOVING: std::sync::LazyLock<Mutex<Marks>> = std::sync::LazyLock::new(Default::default);
+static NEXT_REMOVING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Marks a worktree as being removed until dropped; see [`is_being_removed`].
+#[derive(Debug)]
+pub struct Removing(u64);
+impl Drop for Removing {
+    fn drop(&mut self) {
+        REMOVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.0);
+    }
+}
+
+/// Mark `path` (as spelled and canonically) as being removed, in this process, until
+/// the guard is dropped. New turns, terminals and session launches there are refused.
+pub fn mark_removing(path: &Path) -> Removing {
+    let id = NEXT_REMOVING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut spellings = vec![path.to_string_lossy().into_owned()];
+    let canonical = super::canonical(path).to_string_lossy().into_owned();
+    if !spellings.contains(&canonical) {
+        spellings.push(canonical);
+    }
+    REMOVING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((id, spellings));
+    Removing(id)
+}
+
+/// `cwd` is a worktree being removed, or inside one.
+pub fn is_being_removed(cwd: &str) -> bool {
+    let removing = REMOVING.lock().unwrap_or_else(|e| e.into_inner());
+    if removing.is_empty() || cwd.is_empty() {
+        return false;
+    }
+    let canonical = super::canonical(Path::new(cwd))
+        .to_string_lossy()
+        .into_owned();
+    removing.iter().flat_map(|(_, paths)| paths).any(|path| {
+        crate::files::is_equal_or_inside(cwd, path)
+            || crate::files::is_equal_or_inside(&canonical, path)
+    })
+}
+
+/// `Err(BEING_REMOVED)` when `cwd` is being removed.
+pub fn ensure_not_being_removed(cwd: &str) -> Result<(), String> {
+    if is_being_removed(cwd) {
+        Err(BEING_REMOVED.into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::fixture::{self, has_branch, run};
@@ -604,5 +664,30 @@ mod tests {
         v.sort_by(env_first);
         assert_eq!(v, [".env.local", "x/.env", "a", "b"]);
         assert!(regenerable("pkg/node_modules/x") && !regenerable("src/main.rs"));
+    }
+
+    #[test]
+    fn worktree_being_removed_covers_the_path_and_what_is_inside_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        let inside = tree.join("sub").to_string_lossy().into_owned();
+        let sibling = dir.path().join("tree-2").to_string_lossy().into_owned();
+        assert!(!is_being_removed(&inside));
+        let guard = mark_removing(&tree);
+        let again = mark_removing(&tree);
+        assert!(is_being_removed(&tree.to_string_lossy()));
+        assert!(is_being_removed(&inside));
+        // The canonical spelling (e.g. /private/var on macOS) matches too.
+        assert!(is_being_removed(
+            &super::super::canonical(&tree).to_string_lossy()
+        ));
+        assert!(!is_being_removed(&sibling));
+        assert_eq!(ensure_not_being_removed(&inside), Err(BEING_REMOVED.into()));
+        drop(guard);
+        assert!(is_being_removed(&inside), "another removal still holds it");
+        drop(again);
+        assert!(!is_being_removed(&inside));
+        assert!(ensure_not_being_removed(&inside).is_ok());
     }
 }

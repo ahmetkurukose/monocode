@@ -143,13 +143,16 @@ fn rename_checked(
 }
 
 /// The branch a managed worktree may still be renamed from: it has metadata, was
-/// made by the composer with a generated name, and still uses that name.
+/// made for a session with a generated name, and still uses that name.
 pub fn managed_expected(path: &Path, store: &Store) -> Option<String> {
     let meta = worktree::meta::load(store, path).ok()??;
-    if meta.branch_user_chosen
-        || meta.created_by != worktree::CreatedBy::Composer
-        || meta.branch_at_create.is_empty()
-    {
+    // Only a worktree a session made (composer, quick composer, automation, phone, API)
+    // has a generated name; the dialog's and switcher's names are the user's.
+    let session_made = !matches!(
+        meta.created_by,
+        worktree::CreatedBy::Dialog | worktree::CreatedBy::Switcher
+    );
+    if meta.branch_user_chosen || !session_made || meta.branch_at_create.is_empty() {
         return None;
     }
     Some(meta.branch_at_create)
@@ -344,7 +347,8 @@ mod tests {
             worktree::CreatedBy::Composer,
             &store,
         )
-        .unwrap();
+        .unwrap()
+        .path;
         let expected = managed_expected(&path, &store.lock().unwrap()).unwrap();
         assert_eq!(expected, "me/add-dark-mode");
         let branch = managed_branch(
@@ -379,6 +383,38 @@ mod tests {
         )
         .unwrap();
         assert!(managed_expected(Path::new(&chosen.path), &store.lock().unwrap()).is_none());
+        // Every session-made worktree may be renamed; the dialog's and switcher's not.
+        for (n, by) in [
+            worktree::CreatedBy::Api,
+            worktree::CreatedBy::Automation,
+            worktree::CreatedBy::Mobile,
+            worktree::CreatedBy::Quick,
+            worktree::CreatedBy::Dialog,
+            worktree::CreatedBy::Switcher,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let made = crate::worktree_callers::for_session(
+                &cwd,
+                Some("HEAD"),
+                &format!("origin {n}"),
+                10 + n as i64,
+                by,
+                &store,
+            )
+            .unwrap()
+            .path;
+            let renamable = managed_expected(&made, &store.lock().unwrap()).is_some();
+            assert_eq!(
+                renamable,
+                !matches!(
+                    by,
+                    worktree::CreatedBy::Dialog | worktree::CreatedBy::Switcher
+                ),
+                "{by:?}"
+            );
+        }
         assert!(managed_expected(&cwd, &store.lock().unwrap()).is_none());
     }
 }

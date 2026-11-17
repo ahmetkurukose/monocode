@@ -29,6 +29,8 @@ struct TurnInput {
 }
 pub(crate) struct Update {
     pub(crate) worktree_cwd: Option<String>,
+    /// Non-fatal problems met creating `worktree_cwd` (e.g. a failed fetch).
+    pub(crate) worktree_warnings: Vec<String>,
     pub(crate) commands: Option<Vec<provider::NativeCommand>>,
     pub(crate) provider_turn_id: Option<String>,
     pub(crate) turn_ready: bool,
@@ -157,6 +159,10 @@ fn run_turn_using(
         if settings.worktree_removed {
             return Err("Select a branch or worktree to continue this conversation.".into());
         }
+        // A turn never starts in a worktree that is being deleted.
+        monocode_core::worktree::remove::ensure_not_being_removed(
+            settings.worktree_cwd.as_deref().unwrap_or(&summary.cwd),
+        )?;
         if settings.account.id != monocode_core::accounts::DEFAULT
             && !locked(&store)?
                 .provider_accounts()?
@@ -232,6 +238,7 @@ fn run_turn_using(
             &cancel,
             Update {
                 worktree_cwd: None,
+                worktree_warnings: Vec::new(),
                 commands: None,
                 provider_turn_id: None,
                 turn_ready: false,
@@ -268,15 +275,17 @@ fn run_turn_using(
         if creating_worktree {
             // A managed worktree named from the prompt; the store is not held
             // while Git runs. No chosen base means the repository's default base.
-            let path = monocode_core::worktree_callers::for_session(
+            let made = monocode_core::worktree_callers::for_session(
                 std::path::Path::new(&summary.cwd),
                 settings.worktree_base.as_deref(),
                 &user_request,
                 summary.id,
-                monocode_core::worktree::CreatedBy::Composer,
+                settings
+                    .worktree_origin
+                    .unwrap_or(monocode_core::worktree::CreatedBy::Composer),
                 &store,
             )?;
-            let cwd = path.to_string_lossy().into_owned();
+            let cwd = made.path.to_string_lossy().into_owned();
             created_worktree = Some(cwd.clone());
             settings.worktree_cwd = Some(cwd.clone());
             settings.new_worktree = false;
@@ -292,6 +301,7 @@ fn run_turn_using(
                 &cancel,
                 Update {
                     worktree_cwd: Some(cwd),
+                    worktree_warnings: made.warnings,
                     commands: None,
                     provider_turn_id: None,
                     turn_ready: false,
@@ -340,6 +350,7 @@ fn run_turn_using(
                 &cancel,
                 Update {
                     worktree_cwd: None,
+                    worktree_warnings: Vec::new(),
                     commands: None,
                     provider_turn_id: None,
                     turn_ready: false,
@@ -400,6 +411,7 @@ fn run_turn_using(
                 &cancel,
                 Update {
                     worktree_cwd: None,
+                    worktree_warnings: Vec::new(),
                     commands: None,
                     provider_turn_id: None,
                     turn_ready: false,
@@ -888,6 +900,7 @@ fn run_turn_using(
                         &cancel,
                         Update {
                             worktree_cwd: None,
+                            worktree_warnings: Vec::new(),
                             commands,
                             provider_turn_id,
                             turn_ready,
@@ -1080,6 +1093,7 @@ fn run_turn_using(
         // A stop can make the UI skip intermediate updates. Keep the created
         // checkout in the final receipt so the next Send cannot create it twice.
         worktree_cwd: created_worktree,
+        worktree_warnings: Vec::new(),
         commands: None,
         provider_turn_id: None,
         turn_ready: false,

@@ -45,6 +45,9 @@ pub(super) struct RailWorktrees {
     /// Loads started, for tests.
     #[cfg(test)]
     pub loads: usize,
+    /// Times the lists were marked stale, for tests.
+    #[cfg(test)]
+    pub invalidations: usize,
 }
 
 /// The worktrees the rail lists for `project`: never the main checkout or a missing
@@ -162,10 +165,22 @@ impl Shell {
     /// rows stay until then, so nothing flickers.
     pub(super) fn invalidate_rail_worktrees(&mut self, cx: &mut Context<Self>) {
         let cache = &mut self.rail_worktrees;
+        #[cfg(test)]
+        {
+            cache.invalidations += 1;
+        }
         // A read already running may predate the change.
         cache.loading.clear();
         cache.stale.extend(cache.lists.keys().cloned());
         self.projects_frame.update(cx, |_, cx| cx.notify());
+    }
+
+    /// A worktree was made or removed outside the dialogs (an app or Mono API call):
+    /// the rail, Settings and the Git state read again.
+    pub(crate) fn worktrees_changed_elsewhere(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_rail_worktrees(cx);
+        self.refresh_settings_worktrees(cx);
+        self.sync_git(cx);
     }
 
     fn rail_worktree(&self, project: &str, path: &str) -> Option<&RailWorktree> {
@@ -237,6 +252,7 @@ impl Shell {
                 .project_rail_worktrees_expanded
                 .contains(&tree.path)
             {
+                let hidden = sessions.len().saturating_sub(MAX_WORKTREE_SESSIONS);
                 rows.extend(sessions.into_iter().take(MAX_WORKTREE_SESSIONS).map(|id| {
                     ProjectRailRow::WorktreeSession {
                         project: project.to_owned(),
@@ -244,6 +260,14 @@ impl Shell {
                         last: false,
                     }
                 }));
+                if hidden > 0 {
+                    rows.push(ProjectRailRow::More {
+                        project: project.to_owned(),
+                        hidden,
+                        worktree: Some(tree.path.clone()),
+                        last: false,
+                    });
+                }
             }
         }
         rows.extend(self.pending_worktrees_for(project).into_iter().map(|p| {
@@ -515,6 +539,43 @@ impl Shell {
                             cx.stop_propagation();
                         }),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// "N more…" under an open worktree with more sessions than the tree lists; like
+    /// the project's, it opens what it stands for (here, the worktree).
+    pub(super) fn project_rail_worktree_more_row(
+        &mut self,
+        project: String,
+        path: String,
+        hidden: usize,
+        last: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let n = ordinal(&path);
+        let selector = format!("rail-worktree-more-{path}");
+        let (target_project, target_path) = (project.clone(), path);
+        self.project_rail_child_frame(("rail-worktree-more", n).into(), &project, last, cx)
+            .child(
+                self.project_rail_child_button(
+                    &project,
+                    ("rail-worktree-more-button", n),
+                    format!("{hidden} more sessions"),
+                    false,
+                )
+                .debug_selector(move || selector.clone())
+                .ml(px(super::project_rail_tree::NESTED_INDENT))
+                .text_color(content(0.45))
+                .child(format!("{hidden} more…"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_rail_worktree(
+                        target_project.clone(),
+                        target_path.clone(),
+                        window,
+                        cx,
+                    )
+                })),
             )
             .into_any_element()
     }
@@ -814,6 +875,141 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_open_worktree_with_many_sessions_ends_in_a_more_row(cx: &mut TestAppContext) {
+        let (f, mut visual) = fixture(cx);
+        let visual = &mut visual;
+        // Ten more sessions in the managed worktree: eleven with the fixture's.
+        f.window
+            .update(visual, |shell, _, cx| {
+                for _ in 0..10 {
+                    let mut summary = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", &f.main)
+                        .unwrap();
+                    summary.has_messages = true;
+                    let id = summary.id;
+                    shell.add(summary, cx);
+                    shell.session_summaries.get_mut(&id).unwrap().has_messages = true;
+                    shell.session_worktrees.insert(id, Some(f.managed.clone()));
+                    if let Some(view) = shell.sessions.get(&id) {
+                        view.update(cx, |v, _| {
+                            v.summary.has_messages = true;
+                            v.settings.worktree_cwd = Some(f.managed.clone());
+                        });
+                    }
+                }
+            })
+            .unwrap();
+        expand(&f, visual, &[f.managed.as_str()]);
+        let rows = f
+            .window
+            .update(visual, |shell, _, _| shell.project_rail_list.rows.clone())
+            .unwrap();
+        assert!(rows.iter().any(|r| matches!(r,
+            ProjectRailRow::Worktree { path, sessions: 11, .. } if *path == f.managed)));
+        let nested = rows
+            .iter()
+            .filter(|r| matches!(r, ProjectRailRow::WorktreeSession { .. }))
+            .count();
+        assert_eq!(nested, MAX_WORKTREE_SESSIONS);
+        assert!(rows.iter().any(|r| matches!(r,
+            ProjectRailRow::More { hidden: 3, worktree: Some(path), .. } if *path == f.managed)));
+        // The project's own count is unaffected: its one direct session, nothing hidden.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, ProjectRailRow::More { worktree: None, .. }))
+        );
+        // Like the project's, the row opens what it stands for: the worktree.
+        let more =
+            at(visual, format!("rail-worktree-more-{}", f.managed)).expect("the more row is drawn");
+        visual.simulate_click(more.center(), Default::default());
+        visual.run_until_parked();
+        f.window
+            .update(visual, |shell, _, _| {
+                assert_eq!(
+                    path_key(&shell.worktree_focus[&f.main].path),
+                    path_key(&f.managed)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_list_is_read_again_after_changes_made_outside_the_dialogs(cx: &mut TestAppContext) {
+        let (f, mut visual) = fixture(cx);
+        let visual = &mut visual;
+        expand(&f, visual, &[]);
+        assert_eq!(loads(&f, visual), 1);
+
+        // A session moved to another worktree (e.g. the composer created one).
+        f.window
+            .update(visual, |shell, _, cx| {
+                let view = shell.sessions[&f.direct].clone();
+                view.update(cx, |v, cx| {
+                    v.settings.worktree_cwd = Some(f.legacy.clone());
+                    cx.emit(crate::conversation::SessionChanged);
+                });
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert_eq!(
+            loads(&f, visual),
+            2,
+            "a session's new worktree reloads the list"
+        );
+        // The same worktree again changes nothing.
+        f.window
+            .update(visual, |shell, _, cx| {
+                let view = shell.sessions[&f.direct].clone();
+                view.update(cx, |_, cx| cx.emit(crate::conversation::SessionChanged));
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert_eq!(loads(&f, visual), 2);
+
+        // Coming back to the window: worktrees may have changed outside the app.
+        // (Called directly: a really active test window would start watching Git.)
+        f.window
+            .update(visual, |shell, _, cx| {
+                shell.window_activation_changed(false, cx);
+                shell.window_activation_changed(true, cx);
+                shell.window_active = false;
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert_eq!(loads(&f, visual), 3, "activation reloads the list");
+
+        // A creation dismissed while it ran still shows up.
+        f.window
+            .update(visual, |shell, w, cx| {
+                let id = shell.start_worktree_create(
+                    f.main.clone(),
+                    CreateRequest::new(Path::new(&f.main), "dismissed-early"),
+                    Default::default(),
+                    WorktreeOrigin::Switcher,
+                    w,
+                    cx,
+                );
+                shell.dismiss_pending_worktree(id, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let made = f
+            .window
+            .update(visual, |shell, _, _| {
+                shell
+                    .rail_worktrees
+                    .lists
+                    .get(&f.main)
+                    .is_some_and(|l| l.trees.iter().any(|t| t.name == "dismissed-early"))
+            })
+            .unwrap();
+        assert!(made, "the dismissed creation's worktree is listed");
+        assert_eq!(loads(&f, visual), 4);
+    }
+
+    #[gpui::test]
     fn a_worktrees_sessions_are_listed_under_it_and_not_under_the_project(cx: &mut TestAppContext) {
         let (f, mut visual) = fixture(cx);
         let visual = &mut visual;
@@ -1014,7 +1210,7 @@ mod tests {
                         phase,
                         error,
                         request: CreateRequest::new(Path::new(&f.main), "pending"),
-                        run_setup: false,
+                        setup: Default::default(),
                         origin: WorktreeOrigin::Rail,
                     });
                 }

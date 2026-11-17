@@ -387,10 +387,17 @@ impl Shell {
             .get("thinking")
             .and_then(|value| value.parse().ok());
         settings.access = monocode_core::agent::AccessMode::from_id(&automation.runtime_mode);
-        settings.new_worktree = automation.workspace_mode == "worktree";
-        // A fresh worktree starts from the repository's default base (spec §4);
-        // the first send creates it through `worktree::create`.
+        // "Fresh worktree" starts from HEAD, as it always did; the first send creates
+        // it through `worktree::create`, tagged as the automation's.
+        settings.new_worktree = false;
         settings.worktree_base = None;
+        settings.worktree_origin = None;
+        if automation.workspace_mode == "worktree" {
+            super::worktree_create::fresh_worktree_from_head(
+                &mut settings,
+                monocode_core::worktree::CreatedBy::Automation,
+            );
+        }
         settings.worktree_cwd =
             (automation.workspace_mode == "existing").then(|| automation.worktree_cwd.clone());
         settings.plan = false;
