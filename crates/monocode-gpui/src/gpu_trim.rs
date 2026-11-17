@@ -55,7 +55,8 @@ pub(crate) fn start(cx: &mut App) {
     .detach();
 }
 
-fn trim(cx: &mut App) {
+/// Clear the atlases and renderer buffers now, as after freeing a project.
+pub(crate) fn trim(cx: &mut App) {
     #[cfg(target_os = "macos")]
     gpui_apple::metal_renderer::trim();
     cx.clear_sprite_atlases();

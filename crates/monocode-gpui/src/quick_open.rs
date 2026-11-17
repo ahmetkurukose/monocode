@@ -48,6 +48,8 @@ pub(crate) enum Command {
     Plan,
     Operator,
     Orchestrator,
+    SleepProject,
+    SleepOtherProjects,
 }
 const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::New, "New conversation", "⌘N"),
@@ -66,6 +68,8 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Plan, "Toggle Plan mode", ""),
     (Command::Operator, "Toggle Operator", ""),
     (Command::Orchestrator, "Toggle Orchestrator", ""),
+    (Command::SleepProject, "Sleep this project", ""),
+    (Command::SleepOtherProjects, "Sleep other projects", ""),
 ];
 /// Most content matches listed.
 const CONTENT_ROWS: usize = 80;

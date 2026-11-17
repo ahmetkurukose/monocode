@@ -53,6 +53,13 @@ the same follow-ups after a restart. Scheduled habits take priority over
 heartbeats. Live scheduler and provider behavior still need broader testing;
 see [verification](verification.md).
 
+## Sleeping projects
+
+Right-click a project, or a rail group's header, and choose **Sleep** to stop
+its shells, warm agents and pages and release its loaded chats. Its chats,
+tabs and settings stay, and opening it wakes it. See
+[Sleeping projects](project-sleep.md).
+
 ## Develop
 
 From the repository root:

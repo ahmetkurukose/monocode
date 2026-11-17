@@ -163,7 +163,9 @@ impl Shell {
 
     pub(super) fn close_app_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_app_views(cx);
-        if self.workspace.active.is_none() {
+        // Coming back to a sleeping project shows its sleep screen; only the
+        // user's own open wakes it.
+        if self.workspace.active.is_none() && !self.project_asleep(&self.workspace.project) {
             let previous = self
                 .workspace
                 .project_focus

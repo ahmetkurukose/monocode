@@ -1447,6 +1447,7 @@ impl Shell {
             self.workspace.project == path && !self.app_view_open() && !self.mono_active(cx);
         let label = self.project_label(&path);
         let tooltip = label.clone();
+        let asleep = self.project_asleep(&path);
         let menu_path = path.clone();
         let options_path = path.clone();
         let pin_path = path.clone();
@@ -1485,6 +1486,7 @@ impl Shell {
         } else {
             crate::project_settings::project_icon(&appearance, &seed, 12.)
         };
+        let mark = self.with_sleep_badge(&path, mark, 16.);
         let row = div()
             .id(("rail-project", ix))
             .debug_selector(move || format!("rail-project-{ix}"))
@@ -1504,7 +1506,11 @@ impl Shell {
                     .debug_selector(move || format!("rail-project-button-{ix}"))
                     .group("project-rail-row")
                     .role(Role::Button)
-                    .aria_label(format!("Switch project, {label}"))
+                    .aria_label(if asleep {
+                        format!("Wake and switch to project, {label}, asleep")
+                    } else {
+                        format!("Switch project, {label}")
+                    })
                     .aria_description(path.clone())
                     .aria_selected(selected)
                     .cursor_pointer()
@@ -1519,7 +1525,11 @@ impl Shell {
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(content(1.))
-                    .opacity(if selected { 1. } else { 0.65 })
+                    .opacity(match (selected, asleep) {
+                        (true, _) => 1.,
+                        (false, true) => 0.45,
+                        (false, false) => 0.65,
+                    })
                     .when(selected, |d| d.bg(content(0.1)))
                     .hover(|s| s.bg(content(0.08)).opacity(1.))
                     .when(tree, |d| {
@@ -1587,6 +1597,18 @@ impl Shell {
                                 })
                                 .child(label),
                         )
+                        .when(asleep && !has_app_icons, |d| {
+                            d.child(
+                                div()
+                                    .id(("rail-project-asleep", ix))
+                                    .debug_selector(move || format!("rail-project-asleep-{ix}"))
+                                    .flex_shrink_0()
+                                    .when(!reordering, |d| {
+                                        d.group_hover("project-rail-row", |s| s.invisible())
+                                    })
+                                    .child(icon("moon", 12.).text_color(content(0.5))),
+                            )
+                        })
                     })
                     .when_some(app_icons, |d, icons| {
                         d.child(

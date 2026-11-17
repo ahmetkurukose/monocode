@@ -32,6 +32,7 @@ mod project_rail;
 mod project_rail_tree;
 mod project_removal;
 mod project_settings;
+mod project_sleep;
 mod quick_composer;
 mod quick_open;
 mod rails;
@@ -126,6 +127,8 @@ actions!(
         NextProject,
         MoveProjectBack,
         MoveProjectForward,
+        SleepProject,
+        SleepOtherProjects,
         SwitchModel,
         ToggleRightPanel,
         SplitRight,
@@ -862,6 +865,8 @@ pub(crate) struct Shell {
     browser_agent_stopped: HashSet<i64>,
     /// The page each session's agent used last.
     browser_agent_last: HashMap<i64, i64>,
+    /// What sleeping projects gave back, and the pages to reopen on waking.
+    project_sleep: project_sleep::ProjectSleep,
     /// Addresses pages asked to open in windows of their own.
     pending_browser_pages: Vec<String>,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
@@ -1257,6 +1262,7 @@ impl Shell {
             browser_selftest_started: false,
             browser_agent_stopped: HashSet::new(),
             browser_agent_last: HashMap::new(),
+            project_sleep: Default::default(),
             pending_browser_pages: Vec::new(),
             dock_slide: None,
             dock_resize: None,
@@ -1419,7 +1425,8 @@ impl Shell {
                 if !self.app_view_open()
                     && self.settings.is_none()
                     && !self.search_page()
-                    && !self.mono_active(cx) =>
+                    && !self.mono_active(cx)
+                    && !self.project_asleep(&self.workspace.project) =>
             {
                 self.workspace.layout(tab).leaf_ids().into_iter().collect()
             }
@@ -1597,8 +1604,16 @@ impl Shell {
             state
         };
         let provider = session.summary.provider.clone();
+        let waking = (busy || attention).then(|| session.summary.cwd.clone());
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        if let Some(project) = waking.filter(|project| self.project_asleep(project)) {
+            // Waking reaches every chat; let this one finish updating first.
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| this.wake_project(&project, cx));
+            })
+            .detach();
+        }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
         if !self.archiving.insert(id) {
@@ -2745,6 +2760,9 @@ impl Shell {
         if let Some(view) = self.app_view_body() {
             return view;
         }
+        if let Some(screen) = self.project_sleep_screen(cx) {
+            return screen;
+        }
         let Some(id) = self.workspace.active else {
             return div().size_full().into_any_element();
         };
@@ -3366,7 +3384,7 @@ impl Shell {
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
-        if project.starts_with("remote://") {
+        if project.starts_with("remote://") || self.project_asleep(project) {
             return;
         }
         let Some(dock) = self.workspace.docks.get(project) else {
@@ -3424,6 +3442,8 @@ impl Shell {
             cx.notify();
             return;
         }
+        let project = self.workspace.project.clone();
+        self.wake_project(&project, cx);
         // The dock is not drawn under an app view: go back to the session
         // first, so the new terminal is the one you see.
         if self.app_view_open() {
@@ -3467,6 +3487,8 @@ impl Shell {
             cx.notify();
             return;
         }
+        let project = self.workspace.project.clone();
+        self.wake_project(&project, cx);
         if self.terminal_in_panel(cx) {
             if self.panel_terminal_shown(cx) {
                 self.set_right_panel_open(false, window, cx);
@@ -3661,8 +3683,9 @@ impl Shell {
                 terminal.update(cx, |t, _| t.visible = shown);
             }
         }
-        // The right panel's Terminal tab hosts the shells instead.
-        if self.terminal_in_panel(cx) {
+        // The right panel's Terminal tab hosts the shells instead, and a
+        // sleeping project has none until it wakes.
+        if self.terminal_in_panel(cx) || self.project_asleep(&project) {
             return body;
         }
         let Some(dock) = self.workspace.docks.get(&project).cloned() else {
@@ -4713,6 +4736,7 @@ impl Shell {
         }
     }
     fn activate_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.wake_project_of(id, cx);
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -4878,6 +4902,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.wake_project(&path, cx);
         self.selected_sessions.clear();
         self.selection_anchor = None;
         self.sidebar_target = None;
@@ -4963,7 +4988,12 @@ impl Shell {
         cx.notify();
     }
     fn ensure_project_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.active.is_some() || self.mono_active(cx) {
+        // A sleeping project shows its sleep screen instead of a blank chat;
+        // placing one must not wake it. Waking places one if still needed.
+        if self.workspace.active.is_some()
+            || self.mono_active(cx)
+            || self.project_asleep(&self.workspace.project)
+        {
             return;
         }
         if let Some(id) = self.order.iter().copied().find(|id| {
@@ -6239,12 +6269,15 @@ impl Shell {
                     vec![
                         MenuItem::Custom(controls.clone().into(), controls.read(cx).focus(cx)),
                         MenuItem::Separator,
-                        MenuAction::new("delete-project-group", "Delete group")
-                            .icon("trash")
-                            .description("Projects will become ungrouped")
-                            .danger()
-                            .into(),
-                    ],
+                    ]
+                    .into_iter()
+                    .chain(self.project_group_sleep_menu(id, cx))
+                    .chain([MenuAction::new("delete-project-group", "Delete group")
+                        .icon("trash")
+                        .description("Projects will become ungrouped")
+                        .danger()
+                        .into()])
+                    .collect(),
                     260.,
                     MenuStyle::Group,
                 )
@@ -6337,6 +6370,10 @@ impl Shell {
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
                     MenuItem::Separator,
+                ]);
+                items.extend(self.project_sleep_menu(path, cx));
+                items.extend([
+                    MenuItem::Separator,
                     MenuAction::new("archive", "Archive").icon("archive").into(),
                     MenuAction::new("delete", "Delete")
                         .icon("trash")
@@ -6420,7 +6457,8 @@ impl Shell {
                 }
             }
             MenuTarget::ProjectRailGroup(id) => {
-                if action == "delete-project-group" {
+                if self.run_project_group_sleep_menu(&id, action, window, cx) {
+                } else if action == "delete-project-group" {
                     self.workspace.project_rail_groups.retain(|g| g.id != id);
                     self.workspace
                         .project_rail_assignments
@@ -6446,7 +6484,8 @@ impl Shell {
                 }
             }
             MenuTarget::Project { path, .. } => {
-                if action == "pin" {
+                if self.run_project_sleep_menu(&path, action, window, cx) {
+                } else if action == "pin" {
                     self.toggle_project_rail_pin(&path, cx);
                 } else if action == "project-group:new" {
                     let id = self.create_project_rail_group(Some(&path), cx);
@@ -7598,6 +7637,9 @@ impl Shell {
                             .text_color(content(1.))
                             .child(self.project_label(&path)),
                     )
+                    .when(self.project_asleep(&path), |d| {
+                        d.child(div().text_color(content(0.55)).child("Asleep"))
+                    })
                     .when(!shortcuts.is_empty(), |d| {
                         d.child(div().text_color(content(0.55)).child(shortcuts.clone()))
                     }),
@@ -7660,7 +7702,7 @@ impl Shell {
                             .when(active || dragging, |d| d.bg(content(0.1)))
                             .when(dragging, |d| d.cursor(CursorStyle::ClosedHand))
                             .hover(|s| s.opacity(1.).bg(content(if active { 0.1 } else { 0.05 })))
-                            .child(self.project_mark(&path, 12.))
+                            .child(self.with_sleep_badge(&path, self.project_mark(&path, 12.), 12.))
                             .when(hovered, |d| d.child(self.space_anchor.probe()))
                             .on_hover({
                                 let path = path.clone();
@@ -9660,6 +9702,12 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &MoveProjectForward, _, cx| this.move_current_project(1, cx)),
             )
+            .on_action(cx.listener(|this, _: &SleepProject, window, cx| {
+                this.sleep_current_project(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SleepOtherProjects, window, cx| {
+                this.sleep_other_projects(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &SwitchModel, window, cx| {
                 if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
                     view.update(cx, |v, cx| v.toggle_recent_models(window, cx));
