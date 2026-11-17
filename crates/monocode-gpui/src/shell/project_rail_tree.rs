@@ -1266,6 +1266,26 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_hovered_projects_options_button_leaves_its_app_icons_clear(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        tree(window, visual, &[]);
+        let ix = project_ix(window, visual, "/work/monocode");
+        let row = at(visual, format!("rail-project-button-{ix}")).unwrap();
+        visual.simulate_mouse_move(row.center(), None, Default::default());
+        visual.run_until_parked();
+        let options = at(visual, format!("rail-project-options-{ix}")).unwrap();
+        let icons = at(visual, format!("rail-app-icons-{ix}")).unwrap();
+        let browser = at(visual, format!("rail-app-browser-{ix}")).unwrap();
+        assert!(
+            browser.right() <= options.left(),
+            "the last app icon ends before the options button: {browser:?} {options:?}"
+        );
+        assert!(icons.right() <= row.right());
+    }
+
+    #[gpui::test]
     fn an_app_icon_switches_to_its_project_and_opens_the_app(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, _) = window(cx);

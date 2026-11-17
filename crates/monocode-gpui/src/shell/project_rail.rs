@@ -1471,6 +1471,7 @@ impl Shell {
         } else {
             self.project_rail_app_icons(&path, cx)
         };
+        let has_app_icons = app_icons.is_some();
         let offset = self.project_rail_project_offset(&path);
         let card_top = if tree && card_gap {
             project_rail_tree::CARD_GAP
@@ -1594,28 +1595,47 @@ impl Shell {
                     .when(!compact, |d| {
                         d.child(
                             div()
+                                .id(("rail-project-label", ix))
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .when(!reordering, |d| {
+                                // The options button takes the row's last 24px
+                                // on hover: the label gives them up unless the
+                                // app icons come after it.
+                                .when(!reordering && !has_app_icons, |d| {
                                     d.group_hover("project-rail-row", |s| s.pr(px(24.)))
                                 })
                                 .child(label),
                         )
                     })
-                    .when(!compact, |d| d.children(app_icons))
+                    .when_some(app_icons, |d, icons| {
+                        d.child(
+                            // An id, so the hover padding below reaches layout.
+                            div()
+                                .id(("rail-app-icons", ix))
+                                .debug_selector(move || format!("rail-app-icons-{ix}"))
+                                .flex_shrink_0()
+                                .when(!reordering, |d| {
+                                    d.group_hover("project-rail-row", |s| s.pr(px(24.)))
+                                })
+                                .child(icons),
+                        )
+                    })
                     .when(!compact, |d| {
                         d.when_some(stats, |d, stats| {
                             d.child(
                                 div()
+                                    .id(("rail-project-stats", ix))
                                     .flex_shrink_0()
                                     .flex()
                                     .gap_1()
                                     .text_size(px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .font_features(tabular())
+                                    // Hidden, not just invisible, so the space
+                                    // it held goes to the options button.
                                     .when(!reordering, |d| {
-                                        d.group_hover("project-rail-row", |s| s.invisible())
+                                        d.group_hover("project-rail-row", |s| s.hidden())
                                     })
                                     .when(stats.additions > 0, |d| {
                                         d.child(
@@ -1668,6 +1688,7 @@ impl Shell {
                         )
                         .child(
                             div()
+                                .debug_selector(move || format!("rail-project-options-{ix}"))
                                 .absolute()
                                 .right_1()
                                 .top(px(4.))
