@@ -201,6 +201,10 @@ pub(crate) struct Workspace {
     /// variables, an environment file, a virtual environment, commands.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_terminal_setups: HashMap<String, monocode_core::terminal_setup::TerminalSetup>,
+    /// Each project's run configurations, last run and test runner
+    /// (`project_path -> runs`); resolved per checkout when something runs.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_runs: HashMap<String, monocode_core::code::run::ProjectRuns>,
     /// Last desktop source values, used to reconcile subsequent desktop changes
     /// while retaining deliberate native project and preference edits.
     pub desktop_project_preferences: Option<serde_json::Value>,
@@ -448,6 +452,7 @@ impl Default for Workspace {
             project_appearance: Default::default(),
             project_browser_urls: Default::default(),
             project_terminal_setups: Default::default(),
+            project_runs: Default::default(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
             desktop_preferences_metadata: None,
@@ -723,6 +728,10 @@ impl Workspace {
         state.project_terminal_setups.retain(|project, setup| {
             *setup = std::mem::take(setup).normalized();
             !project.trim().is_empty() && !setup.is_empty()
+        });
+        state.project_runs.retain(|project, runs| {
+            *runs = std::mem::take(runs).normalized();
+            !project.trim().is_empty() && !runs.is_empty()
         });
         state.restore_project_apps();
         state
@@ -2019,6 +2028,33 @@ mod tests {
         // Nothing is written for a workspace without setups.
         let plain = serde_json::to_string(&Workspace::default()).unwrap();
         assert!(!plain.contains("project_terminal_setups"));
+    }
+
+    #[test]
+    fn a_projects_run_configurations_round_trip_and_an_empty_entry_is_dropped() {
+        use monocode_core::code::run::{ProjectRuns, RunConfig, TestRunner};
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        let mut runs = ProjectRuns::default();
+        let id = runs.add(RunConfig {
+            name: " Serve ".into(),
+            command: "npm start".into(),
+            ..Default::default()
+        });
+        runs.test_runner = TestRunner::Unittest;
+        state.project_runs.insert("/p".into(), runs);
+        let mut blank = ProjectRuns::default();
+        blank.add(RunConfig::default());
+        state.project_runs.insert("/blank".into(), blank);
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        let kept = &restored.project_runs["/p"];
+        assert_eq!(kept.get(&id).unwrap().name, "Serve");
+        assert_eq!(kept.test_runner, TestRunner::Unittest);
+        assert!(!restored.project_runs.contains_key("/blank"));
+        // Nothing is written for a workspace without run configurations.
+        let plain = serde_json::to_string(&Workspace::default()).unwrap();
+        assert!(!plain.contains("project_runs"));
     }
 
     #[test]
