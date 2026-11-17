@@ -2,6 +2,7 @@
 //! servers and debug adapters (docs/native/code.md). Everything here is
 //! headless: the panes and the agents' MCP tools sit on the same calls.
 pub mod dap;
+pub mod lsp;
 pub mod run;
 pub mod spawn;
 pub mod toolchain;
