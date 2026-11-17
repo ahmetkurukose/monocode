@@ -27,3 +27,11 @@ pub(crate) fn clear_status(session: i64, cx: &mut App) {
 pub(crate) fn status(session: i64, cx: &App) -> Option<SharedString> {
     cx.try_global::<Statuses>()?.0.get(&session).cloned()
 }
+
+/// The session's title as its rail row shows it, to name the agent that
+/// drives something. Reads the shell, so not from inside a closure the shell
+/// calls while it draws.
+pub(crate) fn session_label(session: i64, cx: &App) -> Option<SharedString> {
+    let shell = cx.try_global::<super::Host>()?.shell.upgrade()?;
+    shell.read(cx).code_session_label(session, cx)
+}

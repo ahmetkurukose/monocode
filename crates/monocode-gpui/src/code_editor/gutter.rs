@@ -62,10 +62,32 @@ pub(crate) struct GutterClick {
     pub position: Point<Pixels>,
 }
 
+/// What a gutter menu does with the id of the row that was picked.
+pub(crate) type GutterPick = std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// A menu a gutter press opens at the pointer, drawn by the editor that was
+/// pressed.
+pub(crate) struct GutterMenu {
+    pub label: SharedString,
+    pub items: Vec<crate::popover::MenuItem>,
+    pub width: f32,
+    pub on_pick: GutterPick,
+}
+
 /// Owns one gutter column of the editors it is installed on. The marks
 /// themselves are pushed through `Hub::set_gutter_marks`.
 pub(crate) trait GutterProvider {
     fn click(&self, doc: &DocumentInfo, click: &GutterClick, window: &mut Window, cx: &mut App);
+    /// Asked before `click`: a menu to open for this press in its place.
+    fn menu(
+        &self,
+        _doc: &DocumentInfo,
+        _click: &GutterClick,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<GutterMenu> {
+        None
+    }
     /// An edit moved the column's marks to these rows.
     fn moved(&self, _doc: &DocumentInfo, _marks: &[GutterMark], _cx: &mut App) {}
 }

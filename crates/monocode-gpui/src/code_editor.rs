@@ -33,8 +33,9 @@ pub(crate) use diagnostics::{
     DiagnosticCounts, ExternalDiagnostic, Severity, remap as remap_diagnostics,
 };
 pub(crate) use gutter::{
-    Breakpoint, Decor, GutterButton, GutterClick, GutterMark, GutterMarkKind, GutterProvider,
-    GutterSlot, InlineNote, LineDecoration, LineStyle, NoteTone, RowShift, SLOT_WIDTH,
+    Breakpoint, Decor, GutterButton, GutterClick, GutterMark, GutterMarkKind, GutterMenu,
+    GutterProvider, GutterSlot, InlineNote, LineDecoration, LineStyle, NoteTone, RowShift,
+    SLOT_WIDTH,
 };
 pub(crate) use header::{Crumb, HeaderAction, HeaderClick, HeaderProvider};
 pub(crate) use history::History;

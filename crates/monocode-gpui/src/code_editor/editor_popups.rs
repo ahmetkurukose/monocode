@@ -30,6 +30,12 @@ pub(super) struct Picker {
     pub(super) targets: Vec<ResolvedTarget>,
     _events: Subscription,
 }
+/// The menu a gutter provider asked for, open at the press.
+pub(super) struct GutterMenuState {
+    menu: Entity<Menu>,
+    position: Point<Pixels>,
+    _events: Subscription,
+}
 
 impl Input {
     /// The buffer offset under a window position, when a character is there
@@ -414,6 +420,46 @@ impl Input {
         }
         cx.notify();
     }
+    pub(super) fn open_gutter_menu(
+        &mut self,
+        menu: crate::code_editor::GutterMenu,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_pick = menu.on_pick;
+        let (label, items, width) = (menu.label, menu.items, menu.width);
+        let menu = cx.new(|cx| Menu::new(label, items, window, cx).width(width));
+        let events = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, _, event: &MenuEvent, window, cx| {
+                if let Some(code) = &mut this.code {
+                    code.ext_mut().gutter_menu = None;
+                }
+                if let MenuEvent::Picked(id, _) = event {
+                    let (id, on_pick) = (id.clone(), on_pick.clone());
+                    // After this update, so the provider may reach the editor.
+                    window.defer(cx, move |window, cx| on_pick(&id, window, cx));
+                }
+                cx.notify();
+            },
+        );
+        if let Some(code) = &mut self.code {
+            code.ext_mut().gutter_menu = Some(GutterMenuState {
+                menu,
+                position,
+                _events: events,
+            });
+        }
+        cx.notify();
+    }
+    #[cfg(test)]
+    pub(crate) fn gutter_menu_open(&self) -> bool {
+        (self.code.as_ref())
+            .and_then(|code| code.ext.as_ref())
+            .is_some_and(|ext| ext.gutter_menu.is_some())
+    }
     #[cfg(test)]
     pub(crate) fn picker_targets(&self) -> Option<&[ResolvedTarget]> {
         let picker = self.code.as_ref()?.ext.as_ref()?.picker.as_ref()?;
@@ -742,6 +788,11 @@ impl Input {
             .chain(self.signature_popover())
             .chain(ext.picker.as_ref().map(|picker| {
                 menu_popover(&picker.menu, Anchor::Point(picker.position), cx)
+                    .without_animation()
+                    .into_any_element()
+            }))
+            .chain(ext.gutter_menu.as_ref().map(|open| {
+                menu_popover(&open.menu, Anchor::Point(open.position), cx)
                     .without_animation()
                     .into_any_element()
             }))

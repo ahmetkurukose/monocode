@@ -171,6 +171,13 @@ impl Shell {
         })
     }
 
+    /// A session's title as the rail shows it.
+    pub(crate) fn code_session_label(&self, session: i64, cx: &App) -> Option<SharedString> {
+        let known =
+            self.sessions.contains_key(&session) || self.session_summaries.contains_key(&session);
+        known.then(|| self.session_metadata(session, cx).display_title().into())
+    }
+
     pub(crate) fn code_open_file(
         &mut self,
         folder: Option<String>,
@@ -786,5 +793,17 @@ impl Shell {
                 shell.show_code_page_dialog(dialog, events, cx);
             });
         });
+    }
+}
+
+#[cfg(test)]
+impl Shell {
+    /// A shell with two projects and a session in each, for the code
+    /// features' own tests: the window, and the sessions of
+    /// `/work/another-project` and `/work/monocode`.
+    pub(crate) fn test_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::WindowHandle<Shell>, i64, i64) {
+        super::tests::window(cx)
     }
 }
