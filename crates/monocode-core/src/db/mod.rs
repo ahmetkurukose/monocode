@@ -5,6 +5,7 @@
 pub mod analysis;
 pub mod conn;
 pub mod consoles;
+pub mod discover;
 pub mod export;
 pub mod format;
 pub mod history;
@@ -15,6 +16,7 @@ pub mod params;
 pub mod runtime;
 pub mod source;
 pub mod split;
+pub mod tunnel;
 
 pub use conn::{Connection, DbError, PgConnection, QueryResult, ResultColumn};
 pub use consoles::ConsoleStore;
@@ -24,4 +26,4 @@ pub use introspect::{
     CatalogEntry, ColumnInfo, ConstraintInfo, IndexInfo, RoutineInfo, RoutineKind, SchemaObjects,
     SequenceInfo, TableDetails, TableInfo, TableKind, TriggerInfo,
 };
-pub use source::{DataSource, DataSourceStore, DbColor, DbKind};
+pub use source::{DataSource, DataSourceStore, DbColor, DbKind, McpAccess, Tunnel, TunnelKind};

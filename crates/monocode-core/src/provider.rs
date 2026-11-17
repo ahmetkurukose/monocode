@@ -1415,6 +1415,7 @@ fn run_operation(
             command.arg("app-server");
             crate::visual_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::browser_bridge::configure_codex(&mut command, &request.settings.environment);
+            crate::db_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::mono::bridge::configure_codex(
                 &mut command,
                 request.settings.mono.as_ref(),
@@ -1499,6 +1500,15 @@ fn run_operation(
             {
                 servers.insert(crate::browser_bridge::SERVER_NAME.into(), server);
                 allowed.push(crate::browser_bridge::CLAUDE_ALLOWED_TOOLS);
+            }
+            // The user's data sources. Reads are allowed up front; db_execute
+            // is not listed, so Claude asks the user before every write.
+            if let Some(server) = (!settings.text_only)
+                .then(|| crate::db_bridge::mcp_server(&settings.environment))
+                .flatten()
+            {
+                servers.insert(crate::db_bridge::SERVER_NAME.into(), server);
+                allowed.push(crate::db_bridge::CLAUDE_ALLOWED_TOOLS);
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);

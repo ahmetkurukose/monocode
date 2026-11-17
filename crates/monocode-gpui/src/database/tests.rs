@@ -1325,3 +1325,57 @@ fn a_mongodb_source_names_its_tree_pages_and_sent_text_in_its_own_terms(cx: &mut
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn agents_statements_land_in_an_agent_console_with_their_result(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("prod"), None, cx);
+            let id = view.selected.clone().unwrap();
+            let users = view.consoles.len();
+            view.show_agent_statement(&id, "select 1", "db_query", Some(sample()), None, cx);
+            view.show_agent_statement(&id, "select oops", "db_query", None, Some("syntax error".into()), cx);
+            // One Agent console, beside the user's own, which stays in front.
+            assert_eq!(view.consoles.len(), users + 1);
+            let agent = view
+                .consoles
+                .iter()
+                .find(|c| c.name.as_deref() == Some("Agent"))
+                .expect("an Agent console");
+            let text = agent.editor.read(cx).content.to_string();
+            assert!(text.contains("-- db_query") && text.contains("select 1;") && text.contains("select oops;"), "{text}");
+            assert_eq!(agent.result.as_ref().map(|r| r.rows.len()), Some(2));
+            assert_eq!(agent.error.as_ref().map(|e| e.0.message.as_str()), Some("syntax error"));
+            assert_ne!(view.active.get(&id), Some(&agent.id));
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn imported_sources_are_saved_with_their_passwords_and_agent_access_changes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            let mut found = local_source("db_prod");
+            found.port = 5599;
+            found.tunnel = Some(monocode_core::db::Tunnel {
+                kind: monocode_core::db::TunnelKind::AlloyDb,
+                instance: "projects/p/locations/r/clusters/c/instances/i".into(),
+                public_ip: true,
+                ..Default::default()
+            });
+            let id = found.id.clone();
+            assert_eq!(view.import(vec![(found, None)], cx), 1);
+            assert_eq!(view.link_state(&id), LinkState::Idle);
+            view.set_mcp_access(&id, monocode_core::db::McpAccess::Write, cx);
+            let saved = DataSourceStore::new(dir.path()).load();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].mcp, monocode_core::db::McpAccess::Write);
+            assert_eq!(saved[0].tunnel.as_ref().unwrap().instance, "projects/p/locations/r/clusters/c/instances/i");
+        })
+        .unwrap();
+}

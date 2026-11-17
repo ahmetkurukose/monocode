@@ -9,7 +9,9 @@ use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, SharedString,
     Subscription, Task, Window, div, prelude::*, px, rgb,
 };
-use monocode_core::db::{Connection, DataSource, DbKind, runtime::runtime};
+use monocode_core::db::{
+    Connection, DataSource, DbKind, McpAccess, Tunnel, TunnelKind, runtime::runtime,
+};
 
 pub(crate) enum DialogEvent {
     Close,
@@ -44,6 +46,14 @@ pub(crate) struct SourceDialog {
     uri: Entity<Input>,
     /// MongoDB: the database users authenticate against.
     auth_source: Entity<Input>,
+    /// The tunnel's instance, kubectl target, or custom command.
+    tunnel_target: Entity<Input>,
+    /// kubectl: the target's port, namespace and context.
+    tunnel_remote_port: Entity<Input>,
+    tunnel_namespace: Entity<Input>,
+    tunnel_context: Entity<Input>,
+    /// Extra arguments, split like a shell would.
+    tunnel_args: Entity<Input>,
     test: Test,
     task: Option<Task<()>>,
     focus: FocusHandle,
@@ -88,6 +98,29 @@ impl SourceDialog {
         let comment = field("Comment", cx);
         let uri = field("mongodb://host:27017/?replicaSet=rs0", cx);
         let auth_source = field("admin", cx);
+        let tunnel_target = field("Instance", cx);
+        let tunnel_remote_port = field("Same as port", cx);
+        let tunnel_namespace = field("default", cx);
+        let tunnel_context = field("current", cx);
+        let tunnel_args = field("--auto-iam-authn", cx);
+        if let Some(tunnel) = &source.tunnel {
+            let target = if tunnel.kind == TunnelKind::Custom {
+                &tunnel.command
+            } else {
+                &tunnel.instance
+            };
+            set(&tunnel_target, target, cx);
+            if let Some(port) = tunnel.remote_port {
+                set(&tunnel_remote_port, &port.to_string(), cx);
+            }
+            set(&tunnel_namespace, &tunnel.namespace, cx);
+            set(&tunnel_context, &tunnel.context, cx);
+            set(
+                &tunnel_args,
+                &shlex::try_join(tunnel.args.iter().map(String::as_str)).unwrap_or_default(),
+                cx,
+            );
+        }
         password.update(cx, |input, _| input.set_secret(true));
         set(&name, &source.name, cx);
         set(&host, &source.host, cx);
@@ -107,6 +140,11 @@ impl SourceDialog {
             &comment,
             &uri,
             &auth_source,
+            &tunnel_target,
+            &tunnel_remote_port,
+            &tunnel_namespace,
+            &tunnel_context,
+            &tunnel_args,
         ]
         .into_iter()
         .map(|input| {
@@ -130,6 +168,11 @@ impl SourceDialog {
             comment,
             uri,
             auth_source,
+            tunnel_target,
+            tunnel_remote_port,
+            tunnel_namespace,
+            tunnel_context,
+            tunnel_args,
             test: Test::Idle,
             task: None,
             focus: cx.focus_handle(),
@@ -162,6 +205,53 @@ impl SourceDialog {
         };
         if !mongo {
             source.tls = false;
+        }
+        if let Some(tunnel) = &mut source.tunnel {
+            let target = Self::text(&self.tunnel_target, cx);
+            if tunnel.kind == TunnelKind::Custom {
+                tunnel.command = target;
+                tunnel.instance.clear();
+            } else {
+                tunnel.instance = target;
+                tunnel.command.clear();
+            }
+            let kubectl = tunnel.kind == TunnelKind::Kubectl;
+            let remote = Self::text(&self.tunnel_remote_port, cx);
+            tunnel.remote_port = if kubectl && !remote.is_empty() {
+                Some(remote.parse().map_err(|_| "The remote port must be a number")?)
+            } else {
+                None
+            };
+            tunnel.namespace = if kubectl {
+                Self::text(&self.tunnel_namespace, cx)
+            } else {
+                String::new()
+            };
+            tunnel.context = if kubectl {
+                Self::text(&self.tunnel_context, cx)
+            } else {
+                String::new()
+            };
+            if tunnel.kind != TunnelKind::AlloyDb {
+                tunnel.public_ip = false;
+            }
+            let args = Self::text(&self.tunnel_args, cx);
+            tunnel.args = if tunnel.kind == TunnelKind::Custom {
+                Vec::new()
+            } else {
+                shlex::split(&args).ok_or("The extra arguments have an unclosed quote")?
+            };
+            if tunnel.instance.is_empty() && tunnel.command.is_empty() {
+                return Err(match tunnel.kind {
+                    TunnelKind::Custom => "Enter the tunnel's command",
+                    TunnelKind::Kubectl => "Enter what to forward (svc/name, pod/name)",
+                    _ => "Enter the proxy's instance",
+                });
+            }
+            // A tunnel listens on the loopback.
+            if source.host.is_empty() {
+                source.host = "127.0.0.1".into();
+            }
         }
         let port = Self::text(&self.port, cx);
         source.port = if port.is_empty() && !source.uri.is_empty() {
@@ -237,6 +327,154 @@ impl SourceDialog {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_kind(kind, cx)))
             }))
             .into_any_element()
+    }
+
+    /// No tunnel, or the program that opens the source's port.
+    fn tunnel_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.source.tunnel.as_ref().map(|t| t.kind);
+        let choices = std::iter::once((None, "None"))
+            .chain(TunnelKind::ALL.into_iter().map(|kind| {
+                let label = match kind {
+                    TunnelKind::AlloyDb => "AlloyDB",
+                    TunnelKind::CloudSql => "Cloud SQL",
+                    TunnelKind::Kubectl => "kubectl",
+                    TunnelKind::Custom => "Command",
+                };
+                (Some(kind), label)
+            }));
+        Self::chips(
+            "Tunnel",
+            choices.map(|(kind, label)| {
+                (
+                    SharedString::from(format!("database-tunnel-{label}")),
+                    label,
+                    kind == current,
+                    Box::new(move |s: &mut DataSource| {
+                        s.tunnel = kind.map(|kind| Tunnel {
+                            kind,
+                            public_ip: kind == TunnelKind::AlloyDb,
+                            ..s.tunnel.clone().unwrap_or_default()
+                        });
+                        if kind.is_some() && s.host.is_empty() {
+                            s.host = "127.0.0.1".into();
+                        }
+                    }) as Box<dyn Fn(&mut DataSource)>,
+                )
+            }),
+            cx,
+        )
+    }
+
+    /// What agents in sessions may do with the source.
+    fn agents_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.source.mcp;
+        Self::chips(
+            "Agents (monocode_db MCP)",
+            McpAccess::ALL.into_iter().map(|access| {
+                (
+                    SharedString::from(format!("database-agents-{}", access.badge())),
+                    access.label(),
+                    access == current,
+                    Box::new(move |s: &mut DataSource| s.mcp = access)
+                        as Box<dyn Fn(&mut DataSource)>,
+                )
+            }),
+            cx,
+        )
+    }
+
+    /// A labelled row of choices, one of them on.
+    fn chips(
+        label: &'static str,
+        choices: impl Iterator<Item = (SharedString, &'static str, bool, Box<dyn Fn(&mut DataSource)>)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row = div().flex().flex_wrap().gap(px(6.)).children(choices.map(
+            |(id, text, on, choose)| {
+                div()
+                    .id(id)
+                    .role(Role::RadioButton)
+                    .aria_label(text)
+                    .aria_selected(on)
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(content(if on { 0.5 } else { 0.12 }))
+                    .when(on, |d| d.bg(content(0.1)))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(content(if on { 1. } else { 0.7 }))
+                    .hover(|s| s.bg(content(0.08)))
+                    .child(text)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        choose(&mut this.source);
+                        this.test = Test::Idle;
+                        cx.notify();
+                    }))
+            },
+        ));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(content(0.5))
+                    .child(label),
+            )
+            .child(row)
+            .into_any_element()
+    }
+
+    /// The tunnel's own fields, by kind.
+    fn tunnel_fields(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tunnel = self.source.tunnel.as_ref()?;
+        let target = match tunnel.kind {
+            TunnelKind::AlloyDb => "Instance (projects/…/clusters/…/instances/…)",
+            TunnelKind::CloudSql => "Instance (project:region:instance)",
+            TunnelKind::Kubectl => "Forward (svc/name, pod/name, deploy/name)",
+            TunnelKind::Custom => "Command (run with sh -c; listens on the port above)",
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(Self::labeled(target, &self.tunnel_target, None));
+        match tunnel.kind {
+            TunnelKind::Kubectl => {
+                column = column.child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(Self::labeled("Remote port", &self.tunnel_remote_port, Some(110.)))
+                        .child(Self::labeled("Namespace", &self.tunnel_namespace, None))
+                        .child(Self::labeled("Context", &self.tunnel_context, None)),
+                );
+            }
+            TunnelKind::Custom => {}
+            _ => {}
+        }
+        if tunnel.kind != TunnelKind::Custom {
+            column = column.child(Self::labeled("Extra arguments", &self.tunnel_args, None));
+        }
+        if tunnel.kind == TunnelKind::AlloyDb {
+            column = column.child(Self::switch(
+                "database-public-ip",
+                "Public IP (--public-ip)",
+                tunnel.public_ip,
+                cx,
+                |s| {
+                    if let Some(t) = &mut s.tunnel {
+                        t.public_ip = !t.public_ip;
+                    }
+                },
+            ));
+        }
+        Some(column.into_any_element())
     }
 
     fn typed_password(&self, cx: &Context<Self>) -> Option<String> {
@@ -502,6 +740,9 @@ impl gpui::Render for SourceDialog {
                     Self::labeled("Database", &self.database, None)
                 })
                 .child(Self::labeled("Comment", &self.comment, None))
+                .child(self.tunnel_row(cx))
+                .children(self.tunnel_fields(cx))
+                .child(self.agents_row(cx))
                 .children(self.projects_row(cx))
                 .child(
                     div()

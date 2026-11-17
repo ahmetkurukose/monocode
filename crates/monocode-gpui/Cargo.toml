@@ -16,6 +16,7 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, features = ["font-kit", "runtime_shaders", "x11", "wayland"] }
 unicode-segmentation = "1"
+shlex = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-channel = "2"
 base64 = "0.22"

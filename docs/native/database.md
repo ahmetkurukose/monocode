@@ -5,14 +5,14 @@ bir **Database** görünümü. Yalnızca PostgreSQL. Arayüz düzeni IntelliJ'in
 Database aracından (openidea'nın da aldığı yerden): solda veri kaynağı ağacı,
 sağ üstte SQL konsolu, sağ altta sonuç grid'i.
 
-Durum: plan. Kod yok. Hedef branch `AK/monocode_enhancements`.
+Durum: uygulandı (PostgreSQL, MongoDB, tüneller, footer, `monocode_db` MCP). Branch `AK/monocode_enhancements`.
 
 ## 1. Kararlar ve gerekçeleri
 
 | Karar | Seçim | Neden |
 |---|---|---|
 | Sürücü | `tokio-postgres` (`NoTls` ile başla) | `simple_query` her değeri metin getirir, tip bazlı decode yok; `CancelToken` ile sunucu tarafı iptal; sqlx'e göre çok daha hafif derleme. |
-| Bağlantı kaynağı | Monocode'un kendi listesi | dbports'a veya başka bir araca bağımlılık yok. Tünel nasıl açılırsa açılsın (dbports, elle proxy, SSH) Monocode yalnızca host:port görür. |
+| Bağlantı kaynağı | Monocode'un kendi listesi; tüneli de kendisi açar (§14) | dbports ve SOCket'in işi Rust ile içeri alındı: tünel tanımı veri kaynağının parçası, harici bir araca bağımlılık yok. Var olan dbports / SOCket / shell tanımları içe aktarılır. |
 | openidea'dan alınanlar | model (`source.rs`), `split.rs`, introspection SQL'leri, `QueryResult` şekli, arayüz düzeni | UI (React) ve sürücü katmanı (`conn.rs`, sqlx çok-sürücülü) alınmaz. Referans commit: openidea `f665beb1`. |
 | Şifre | işletim sistemi anahtarlığı (`keyring`, zaten bağımlılıkta) | openidea ile aynı; dosyada düz metin yok. |
 | Saklama | global (uygulama verisi dizini) | DB'ler projeden bağımsız kullanılıyor. Proje etiketi ileride. |
@@ -48,7 +48,7 @@ Durum: plan. Kod yok. Hedef branch `AK/monocode_enhancements`.
 - Proje etiketi: bir kaynağı yalnızca belirli projelerde göster.
 
 ### Kapsam dışı
-MySQL / SQLite / SQL Server / ClickHouse; dbports ile bütünleşme; şema düzenleme (DDL üretme).
+MySQL / SQLite / SQL Server / ClickHouse; şema düzenleme (DDL üretme); SOCket'in pod / deploy / frontend tarafı.
 
 ## 3. Mimari
 
@@ -287,3 +287,40 @@ Toplam ≈ 6–7 oturum. Paket 1–4 arayüzden bağımsız, 5–10 sırayla.
    ağır sorguyu engeller; iptal zaten var.
 3. Konsol sekmesi başlıkları: `socradar@prod · 1` mi, yoksa ilk satırdaki `-- başlık` yorumu mu?
    Önerim: yorum varsa o, yoksa numara.
+
+## 14. Tüneller, footer ve ajanlar (`monocode_db`)
+
+LocalDBPortManager (dbports) ile SOCket'in veritabanı tarafı Rust ile içeri alındı.
+
+### Tünel (`monocode-core/src/db/tunnel.rs`)
+- `DataSource.tunnel: Option<Tunnel>` — `alloydb` | `cloudsql` | `kubectl` (port-forward) | `custom` (`sh -c`).
+  Yerel port kaynağın `port`'u, host loopback. Aynı portu paylaşan kaynaklar aynı tüneli kullanır; durum porta göre tutulur.
+- Proxy bağımsız oturumda başlar (setsid), Monocode kapansa da açık kalır. Durum tek `lsof` çağrısıyla:
+  çalışıyor / açılıyor / başarısız (logun son satırı, gcloud oturum ipuçlarıyla) / port başkasında.
+- `Connection::connect` port dinlemiyorsa önce tüneli açar (`conn::set_tunnel_dir`): konsol, ağaç, Test Connection
+  ve ajanlar aynı yoldan geçer. Aynı tüneli iki kez açmamak için port başına kilit dosyası.
+- Dosyalar: `<veri>/db/tunnels/{logs,pids,locks}`.
+
+### Footer (`shell/database_footer.rs`)
+- Branch düğmesinin solunda **Databases**: projenin kaynakları, en iyi durum için renkli nokta
+  (yeşil bağlı, mavi tünel açık, sarı açılıyor, kırmızı hata, turuncu port başkasında), ajan çalışırken bot simgesi.
+- Menü: kaynak başına durum + port + ajan çağrı sayısı + MCP rozeti (`off` / `ro` / `rw`); alt menüde
+  Connect/Disconnect, Open in Database, Open/Stop tunnel, tünel logu, komutu kopyala, Agents: Off/Read/Read & write, Edit.
+- **Find existing connections…** (`db/discover.rs`): dbports (`connections.yaml` + `databases.yaml`, kullanıcı ve
+  parolalarla), SOCket (`~/.config/socradar-socket/connections.json`), `~/.zshrc` ve diğer başlangıç dosyalarındaki
+  alias / fonksiyonlar (SOCket'in kurallarıyla: bir seviye `source` takibi, parola/token içeren satırlar atlanır) ve
+  o an çalışan proxy / port-forward'lar. Zaten kayıtlı olanlar elenir; bulunanlar işaretlenip tek seferde eklenir,
+  parolalar anahtarlığa gider.
+- Durum yoklanır: bir şey açılırken 1 sn, tünel varken 3 sn, yoksa 10 sn; footer yalnızca gösterdiği şey değişince çizilir.
+
+### Ajanlar (`monocode-core/src/db_bridge.rs`)
+- `monocode_browser` gibi oturuma kendiliğinden eklenen yerleşik MCP: `db-mcp` stdio alt komutu, oturum başına token.
+  Çağrılar uygulamanın içinde, mevcut `Connection` katmanıyla çalışır.
+- Tool'lar: `db_list_sources`, `db_list_databases`, `db_list_schemas`, `db_list_tables`, `db_describe_table`,
+  `db_search`, `db_query`, `db_explain`, `db_execute`. PostgreSQL ve MongoDB (Mongo konsolunun shell sözdizimi).
+- Okuma her zaman salt okunur oturumda (Postgres `default_transaction_read_only`, Mongo yazma metodlarını reddeder),
+  tek ifade, satır / süre / boyut sınırlı. `db_execute` yalnızca **Read & write** kaynaklarda ve izin listesinde değil:
+  sağlayıcı her seferinde kullanıcıya sorar.
+- Ajan yalnızca oturumun projesindeki ve `mcp != off` kaynakları görür. Parolalar: anahtarlık ya da bu çalıştırmada yazılan.
+- Her ajan ifadesi kaynağın **Agent** konsoluna sonucuyla düşer; kullanıcının kendi konsolu önde kalır.
+  Denetim logu: `<veri>/db/mcp-audit.jsonl`.

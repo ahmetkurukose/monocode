@@ -10,6 +10,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod database_footer;
 mod database_send;
 mod file_panes;
 mod github_star;
@@ -405,6 +406,10 @@ pub(crate) enum MenuTarget {
     RunningTerminals,
     /// The footer Actions button's list of saved commands.
     Actions,
+    /// The footer Databases button's data sources.
+    Databases,
+    /// Connections found elsewhere, offered for import.
+    DatabaseImport,
     /// The title strip's new-tab button, when terminals open in the title bar.
     NewTab,
 }
@@ -711,6 +716,8 @@ pub(crate) struct Shell {
     link_dialog: Option<session_groups::LinkDialog>,
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
+    databases_anchor: AnchorSlot,
+    db_footer: database_footer::DbFooter,
     new_tab_anchor: AnchorSlot,
     git_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
@@ -1140,6 +1147,8 @@ impl Shell {
             link_dialog: None,
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
+            databases_anchor: AnchorSlot::default(),
+            db_footer: Default::default(),
             new_tab_anchor: AnchorSlot::default(),
             git_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
@@ -5814,6 +5823,20 @@ impl Shell {
                     menu.update(cx, |menu, cx| menu.replace_items(items, cx));
                     return;
                 }
+                // Ticking a found connection keeps the import menu open.
+                if let MenuEvent::Picked(id, _) = event
+                    && let Some(open) = this
+                        .menu
+                        .as_ref()
+                        .filter(|m| m.target == MenuTarget::DatabaseImport)
+                    && id.starts_with("pick:")
+                {
+                    let menu = open.menu.clone();
+                    this.toggle_found(id);
+                    let items = this.database_import_menu();
+                    menu.update(cx, |menu, cx| menu.replace_items(items, cx));
+                    return;
+                }
                 // A project row opens or closes its sessions, here and in
                 // the rail's own tree; the menu stays.
                 if let MenuEvent::Picked(id, _) = event
@@ -5888,6 +5911,18 @@ impl Shell {
                 "Actions".into(),
                 self.actions_menu(),
                 200.,
+                MenuStyle::Explorer,
+            ),
+            MenuTarget::Databases => (
+                "Databases".into(),
+                self.databases_menu(cx),
+                300.,
+                MenuStyle::Explorer,
+            ),
+            MenuTarget::DatabaseImport => (
+                "Import connections".into(),
+                self.database_import_menu(),
+                380.,
                 MenuStyle::Explorer,
             ),
             MenuTarget::RailSessions => (
@@ -6377,6 +6412,8 @@ impl Shell {
             MenuTarget::TerminalTab(ix) => self.run_terminal_tab_menu(ix, action, window, cx),
             MenuTarget::RunningTerminals => self.run_running_terminals_menu(action, window, cx),
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
+            MenuTarget::Databases => self.run_databases_menu(action, window, cx),
+            MenuTarget::DatabaseImport => self.run_database_import_menu(action, window, cx),
             MenuTarget::NewTab => match action {
                 "terminal" => self.new_title_terminal(window, cx),
                 "browser" => self.new_browser_pane(None, window, cx),
@@ -9138,6 +9175,7 @@ impl Render for Shell {
         }
         if !std::mem::replace(&mut self.browser_selftest_started, true) {
             self.start_browser_agent(window, cx);
+            self.start_database_footer(window, cx);
             self.start_browser_selftest(window, cx);
         }
         if let Some(m) = &self.monos {
@@ -9906,6 +9944,13 @@ impl Render for Shell {
                     .when(open.target == MenuTarget::Actions, |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
+                    .when(
+                        matches!(
+                            open.target,
+                            MenuTarget::Databases | MenuTarget::DatabaseImport
+                        ),
+                        |p| p.side(Side::Top).align(crate::popover::Align::End).max_height(560.),
+                    )
                     .when(open.target == MenuTarget::RunningTerminals, |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })

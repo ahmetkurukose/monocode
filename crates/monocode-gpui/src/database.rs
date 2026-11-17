@@ -5,6 +5,7 @@
 //! and runs on its tokio runtime, never on the UI thread.
 
 mod dialog;
+mod external;
 mod grid;
 mod mongo;
 mod render;
@@ -47,6 +48,7 @@ pub(crate) enum Event {
 
 #[cfg(test)]
 pub(crate) use send::write_sources;
+pub(crate) use external::LinkState;
 pub(crate) use send::{MAX_SEND_BYTES, Origin, Target, send_targets};
 
 const LIMITS: [usize; 4] = [100, 500, 1000, 5000];
@@ -673,6 +675,8 @@ fn quote_ident(name: &str) -> String {
 
 impl DatabaseView {
     pub(crate) fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+        // Connecting opens a source's tunnel; its logs live beside the sources.
+        monocode_core::db::conn::set_tunnel_dir(dir.join("tunnels"));
         let store = DataSourceStore::new(&dir);
         let rename_input = cx.new(|cx| {
             let mut input = Input::field("Console name", "Console name", content(0.35), cx);
@@ -2983,9 +2987,13 @@ impl DatabaseView {
                 }
                 self.passwords.remove(&id);
             } else {
+                // Agents use the source with the password typed this run, too.
+                monocode_core::db_bridge::remember_password(&id, &password);
                 self.passwords.insert(id.clone(), password);
             }
         }
+        // Agents' pooled connections were made with the old settings.
+        monocode_core::db_bridge::forget_source(&id);
         if !data_source.save_password && had_saved {
             source::forget_password(&id);
         }
@@ -3008,6 +3016,7 @@ impl DatabaseView {
     fn remove_source(&mut self, id: &str, cx: &mut Context<Self>) {
         let had_saved = self.source(id).is_some_and(|s| s.save_password);
         self.disconnect_source(id, cx);
+        monocode_core::db_bridge::forget_source(id);
         self.sources.retain(|s| s.id != id);
         self.consoles.retain(|c| c.source != id);
         self.console_store.delete_source(id);

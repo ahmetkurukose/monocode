@@ -61,6 +61,96 @@ impl DbKind {
     }
 }
 
+/// What agents in Monocode sessions may do with a data source through the
+/// built-in `monocode_db` MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAccess {
+    /// Agents do not see the source at all.
+    Off,
+    /// Agents read: every statement runs in a read-only session.
+    #[default]
+    Read,
+    /// Agents may also write, through a separate tool the provider asks about.
+    Write,
+}
+
+impl McpAccess {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Read, Self::Write];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Read => "Read",
+            Self::Write => "Read & write",
+        }
+    }
+
+    /// The footer's short badge.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Read => "ro",
+            Self::Write => "rw",
+        }
+    }
+}
+
+/// The program that makes a remote server reachable on the source's local
+/// port (`127.0.0.1:<DataSource::port>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TunnelKind {
+    /// `alloydb-auth-proxy <instance> --port=<port> [--public-ip]`
+    #[default]
+    #[serde(rename = "alloydb")]
+    AlloyDb,
+    /// `cloud-sql-proxy <instance> --port=<port>`
+    #[serde(rename = "cloudsql")]
+    CloudSql,
+    /// `kubectl port-forward <target> <port>:<remote_port>`
+    #[serde(rename = "kubectl")]
+    Kubectl,
+    /// Any command, run with `sh -c` (an `ssh -N -L …`, say).
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+impl TunnelKind {
+    pub const ALL: [Self; 4] = [Self::AlloyDb, Self::CloudSql, Self::Kubectl, Self::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlloyDb => "AlloyDB proxy",
+            Self::CloudSql => "Cloud SQL proxy",
+            Self::Kubectl => "kubectl port-forward",
+            Self::Custom => "Custom command",
+        }
+    }
+}
+
+/// How a data source's local port is opened. The port itself is the
+/// source's `port`; the host is the loopback.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tunnel {
+    pub kind: TunnelKind,
+    /// AlloyDB: `projects/…/instances/…`; Cloud SQL: `project:region:instance`;
+    /// kubectl: `svc/name`, `pod/name` or `deploy/name`.
+    pub instance: String,
+    /// AlloyDB: `--public-ip`.
+    pub public_ip: bool,
+    /// kubectl: the port on the target.
+    pub remote_port: Option<u16>,
+    /// kubectl: `-n`.
+    pub namespace: String,
+    /// kubectl: `--context`.
+    pub context: String,
+    /// Extra arguments for the proxy or kubectl.
+    pub args: Vec<String>,
+    /// Custom: the whole command, run by `sh -c`.
+    pub command: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataSource {
@@ -89,6 +179,10 @@ pub struct DataSource {
     pub auth_source: String,
     /// MongoDB: connect over TLS.
     pub tls: bool,
+    /// Opened before connecting when the port is not listening yet.
+    pub tunnel: Option<Tunnel>,
+    /// What agents may do with this source.
+    pub mcp: McpAccess,
 }
 
 impl DataSource {
@@ -128,6 +222,8 @@ impl Default for DataSource {
             uri: String::new(),
             auth_source: String::new(),
             tls: false,
+            tunnel: None,
+            mcp: McpAccess::Read,
         }
     }
 }
