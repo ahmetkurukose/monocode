@@ -174,14 +174,15 @@ mod tests {
                     text: "tail".into(),
                 },
             ];
-            let mut partition = item("partition", None);
-            partition.replace = at - 2..at;
-            vec![path, partition]
+            let mut parse = item("parse", None);
+            parse.replace = at - 2..at;
+            vec![path, parse]
         };
         // One more letter narrows the list and moves what lies after it.
         let typed = "import os\nos.pat\nrest";
         let carried = carry(items(), old, at, typed, at + 1);
-        assert_eq!(carried.len(), 1);
+        assert_eq!(carried.len(), 1, "`parse` has no `t`");
+        assert_eq!(carried[0].label, "path");
         assert_eq!(&typed[carried[0].replace.clone()], "pat");
         assert_eq!(carried[0].additional_edits[0].range, 0..0);
         assert_eq!(&typed[carried[0].additional_edits[1].range.clone()], "rest");

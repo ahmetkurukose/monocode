@@ -79,8 +79,8 @@ pub(super) fn register(cx: &mut App) {
             id: PAGE,
             title: "Code insight",
             icon: "code",
-            build: Rc::new(|page, _, cx| {
-                let view = cx.new(|cx| Page::new(page, cx));
+            build: Rc::new(|page, window, cx| {
+                let view = cx.new(|cx| Page::new(page, window, cx));
                 #[cfg(test)]
                 cx.set_global(LastPage(view.clone()));
                 view.into()
@@ -130,7 +130,7 @@ fn line(label: &str, placeholder: &str, text: &str, cx: &mut App) -> Entity<Inpu
 }
 
 impl Page {
-    fn new(page: PageContext, cx: &mut Context<Self>) -> Self {
+    fn new(page: PageContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let saved: InsightSettings = (page.value)
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
@@ -181,6 +181,12 @@ impl Page {
                 this.problem = None;
                 cx.notify();
             }));
+            // Enter in a field saves the form.
+            events.push(cx.subscribe_in(
+                field,
+                window,
+                |this, _, _: &input::Submitted, window, cx| this.save(window, cx),
+            ));
         }
         Self {
             project: page.project,
