@@ -358,13 +358,16 @@ pub fn configure_codex(command: &mut std::process::Command, environment: &HashMa
 /// that steer or end what the agent itself started. Starting a program and
 /// evaluating in one run code, so they go through the session's permission
 /// mode like a shell command does.
-pub fn claude_allowed_tools() -> String {
-    TOOLS
-        .iter()
-        .filter(|tool| !tool.asks)
-        .map(|tool| format!("mcp__{SERVER_NAME}__{}", tool.name))
-        .collect::<Vec<_>>()
-        .join(",")
+pub fn claude_allowed_tools() -> &'static str {
+    static ALLOWED: OnceLock<String> = OnceLock::new();
+    ALLOWED.get_or_init(|| {
+        TOOLS
+            .iter()
+            .filter(|tool| !tool.asks)
+            .map(|tool| format!("mcp__{SERVER_NAME}__{}", tool.name))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
 }
 
 fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option<Value> {
