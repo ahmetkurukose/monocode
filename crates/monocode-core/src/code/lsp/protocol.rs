@@ -229,13 +229,17 @@ pub(crate) fn hover(converter: &mut Converter, path: &Path, result: &Value) -> O
 pub(crate) fn strip_snippet(snippet: &str) -> String {
     let characters: Vec<char> = snippet.chars().collect();
     let mut out = String::new();
-    let mut at = 0;
-    snippet_text(&characters, &mut at, &mut out, false);
+    snippet_text(&characters, &mut out);
     out
 }
 
-fn snippet_text(characters: &[char], at: &mut usize, out: &mut String, nested: bool) {
+fn snippet_text(characters: &[char], out: &mut String) {
     let name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // How many `${1:` placeholders are open. Counted rather than recursed
+    // into: the text is a server's, and nesting it deeply must not be able
+    // to run this thread out of stack.
+    let mut open = 0usize;
+    let at = &mut 0usize;
     while let Some(&character) = characters.get(*at) {
         let next = characters.get(*at + 1).copied();
         match character {
@@ -243,9 +247,9 @@ fn snippet_text(characters: &[char], at: &mut usize, out: &mut String, nested: b
                 out.extend(next);
                 *at += 2;
             }
-            '}' if nested => {
+            '}' if open > 0 => {
+                open -= 1;
                 *at += 1;
-                return;
             }
             '$' if next.is_some_and(name) => {
                 *at += 1;
@@ -262,7 +266,7 @@ fn snippet_text(characters: &[char], at: &mut usize, out: &mut String, nested: b
                     Some('}') => *at = end + 1,
                     Some(':') => {
                         *at = end + 1;
-                        snippet_text(characters, at, out, true);
+                        open += 1;
                     }
                     Some('|') => {
                         // `${1|one,two|}`: the first choice is what stays.
@@ -688,6 +692,11 @@ mod tests {
         assert_eq!(strip_snippet("${1/(.*)/${1:/upcase}/}done"), "/}done");
         assert_eq!(strip_snippet("a $ b } ${"), "a $ b } ${");
         assert_eq!(strip_snippet("plain"), "plain");
+        // Nesting far deeper than a stack of calls could follow.
+        let depth = 200_000;
+        let deep = format!("{}x{}", "${1:".repeat(depth), "}".repeat(depth));
+        assert_eq!(strip_snippet(&deep), "x");
+        assert_eq!(strip_snippet(&"${1:".repeat(depth)), "");
     }
 
     #[test]
