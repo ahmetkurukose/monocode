@@ -15,8 +15,9 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    App, AppContext, Context, Entity, Focusable, Global, KeyDownEvent, Role, ScrollHandle,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, Focusable, Global, KeyDownEvent, Role,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*,
+    px, uniform_list,
 };
 use std::sync::Arc;
 
@@ -111,9 +112,14 @@ pub(super) struct Outline {
     symbols: Arc<Vec<Symbol>>,
     caret: usize,
     filter: Entity<Input>,
+    /// The symbols the filter keeps, as indexes into `symbols`; worked out
+    /// when the symbols or the filter change, not when the caret moves.
+    rows: Vec<usize>,
+    /// The innermost symbol the caret is in.
+    current: Option<usize>,
     /// The row the keyboard is on, as an index into `symbols`.
     selected: Option<usize>,
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
     _watching: Vec<Subscription>,
     _events: Vec<Subscription>,
 }
@@ -131,12 +137,13 @@ impl Outline {
             }),
             cx.subscribe(&filter, |this, _, _: &input::Changed, cx| {
                 this.selected = None;
+                this.filtered(cx);
                 cx.notify();
             }),
             cx.subscribe(&filter, |this, _, _: &input::Submitted, cx| {
                 // Enter in the filter goes to the selected row, else to
                 // the first match.
-                let first = this.selected.or_else(|| this.rows(cx).first().copied());
+                let first = this.selected.or_else(|| this.rows.first().copied());
                 if let Some(index) = first {
                     this.jump(index, None, cx);
                 }
@@ -147,8 +154,10 @@ impl Outline {
             symbols: Arc::default(),
             caret: 0,
             filter,
+            rows: Vec::new(),
+            current: None,
             selected: None,
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
             _watching: Vec::new(),
             _events: events,
         };
@@ -174,6 +183,9 @@ impl Outline {
             ];
         }
         self.symbols = Arc::default();
+        self.caret = 0;
+        self.current = None;
+        self.filtered(cx);
         self.refresh(cx);
         cx.notify();
     }
@@ -185,19 +197,30 @@ impl Outline {
         let editor = editor.read(cx);
         let symbols = editor.outline();
         let caret = editor.input.read(cx).caret();
-        if !Arc::ptr_eq(&symbols, &self.symbols) || caret != self.caret {
+        if !Arc::ptr_eq(&symbols, &self.symbols) {
             self.symbols = symbols;
             self.caret = caret;
+            self.current = self.innermost();
+            self.filtered(cx);
             cx.notify();
+        } else if caret != self.caret {
+            // Typing and moving about only change which row is marked.
+            self.caret = caret;
+            let current = self.innermost();
+            if current != self.current {
+                self.current = current;
+                cx.notify();
+            }
         }
     }
 
-    fn rows(&self, cx: &App) -> Vec<usize> {
-        matching(&self.symbols, &self.filter.read(cx).content)
+    /// Keeps the symbols the filter lets through.
+    fn filtered(&mut self, cx: &App) {
+        self.rows = matching(&self.symbols, &self.filter.read(cx).content);
     }
 
     /// The innermost symbol the caret is in.
-    fn current(&self) -> Option<usize> {
+    fn innermost(&self) -> Option<usize> {
         let innermost = *symbols::chain_at(&self.symbols, self.caret).last()?;
         (self.symbols.iter()).position(|symbol| std::ptr::eq(symbol, innermost))
     }
@@ -223,8 +246,8 @@ impl Outline {
     }
 
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
-        let at = (self.selected.or_else(|| self.current()))
+        let rows = self.rows.clone();
+        let at = (self.selected.or(self.current))
             .and_then(|index| rows.iter().position(|row| *row == index));
         let next = match (event.keystroke.key.as_str(), at) {
             ("down", None) => rows.first().copied(),
@@ -236,7 +259,7 @@ impl Outline {
         if let Some(next) = next {
             self.selected = Some(next);
             if let Some(shown) = rows.iter().position(|row| *row == next) {
-                self.scroll.scroll_to_item(shown);
+                self.scroll.scroll_to_item(shown, ScrollStrategy::Nearest);
             }
             cx.notify();
         }
@@ -245,10 +268,14 @@ impl Outline {
 
     /// The names listed, each marked when it is the caret's symbol.
     #[cfg(test)]
-    pub(super) fn listed(&self, cx: &App) -> Vec<(String, bool)> {
-        let current = self.current();
-        (self.rows(cx).into_iter())
-            .map(|index| (self.symbols[index].name.clone(), current == Some(index)))
+    pub(super) fn listed(&self) -> Vec<(String, bool)> {
+        (self.rows.iter().copied())
+            .map(|index| {
+                (
+                    self.symbols[index].name.clone(),
+                    self.current == Some(index),
+                )
+            })
             .collect()
     }
 
@@ -256,6 +283,7 @@ impl Outline {
     pub(super) fn filter_by(&mut self, text: &str, cx: &mut Context<Self>) {
         (self.filter).update(cx, |filter, cx| filter.set_text(text.to_owned(), cx));
         self.selected = None;
+        self.filtered(cx);
         cx.notify();
     }
 
@@ -272,61 +300,62 @@ impl Outline {
     }
 }
 
+impl Outline {
+    /// One row of the list.
+    fn row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let symbol = &self.symbols[index];
+        let (mark, colour) = kind_mark(symbol.kind);
+        div()
+            .id(("code-outline-row", index))
+            .role(Role::Link)
+            .aria_label(format!("{} {}", kind_name(symbol.kind), symbol.name))
+            .cursor_pointer()
+            .h(px(22.))
+            .pl(px(8. + symbol.depth as f32 * 14.))
+            .pr_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(self.current == Some(index), |d| {
+                d.bg(content(0.08)).text_color(content(1.))
+            })
+            .when(self.selected == Some(index), |d| d.bg(content(0.14)))
+            .hover(|s| s.bg(content(0.06)))
+            .child(
+                div()
+                    .w(px(12.))
+                    .flex_shrink_0()
+                    .font_family(crate::fonts::mono())
+                    .text_color(syntax_color(colour))
+                    .child(mark),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(symbol.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(content(0.35))
+                    .child((symbol.row + 1).to_string()),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.jump(index, Some(window), cx)))
+            .into_any_element()
+    }
+}
+
 impl Render for Outline {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.rows(cx);
-        let current = self.current();
-        let selected = self.selected;
         let empty: Option<SharedString> = match (&self.file, self.symbols.is_empty()) {
             (None, _) => Some("Open a file to see its outline.".into()),
             (Some(_), true) => Some("No symbols in this file.".into()),
-            (Some(_), false) if rows.is_empty() => Some("Nothing matches the filter.".into()),
+            (Some(_), false) if self.rows.is_empty() => Some("Nothing matches the filter.".into()),
             _ => None,
         };
-        let list = rows.into_iter().map(|index| {
-            let symbol = &self.symbols[index];
-            let (mark, colour) = kind_mark(symbol.kind);
-            div()
-                .id(("code-outline-row", index))
-                .role(Role::Link)
-                .aria_label(format!("{} {}", kind_name(symbol.kind), symbol.name))
-                .cursor_pointer()
-                .h(px(22.))
-                .pl(px(8. + symbol.depth as f32 * 14.))
-                .pr_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .when(current == Some(index), |d| {
-                    d.bg(content(0.08)).text_color(content(1.))
-                })
-                .when(selected == Some(index), |d| d.bg(content(0.14)))
-                .hover(|s| s.bg(content(0.06)))
-                .child(
-                    div()
-                        .w(px(12.))
-                        .flex_shrink_0()
-                        .font_family(crate::fonts::mono())
-                        .text_color(syntax_color(colour))
-                        .child(mark),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(symbol.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(content(0.35))
-                        .child((symbol.row + 1).to_string()),
-                )
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.jump(index, Some(window), cx)),
-                )
-        });
+        let entity = cx.entity();
         div()
             .id("code-outline")
             .debug_selector(|| "code-outline".into())
@@ -352,18 +381,29 @@ impl Render for Outline {
                         .child(div().flex_1().min_w_0().child(self.filter.clone())),
                 ),
             )
-            .child(
-                div()
+            .child(match empty {
+                Some(text) => div()
                     .id("code-outline-list")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(list)
-                    .when_some(empty, |d, text| {
-                        d.child(div().px_2().py_1().text_color(content(0.45)).child(text))
-                    }),
-            )
+                    .child(div().px_2().py_1().text_color(content(0.45)).child(text))
+                    .into_any_element(),
+                // Only the rows in view are built.
+                None => uniform_list("code-outline-list", self.rows.len(), move |range, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        range
+                            .filter_map(|at| {
+                                let index = *this.rows.get(at)?;
+                                Some(this.row(index, cx))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .track_scroll(&self.scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element(),
+            })
     }
 }
 
