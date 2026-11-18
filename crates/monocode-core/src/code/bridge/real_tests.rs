@@ -84,6 +84,21 @@ fn diagnostics_and_navigation_come_from_the_real_servers() {
     let Some(stage) = project() else {
         return;
     };
+    // Nothing runs yet, and the insight tools do not start a server of the
+    // project's own: they say which tool does.
+    let cold = stage.ok("code_diagnostics", json!({"files": ["main.py"]}));
+    assert!(
+        cold.contains("No language server is running for main.py")
+            && cold.contains("code_servers_start"),
+        "{cold}"
+    );
+    assert!(stage.services.lsp().statuses().is_empty());
+    let started = stage.ok(
+        "code_servers_start",
+        json!({"file": "main.py", "timeout_s": 90}),
+    );
+    assert!(started.contains("basedpyright: "), "{started}");
+    assert!(started.contains("ruff: "), "{started}");
     let problems = stage.ok(
         "code_diagnostics",
         json!({"files": ["main.py", "shapes.py"], "timeout_s": 90}),
@@ -171,13 +186,15 @@ fn a_missing_language_server_is_named_with_what_to_install() {
     });
     let problems = stage.ok("code_diagnostics", json!({"files": ["main.py"]}));
     assert!(
-        problems.contains("Note: basedpyright is not installed (looked for basedpyright-langserver, pyright-langserver"),
+        problems.contains(
+            "basedpyright is not installed (looked for basedpyright-langserver, pyright-langserver"
+        ),
         "{problems}"
     );
-    assert!(
-        problems.contains("Note: ruff is not installed"),
-        "{problems}"
-    );
+    assert!(problems.contains("ruff is not installed"), "{problems}");
+    let started = stage.ok("code_servers_start", json!({"file": "main.py"}));
+    assert!(started.contains("basedpyright: not installed"), "{started}");
+    assert!(started.contains("ruff: not installed"), "{started}");
     let refused = stage.refused(
         "code_definition",
         json!({"file": "main.py", "line": 4, "symbol": "describe"}),

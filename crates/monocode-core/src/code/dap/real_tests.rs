@@ -418,6 +418,21 @@ while True:
     time.sleep(0.05)
 ";
 
+/// `debugpy.adapter` stays up after its debuggee is gone, waiting for a
+/// client with nothing more to ask: ending the session has to end it.
+#[cfg(unix)]
+#[test]
+fn the_adapter_goes_when_the_program_ends() {
+    let Some(project) = project(&[("quick.py", "print('done')\n")]) else {
+        return;
+    };
+    let session = project.debug("python", &["quick.py"]);
+    let adapter = session.adapter_process_id().expect("a process of its own");
+    assert!(alive(adapter as i32));
+    assert_eq!(session.wait_for_exit(PATIENCE), Ok(Some(0)));
+    wait_until("the adapter to leave", || !alive(adapter as i32));
+}
+
 #[cfg(unix)]
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }

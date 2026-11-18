@@ -4,12 +4,24 @@ use std::process::Command;
 /// Apply scheduling hints before exec so descendants inherit them.
 /// Best effort: a refused hint must not prevent a provider from launching.
 pub fn configure_child(command: &mut Command) {
+    configure(command, true);
+}
+
+/// For a program the user runs and waits for (a run, a debug adapter and
+/// the debuggee it starts): the ordinary signal mask and no console window,
+/// like `configure_child`, but at the user's own priority. The hints above
+/// are for background work and are inherited by every descendant.
+pub fn configure_user_child(command: &mut Command) {
+    configure(command, false);
+}
+
+fn configure(command: &mut Command, background: bool) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // Only system calls here: the post-fork child must not allocate or lock.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 // A GUI executor's worker may block signals. exec preserves
                 // that mask; Tokio-based provider children then never receive
                 // SIGCHLD and their command sessions never finish. Give the
@@ -18,6 +30,9 @@ pub fn configure_child(command: &mut Command) {
                 libc::sigemptyset(&mut signals);
                 if libc::sigprocmask(libc::SIG_SETMASK, &signals, std::ptr::null_mut()) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if !background {
+                    return Ok(());
                 }
                 let priority = libc::getpriority(libc::PRIO_PROCESS, 0).max(10);
                 libc::setpriority(libc::PRIO_PROCESS, 0, priority);
@@ -34,7 +49,7 @@ pub fn configure_child(command: &mut Command) {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let _ = command;
+    let _ = (command, background);
 }
 
 #[cfg(windows)]

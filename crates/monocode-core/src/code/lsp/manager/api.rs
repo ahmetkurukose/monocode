@@ -2,6 +2,44 @@
 //! make. What happens behind them is in the parent module.
 use super::*;
 
+/// Which servers a file gets are running, by registry id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    pub running: Vec<String>,
+    pub absent: Vec<String>,
+}
+
+/// An open that is closed again when this goes out of scope, however the
+/// question in between ended.
+struct Held<'a> {
+    manager: &'a Manager,
+    path: &'a Path,
+    open: bool,
+}
+
+impl<'a> Held<'a> {
+    fn new(manager: &'a Manager, path: &'a Path, open: bool) -> Self {
+        Self {
+            manager,
+            path,
+            open,
+        }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            self.manager.close(self.path);
+        }
+    }
+}
+
+fn read_from_disk(path: &Path) -> Result<String, LspError> {
+    std::fs::read_to_string(path)
+        .map_err(|error| LspError::Io(format!("{} could not be read: {error}", path.display())))
+}
+
 /// The language servers of the whole app. Cheap to clone; every clone is the
 /// same manager. Dropping the last one kills every server.
 #[derive(Clone)]
@@ -50,6 +88,7 @@ impl Manager {
                 clock,
                 state: Mutex::new(State::default()),
                 changed: Condvar::new(),
+                handshaking: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -67,39 +106,63 @@ impl Manager {
     /// document that is already open only counts the extra opener; the text
     /// stays what the last `change` made it. Every `open` needs its `close`.
     pub fn open(&self, path: &Path, text: &str, context: &DocumentContext) {
+        let _ = self.open_with(path, || Ok(text.to_owned()), context, true);
+    }
+
+    /// Opens or joins a document as one step under the manager's lock, so
+    /// that what is joined cannot be closed between the look and the open.
+    /// `read` gives the text and is only called when the document is not
+    /// open yet. With `start` false no server is started: the document gets
+    /// the servers that are already starting or running, and when there are
+    /// none it is not opened at all. Returns how many servers it has.
+    fn open_with(
+        &self,
+        path: &Path,
+        read: impl FnOnce() -> Result<String, LspError>,
+        context: &DocumentContext,
+        start: bool,
+    ) -> Result<usize, LspError> {
         let Some(language) = Language::of(path) else {
-            return;
+            return Ok(0);
         };
         let canonical = std::fs::canonicalize(path).ok().filter(|real| real != path);
         let shared = &self.shared;
         let now = (shared.clock)();
         let mut state = shared.state();
-        if let Some(document) = state.documents.get_mut(path) {
-            document.opens += 1;
-            return;
+        if state.documents.contains_key(path) {
+            let specs = shared.specs_for(&state, language, context);
+            if let Some(document) = state.documents.get_mut(path) {
+                document.opens += 1;
+            }
+            if let (true, Some(specs)) = (start, specs) {
+                shared.top_up(&mut state, path, &specs, context, now);
+            }
+            return Ok(state
+                .documents
+                .get(path)
+                .map_or(0, |document| document.servers.len()));
         }
-        let settings = state.projects.get(&context.project);
-        if settings.is_some_and(|settings| settings.disabled) {
-            return;
-        }
-        let specs: Vec<ServerSpec> = shared
-            .registry
-            .for_language(language)
-            .filter(|spec| {
-                settings.is_none_or(|settings| !settings.disabled_servers.contains(spec.id))
-            })
-            .cloned()
-            .collect();
+        // A project switched off gets no servers, and no document.
+        let Some(specs) = shared.specs_for(&state, language, context) else {
+            return Ok(0);
+        };
+        let text = read()?;
         let mut servers = Vec::new();
         for spec in &specs {
-            let id = shared.attach(&mut state, path, spec, context, now);
+            let Some(id) = shared.attach(&mut state, path, spec, context, now, start) else {
+                continue;
+            };
             if !servers.contains(&id) {
                 servers.push(id);
             }
         }
+        if !start && servers.is_empty() {
+            return Ok(0);
+        }
+        let version = state.versions.remove(path).map_or(1, |last| last + 1);
         let document = Document {
             text: Arc::from(text),
-            version: 1,
+            version,
             language,
             servers,
             opens: 1,
@@ -113,14 +176,17 @@ impl Manager {
             entry.idle_since = None;
             entry.last_used = now;
             if let Some(client) = entry.running().cloned() {
-                send_open(&client, path, &document);
+                let ticket = send_open(&client, path, &document);
+                entry.synced.insert(path.to_path_buf(), ticket);
                 if client.pull_diagnostics().is_some() {
                     shared.pull(entry, *id, &[path.to_path_buf()]);
                 }
             }
         }
+        let attached = document.servers.len();
         state.documents.insert(path.to_path_buf(), document);
         state.reached.remove(path);
+        Ok(attached)
     }
 
     /// Replaces the document's text. Servers are told with a new version and
@@ -149,13 +215,14 @@ impl Manager {
                 continue;
             };
             if client.syncs_changes() {
-                client.notify(
+                let ticket = client.notify(
                     "textDocument/didChange",
                     json!({
                         "textDocument": { "uri": path_to_uri(path), "version": document.version },
                         "contentChanges": [{ "text": text }],
                     }),
                 );
+                entry.synced.insert(path.to_path_buf(), ticket);
             }
             match client.pull_diagnostics() {
                 Some(pull) if pull.inter_file => shared.pull_all(entry, *id),
@@ -179,17 +246,21 @@ impl Manager {
         if document.opens > 0 {
             return;
         }
-        let servers = state
-            .documents
-            .remove(path)
-            .map(|document| document.servers)
-            .unwrap_or_default();
+        let Some(closed) = state.documents.remove(path) else {
+            return;
+        };
+        if state.versions.len() >= VERSIONS_KEPT {
+            state.versions.clear();
+        }
+        state.versions.insert(path.to_path_buf(), closed.version);
+        let servers = closed.servers;
         for id in servers {
             let Some(entry) = state.entries.get_mut(&id) else {
                 continue;
             };
             entry.documents.remove(path);
             entry.reported.remove(path);
+            entry.synced.remove(path);
             if let Some(client) = entry.running() {
                 client.notify(
                     "textDocument/didClose",
@@ -497,17 +568,154 @@ impl Manager {
         context: &DocumentContext,
         ask: impl FnOnce(&Manager) -> T,
     ) -> Result<T, LspError> {
-        let text = if self.is_open(path) {
-            String::new()
-        } else {
-            std::fs::read_to_string(path).map_err(|error| {
-                LspError::Io(format!("{} could not be read: {error}", path.display()))
-            })?
+        let attached = self.open_with(path, || read_from_disk(path), context, true)?;
+        let _open = Held::new(self, path, attached > 0);
+        Ok(ask(self))
+    }
+
+    /// `with_file` for callers that must not start language servers, whose
+    /// programs come out of the project's own folders: only servers already
+    /// starting or running (the editor's, or ones `start_servers` started)
+    /// are joined. `LspError::NoServer` when there are none. `owner`, when
+    /// it holds a lease on a server it joins, has the lease renewed.
+    pub fn with_running_file<T>(
+        &self,
+        path: &Path,
+        context: &DocumentContext,
+        owner: &str,
+        ask: impl FnOnce(&Manager) -> T,
+    ) -> Result<T, LspError> {
+        let attached = self.open_with(path, || read_from_disk(path), context, false)?;
+        if attached == 0 {
+            return Err(LspError::NoServer);
+        }
+        let _open = Held::new(self, path, true);
+        self.renew_leases(owner, path);
+        Ok(ask(self))
+    }
+
+    /// The text the manager holds for an open document: the editor's, which
+    /// may differ from what is on disk. Positions for a question must be
+    /// counted in this.
+    pub fn document_text(&self, path: &Path) -> Option<Arc<str>> {
+        self.shared
+            .state()
+            .documents
+            .get(path)
+            .map(|document| document.text.clone())
+    }
+
+    /// Which servers of the kinds `path` gets are running (or starting) now
+    /// and which are not, by registry id. Starts nothing; never waits.
+    pub fn coverage(&self, path: &Path, context: &DocumentContext) -> Coverage {
+        let mut coverage = Coverage::default();
+        let Some(language) = Language::of(path) else {
+            return coverage;
         };
-        self.open(path, &text, context);
-        let answer = ask(self);
-        self.close(path);
-        Ok(answer)
+        let shared = &self.shared;
+        let state = shared.state();
+        let Some(specs) = shared.specs_for(&state, language, context) else {
+            return coverage;
+        };
+        let held = state.documents.get(path);
+        for spec in &specs {
+            let in_document = held.is_some_and(|document| {
+                document.servers.iter().any(|id| {
+                    state
+                        .entries
+                        .get(id)
+                        .is_some_and(|entry| entry.live() && entry.spec.id == spec.id)
+                })
+            });
+            let key = ServerKey {
+                root: find_root(path, &context.checkout, spec.root_markers),
+                server: spec.id,
+                toolchain: context.toolchain.clone(),
+            };
+            let by_key = state
+                .by_key
+                .get(&key)
+                .and_then(|id| state.entries.get(id))
+                .is_some_and(|entry| entry.live());
+            match in_document || by_key {
+                true => coverage.running.push(spec.id.to_string()),
+                false => coverage.absent.push(spec.id.to_string()),
+            }
+        }
+        coverage
+    }
+
+    /// Starts the servers `path` gets and waits until they are ready, have
+    /// failed, or `wait` has passed; each is kept up for `LEASE_PERIOD`
+    /// after `owner` last used it, whatever the idle period is. Returns the
+    /// state of each, a tool that is not installed included. Blocks.
+    pub fn start_servers(
+        &self,
+        path: &Path,
+        context: &DocumentContext,
+        owner: &str,
+        wait: Duration,
+    ) -> Result<Vec<ServerStatus>, LspError> {
+        let shared = &self.shared;
+        let deadline = Instant::now() + wait;
+        let attached = self.open_with(path, || read_from_disk(path), context, true)?;
+        let _open = Held::new(self, path, attached > 0);
+        let now = (shared.clock)();
+        let mut state = shared.state();
+        loop {
+            let ids = match state.documents.get(path) {
+                Some(document) => document.servers.clone(),
+                None => return Ok(Vec::new()),
+            };
+            let mut starting = false;
+            for id in &ids {
+                if let Some(entry) = state.entries.get_mut(id) {
+                    entry.leases.insert(owner.to_string(), now + LEASE_PERIOD);
+                    starting |= matches!(entry.phase, Phase::Starting);
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !starting || left.is_zero() {
+                return Ok(ids
+                    .iter()
+                    .filter_map(|id| Some(state.entries.get(id)?.status(*id)))
+                    .collect());
+            }
+            state = shared
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    /// Lets go of what `owner` asked to be kept up: its servers follow the
+    /// idle policy from now on.
+    pub fn release_servers(&self, owner: &str) {
+        let mut state = self.shared.state();
+        for entry in state.entries.values_mut() {
+            entry.leases.remove(owner);
+        }
+    }
+
+    /// Extends the lease `owner` holds on the servers of an open document.
+    fn renew_leases(&self, owner: &str, path: &Path) {
+        let now = (self.shared.clock)();
+        let mut state = self.shared.state();
+        let State {
+            entries, documents, ..
+        } = &mut *state;
+        let Some(document) = documents.get(path) else {
+            return;
+        };
+        for id in &document.servers {
+            if let Some(until) = entries
+                .get_mut(id)
+                .and_then(|entry| entry.leases.get_mut(owner))
+            {
+                *until = now + LEASE_PERIOD;
+            }
+        }
     }
 
     /// Every server known, running or not, oldest first. Never waits.
@@ -541,12 +749,37 @@ impl Manager {
         }
     }
 
-    /// Stops every server, as when the app quits.
+    /// Stops every server, as when the app quits, and returns once they
+    /// are gone: a polite goodbye, and the process groups killed after at
+    /// most about a second. Blocks for that long.
     pub fn stop_all(&self) {
-        let mut state = self.shared.state();
-        let ids: Vec<ServerId> = state.entries.keys().copied().collect();
-        for id in ids {
-            self.shared.stop(&mut state, id);
+        let mut clients: Vec<Arc<Client>> = std::mem::take(&mut *lock(&self.shared.handshaking));
+        {
+            let mut state = self.shared.state();
+            let ids: Vec<ServerId> = state.entries.keys().copied().collect();
+            for id in ids {
+                clients.extend(self.shared.stop_entry(&mut state, id));
+            }
+        }
+        // All at once, so many servers cost no more time than one.
+        let goodbyes: Vec<_> = clients
+            .iter()
+            .filter_map(|client| {
+                let client = client.clone();
+                std::thread::Builder::new()
+                    .name("lsp-quit".into())
+                    .spawn(move || {
+                        client
+                            .shutdown_within(Duration::from_millis(500), Duration::from_millis(300))
+                    })
+                    .ok()
+            })
+            .collect();
+        for goodbye in goodbyes {
+            let _ = goodbye.join();
+        }
+        for client in clients {
+            client.kill();
         }
     }
 

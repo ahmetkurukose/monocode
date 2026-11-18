@@ -4,6 +4,7 @@
 //! stop ends the whole group, so a test runner's children go with it.
 use super::output::Decoder;
 use super::registry::{Registry, RunId, StartedBy};
+use crate::code::child::{exited, lead_group};
 use crate::code::spawn::Spawn;
 use crate::code::toolchain::Toolchain;
 use std::io::Read;
@@ -20,13 +21,9 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// process still holds the pipe open.
 const DRAIN: Duration = Duration::from_millis(500);
 
+// The process leads its own group, so a signal to it reaches its children.
 #[cfg(unix)]
-fn signal_group(pid: u32, signal: i32) {
-    // The process leads its own group, so this reaches its children too.
-    unsafe {
-        libc::kill(-(pid as i32), signal);
-    }
-}
+use crate::code::child::signal_group;
 
 /// Asks the run's process group to end.
 fn interrupt(pid: u32) {
@@ -72,18 +69,14 @@ fn read_into(
 }
 
 /// Waits for the process, honouring a stop request on the way. Only this
-/// thread reaps the child, so the group it signals is always still its own.
+/// thread reaps the child, and only after the group has been killed, so
+/// the group it signals is always still its own.
 fn watch(mut child: Child, registry: Registry, id: RunId, readers: mpsc::Receiver<()>) {
     std::thread::spawn(move || {
         let pid = child.id();
         let mut asked: Option<Instant> = None;
         let mut killed = false;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(_) => break None,
-            }
+        while !exited(&mut child) {
             if registry.stop_requested(id) {
                 match asked {
                     None => {
@@ -98,11 +91,13 @@ fn watch(mut child: Child, registry: Registry, id: RunId, readers: mpsc::Receive
                 }
             }
             std::thread::sleep(POLL);
-        };
-        if asked.is_some() {
-            // What the process left behind in its group goes with it.
-            kill(pid);
         }
+        // What the process left behind in its group goes with it, however
+        // it ended: a run that is over holds no processes, and nothing
+        // could stop them afterwards. The leader is not reaped yet, so its
+        // exit status is untouched by this.
+        kill(pid);
+        let status = child.wait().ok();
         let deadline = Instant::now() + DRAIN;
         for _ in 0..2 {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -157,12 +152,9 @@ impl Registry {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::process::configure_child(&mut command);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        // The user's own program: not throttled like background work.
+        crate::process::configure_user_child(&mut command);
+        lead_group(&mut command);
         let mut child = command.spawn().map_err(|error| {
             if !spawn.cwd.is_dir() {
                 format!("The folder {} does not exist.", spawn.cwd.display())
@@ -295,6 +287,59 @@ mod tests {
             -1,
             "the group is gone"
         );
+    }
+
+    #[test]
+    fn what_a_finished_run_left_running_is_killed() {
+        let folder = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        // The shell exits at once and leaves a child behind in its group.
+        let script = "sleep 60 & echo started; exit 4";
+        let id = registry
+            .start_headless(
+                shell(script, folder.path()),
+                folder.path(),
+                StartedBy::User,
+                &Toolchain::default(),
+            )
+            .unwrap();
+        let pid = registry.get(id).unwrap().pid.unwrap();
+        let ended = Instant::now();
+        let info = finished(&registry, id);
+        // Its own exit code, not the kill's, and without waiting out the
+        // child that held the output open.
+        assert_eq!(info.state, RunState::Exited(Some(4)));
+        assert!(ended.elapsed() < Duration::from_secs(10));
+        assert!(registry.output(id, 0).unwrap().text.contains("started"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(-(pid as i32), 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::kill(-(pid as i32), 0) },
+            -1,
+            "the group is gone"
+        );
+    }
+
+    /// A run is the user's program: it starts at this app's own priority,
+    /// not at the one background work is given.
+    #[test]
+    fn a_run_is_not_niced() {
+        let folder = tempfile::tempdir().unwrap();
+        let registry = Registry::new();
+        let id = registry
+            .start_headless(
+                shell("ps -o nice= -p $$", folder.path()),
+                folder.path(),
+                StartedBy::User,
+                &Toolchain::default(),
+            )
+            .unwrap();
+        assert_eq!(finished(&registry, id).state, RunState::Exited(Some(0)));
+        let ours = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let output = registry.output(id, 0).unwrap().text;
+        assert_eq!(output.trim().parse::<i32>().ok(), Some(ours), "{output}");
     }
 
     #[test]

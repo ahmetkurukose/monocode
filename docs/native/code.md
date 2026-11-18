@@ -189,8 +189,8 @@ the next `open`, three times, then only by `restart_server`.
 
 - Never wait (fine on the UI thread): `open(path, text, &DocumentContext)`,
   `change(path, text)` (whole text), `close(path)`, `is_open`, `diagnostics(path)`,
-  `triggers(path)`, `statuses()`, `stop_server(id)`, `restart_server(id)`, `stop_all()`,
-  `subscribe()`, `sweep()`. `open` is counted: every `open` needs its `close`, and a
+  `triggers(path)`, `statuses()`, `stop_server(id)`, `restart_server(id)`,
+  `subscribe()`, `sweep()`, `coverage(path, &context)`, `document_text(path)`. `open` is counted: every `open` needs its `close`, and a
   second opener does not replace the text.
 - Wait for a server, at most `request_timeout` (10 s) for it to start plus the same for
   its answer, so call them on a background thread, each with a `CancelToken` whose
@@ -198,7 +198,13 @@ the next `open`, three times, then only by `restart_server`.
   `resolve_completion`, `signature_help`, `document_symbols`.
 - `diagnostics_settled(path, timeout)` waits until every server has reported on the
   current text. `with_file(path, &context, |manager| ...)` is for one-off questions about
-  a file nobody has open: it opens from disk (or joins the editor's copy), asks, closes.
+  a file nobody has open: it opens from disk (or joins the editor's copy) as one step under
+  the manager's lock, asks, closes. `with_running_file(path, &context, owner, ..)` is the same
+  without starting a server (`LspError::NoServer` when none runs), and
+  `start_servers(path, &context, owner, wait)` starts them and leases them to `owner` for 15
+  minutes past its last use. `stop_all()` blocks for about a second: every server is asked to
+  shut down at once and its process group is killed after, so it is for the quit and not for
+  the UI thread. A reopened document's `version` carries on from its last open.
 - `subscribe()` returns an `async_channel::Receiver<LspEvent>`:
   `DiagnosticsChanged { path }` (then read `diagnostics(path)`) and
   `ServerChanged(ServerStatus)`. States: `Starting`, `Ready`, `Indexing { title }` (from
@@ -689,8 +695,9 @@ count from 1.
 
 | Tool | Does | Asks first (Claude) |
 |---|---|---|
-| `code_diagnostics` | Errors and warnings for up to 20 files once the servers have settled (20 s default) | no |
-| `code_definition` | Definition of the symbol at `file` + `line` + `column`, or + `symbol` (a name on that line): path, line, the line's text | no |
+| `code_servers_start` | Starts the language servers for a file's project and waits until they are ready, or reports the missing tool with its install hint; they stay up (a lease of 15 minutes from the agent's last use, renewed by each insight call) | yes |
+| `code_diagnostics` | Errors and warnings for up to 20 files once the running servers have settled (20 s default); columns are characters from 1 | no |
+| `code_definition` | Definition of the symbol at `file` + `line` + `column` (in characters), or + `symbol` (a name on that line): path, line, column, the line's text | no |
 | `code_references` | Every use, the same way; at most 120 listed | no |
 | `code_hover` | Type, signature and documentation | no |
 | `code_symbols` | A file's outline with line ranges | no |
@@ -700,7 +707,8 @@ count from 1.
 | `run_stop` | Stops a run this session started | no |
 | `run_status` | Running and recently ended runs of the checkout, the user's included, with local addresses | no |
 | `debug_start` | `run_start`'s targets under debugpy (`internalConsole`), `breakpoints` set first; returns at the first stop or the end | yes |
-| `debug_breakpoints` | `list` / `set` / `clear` by file and line, with a condition; the editor's store | no |
+| `debug_breakpoints` | `list` / `set` / `clear` plain line breakpoints by file and line; the editor's store. A condition, hit condition or log message is refused here | no |
+| `debug_breakpoint_condition` | A breakpoint with a `condition`, `hit_condition` or `log_message`: the debuggee evaluates them, so it is like `debug_evaluate` | yes |
 | `debug_continue`, `debug_step` | Continue (or keep waiting), step `over` / `in` / `out`; return the next stop or the end | no |
 | `debug_stack` | Frames with ids and the locals of the top 1 to 5 | no |
 | `debug_variables` | The children of one `ref`, paged | no |
@@ -713,21 +721,46 @@ can be expanded) and what the program printed since the last report. An end is t
 code and that output. A wait that runs out says the program is still running and changes
 nothing.
 
+**Calls and connections.** The stdio server answers `tools/call` on a thread per call
+(at most 16 at once), so `debug_stop` is not held up behind a `debug_continue` that waits, and
+`notifications/cancelled` closes that call's connection to the app: the call gets no answer,
+and the app, noticing the hang-up, ends its wait (the program or run it waited for is left
+as it is). A tool that panics answers with an error and frees its connection slot (a drop
+guard); a request must be complete within 10 s whatever the pace it arrives at. The accept
+loop logs and backs off on an error and carries on; the cached hub listens again, on the
+same address if it can, with the sessions already issued, if its thread ever ends.
+`bridge::revoke(session)` ends a session's token (nothing in the app calls it yet; neither
+does the browser bridge's), and at most 512 sessions are remembered. A session needs an
+absolute folder and project to be given a capability, and a checkout that the app does not
+vouch for and that lies above both is replaced by the session's own folder.
+"Unseen output" of a debug session is counted per agent session in all the bytes the
+session ever printed.
+
 **Who steers.** Sessions an agent starts have `Actor::Agent(session id)` as origin and
 driver. `debug_continue`, `debug_step`, `debug_evaluate` and `debug_stop` check
 `Session::driver()` and refuse, saying so, once the user has taken the session over;
 `debug_stack`, `debug_variables` and `debug_sessions` keep working. A run is stopped only
 by whoever started it.
 
+**Language servers are started only on request.** A language server is a program from the
+project's own environment, so a pre-allowed tool must not start one (an agent allowed to edit
+but not to run commands could plant `.venv/bin/basedpyright-langserver`). The `code_*` insight
+tools join only servers that already run (the editor's, or those `code_servers_start`
+started: `lsp::Manager::with_running_file`) and otherwise answer that no server is running
+and which tool to call. The question is put in the text the manager holds for the file,
+which is the editor's when it has the file open with unsaved changes. Servers started for an
+agent carry a lease of 15 minutes (`Manager::start_servers`, renewed by that agent's
+later calls) that the idle sweep respects.
+
 **Trust.** Program output, variable values, evaluation results and hover text are the
 project's own text and can be written to steer an agent. They are returned under a line
 saying they are data, and the server's instructions and each such tool's description say
 the same. Claude is given the reading and steering tools ahead of its permission mode
-(`bridge::claude_allowed_tools()`); `run_start`, `debug_start` and `debug_evaluate` run the
+(`bridge::claude_allowed_tools()`); `run_start`, `debug_start`, `debug_evaluate` and `debug_breakpoint_condition` run the
 project's code and go through the session's permission mode like a shell command.
 
 **Not there.** Completion and signature help (an editor's needs), attach to a process,
-exception filters, log points, and remembering what an agent ran as the project's last
+exception filters, and remembering what an agent ran as the project's last
 run. A file the editor shows under another spelling of its path than the resolved one is
 opened a second time by a tool rather than joined.
 

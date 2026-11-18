@@ -15,7 +15,7 @@ use crate::code::spawn::Spawn;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -123,6 +123,9 @@ struct Cache {
     variables: HashMap<(i64, Option<Page>), Vec<Variable>>,
     output: VecDeque<Output>,
     output_bytes: usize,
+    /// Bytes of output ever received, kept or not: what a reader counts
+    /// "since I last looked" in, since the kept part stops growing.
+    output_total: u64,
     exit_code: Option<i32>,
     process_id: Option<u32>,
     failure: Option<String>,
@@ -151,6 +154,10 @@ pub struct Session {
     /// changes cannot reach the adapter in the wrong order.
     sync: Mutex<()>,
     children: Mutex<Vec<Arc<Session>>>,
+    /// The adapter has been told goodbye; it is not told twice.
+    goodbye: AtomicBool,
+    /// The adapter is being, or has been, let go of (never for a subprocess's).
+    retired: AtomicBool,
     this: Weak<Session>,
 }
 
@@ -183,6 +190,7 @@ impl Session {
                 variables: HashMap::new(),
                 output: VecDeque::new(),
                 output_bytes: 0,
+                output_total: 0,
                 exit_code: None,
                 process_id: None,
                 failure: None,
@@ -195,6 +203,8 @@ impl Session {
             jobs: Mutex::new(jobs),
             sync: Mutex::new(()),
             children: Mutex::new(Vec::new()),
+            goodbye: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             this: this.clone(),
         });
 
@@ -292,6 +302,12 @@ impl Session {
         self.parent
     }
 
+    /// The adapter's process, until it has been ended.
+    #[cfg(test)]
+    pub(crate) fn adapter_process_id(&self) -> Option<u32> {
+        self.client.process_id()
+    }
+
     pub fn label(&self) -> &str {
         &self.request.label
     }
@@ -377,6 +393,15 @@ impl Session {
     /// What the debuggee and the debugger printed, oldest first.
     pub fn output(&self) -> Vec<Output> {
         lock(&self.cache).output.iter().cloned().collect()
+    }
+
+    /// The kept output and, read at the same moment, how many bytes of
+    /// output the session has produced in all. Older output is dropped from
+    /// the front once there is a lot, so the total can be more than what is
+    /// kept.
+    pub fn output_with_total(&self) -> (Vec<Output>, u64) {
+        let cache = lock(&self.cache);
+        (cache.output.iter().cloned().collect(), cache.output_total)
     }
 
     /// The terminal the adapter asked for and nobody has answered yet.
@@ -532,7 +557,18 @@ impl Session {
     /// Waits until the debuggee is stopped or over and returns that state;
     /// at once when it already is.
     pub fn wait_for_stop(&self, timeout: Duration) -> Result<SessionState, DapError> {
-        self.wait(timeout, |cache| {
+        self.wait_for_stop_unless(timeout, &|| false)
+    }
+
+    /// `wait_for_stop` that gives up as soon as `abandon` says so (checked
+    /// about ten times a second), with `DapError::StillRunning` as for a
+    /// wait that ran out: the program is left as it is.
+    pub fn wait_for_stop_unless(
+        &self,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        self.wait(timeout, abandon, |cache| {
             matches!(
                 cache.state,
                 SessionState::Stopped(_) | SessionState::Terminated { .. }
@@ -542,7 +578,7 @@ impl Session {
 
     /// Waits until the session is over and returns the exit code, if any.
     pub fn wait_for_exit(&self, timeout: Duration) -> Result<Option<i32>, DapError> {
-        match self.wait(timeout, |cache| cache.state.is_terminated())? {
+        match self.wait(timeout, &|| false, |cache| cache.state.is_terminated())? {
             SessionState::Terminated { exit_code } => Ok(exit_code),
             _ => Ok(None),
         }
@@ -550,8 +586,18 @@ impl Session {
 
     /// Continues and waits for the next stop or the end.
     pub fn continue_and_wait(&self, timeout: Duration) -> Result<SessionState, DapError> {
+        self.continue_and_wait_unless(timeout, &|| false)
+    }
+
+    /// `continue_and_wait` that stops waiting, not the program, once
+    /// `abandon` says so.
+    pub fn continue_and_wait_unless(
+        &self,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
         let stops = self.run("continue", None)?;
-        self.wait_after(stops, timeout)
+        self.wait_after(stops, timeout, abandon)
     }
 
     pub fn step_and_wait(
@@ -559,12 +605,26 @@ impl Session {
         kind: StepKind,
         timeout: Duration,
     ) -> Result<SessionState, DapError> {
-        let stops = self.run(kind.command(), None)?;
-        self.wait_after(stops, timeout)
+        self.step_and_wait_unless(kind, timeout, &|| false)
     }
 
-    fn wait_after(&self, stops: u64, timeout: Duration) -> Result<SessionState, DapError> {
-        self.wait(timeout, |cache| {
+    pub fn step_and_wait_unless(
+        &self,
+        kind: StepKind,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        let stops = self.run(kind.command(), None)?;
+        self.wait_after(stops, timeout, abandon)
+    }
+
+    fn wait_after(
+        &self,
+        stops: u64,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        self.wait(timeout, abandon, |cache| {
             cache.stops > stops || cache.state.is_terminated()
         })
     }
@@ -572,6 +632,7 @@ impl Session {
     fn wait(
         &self,
         timeout: Duration,
+        abandon: &dyn Fn() -> bool,
         done: impl Fn(&Cache) -> bool,
     ) -> Result<SessionState, DapError> {
         let deadline = Instant::now() + timeout;
@@ -583,9 +644,12 @@ impl Session {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(DapError::StillRunning);
             };
+            if abandon() {
+                return Err(DapError::StillRunning);
+            }
             cache = self
                 .changed
-                .wait_timeout(cache, left)
+                .wait_timeout(cache, left.min(Duration::from_millis(100)))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -694,8 +758,11 @@ impl Session {
             let mut cache = lock(&self.cache);
             if cache.stops == stops && cache.state == SessionState::Running {
                 cache.state = before.clone();
-                drop(cache);
+                // Announced like every other transition, under the lock
+                // and with the waiters woken: the debuggee is stopped
+                // again, and who waits for a stop must not sleep on.
                 self.emit(SessionEvent::StateChanged(before));
+                self.changed.notify_all();
             }
             return Err(error);
         }
@@ -710,6 +777,7 @@ impl Session {
         if terminate && launched && self.supports("supportsTerminateRequest") {
             self.ask("terminate", json!({})).map(drop)
         } else {
+            self.goodbye.store(true, Ordering::SeqCst);
             let result = self.ask(
                 "disconnect",
                 json!({ "terminateDebuggee": terminate && launched }),
@@ -905,6 +973,7 @@ impl Session {
         {
             let mut cache = lock(&self.cache);
             cache.output_bytes += output.text.len();
+            cache.output_total = cache.output_total.saturating_add(output.text.len() as u64);
             cache.output.push_back(output.clone());
             while cache.output_bytes > OUTPUT_KEPT && cache.output.len() > 1 {
                 if let Some(old) = cache.output.pop_front() {
@@ -957,6 +1026,40 @@ impl Session {
     fn finish(&self) {
         let exit_code = lock(&self.cache).exit_code;
         self.set_state(SessionState::Terminated { exit_code });
+        self.retire();
+    }
+
+    /// Lets go of the adapter of a session that is over. An adapter is not
+    /// done when its debuggee is: `debugpy.adapter` stays up, waiting for a
+    /// client that will never ask again, until something ends it. Done in
+    /// the background, since the goodbye waits a moment for it to leave.
+    fn retire(&self) {
+        if self.retired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A subprocess is another connection to its parent's adapter, which
+        // goes on serving the parent: hanging up on it would end the
+        // parent's debugging too. The parent lets go of it with itself.
+        if self.parent.is_some() {
+            return;
+        }
+        // No owner left means the session is being dropped, and `close`
+        // hangs up on that thread.
+        if let Some(session) = self.this.upgrade() {
+            spawn_thread("dap-retire", move || session.hang_up());
+        }
+    }
+
+    /// Says goodbye to the adapter, if nobody has, and ends its connection
+    /// and its process group.
+    fn hang_up(&self) {
+        if !self.goodbye.swap(true, Ordering::SeqCst) && !self.client.is_closed() {
+            let launched = self.request.kind == RequestKind::Launch;
+            self.client
+                .send("disconnect", json!({ "terminateDebuggee": launched }))
+                .ok();
+        }
+        self.client.shutdown(DROP_GRACE);
     }
 
     fn fail_start(&self, message: &str) {
@@ -1060,12 +1163,10 @@ impl Session {
             (cache.state.is_terminated(), cache.process_id)
         };
         let launched = self.request.kind == RequestKind::Launch;
-        if !terminated {
-            self.client
-                .send("disconnect", json!({ "terminateDebuggee": launched }))
-                .ok();
-        }
-        self.client.shutdown(DROP_GRACE);
+        // Marked first, so the end announced below does not hang up a
+        // second time on a thread of its own.
+        self.retired.store(true, Ordering::SeqCst);
+        self.hang_up();
         // A debuggee in a terminal belongs to the terminal that started it.
         if launched && !terminated && !self.request.uses_terminal() {
             kill_debuggee(process_id);

@@ -3,7 +3,7 @@
 //! the terminal and child-session requests, and the state transitions.
 use super::adapter::{adapter, derive, Console, LaunchOptions, DEBUGPY};
 use super::breakpoints::{Breakpoint, BreakpointStatus, BreakpointStore, ExceptionFilters};
-use super::fake::{fake, fake_listening, wait_until, Peer};
+use super::fake::{fake, fake_listening, fake_with_process, wait_until, Peer};
 use super::session::{Refresh, Session, SessionEvent, Setup};
 use super::types::{
     Actor, DapError, EvaluateContext, OutputCategory, Page, SessionState, StepKind,
@@ -29,6 +29,8 @@ struct Plan {
     child_port: Option<u16>,
     /// Hang up instead of answering `continue`.
     die_on_continue: bool,
+    /// Refuse `continue`, after a moment.
+    refuse_continue: bool,
 }
 
 /// An adapter with one thread in `/p/app.py`. The first `continue` runs
@@ -185,6 +187,11 @@ fn python_like(peer: &mut Peer, log: &Log, plan: Plan) {
             "continue" => {
                 if plan.die_on_continue {
                     return;
+                }
+                if plan.refuse_continue {
+                    std::thread::sleep(Duration::from_millis(200));
+                    peer.refuse(&message, "The thread cannot continue.");
+                    continue;
                 }
                 peer.respond(&message, json!({ "allThreadsContinued": true }));
                 continues += 1;
@@ -779,6 +786,37 @@ fn an_adapter_that_dies_ends_the_session() {
 }
 
 #[test]
+fn a_refused_continue_wakes_who_waits_for_the_stop() {
+    let started = stopped(Plan {
+        refuse_continue: true,
+        ..Plan::default()
+    });
+    let session = started.session.clone();
+    let events = session.subscribe();
+    let steering = session.clone();
+    let asked = std::thread::spawn(move || steering.continue_and_wait(SOON));
+    // Shown as running until the adapter says no.
+    wait_until("running", || session.state() == SessionState::Running);
+    let waited = std::time::Instant::now();
+    let state = session.wait_for_stop(SOON).unwrap();
+    assert!(state.stop().is_some(), "{state:?}");
+    assert!(
+        waited.elapsed() < Duration::from_secs(3),
+        "woken by the refusal, not by the timeout"
+    );
+    assert_eq!(
+        asked.join().unwrap(),
+        Err(DapError::Adapter {
+            command: "continue".into(),
+            message: "The thread cannot continue.".into()
+        })
+    );
+    assert_eq!(drain(&events), ["state running", "state stopped"]);
+    drop(session);
+    started.end();
+}
+
+#[test]
 fn an_adapter_that_never_answers_is_a_start_error() {
     let (client, incoming, adapter) = fake(|peer| {
         peer.expect("initialize");
@@ -789,5 +827,50 @@ fn an_adapter_that_never_answers_is_a_start_error() {
         setup(&BreakpointStore::new(), Console::InternalConsole),
     );
     assert!(matches!(result, Err(DapError::Start(_))));
+    adapter.join().unwrap();
+}
+
+/// A finished debuggee does not end its adapter: `debugpy.adapter` would
+/// wait for ever for a client that has nothing more to ask.
+#[cfg(unix)]
+#[test]
+fn a_session_that_ends_ends_its_adapter() {
+    use std::process::{Command, Stdio};
+    let mut adapter_process = Command::new("/bin/sleep");
+    adapter_process.arg("60").stdin(Stdio::null());
+    crate::code::child::lead_group(&mut adapter_process);
+    let process = adapter_process.spawn().unwrap();
+    let id = process.id();
+    let log = Log::default();
+    let script_log = log.clone();
+    let (client, incoming, adapter) = fake_with_process(
+        move |peer| {
+            python_like(
+                peer,
+                &script_log,
+                Plan {
+                    stop_at_start: true,
+                    ..Plan::default()
+                },
+            )
+        },
+        Some(process),
+    );
+    let session = Session::open(
+        client,
+        incoming,
+        setup(&BreakpointStore::new(), Console::InternalConsole),
+    )
+    .unwrap();
+    session.wait_for_stop(SOON).unwrap();
+    session.continue_and_wait(SOON).unwrap();
+    let state = session.continue_and_wait(SOON).unwrap();
+    assert!(state.is_terminated(), "{state:?}");
+    // Gone, and reaped: its group is no longer there to signal.
+    wait_until(
+        "the adapter to end",
+        || unsafe { libc::killpg(id as i32, 0) } != 0,
+    );
+    drop(session);
     adapter.join().unwrap();
 }

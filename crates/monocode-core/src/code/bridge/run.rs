@@ -3,7 +3,7 @@
 //! so the user sees an agent's runs and an agent sees the user's.
 use super::tools::{one_line, tail, untrusted, Call};
 use crate::code::run::{
-    builtin_tasks, resolve, RunConfig, RunContext, RunId, RunInfo, RunState, StartedBy,
+    builtin_tasks, resolve, RunConfig, RunContext, RunId, RunInfo, RunState, StartedBy, Variable,
 };
 use crate::code::spawn::Spawn;
 use crate::code::toolchain::Toolchain;
@@ -43,32 +43,8 @@ pub(super) fn target(call: &Call) -> Result<(Spawn, Toolchain), String> {
             return Err("Give `name` (a configuration or task from run_list) or `command`.".into())
         }
         (Some(command), None) => {
-            let cwd = match call.text("cwd")? {
-                Some(cwd) => {
-                    let folder = call.path(cwd)?;
-                    if !folder.is_dir() {
-                        return Err(format!("{cwd} is not a folder."));
-                    }
-                    folder.to_string_lossy().into_owned()
-                }
-                None => String::new(),
-            };
-            let mut env = String::new();
-            for (key, value) in call.object("env")?.into_iter().flatten() {
-                let value = value
-                    .as_str()
-                    .ok_or_else(|| format!("`env.{key}` must be a string."))?;
-                if key.contains(['=', '\n']) || value.contains('\n') {
-                    return Err(format!("`env.{key}` cannot be set this way."));
-                }
-                env.push_str(&format!("{key}={value}\n"));
-            }
-            RunConfig {
-                command: command.to_owned(),
-                cwd,
-                env,
-                ..RunConfig::default()
-            }
+            let spawn = explicit(call, command, &toolchain)?;
+            return Ok((spawn, toolchain));
         }
         (None, Some(name)) => {
             let runs = &call.context.runs;
@@ -95,6 +71,105 @@ pub(super) fn target(call: &Call) -> Result<(Spawn, Toolchain), String> {
     };
     let spawn = resolve(&config, &context, &toolchain).map_err(|error| error.to_string())?;
     Ok((spawn, toolchain))
+}
+
+/// `text` with `$PYTHON` and `${PYTHON}` replaced by the interpreter, and
+/// nothing else touched: what an agent typed is not a template, so `$FILE`
+/// or `$$` in an `sh -c` script stay the shell's own.
+fn with_python(text: &str, python: &dyn Fn() -> Result<String, String>) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (named, tail) = match after.strip_prefix("{PYTHON}") {
+            Some(tail) => (true, tail),
+            None => match after.strip_prefix("PYTHON") {
+                Some(tail) if !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_') => {
+                    (true, tail)
+                }
+                _ => (false, after),
+            },
+        };
+        if named {
+            out.push_str(&python()?);
+        } else {
+            out.push('$');
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn valid_name(key: &str) -> bool {
+    let mut letters = key.chars();
+    letters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && letters.all(|letter| letter.is_ascii_alphanumeric() || letter == '_')
+}
+
+/// The process for a command line the agent typed. It is not a run
+/// configuration: nothing in it is a variable but `$PYTHON`, the folder is
+/// the one that was checked, and an environment entry that cannot be set is
+/// said so rather than dropped.
+fn explicit(call: &Call, command: &str, toolchain: &Toolchain) -> Result<Spawn, String> {
+    let python = || {
+        toolchain
+            .python()
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| Variable::Python.missing().to_owned())
+    };
+    let typed = shlex::split(command).ok_or("The command has a quote that is never closed.")?;
+    let mut words = Vec::with_capacity(typed.len());
+    for word in &typed {
+        words.push(with_python(word, &python)?);
+    }
+    let mut words = words.into_iter();
+    let mut program = words
+        .next()
+        .filter(|program| !program.is_empty())
+        .ok_or("The configuration has no command.")?;
+    if matches!(typed[0].as_str(), "python" | "python3") {
+        // The venv's interpreter is all `activate` amounts to for Python.
+        if let Ok(interpreter) = python() {
+            program = interpreter;
+        }
+    }
+    let cwd = match call.text("cwd")? {
+        Some(cwd) => {
+            let folder = call.path(cwd)?;
+            if !folder.is_dir() {
+                return Err(format!("{cwd} is not a folder."));
+            }
+            folder
+        }
+        None => call.context.checkout.clone(),
+    };
+    let mut env = Vec::new();
+    for (key, value) in call.object("env")?.into_iter().flatten() {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("`env.{key}` must be a string."))?;
+        if !valid_name(key) {
+            return Err(format!(
+                "`env.{key}` is not a variable name: letters, digits and underscores, not \
+                 starting with a digit."
+            ));
+        }
+        if value.contains(['\n', '\0']) {
+            return Err(format!("`env.{key}` cannot hold a line break or a NUL."));
+        }
+        env.push((key.clone(), with_python(value, &python)?));
+    }
+    Ok(Spawn {
+        label: command.trim().to_owned(),
+        command: program,
+        args: words.collect(),
+        cwd,
+        env,
+    })
 }
 
 /// One line of `run_list`: what a configuration becomes here, or why it
@@ -222,7 +297,7 @@ fn report(call: &Call, info: &RunInfo, cursor: Option<u64>) -> String {
             while !output.text.is_char_boundary(cut) {
                 cut -= 1;
             }
-            next -= (output.text.len() - cut) as u64;
+            next = next.saturating_sub((output.text.len() - cut) as u64);
             text.push_str("\nMore output follows: call again with the cursor.");
             output.text[..cut].to_owned()
         }
@@ -258,7 +333,7 @@ pub(super) fn start(call: &Call) -> Result<String, String> {
         let Some(info) = runs.get(id) else {
             return Err("The run was removed.".into());
         };
-        if !info.state.is_running() || Instant::now() >= deadline {
+        if !info.state.is_running() || Instant::now() >= deadline || (call.abandoned)() {
             break info;
         }
         std::thread::sleep(Duration::from_millis(40));

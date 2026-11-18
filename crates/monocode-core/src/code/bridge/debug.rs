@@ -111,11 +111,12 @@ fn variable_line(variable: &Variable) -> String {
 fn source(path: &Path, line: u32) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let first = line.saturating_sub(AROUND).max(1);
+    let shown = (line.saturating_sub(first) as usize).saturating_add(AROUND as usize + 1);
     let lines: Vec<String> = (text.lines().enumerate())
-        .skip(first as usize - 1)
-        .take((line - first + AROUND + 1) as usize)
+        .skip((first as usize).saturating_sub(1))
+        .take(shown)
         .map(|(index, content)| {
-            let number = index as u32 + 1;
+            let number = u32::try_from(index).map_or(u32::MAX, |index| index.saturating_add(1));
             let mark = if number == line { "->" } else { "  " };
             format!("{mark} {number:>4}  {}", head(content, 200))
         })
@@ -138,7 +139,10 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
         ));
     }
     if stack.len() > MAX_FRAMES {
-        text.push_str(&format!("  … and {} more\n", stack.len() - MAX_FRAMES));
+        text.push_str(&format!(
+            "  … and {} more\n",
+            stack.len().saturating_sub(MAX_FRAMES)
+        ));
     }
     for (index, entry) in stack.iter().take(with_locals).enumerate() {
         if entry.locals.is_empty() {
@@ -154,7 +158,7 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
         if entry.locals.len() > MAX_LOCALS {
             text.push_str(&format!(
                 "  … and {} more\n",
-                entry.locals.len() - MAX_LOCALS
+                entry.locals.len().saturating_sub(MAX_LOCALS)
             ));
         }
     }
@@ -163,11 +167,13 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
 
 /// What the program printed since this agent was last told, if anything.
 fn new_output(call: &Call, session: &Session) -> Option<String> {
-    let text: String = (session.output().iter())
-        .map(|output| output.text.as_str())
-        .collect();
-    let unseen = call.memory.unseen(session.id(), text.len());
-    let mut start = text.len() - unseen;
+    let (kept, total) = session.output_with_total();
+    let text: String = kept.iter().map(|output| output.text.as_str()).collect();
+    // Counted in what the session has ever printed: what it still keeps
+    // stops growing once it is full.
+    let unseen = call.memory.unseen(call.scope.session, session.id(), total);
+    let shown = usize::try_from(unseen).map_or(text.len(), |unseen| unseen.min(text.len()));
+    let mut start = text.len() - shown;
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -288,7 +294,7 @@ pub(super) fn start(call: &Call) -> Result<String, String> {
         .dap()
         .start(&spawn, &toolchain, &options, me(call))
         .map_err(|error| error.to_string())?;
-    let outcome = session.wait_for_stop(wait);
+    let outcome = session.wait_for_stop_unless(wait, call.abandoned);
     report(call, &session, outcome, wait)
 }
 
@@ -296,8 +302,8 @@ pub(super) fn resume(call: &Call) -> Result<String, String> {
     let wait = call.wait("timeout_s", 30, super::MAX_WAIT)?;
     let session = steered(call)?;
     let outcome = match session.state() {
-        SessionState::Stopped(_) => session.continue_and_wait(wait),
-        _ => session.wait_for_stop(wait),
+        SessionState::Stopped(_) => session.continue_and_wait_unless(wait, call.abandoned),
+        _ => session.wait_for_stop_unless(wait, call.abandoned),
     };
     report(call, &session, outcome, wait)
 }
@@ -322,7 +328,7 @@ pub(super) fn step(call: &Call) -> Result<String, String> {
             )
         }
     }
-    let outcome = session.step_and_wait(kind, wait);
+    let outcome = session.step_and_wait_unless(kind, wait, call.abandoned);
     report(call, &session, outcome, wait)
 }
 
@@ -371,7 +377,7 @@ pub(super) fn variables(call: &Call) -> Result<String, String> {
     if found.len() as u64 == count {
         text.push_str(&format!(
             "There may be more: ask again with start={}.",
-            start + count
+            start.saturating_add(count)
         ));
     }
     Ok(text.trim_end().to_owned())
@@ -474,20 +480,24 @@ pub(super) fn sessions(call: &Call) -> Result<String, String> {
     }
 }
 
+/// A breakpoint's expression, hit condition or log message: text the
+/// debuggee evaluates. Only `breakpoint_condition` takes them.
+const CODE_KEYS: [&str; 3] = ["condition", "hit_condition", "log_message"];
+
 pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
+    // This tool is let through ahead of the permission mode, which is only
+    // sound while it cannot make the program evaluate anything.
+    if let Some(key) = CODE_KEYS.iter().find(|key| call.arguments_has(key)) {
+        return Err(format!(
+            "`{key}` is code the program evaluates, so debug_breakpoint_condition sets it,              and asks first. debug_breakpoints only sets plain line breakpoints."
+        ));
+    }
     let store = call.services.breakpoints();
     let file = match call.text("file")? {
         Some(file) => Some(call.path(file)?),
         None => None,
     };
     let line = call.ordinal("line")?;
-    let mine = || -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = (store.files().into_iter())
-            .filter(|path| call.owns(path))
-            .collect();
-        files.sort();
-        files
-    };
     let mut done = String::new();
     match call.text("action")?.unwrap_or("list") {
         "list" => {}
@@ -495,17 +505,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
             let (Some(file), Some(line)) = (&file, line) else {
                 return Err("set needs a `file` and a `line`.".into());
             };
-            if !file.is_file() {
-                return Err(format!("{} is not a file.", call.shown(file)));
-            }
-            let mut breakpoint = Breakpoint::at(line);
-            if let Some(condition) = call.text("condition")? {
-                breakpoint = breakpoint.with_condition(condition);
-            }
-            store.set(file, breakpoint);
-            // A running session answers whether it took the line.
-            std::thread::sleep(Duration::from_millis(150));
-            done = format!("Set {}:{line}.\n", call.shown(file));
+            done = put(call, file, Breakpoint::at(line))?;
         }
         "clear" => match (&file, line) {
             (Some(file), Some(line)) => {
@@ -520,7 +520,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
             }
             (None, Some(_)) => return Err("clear with a `line` needs its `file`.".into()),
             (None, None) => {
-                for file in mine() {
+                for file in mine(call) {
                     store.clear(Some(&file));
                 }
                 done = "Cleared this project's breakpoints.\n".into();
@@ -528,12 +528,72 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
         },
         other => return Err(format!("`action` is list, set or clear, not {other}.")),
     }
+    Ok(listing(call, &done))
+}
+
+/// A breakpoint with a condition, a hit condition or a log message. They are
+/// evaluated by the program, in its frame, so this runs code like
+/// `debug_evaluate` does.
+pub(super) fn breakpoint_condition(call: &Call) -> Result<String, String> {
+    let file = call.required_text("file")?;
+    let file = call.path(file)?;
+    let line = call
+        .ordinal("line")?
+        .ok_or("`line` is required (from 1).")?;
+    let mut breakpoint = Breakpoint::at(line);
+    breakpoint.condition = call.text("condition")?.map(str::to_owned);
+    breakpoint.hit_condition = call.text("hit_condition")?.map(str::to_owned);
+    breakpoint.log_message = call.text("log_message")?.map(str::to_owned);
+    if breakpoint.condition.is_none()
+        && breakpoint.hit_condition.is_none()
+        && breakpoint.log_message.is_none()
+    {
+        return Err(
+            "Give a `condition`, a `hit_condition` or a `log_message`; debug_breakpoints sets              a plain breakpoint."
+                .into(),
+        );
+    }
+    let done = put(call, &file, breakpoint)?;
+    Ok(listing(call, &done))
+}
+
+/// Sets one breakpoint, once its file is known to be one.
+fn put(call: &Call, file: &Path, breakpoint: Breakpoint) -> Result<String, String> {
+    if !file.is_file() {
+        return Err(format!("{} is not a file.", call.shown(file)));
+    }
+    let line = breakpoint.line;
+    call.services.breakpoints().set(file, breakpoint);
+    // A running session answers whether it took the line.
+    std::thread::sleep(Duration::from_millis(150));
+    Ok(format!("Set {}:{line}.\n", call.shown(file)))
+}
+
+/// The project's files that have breakpoints, in a stable order.
+fn mine(call: &Call) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = (call.services.breakpoints().files().into_iter())
+        .filter(|path| call.owns(path))
+        .collect();
+    files.sort();
+    files
+}
+
+/// `done`, then every breakpoint of the project with what the debugger made
+/// of it.
+fn listing(call: &Call, done: &str) -> String {
+    let store = call.services.breakpoints();
     let mut lines = Vec::new();
-    for path in mine() {
+    for path in mine(call) {
         for breakpoint in store.in_file(&path) {
             let mut text = format!("  {}:{}", call.shown(&path), breakpoint.line);
             if let Some(condition) = &breakpoint.condition {
                 text.push_str(&format!("  when {}", one_line(condition, 120)));
+            }
+            if let Some(hits) = &breakpoint.hit_condition {
+                text.push_str(&format!("  on hits {}", one_line(hits, 60)));
+            }
+            if let Some(message) = &breakpoint.log_message {
+                text.push_str(&format!("  logs {}", one_line(message, 120)));
             }
             if !breakpoint.enabled {
                 text.push_str("  (disabled)");
@@ -555,7 +615,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
         }
     }
     match lines.is_empty() {
-        true => Ok(format!("{done}No breakpoints are set in this project.")),
-        false => Ok(format!("{done}Breakpoints:\n{}", lines.join("\n"))),
+        true => format!("{done}No breakpoints are set in this project."),
+        false => format!("{done}Breakpoints:\n{}", lines.join("\n")),
     }
 }

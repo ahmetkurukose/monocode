@@ -347,7 +347,13 @@ fn every_listed_tool_is_answered_and_described() {
     let allowed = claude_allowed_tools();
     assert!(allowed.contains("mcp__monocode_code__code_diagnostics"));
     assert!(allowed.contains("mcp__monocode_code__debug_step"));
-    for asks in ["run_start", "debug_start", "debug_evaluate"] {
+    for asks in [
+        "code_servers_start",
+        "run_start",
+        "debug_start",
+        "debug_evaluate",
+        "debug_breakpoint_condition",
+    ] {
         assert!(!allowed.contains(asks), "{asks}");
     }
 }
@@ -447,12 +453,16 @@ fn answers_are_cut_to_size_on_whole_characters() {
     );
     assert_eq!(one_line(" a\n\tb\r\n ", 20), "a  b");
     let memory = Memory::default();
-    assert_eq!(memory.unseen(1, 10), 10);
-    assert_eq!(memory.unseen(1, 25), 15);
-    assert_eq!(memory.unseen(1, 25), 0);
+    assert_eq!(memory.unseen(7, 1, 10), 10);
+    assert_eq!(memory.unseen(7, 1, 25), 15);
+    assert_eq!(memory.unseen(7, 1, 25), 0);
     // Output dropped from the front never counts backwards.
-    assert_eq!(memory.unseen(1, 5), 0);
-    assert_eq!(memory.unseen(2, 3), 3);
+    assert_eq!(memory.unseen(7, 1, 5), 0);
+    assert_eq!(memory.unseen(7, 2, 3), 3);
+    // What one agent was shown is still news to another, and a session
+    // that has printed far more than it keeps is still counted.
+    assert_eq!(memory.unseen(8, 1, 25), 25);
+    assert_eq!(memory.unseen(8, 1, 25 + (3 << 20)), 3 << 20);
 }
 
 fn with_configurations(context: &mut CodeContext) {
@@ -629,15 +639,41 @@ fn breakpoints_are_shared_with_the_editor_and_kept_to_the_project() {
         stage.ok("debug_breakpoints", json!({})),
         "No breakpoints are set in this project."
     );
+    // What the program would evaluate is not for the pre-allowed tool.
+    for key in ["condition", "hit_condition", "log_message"] {
+        let said = stage.refused(
+            "debug_breakpoints",
+            json!({"action": "set", "file": "app.py", "line": 2, key: "b > 1"}),
+        );
+        assert!(said.contains("debug_breakpoint_condition"), "{said}");
+    }
+    assert!(store.files().iter().all(|file| !file.ends_with("app.py")));
+    assert!(stage
+        .refused(
+            "debug_breakpoint_condition",
+            json!({"file": "app.py", "line": 2})
+        )
+        .contains("Give a `condition`"));
     let set = stage.ok(
-        "debug_breakpoints",
-        json!({"action": "set", "file": "app.py", "line": 2, "condition": "b > 1"}),
+        "debug_breakpoint_condition",
+        json!({"file": "app.py", "line": 2, "condition": "b > 1"}),
     );
     assert_eq!(set, "Set app.py:2.\nBreakpoints:\n  app.py:2  when b > 1");
     // The editor's gutter reads the same store.
     let kept = store.in_file(&stage.root.join("app.py"));
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].condition.as_deref(), Some("b > 1"));
+    stage.ok(
+        "debug_breakpoint_condition",
+        json!({"file": "app.py", "line": 3, "hit_condition": ">= 3", "log_message": "c={c}"}),
+    );
+    let both = store.in_file(&stage.root.join("app.py"));
+    assert_eq!(both[1].hit_condition.as_deref(), Some(">= 3"));
+    assert_eq!(both[1].log_message.as_deref(), Some("c={c}"));
+    stage.ok(
+        "debug_breakpoints",
+        json!({"action": "clear", "file": "app.py", "line": 3}),
+    );
     stage.ok(
         "debug_breakpoints",
         json!({"action": "set", "file": "lib/util.py", "line": 1}),
@@ -660,4 +696,82 @@ fn breakpoints_are_shared_with_the_editor_and_kept_to_the_project() {
     );
     // Clearing everything is everything of this project: the other stays.
     assert_eq!(store.in_file(&outside).len(), 1);
+}
+
+/// An agent that may edit files but not run commands can plant a language
+/// server in the project's environment; the tools let through ahead of the
+/// permission mode must never run it.
+#[cfg(unix)]
+#[test]
+fn the_insight_tools_never_start_a_language_server() {
+    use crate::terminal_setup::{TerminalSetup, Venv};
+    use std::os::unix::fs::PermissionsExt;
+    let marker = tempfile::tempdir().unwrap();
+    let marker = marker.path().join("ran");
+    let venv_marker = marker.clone();
+    let stage = Stage::new(&[("app.py", "x = 1\ny = x\n")], move |context| {
+        let venv = context.checkout.join(".venv");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        for name in ["basedpyright-langserver", "ruff"] {
+            let program = venv.join("bin").join(name);
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\ntouch {}\n", venv_marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        context.setup = TerminalSetup {
+            venv: Venv::Path(venv.to_string_lossy().into_owned()),
+            ..TerminalSetup::default()
+        };
+    });
+    let said = |text: String| {
+        assert!(text.contains("No language server is running"), "{text}");
+        assert!(text.contains("code_servers_start"), "{text}");
+    };
+    said(stage.ok("code_diagnostics", json!({"files": ["app.py"]})));
+    said(stage.refused(
+        "code_hover",
+        json!({"file": "app.py", "line": 2, "symbol": "x"}),
+    ));
+    said(stage.refused(
+        "code_definition",
+        json!({"file": "app.py", "line": 2, "column": 5}),
+    ));
+    said(stage.refused(
+        "code_references",
+        json!({"file": "app.py", "line": 1, "column": 1}),
+    ));
+    said(stage.refused("code_symbols", json!({"file": "app.py"})));
+    assert!(stage.services.lsp().statuses().is_empty());
+    assert!(!stage.services.lsp().is_open(&stage.root.join("app.py")));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the planted server was run");
+}
+
+#[test]
+fn columns_are_counted_in_characters_both_ways() {
+    use crate::code::lsp::{LineIndex, Point};
+    // Two bytes each for the first three characters of the line.
+    let text = "ab\nαβγ = 1\r\nlast";
+    let index = LineIndex::new(text);
+    let at = |line: u32, column: u32| Point { line, column };
+    assert_eq!(insight::characters(text, &index, at(1, 6)), 4);
+    assert_eq!(insight::characters(text, &index, at(1, 0)), 1);
+    assert_eq!(insight::characters(text, &index, at(0, 2)), 3);
+    // Past the end of the text: the column as given, not a panic.
+    assert_eq!(insight::characters(text, &index, at(9, 4)), 5);
+    assert_eq!(insight::characters(text, &index, at(2, u32::MAX)), 5);
+
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("a.py");
+    std::fs::write(&path, text).unwrap();
+    let mut texts = HashMap::new();
+    assert_eq!(tools::char_column(&mut texts, &path, at(1, 6)), 4);
+    assert_eq!(tools::char_column(&mut texts, &path, at(7, 2)), 3);
+    assert_eq!(
+        tools::char_column(&mut texts, &folder.path().join("none.py"), at(0, 7)),
+        8
+    );
 }
