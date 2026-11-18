@@ -167,7 +167,10 @@ servers. `lsp::Manager` is the only way in, for the editor and for the agents' t
 (based)pyright gets the interpreter as `python.pythonPath` and `diagnosticMode:
 openFilesOnly` through `workspace/configuration`, so a monorepo is not analysed whole.
 A path the user set for a server id (`ManagerOptions::tool_paths`) is used or nothing is.
-Only Python has been run against real servers; the others are registered and untested.
+Only Python has been run against real servers; the others are registered and untested, so
+they are off by default and a project switches each on in its "Code insight" settings page
+(group "Other languages - not yet verified"). A language that is off has no server, no
+providers, no chip entry and no missing-tool notice, for the editor and for the agents' tools.
 
 **Root and identity.** The root is the nearest folder at or above the file, inside the
 checkout, holding one of the server's markers (`pyproject.toml`, `setup.py`,
@@ -557,8 +560,9 @@ markers for Go, Rust and JavaScript (their file tasks are in the header menu).
   install hint, a failed one its message, both copyable, and "Set its path…" opens the
   settings. "Look again" on either rebuilds the checkout's context from disk first.
   Running servers are registered with `code_shell::processes`.
-- **Settings** (`settings.rs`, page `code-insight`). Per project: on or off, each server
-  on or off, an executable per server. Saving applies it: the project's documents are
+- **Settings** (`settings.rs`, page `code-insight`). Per project: on or off, each Python
+  server on or off, the other languages' servers (off until listed under `languages`), an
+  executable per server. Saving applies it: the project's documents are
   closed, its servers stopped, and what may be open is opened again. The idle minutes
   and the server cap are the app's; saving them writes them to every open project.
 - **Lifecycle.** `CheckoutRemoved` and `ProjectClosed` close the checkout's documents

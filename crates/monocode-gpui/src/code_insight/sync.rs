@@ -39,11 +39,26 @@ const MAX_BYTES: usize = 512 * 1024;
 const MAX_LINE_BYTES: usize = 20_000;
 const MEMORY_PERIOD: Duration = Duration::from_secs(10);
 
-static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::builtin);
+pub(super) static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::builtin);
 
-/// Whether a language server is registered for the file's language.
-pub(super) fn served(path: &Path) -> bool {
-    Language::of(path).is_some_and(|language| REGISTRY.for_language(language).next().is_some())
+/// Whether a language server is registered for the file's language and the
+/// project's settings let it run: Python's always, another language's only
+/// once the project switched it on.
+pub(super) fn served(path: &Path, chosen: &settings::InsightSettings) -> bool {
+    Language::of(path)
+        .is_some_and(|language| (REGISTRY.for_language(language)).any(|spec| chosen.runs(spec)))
+}
+
+/// `served` for an editor's document, under its project's settings.
+pub(super) fn serves(info: &DocumentInfo, cx: &App) -> bool {
+    // Most files have no server at all: those never ask where they belong.
+    let known = Language::of(&info.path)
+        .is_some_and(|language| REGISTRY.for_language(language).next().is_some());
+    if !known {
+        return false;
+    }
+    let project = services().context(&home_of(info, cx)).project;
+    served(&info.path, &settings::load(&project.to_string_lossy(), cx))
 }
 
 fn too_big(text: &str) -> bool {
@@ -204,7 +219,7 @@ impl Sync {
         let Some(doc) = self.docs.get_mut(path) else {
             return;
         };
-        if !matches!(doc.phase, Phase::Skipped) || !served(path) || too_big(&doc.text) {
+        if !matches!(doc.phase, Phase::Skipped) || !serves(&doc.info, cx) || too_big(&doc.text) {
             return;
         }
         let code = services().context(&home_of(&doc.info, cx));
@@ -495,6 +510,9 @@ impl Sync {
         );
         self.project_opened(project, cx);
         self.retry_skipped(cx);
+        // A language switched on or off changes which editors have the
+        // servers' providers.
+        code_editor::hub(cx).update(cx, |_, cx| cx.emit(code_editor::HubEvent::Providers));
     }
 
     /// Looks at the checkout's disk again, as after a tool was installed or
@@ -578,9 +596,21 @@ mod tests {
 
     #[test]
     fn only_files_a_server_knows_and_can_take_are_synced() {
-        assert!(served(Path::new("/p/app.py")));
-        assert!(served(Path::new("/p/main.rs")));
-        assert!(!served(Path::new("/p/notes.md")));
+        let saved = settings::InsightSettings::default();
+        assert!(served(Path::new("/p/app.py"), &saved));
+        assert!(!served(Path::new("/p/notes.md"), &saved));
+        // The other languages wait for the project to switch them on.
+        let rust = settings::InsightSettings {
+            languages: vec!["rust-analyzer".into()],
+            ..Default::default()
+        };
+        for other in ["/p/main.rs", "/p/main.go", "/p/app.ts", "/p/app.jsx"] {
+            assert!(!served(Path::new(other), &saved), "{other}");
+            assert_eq!(served(Path::new(other), &rust), other.ends_with(".rs"));
+        }
+        let off = rust.for_manager().disabled_servers;
+        assert!(off.contains("gopls") && off.contains("typescript"));
+        assert!(!off.contains("rust-analyzer") && !off.contains("ruff"));
         assert!(!too_big("x = 1\n"));
         assert!(too_big(&"x".repeat(MAX_LINE_BYTES + 1)));
         assert!(too_big(&"x = 1\n".repeat(MAX_BYTES / 6 + 1)));

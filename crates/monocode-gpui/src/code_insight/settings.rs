@@ -14,7 +14,7 @@ use crate::{
 use gpui::{
     App, AppContext, Context, Entity, Role, SharedString, Subscription, Window, div, prelude::*, px,
 };
-use monocode_core::code::lsp::{self, ManagerOptions, Registry};
+use monocode_core::code::lsp::{self, Language, ManagerOptions, Registry, ServerSpec};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, rc::Rc, time::Duration};
 
@@ -31,15 +31,29 @@ pub(super) struct InsightSettings {
     pub disabled_servers: Vec<String>,
     /// Executables by registry id.
     pub tool_paths: BTreeMap<String, String>,
+    /// Registry ids of the servers of the other languages switched on.
+    /// Only Python has been run against real servers, so the rest stay off
+    /// until a project asks for them.
+    pub languages: Vec<String>,
     pub idle_minutes: Option<u64>,
     pub max_servers: Option<usize>,
 }
 
 impl InsightSettings {
+    /// Whether a server may run for this project: Python's unless switched
+    /// off one by one, another language's only once it was switched on.
+    pub(super) fn runs(&self, spec: &ServerSpec) -> bool {
+        !unverified(spec) || self.languages.iter().any(|on| on == spec.id)
+    }
+
     pub(super) fn for_manager(&self) -> lsp::ProjectSettings {
+        // A language that is off is off for an agent's tools too.
+        let off = (super::sync::REGISTRY.servers.iter())
+            .filter(|spec| !self.runs(spec))
+            .map(|spec| spec.id.to_owned());
         lsp::ProjectSettings {
             disabled: self.disabled,
-            disabled_servers: self.disabled_servers.iter().cloned().collect(),
+            disabled_servers: (self.disabled_servers.iter().cloned()).chain(off).collect(),
             tool_paths: (self.tool_paths.iter())
                 .map(|(id, path)| (id.clone(), PathBuf::from(path)))
                 .collect(),
@@ -58,6 +72,11 @@ impl InsightSettings {
             self.max_servers.unwrap_or(defaults.max_servers),
         ))
     }
+}
+
+/// Whether a server is for a language nobody has run it for yet.
+fn unverified(spec: &ServerSpec) -> bool {
+    !spec.languages.contains(&Language::Python)
 }
 
 /// What `project` saved; the defaults when it saved nothing.
@@ -106,6 +125,8 @@ struct ServerRow {
     /// What the server is for, after its name: "Python".
     languages: String,
     off: bool,
+    /// One of the other languages' servers: off unless switched on.
+    unverified: bool,
     path: Entity<Input>,
 }
 
@@ -153,7 +174,12 @@ impl Page {
                     }
                     names.join(", ")
                 },
-                off: saved.disabled_servers.iter().any(|off| off == spec.id),
+                off: if unverified(spec) {
+                    !saved.runs(spec)
+                } else {
+                    saved.disabled_servers.iter().any(|off| off == spec.id)
+                },
+                unverified: unverified(spec),
                 path: line(
                     &format!("Executable of {}", spec.id),
                     "Found in the virtual environment or on PATH",
@@ -217,7 +243,11 @@ impl Page {
         Ok(InsightSettings {
             disabled: self.disabled,
             disabled_servers: (self.servers.iter())
-                .filter(|row| row.off)
+                .filter(|row| row.off && !row.unverified)
+                .map(|row| row.id.to_owned())
+                .collect(),
+            languages: (self.servers.iter())
+                .filter(|row| row.unverified && !row.off)
                 .map(|row| row.id.to_owned())
                 .collect(),
             tool_paths: (self.servers.iter())
@@ -274,6 +304,22 @@ impl Page {
 
     pub(super) fn set_disabled(&mut self, off: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.disabled = off;
+        self.save(window, cx);
+    }
+
+    /// Switches one of the other languages' servers on or off.
+    #[cfg(test)]
+    pub(super) fn set_language(
+        &mut self,
+        server: &str,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = (self.servers.iter_mut()).find(|row| row.unverified && row.id == server)
+        {
+            row.off = !on;
+        }
         self.save(window, cx);
     }
 
@@ -352,24 +398,36 @@ fn boxed(field: &Entity<Input>) -> gpui::Div {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = !self.disabled;
-        let servers = self.servers.iter().enumerate().map(|(n, row)| {
-            div()
+        let mut servers = Vec::new();
+        // The languages that are off until asked for, under their own label.
+        let mut others = Vec::new();
+        for (n, row) in self.servers.iter().enumerate() {
+            let label = if row.unverified {
+                format!("{} ({})", row.languages, row.id)
+            } else {
+                format!("{} ({})", row.id, row.languages)
+            };
+            let element = div()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(
-                    check(
-                        ("code-insight-server", n),
-                        format!("{} ({})", row.id, row.languages).into(),
-                        !row.off,
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.servers[n].off = !this.servers[n].off;
-                        this.save(window, cx);
-                    })),
+                    check(("code-insight-server", n), label.into(), !row.off).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.servers[n].off = !this.servers[n].off;
+                            this.save(window, cx);
+                        }),
+                    ),
                 )
-                .child(boxed(&row.path).ml(px(22.)))
-        });
+                .when(!row.off || !row.unverified, |d| {
+                    d.child(boxed(&row.path).ml(px(22.)))
+                });
+            if row.unverified {
+                others.push(element);
+            } else {
+                servers.push(element);
+            }
+        }
         div()
             .id("code-insight-settings")
             .debug_selector(|| "code-insight-settings".into())
@@ -401,6 +459,13 @@ impl Render for Page {
                     .children(servers)
                     .child(hint(
                         "A path set here is used as it is; when it is not there, nothing else is tried.",
+                    ))
+                    .child(section_label(
+                        "Other languages \u{2014} not yet verified",
+                    ))
+                    .children(others)
+                    .child(hint(
+                        "Off: files of the language open as they did before code insight, with no server started or looked for.",
                     ))
             })
             .child(section_label("Limits, for every project"))

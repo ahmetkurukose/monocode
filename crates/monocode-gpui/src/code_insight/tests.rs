@@ -248,6 +248,12 @@ pub(crate) fn set_tool_path(server: &str, path: &str, window: &mut gpui::Window,
     });
 }
 
+pub(crate) fn set_language(server: &str, on: bool, window: &mut gpui::Window, cx: &mut App) {
+    with_settings_page(window, cx, |page, window, cx| {
+        page.set_language(server, on, window, cx)
+    });
+}
+
 pub(crate) fn set_disabled(off: bool, window: &mut gpui::Window, cx: &mut App) {
     with_settings_page(window, cx, |page, window, cx| {
         page.set_disabled(off, window, cx)
