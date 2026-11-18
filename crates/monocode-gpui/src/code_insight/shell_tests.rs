@@ -436,6 +436,62 @@ fn the_chip_follows_the_servers_and_the_projects_settings_decide_what_runs(
 }
 
 #[gpui::test]
+fn a_leading_at_sign_still_finds_files_and_text_where_there_are_no_symbols(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::new(cx);
+    let store = rig.write("store.py", "class Store:\n    pass\n");
+    rig.write("web/@types/shapes.d.ts", "export type Shape = string;\n");
+    let css = rig.write("web/site.css", "@media print {\n  body { margin: 0 }\n}\n");
+    let (window, mut visual) = start(&rig.root, cx);
+    let cx = &mut visual;
+    // Quick open lists the files of the project in front.
+    window
+        .update(cx, |shell, _, _| {
+            shell.workspace.project = rig.root.to_string_lossy().into_owned()
+        })
+        .unwrap();
+    let ask = |cx: &mut VisualTestContext, typed: &str, content: bool| -> Vec<String> {
+        let typed = typed.to_owned();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open_quick_open(false, window, cx);
+                if content {
+                    let picker = shell.quick_open.as_ref().unwrap().picker().clone();
+                    picker.update(cx, |picker, cx| picker.show_content(cx));
+                }
+                shell.set_quick_open_query(typed, cx);
+            })
+            .unwrap();
+        let mut rows = Vec::new();
+        wait(cx, "quick open's rows", |cx| {
+            rows = window
+                .update(cx, |shell, _, cx| {
+                    let open = shell.quick_open.as_ref().unwrap();
+                    open.picker().read(cx).row_labels()
+                })
+                .unwrap();
+            !rows.is_empty()
+        });
+        window
+            .update(cx, |shell, window, cx| shell.close_quick_open(window, cx))
+            .unwrap();
+        rows.into_iter().map(|(label, _)| label).collect()
+    };
+    // No symbols in the file in front: `@` is a character of the name
+    // looked for.
+    open_file(window, cx, &css);
+    assert_eq!(ask(cx, "@types", false), ["shapes.d.ts"]);
+    // A file with symbols in front: its symbols, and when none answers,
+    // the files again.
+    open_file(window, cx, &store);
+    assert_eq!(ask(cx, "@sto", false), ["Store"]);
+    assert_eq!(ask(cx, "@types", false), ["shapes.d.ts"]);
+    // Inside the files the text is looked for as it was typed.
+    assert_eq!(ask(cx, "@media", true), ["@media print {"]);
+}
+
+#[gpui::test]
 fn another_language_has_no_server_until_its_project_switches_it_on(cx: &mut TestAppContext) {
     let rig = Rig::new(cx);
     rig.write(".venv/bin/rust-analyzer", "");

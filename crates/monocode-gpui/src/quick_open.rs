@@ -142,9 +142,10 @@ impl QuickOpen {
         }
         let changed = cx.subscribe(&search, |this, _, _: &input::Changed, cx| {
             this.active = 0;
+            // First, so the list knows a mode is being asked.
+            this.search_mode(cx);
             this.rank(cx);
             this.search_content(cx);
-            this.search_mode(cx);
             cx.notify();
         });
         let cwd_for_search = cwd.clone();
@@ -238,7 +239,9 @@ impl QuickOpen {
             }
             commands.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             commands.into_iter().map(|(_, row)| row).collect()
-        } else if crate::code_shell::commands::mode_for(query, cx).is_some() {
+        } else if self.prefix_mode(query, cx).is_some()
+            && (self.mode_searching || !self.mode_rows.is_empty())
+        {
             self.mode_rows.clone()
         } else if self.mode == Mode::Content {
             self.content_rows.clone()
@@ -260,11 +263,25 @@ impl QuickOpen {
         self.active = self.active.min(self.rows.len().saturating_sub(1));
         self.scroll.scroll_to_item(self.active);
     }
+    /// The feature mode `query` is in. Never on the Content tab: what is
+    /// typed there is looked for in the files as it is, `@media` included.
+    /// A mode that finds nothing gives way to the file list in `rank`.
+    fn prefix_mode(
+        &self,
+        query: &str,
+        cx: &gpui::App,
+    ) -> Option<(crate::code_shell::commands::Mode, String)> {
+        if self.mode == Mode::Content {
+            return None;
+        }
+        crate::code_shell::commands::mode_for(query, cx)
+    }
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;
             self.active = 0;
             self.content_rows.clear();
+            self.search_mode(cx);
             self.rank(cx);
             self.search_content(cx);
             cx.notify();
@@ -277,11 +294,7 @@ impl QuickOpen {
         self.content_task = None;
         self.searching = false;
         let query = self.search.read(cx).content.trim().to_owned();
-        if self.mode != Mode::Content
-            || query.is_empty()
-            || query.starts_with('>')
-            || crate::code_shell::commands::mode_for(&query, cx).is_some()
-        {
+        if self.mode != Mode::Content || query.is_empty() || query.starts_with('>') {
             if !self.content_rows.is_empty() {
                 self.content_rows.clear();
                 self.rank(cx);
@@ -362,7 +375,7 @@ impl QuickOpen {
         self.mode_task = None;
         self.mode_searching = false;
         let typed = self.search.read(cx).content.trim().to_owned();
-        let Some((mode, query)) = crate::code_shell::commands::mode_for(&typed, cx) else {
+        let Some((mode, query)) = self.prefix_mode(&typed, cx) else {
             self.mode_rows.clear();
             return;
         };
@@ -402,6 +415,10 @@ impl QuickOpen {
         (self.rows.iter())
             .map(|row| (row.label.clone(), row.detail.clone()))
             .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn show_content(&mut self, cx: &mut Context<Self>) {
+        self.set_mode(Mode::Content, cx)
     }
     #[cfg(test)]
     pub(crate) fn pick_row(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -583,11 +600,9 @@ impl Render for QuickOpen {
                                 .text_color(content(0.45))
                                 .child(if let Some(error) = self.error.clone() {
                                     error
-                                } else if let Some((mode, query)) =
-                                    crate::code_shell::commands::mode_for(
-                                        self.search.read(cx).content.trim(),
-                                        cx,
-                                    )
+                                } else if let Some((mode, query)) = self
+                                    .prefix_mode(self.search.read(cx).content.trim(), cx)
+                                    .filter(|(_, query)| self.mode_searching || query.is_empty())
                                 {
                                     if self.mode_searching {
                                         "Searching…".to_owned()

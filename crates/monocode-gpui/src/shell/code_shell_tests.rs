@@ -533,6 +533,7 @@ fn quick_open_lists_a_features_commands_and_the_rows_of_its_prefix_mode(cx: &mut
                 id: "fake-symbols",
                 prefix: '@',
                 hint: "Type to search symbols",
+                applies: Rc::new(|_| true),
                 search: Rc::new(move |query, _, cx| {
                     let path = path.clone();
                     // The feature's own work, off the UI thread.

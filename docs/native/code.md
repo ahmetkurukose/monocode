@@ -552,6 +552,10 @@ markers for Go, Rust and JavaScript (their file tasks are in the header menu).
   language: a breadth-first walk skipping dot folders and vendored ones, at most 1,500
   files of 512 KiB and 700 ms. Prefix matches first, then inside the name, then letters
   in order.
+  A mode registers `applies`: `@` applies only with a file of a language that has an
+  outline in front, and never on quick open's Content tab; where it does not apply, or finds
+  nothing, the whole query (the `@` included) ranks files as usual, so `@types` still finds
+  the folder.
 - **Chip** (`chip.rs`, `code-servers`). The servers of the checkout in front and of the
   file in front: hidden with none, quiet when ready (`2 servers`), busy while starting or
   indexing, a warning for a missing tool or a failed server. Its list has a row per
