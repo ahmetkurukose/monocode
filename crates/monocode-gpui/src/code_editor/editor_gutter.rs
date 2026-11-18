@@ -126,7 +126,13 @@ impl Input {
     }
     pub(super) fn gutter_tooltip(&self) -> Option<AnyElement> {
         let code = self.code.as_ref()?;
-        let (text, top) = code.ext.as_ref()?.gutter_tip.clone()?;
+        let ext = code.ext.as_ref()?;
+        // The mark's menu covers the same place; a tip over it hides its
+        // first row.
+        if ext.gutter_menu.is_some() {
+            return None;
+        }
+        let (text, top) = ext.gutter_tip.clone()?;
         Some(
             div()
                 .absolute()
