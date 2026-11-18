@@ -7,7 +7,10 @@ use super::*;
 use crate::code_editor::{
     CompletionProvider, CompletionRequest, CompletionTrigger, DiagnosticCounts, DocumentInfo,
     ExternalDiagnostic, GutterMark, GutterSlot, InlineNote, LineDecoration, Location, Position,
-    Providers, RowShift, TextEdit, markdown::Document, rank,
+    Providers, RowShift, TextEdit,
+    markdown::Document,
+    popup_place::{self, Area},
+    rank,
 };
 use crate::editor_analysis::Edit;
 use gpui::AsyncApp;
@@ -433,33 +436,30 @@ impl Input {
             });
         }));
     }
+    /// The selected item's documentation, beside the list or past it, and
+    /// nothing when there is no room that leaves the list and the caret's
+    /// line uncovered.
     pub(super) fn completion_documentation(
         &self,
-        left: f32,
-        top: f32,
-        width: f32,
-        viewport_width: f32,
+        container: (f32, f32),
+        list: Area,
+        line: Area,
     ) -> Option<AnyElement> {
         let code = self.code.as_ref()?;
         let (index, doc) = code.ext.as_ref()?.completion_doc.as_ref()?;
         if *index != code.completion_index {
             return None;
         }
-        let doc_width = 320_f32.min(viewport_width - 8.);
-        // Beside the list where there is room, right first.
-        let x = if left + width + 4. + doc_width <= viewport_width {
-            left + width + 4.
-        } else {
-            (left - doc_width - 4.).max(4.)
-        };
+        let area = popup_place::documentation(container, list, line)?;
         Some(
             crate::code_editor::markdown::surface()
                 .id("editor-completion-documentation")
+                .debug_selector(|| "editor-completion-documentation".into())
                 .absolute()
-                .left(px(x))
-                .top(px(top))
-                .w(px(doc_width))
-                .max_h(px(240.))
+                .left(px(area.x))
+                .top(px(area.y))
+                .w(px(area.w))
+                .max_h(px(area.h))
                 .overflow_y_scroll()
                 .px_2()
                 .py_1p5()

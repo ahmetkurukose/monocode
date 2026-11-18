@@ -22,6 +22,7 @@ mod header;
 mod history;
 mod hover;
 mod hub;
+pub(crate) mod popup_place;
 pub(crate) mod links;
 pub(crate) mod markdown;
 pub(crate) mod symbols;
