@@ -410,7 +410,7 @@ impl QuickOpen {
             });
         }));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn row_labels(&self) -> Vec<(String, String)> {
         (self.rows.iter())
             .map(|row| (row.label.clone(), row.detail.clone()))

@@ -33,7 +33,7 @@ pub(super) fn install(cx: &mut App) {
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 pub(super) fn shown(cx: &App) -> Option<Entity<Usages>> {
     cx.try_global::<Shown>()?.0.clone()
 }
@@ -228,7 +228,7 @@ impl Usages {
     }
 
     /// The symbol, the count, and each listed place as `path:line: text`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn listed(&self) -> (String, usize, Vec<String>) {
         let lines = (self.rows.iter())
             .filter_map(|row| match row {

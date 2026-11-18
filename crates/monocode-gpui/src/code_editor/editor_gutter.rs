@@ -126,7 +126,13 @@ impl Input {
     }
     pub(super) fn gutter_tooltip(&self) -> Option<AnyElement> {
         let code = self.code.as_ref()?;
-        let (text, top) = code.ext.as_ref()?.gutter_tip.clone()?;
+        let ext = code.ext.as_ref()?;
+        // The mark's menu covers the same place; a tip over it hides its
+        // first row.
+        if ext.gutter_menu.is_some() {
+            return None;
+        }
+        let (text, top) = ext.gutter_tip.clone()?;
         Some(
             div()
                 .absolute()
@@ -145,7 +151,7 @@ impl Input {
                 .into_any_element(),
         )
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn gutter_slot_center(&self, slot: GutterSlot, row: usize) -> Option<Point<Pixels>> {
         let code = self.code.as_ref()?;
         let bounds = self.bounds?;
@@ -155,6 +161,14 @@ impl Input {
             bounds.top() + px(code.top(row, self.line_height) + self.line_height / 2.)
                 - self.scroll_y,
         ))
+    }
+    /// A window position inside the character at `offset`, for the self-test
+    /// that points at text in a real window.
+    #[cfg(feature = "selftest")]
+    pub(crate) fn glyph_center(&self, offset: usize) -> Option<Point<Pixels>> {
+        let origin = self.bounds?.origin;
+        let at = self.code_position(offset) - point(self.scroll_x, self.scroll_y);
+        Some(origin + at + point(px(3.), px(self.line_height / 2.)))
     }
 }
 

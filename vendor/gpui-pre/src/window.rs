@@ -2921,6 +2921,14 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// Monocode: the bounds of the element with this `debug_selector` in the
+    /// frame on screen, for the self-test that clicks in a real window
+    /// (shell/code_selftest.rs). Tests have `VisualTestContext::debug_bounds`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn debug_bounds(&self, selector: &str) -> Option<Bounds<Pixels>> {
+        self.rendered_frame.debug_bounds.get(selector).copied()
+    }
+
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.

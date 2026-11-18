@@ -586,7 +586,7 @@ impl Input {
         ext.hover_probe = Some(range.clone());
         self.request_hover(at, range, Duration::ZERO, window, cx);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn hover_text(&self) -> Option<(Range<usize>, SharedString)> {
         let hover = self.code.as_ref()?.ext.as_ref()?.hover.as_ref()?;
         Some((hover.range.clone(), hover.doc.text.clone()))
@@ -642,7 +642,7 @@ impl Input {
             cx.propagate();
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn signature_shown(&self) -> Option<&Signature> {
         let popup = self.code.as_ref()?.ext.as_ref()?.signature.as_ref()?;
         Some(&popup.signature)
@@ -677,7 +677,10 @@ impl Input {
             .map(|line| line.chars().count())
             .max()
             .unwrap_or(0);
-        let width = (longest as f32 * 6.6 + 28.)
+        // A code block is wider than its characters: it has its own padding
+        // and a line number, and it scrolls instead of wrapping, so a width
+        // that is short by a few characters hides the end of a type.
+        let width = (longest as f32 * 7.4 + 64.)
             .clamp(160., 480.)
             .min((viewport.width.as_f32() - 8.).max(1.));
         let left = x.clamp(4., (viewport.width.as_f32() - width - 4.).max(4.));

@@ -541,6 +541,51 @@ fn python_tests_get_run_markers_and_a_click_runs_that_one_test(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn debug_chosen_in_a_markers_menu_starts_without_the_editor_being_read_twice(
+    cx: &mut TestAppContext,
+) {
+    // The menu's click runs inside an update of the file's editor; a start
+    // that reads that editor at once (to save it) used to panic there.
+    let mut fx = Fixture::new(&[("tests/test_math.py", TESTS)], cx);
+    fx.open("tests/test_math.py");
+    let path = fx.path("tests/test_math.py");
+    let hub = fx.visual.update(|_, cx| code_editor::hub(cx));
+    fx.wait("the markers", |cx| {
+        !hub.read_with(cx, |hub, _| {
+            hub.gutter_marks(&path, GutterSlot::Run).is_empty()
+        })
+    });
+    let debugged: Rc<RefCell<Vec<Spawn>>> = Rc::default();
+    fx.visual.update(|_, cx| {
+        let sink = debugged.clone();
+        launch::set_debugger(
+            Rc::new(move |spawn, _, _, _| sink.borrow_mut().push(spawn)),
+            cx,
+        );
+    });
+    fx.visual.run_until_parked();
+    let add = row(TESTS, "def test_add");
+    let marker = fx.visual.update(|_, cx| {
+        let editor = context::focused_file(cx).unwrap().editor.upgrade().unwrap();
+        (editor.read(cx).input.read(cx)).gutter_slot_center(GutterSlot::Run, add)
+    });
+    let marker = marker.expect("the run column is drawn");
+    fx.visual
+        .simulate_mouse_down(marker, gpui::MouseButton::Right, Modifiers::default());
+    fx.visual
+        .simulate_mouse_up(marker, gpui::MouseButton::Right, Modifiers::default());
+    fx.visual.run_until_parked();
+    let row = fx
+        .visual
+        .debug_bounds("menu-action-debug:0")
+        .expect("the menu offers Debug");
+    fx.visual.simulate_click(row.center(), Modifiers::default());
+    fx.wait("the debugger to be handed the test", |_| {
+        !debugged.borrow().is_empty()
+    });
+}
+
+#[gpui::test]
 fn the_header_offers_what_can_run_in_the_file_and_its_button_runs_the_default(
     cx: &mut TestAppContext,
 ) {
@@ -867,13 +912,16 @@ fn the_chip_counts_what_is_running_and_lists_agents_runs_with_their_output(
         "Local: http://localhost:5173/\n"
     );
 
-    // Stopped from the list, the chip goes and the row stays for a while.
+    // Stopped from the list, the chip stays, quiet, so that the row stays
+    // reachable.
     fx.feature(|window, cx| chip::pick(&format!("stop:{}", id.0), window, cx));
     assert_eq!(fx.wait_for_end(id).state, RunState::Stopped);
     fx.visual.run_until_parked();
     let (state, items) = chip_state(&mut fx);
-    assert!(state.is_none());
-    assert!(fx.visual.debug_bounds(chip::CHIP).is_none());
+    let state = state.expect("a finished run keeps the chip");
+    assert_eq!(state.text, "1 run");
+    assert_eq!(state.tone, chips::Tone::Quiet);
+    assert!(fx.visual.debug_bounds(chip::CHIP).is_some());
     assert!(items[0].detail.clone().unwrap().starts_with("Stopped"));
     let last = items[0].actions.last().unwrap().1.clone();
     assert_eq!(last, "Remove from this list");

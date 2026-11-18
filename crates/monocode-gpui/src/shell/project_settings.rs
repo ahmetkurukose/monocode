@@ -253,7 +253,7 @@ impl Shell {
         });
         cx.notify();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn code_page_dialog(
         &self,
     ) -> Option<Entity<crate::code_shell::settings::PageDialog>> {

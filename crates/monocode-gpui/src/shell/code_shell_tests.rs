@@ -787,6 +787,45 @@ fn a_settings_page_is_built_for_its_project_and_its_value_is_kept(cx: &mut TestA
 }
 
 #[gpui::test]
+fn escape_closes_a_settings_page_with_a_field_focused(cx: &mut TestAppContext) {
+    let (window, mut visual, _) = shell(cx);
+    let visual = &mut visual;
+    visual.update(|_, cx| {
+        settings::register(
+            SettingsPage {
+                id: "fake-run",
+                title: "Run configurations",
+                icon: "play",
+                build: Rc::new(|_, window, cx| {
+                    let field = cx.new(|cx| crate::input::Input::new(cx));
+                    window.focus(&field.focus_handle(cx), cx);
+                    field.into()
+                }),
+            },
+            cx,
+        );
+    });
+    assert!(feature(window, visual, |window, cx| {
+        settings::open(PROJECT, "fake-run", window, cx)
+    }));
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, window, cx| {
+            let field = shell.code_page_dialog().is_some();
+            assert!(field);
+            let _ = (window, cx);
+        })
+        .unwrap();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    window
+        .update(visual, |shell, _, _| {
+            assert!(shell.code_page_dialog().is_none())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn a_feature_puts_a_status_on_a_sessions_rail_row_and_clears_it(cx: &mut TestAppContext) {
     let (_, mut visual, session) = shell(cx);
     let visual = &mut visual;

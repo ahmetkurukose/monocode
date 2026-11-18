@@ -198,7 +198,7 @@ pub(crate) fn agent_name(session: i64, cx: &App) -> SharedString {
 }
 
 /// The last sentence a start showed the user.
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 pub(crate) fn last_notice(cx: &App) -> Option<String> {
     cx.global::<State>().notice.clone()
 }
@@ -235,9 +235,12 @@ fn save_focused(cx: &mut App) -> Option<(async_channel::Receiver<()>, Subscripti
 /// once the file is saved and the configuration resolved.
 pub(crate) fn begin(request: Request, cx: &mut App) -> Outcome {
     let (report, outcome) = async_channel::bounded(1);
-    let saving = save_focused(cx);
-    let setup = context::terminal_setup(&request.checkout.project, cx);
     cx.spawn(async move |cx| {
+        // Not read here, before the spawn: a gutter menu's click runs inside
+        // an update of the file's editor, and the save reads that editor.
+        let project = request.checkout.project.clone();
+        let (saving, setup) =
+            cx.update(|cx| (save_focused(cx), context::terminal_setup(&project, cx)));
         if let Some((saved, _watch)) = saving {
             let _ = saved.recv().await;
         }

@@ -268,7 +268,7 @@ impl Debugger {
     }
 
     /// The models of the sessions shown, oldest first.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn models(&self) -> Vec<Entity<Model>> {
         (self.entries.iter())
             .map(|entry| entry.model.clone())

@@ -6,6 +6,8 @@ mod automation_runs;
 mod browser_agent;
 mod browser_panes;
 mod browser_selftest;
+#[cfg(feature = "selftest")]
+mod code_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -9162,6 +9164,8 @@ impl Render for Shell {
         if !std::mem::replace(&mut self.browser_selftest_started, true) {
             self.start_browser_agent(window, cx);
             self.start_browser_selftest(window, cx);
+            #[cfg(feature = "selftest")]
+            self.start_code_selftest(window, cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
@@ -9713,6 +9717,13 @@ impl Render for Shell {
                 }
                 if this.action_dialog.is_some() {
                     this.close_action_dialog(window, cx);
+                    return;
+                }
+                // The project's dialogs (run configurations, the terminal
+                // setup) close on Escape from whatever field has focus; the
+                // key reaches this action before their own handler.
+                if this.background_dialog.is_some() {
+                    this.close_project_dialog(window, cx);
                     return;
                 }
                 if let Some(settings) = this.settings.clone() {

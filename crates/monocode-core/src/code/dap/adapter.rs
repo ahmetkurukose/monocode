@@ -149,24 +149,38 @@ impl Adapter for Debugpy {
             hint: "Create a virtual environment in the project or put python3 on the PATH.".into(),
         })?;
         // Asked of the interpreter itself: only it knows what it can import.
-        let mut probe = Command::new(&python);
-        probe
-            .args(["-c", "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('debugpy') else 3)"])
-            .envs(toolchain.environment.iter().map(|(key, value)| (key, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        crate::process::configure_child(&mut probe);
-        match probe.status() {
+        let can_import = |module: &str| {
+            let mut probe = Command::new(&python);
+            probe
+                .args([
+                    "-c",
+                    &format!("import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('{module}') else 3)"),
+                ])
+                .envs(toolchain.environment.iter().map(|(key, value)| (key, value)))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::process::configure_child(&mut probe);
+            probe.status()
+        };
+        match can_import(DEBUGPY) {
             Ok(status) if status.success() => {}
             Ok(_) => {
-                return Err(DapError::ToolMissing {
-                    tool: DEBUGPY.into(),
-                    hint: format!(
+                // An environment made by `uv venv` has no pip to ask.
+                let hint = match can_import("pip") {
+                    Ok(status) if !status.success() => format!(
+                        "Install it in the project's environment: uv pip install --python {} debugpy",
+                        python.display()
+                    ),
+                    _ => format!(
                         "Install it in the project's environment: {} -m pip install debugpy",
                         python.display()
                     ),
-                })
+                };
+                return Err(DapError::ToolMissing {
+                    tool: DEBUGPY.into(),
+                    hint,
+                });
             }
             Err(error) => {
                 return Err(DapError::Start(format!(
@@ -565,7 +579,12 @@ mod tests {
         let bin = root.path().join(".venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("activate"), "").unwrap();
-        std::fs::write(bin.join("python"), "#!/bin/sh\nexit 3\n").unwrap();
+        // It cannot import debugpy, but has pip, as a `venv` makes it.
+        std::fs::write(
+            bin.join("python"),
+            "#!/bin/sh\ncase \"$2\" in *\"'pip'\"*) exit 0;; esac\nexit 3\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -581,7 +600,16 @@ mod tests {
         match Debugpy.locate(&toolchain, root.path()) {
             Err(DapError::ToolMissing { tool, hint }) => {
                 assert_eq!(tool, "debugpy");
-                assert!(hint.contains("pip install debugpy"), "{hint}");
+                assert!(hint.contains("-m pip install debugpy"), "{hint}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without pip too (`uv venv`), the hint is uv's.
+        std::fs::write(bin.join("python"), "#!/bin/sh\nexit 3\n").unwrap();
+        match Debugpy.locate(&toolchain, root.path()) {
+            Err(DapError::ToolMissing { hint, .. }) => {
+                assert!(hint.contains("uv pip install --python "), "{hint}");
+                assert!(hint.ends_with(" debugpy"), "{hint}");
             }
             other => panic!("{other:?}"),
         }

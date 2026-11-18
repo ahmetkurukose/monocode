@@ -1,5 +1,6 @@
-//! The footer's chip for running work: shown while something in the focused
-//! project is running, with the count. Its list has what is running and what
+//! The footer's chip for running work: shown with the count while something
+//! in the focused project is running, and quietly while only finished runs
+//! are left, so that their output stays reachable. Its list has what is running and what
 //! ended lately, whoever started it (the user or an agent, in a tab or
 //! without one), and what can be done with each: show it, stop it, run it
 //! again, open the address it announced.
@@ -67,14 +68,26 @@ pub(crate) fn runs(cx: &App) -> Vec<RunInfo> {
 }
 
 fn state(cx: &App) -> Option<ChipState> {
-    let running = (runs(cx).iter())
-        .filter(|info| info.state.is_running())
-        .count();
-    (running > 0).then(|| ChipState {
+    let runs = runs(cx);
+    let running = runs.iter().filter(|info| info.state.is_running()).count();
+    if running > 0 {
+        return Some(ChipState {
+            icon: "play",
+            text: format!("{running} running").into(),
+            tone: Tone::Busy,
+            tooltip: "What is running in this project".into(),
+        });
+    }
+    // A run that has ended is still wanted: its output, its exit status and
+    // running it again are in the list, which only the chip opens.
+    (!runs.is_empty()).then(|| ChipState {
         icon: "play",
-        text: format!("{running} running").into(),
-        tone: Tone::Busy,
-        tooltip: "What is running in this project".into(),
+        text: match runs.len() {
+            1 => "1 run".into(),
+            count => format!("{count} runs").into(),
+        },
+        tone: Tone::Quiet,
+        tooltip: "What ran lately in this project".into(),
     })
 }
 

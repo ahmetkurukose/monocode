@@ -11,6 +11,8 @@ mod hover;
 mod keys;
 mod launch;
 mod model;
+#[cfg(feature = "selftest")]
+pub(crate) mod probe;
 mod sessions;
 mod tab;
 mod values;

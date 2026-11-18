@@ -220,7 +220,7 @@ impl Input {
             code.layout_width = None;
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn completion_labels(&self) -> Vec<String> {
         self.code
             .as_ref()
