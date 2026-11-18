@@ -13,6 +13,8 @@ struct Patterns {
     address: Regex,
     /// `Listening on port 5173`, `server started, port=8080`
     port: Regex,
+    /// `Connecting to database server on port 5432`: somebody else's port.
+    client: Regex,
     /// `listening on :8080`, `Listening at *:9000`
     any_host: Regex,
 }
@@ -28,7 +30,11 @@ fn patterns() -> Option<&'static Patterns> {
                 .ok()?,
                 address: Regex::new(&format!(r"(?i)(?:^|[^\w./@:-])({HOST}):(\d{{2,5}})\b")).ok()?,
                 port: Regex::new(
-                    r"(?i)\b(?:listening|serving|running|started|ready|available|server)\b.*?\bport\s*[:=]?\s*(\d{2,5})\b",
+                    r"(?i)\b(?:listening|listens|serving|serves|running|started|ready|available)\b.*?\bport\s*[:=]?\s*(\d{2,5})\b",
+                )
+                .ok()?,
+                client: Regex::new(
+                    r"(?i)\b(?:connect(?:ing|ed|ion|s)?|waiting|wait|retry(?:ing)?|unreachable|refused|failed|cannot|could not|unable)\b",
                 )
                 .ok()?,
                 any_host: Regex::new(
@@ -112,6 +118,11 @@ fn line_urls(line: &str, patterns: &Patterns, found: &mut Vec<String>) {
     if any {
         return;
     }
+    // A sentence about a port is only an announcement when the program says
+    // it is the one listening; a client naming the port it dials is not.
+    if patterns.client.is_match(line) {
+        return;
+    }
     let port = patterns
         .any_host
         .captures(line)
@@ -147,7 +158,7 @@ mod tests {
 
     #[test]
     fn local_addresses_are_found() {
-        let cases: [(&str, &[&str]); 24] = [
+        let cases: [(&str, &[&str]); 29] = [
             (
                 "Starting development server at http://127.0.0.1:8000/",
                 &["http://127.0.0.1:8000/"],
@@ -203,6 +214,12 @@ mod tests {
             ),
             ("http://localhost:99999 localhost:0 port 7 is closed", &[]),
             ("12 tests passed in 3.21s on report 8080", &[]),
+            // A port somebody else listens on, or a server with no verb.
+            ("Connecting to database server on port 5432", &[]),
+            ("Connected to redis running on port 6379", &[]),
+            ("Waiting for the server to be ready on port 9200", &[]),
+            ("postgres server port 5432", &[]),
+            ("connection refused: nothing listening on :8080", &[]),
         ];
         for (text, expected) in cases {
             assert_eq!(local_urls(text), expected, "{text}");
