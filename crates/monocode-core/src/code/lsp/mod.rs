@@ -18,8 +18,8 @@ pub mod types;
 
 pub use client::CancelToken;
 pub use manager::{
-    Clock, Coverage, DocumentContext, DocumentDiagnostics, Manager, ManagerOptions, ProjectSettings,
-    ServerDiagnostics,
+    Clock, Coverage, DocumentContext, DocumentDiagnostics, Manager, ManagerOptions,
+    ProjectSettings, ServerDiagnostics,
 };
 pub use position::{Encoding, LineIndex, Point, Position, Span};
 pub use registry::{Language, Registry, Role, ServerSpec};

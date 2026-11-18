@@ -189,8 +189,8 @@ the next `open`, three times, then only by `restart_server`.
 
 - Never wait (fine on the UI thread): `open(path, text, &DocumentContext)`,
   `change(path, text)` (whole text), `close(path)`, `is_open`, `diagnostics(path)`,
-  `triggers(path)`, `statuses()`, `stop_server(id)`, `restart_server(id)`, `stop_all()`,
-  `subscribe()`, `sweep()`. `open` is counted: every `open` needs its `close`, and a
+  `triggers(path)`, `statuses()`, `stop_server(id)`, `restart_server(id)`,
+  `subscribe()`, `sweep()`, `coverage(path, &context)`, `document_text(path)`. `open` is counted: every `open` needs its `close`, and a
   second opener does not replace the text.
 - Wait for a server, at most `request_timeout` (10 s) for it to start plus the same for
   its answer, so call them on a background thread, each with a `CancelToken` whose
@@ -198,7 +198,13 @@ the next `open`, three times, then only by `restart_server`.
   `resolve_completion`, `signature_help`, `document_symbols`.
 - `diagnostics_settled(path, timeout)` waits until every server has reported on the
   current text. `with_file(path, &context, |manager| ...)` is for one-off questions about
-  a file nobody has open: it opens from disk (or joins the editor's copy), asks, closes.
+  a file nobody has open: it opens from disk (or joins the editor's copy) as one step under
+  the manager's lock, asks, closes. `with_running_file(path, &context, owner, ..)` is the same
+  without starting a server (`LspError::NoServer` when none runs), and
+  `start_servers(path, &context, owner, wait)` starts them and leases them to `owner` for 15
+  minutes past its last use. `stop_all()` blocks for about a second: every server is asked to
+  shut down at once and its process group is killed after, so it is for the quit and not for
+  the UI thread. A reopened document's `version` carries on from its last open.
 - `subscribe()` returns an `async_channel::Receiver<LspEvent>`:
   `DiagnosticsChanged { path }` (then read `diagnostics(path)`) and
   `ServerChanged(ServerStatus)`. States: `Starting`, `Ready`, `Indexing { title }` (from
