@@ -3,7 +3,7 @@
 //! the terminal and child-session requests, and the state transitions.
 use super::adapter::{adapter, derive, Console, LaunchOptions, DEBUGPY};
 use super::breakpoints::{Breakpoint, BreakpointStatus, BreakpointStore, ExceptionFilters};
-use super::fake::{fake, fake_listening, wait_until, Peer};
+use super::fake::{fake, fake_listening, fake_with_process, wait_until, Peer};
 use super::session::{Refresh, Session, SessionEvent, Setup};
 use super::types::{
     Actor, DapError, EvaluateContext, OutputCategory, Page, SessionState, StepKind,
@@ -827,5 +827,50 @@ fn an_adapter_that_never_answers_is_a_start_error() {
         setup(&BreakpointStore::new(), Console::InternalConsole),
     );
     assert!(matches!(result, Err(DapError::Start(_))));
+    adapter.join().unwrap();
+}
+
+/// A finished debuggee does not end its adapter: `debugpy.adapter` would
+/// wait for ever for a client that has nothing more to ask.
+#[cfg(unix)]
+#[test]
+fn a_session_that_ends_ends_its_adapter() {
+    use std::process::{Command, Stdio};
+    let mut adapter_process = Command::new("/bin/sleep");
+    adapter_process.arg("60").stdin(Stdio::null());
+    crate::code::child::lead_group(&mut adapter_process);
+    let process = adapter_process.spawn().unwrap();
+    let id = process.id();
+    let log = Log::default();
+    let script_log = log.clone();
+    let (client, incoming, adapter) = fake_with_process(
+        move |peer| {
+            python_like(
+                peer,
+                &script_log,
+                Plan {
+                    stop_at_start: true,
+                    ..Plan::default()
+                },
+            )
+        },
+        Some(process),
+    );
+    let session = Session::open(
+        client,
+        incoming,
+        setup(&BreakpointStore::new(), Console::InternalConsole),
+    )
+    .unwrap();
+    session.wait_for_stop(SOON).unwrap();
+    session.continue_and_wait(SOON).unwrap();
+    let state = session.continue_and_wait(SOON).unwrap();
+    assert!(state.is_terminated(), "{state:?}");
+    // Gone, and reaped: its group is no longer there to signal.
+    wait_until(
+        "the adapter to end",
+        || unsafe { libc::killpg(id as i32, 0) } != 0,
+    );
+    drop(session);
     adapter.join().unwrap();
 }

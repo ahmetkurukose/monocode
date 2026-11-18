@@ -119,6 +119,15 @@ impl Peer {
 pub fn fake(
     script: impl FnOnce(&mut Peer) + Send + 'static,
 ) -> (Client, mpsc::Receiver<Incoming>, JoinHandle<()>) {
+    fake_with_process(script, None)
+}
+
+/// `fake`, with `process` standing in for the adapter's own process: the
+/// client owns it and ends it as it would a real adapter.
+pub fn fake_with_process(
+    script: impl FnOnce(&mut Peer) + Send + 'static,
+    process: Option<std::process::Child>,
+) -> (Client, mpsc::Receiver<Incoming>, JoinHandle<()>) {
     let (to_adapter, from_client) = pipe();
     let (to_client, from_adapter) = pipe();
     let handle = std::thread::spawn(move || {
@@ -129,7 +138,7 @@ pub fn fake(
         };
         script(&mut peer);
     });
-    let (client, incoming) = Client::over(from_adapter, to_adapter, None);
+    let (client, incoming) = Client::over(from_adapter, to_adapter, process);
     (client, incoming, handle)
 }
 

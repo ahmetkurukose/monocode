@@ -15,7 +15,7 @@ use crate::code::spawn::Spawn;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,10 @@ pub struct Session {
     /// changes cannot reach the adapter in the wrong order.
     sync: Mutex<()>,
     children: Mutex<Vec<Arc<Session>>>,
+    /// The adapter has been told goodbye; it is not told twice.
+    goodbye: AtomicBool,
+    /// The adapter is being, or has been, let go of.
+    retired: AtomicBool,
     this: Weak<Session>,
 }
 
@@ -195,6 +199,8 @@ impl Session {
             jobs: Mutex::new(jobs),
             sync: Mutex::new(()),
             children: Mutex::new(Vec::new()),
+            goodbye: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             this: this.clone(),
         });
 
@@ -713,6 +719,7 @@ impl Session {
         if terminate && launched && self.supports("supportsTerminateRequest") {
             self.ask("terminate", json!({})).map(drop)
         } else {
+            self.goodbye.store(true, Ordering::SeqCst);
             let result = self.ask(
                 "disconnect",
                 json!({ "terminateDebuggee": terminate && launched }),
@@ -960,6 +967,34 @@ impl Session {
     fn finish(&self) {
         let exit_code = lock(&self.cache).exit_code;
         self.set_state(SessionState::Terminated { exit_code });
+        self.retire();
+    }
+
+    /// Lets go of the adapter of a session that is over. An adapter is not
+    /// done when its debuggee is: `debugpy.adapter` stays up, waiting for a
+    /// client that will never ask again, until something ends it. Done in
+    /// the background, since the goodbye waits a moment for it to leave.
+    fn retire(&self) {
+        if self.retired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // No owner left means the session is being dropped, and `close`
+        // hangs up on that thread.
+        if let Some(session) = self.this.upgrade() {
+            spawn_thread("dap-retire", move || session.hang_up());
+        }
+    }
+
+    /// Says goodbye to the adapter, if nobody has, and ends its connection
+    /// and its process group.
+    fn hang_up(&self) {
+        if !self.goodbye.swap(true, Ordering::SeqCst) && !self.client.is_closed() {
+            let launched = self.request.kind == RequestKind::Launch;
+            self.client
+                .send("disconnect", json!({ "terminateDebuggee": launched }))
+                .ok();
+        }
+        self.client.shutdown(DROP_GRACE);
     }
 
     fn fail_start(&self, message: &str) {
@@ -1063,12 +1098,10 @@ impl Session {
             (cache.state.is_terminated(), cache.process_id)
         };
         let launched = self.request.kind == RequestKind::Launch;
-        if !terminated {
-            self.client
-                .send("disconnect", json!({ "terminateDebuggee": launched }))
-                .ok();
-        }
-        self.client.shutdown(DROP_GRACE);
+        // Marked first, so the end announced below does not hang up a
+        // second time on a thread of its own.
+        self.retired.store(true, Ordering::SeqCst);
+        self.hang_up();
         // A debuggee in a terminal belongs to the terminal that started it.
         if launched && !terminated && !self.request.uses_terminal() {
             kill_debuggee(process_id);

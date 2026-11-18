@@ -89,7 +89,9 @@ impl Manager {
     /// Lists a started session, letting the oldest ended ones go.
     fn adopt(&self, session: Arc<Session>, toolchain: Toolchain) {
         let id = session.id();
-        let mut dropped = Vec::new();
+        // Let go of after the lock: a session that nobody else holds ends
+        // here, and ending waits a moment for its adapter.
+        let mut dropped: Vec<Entry> = Vec::new();
         {
             let mut sessions = lock(&self.sessions);
             let ended = |entry: &Entry| entry.session.state().is_terminated();
@@ -98,18 +100,17 @@ impl Manager {
                 .filter(|entry| ended(entry))
                 .count()
                 .saturating_sub(ENDED_KEPT);
-            sessions.retain(|entry| {
+            let (gone, kept): (Vec<Entry>, Vec<Entry>) = sessions.drain(..).partition(|entry| {
                 let goes = excess > 0 && ended(entry);
                 excess -= usize::from(goes);
-                if goes {
-                    dropped.push(entry.session.id());
-                }
-                !goes
+                goes
             });
+            *sessions = kept;
+            dropped.extend(gone);
             sessions.push(Entry { session, toolchain });
         }
-        for id in dropped {
-            self.emit(ManagerEvent::Removed(id));
+        for entry in &dropped {
+            self.emit(ManagerEvent::Removed(entry.session.id()));
         }
         self.emit(ManagerEvent::Added(id));
     }
