@@ -66,6 +66,40 @@ pub struct ServerCommand {
 pub struct SettingsContext<'a> {
     pub root: &'a Path,
     pub toolchain: &'a Toolchain,
+    pub strictness: Strictness,
+}
+
+/// How much the servers say about a project's code. A type checker's full
+/// set is written for annotated code: on a codebase without annotations it
+/// marks nearly every line, which hides the few marks that matter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Strictness {
+    /// What is wrong whatever the style: syntax, names that do not exist,
+    /// imports that do not resolve, unused imports and variables.
+    #[default]
+    Essential,
+    /// Also what the type checker can prove wrong from what it infers.
+    Standard,
+    /// Everything the servers report by default.
+    Strict,
+}
+
+impl Strictness {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Essential => "essential",
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "standard" => Self::Standard,
+            "strict" => Self::Strict,
+            _ => Self::Essential,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,11 +126,29 @@ fn nothing(_: &SettingsContext) -> Value {
 /// Pyright and basedpyright read the same settings under different names.
 /// Analysis is limited to open files so a large monorepo is not walked.
 fn pyright_settings(context: &SettingsContext) -> Value {
-    let analysis = json!({
+    let mut analysis = json!({
         "diagnosticMode": "openFilesOnly",
         "autoSearchPaths": true,
         "useLibraryCodeForTypes": true,
     });
+    match context.strictness {
+        // Type checking off still reports syntax; the overrides add back
+        // the few rules that are right for any code.
+        Strictness::Essential => {
+            analysis["typeCheckingMode"] = json!("off");
+            analysis["diagnosticSeverityOverrides"] = json!({
+                "reportUndefinedVariable": "error",
+                "reportMissingImports": "warning",
+                "reportPossiblyUnbound": "warning",
+                "reportUnusedCoroutine": "warning",
+                "reportRedeclaration": "warning",
+                "reportSelfClsParameterName": "warning",
+            });
+        }
+        Strictness::Standard => analysis["typeCheckingMode"] = json!("basic"),
+        // The server's own default.
+        Strictness::Strict => {}
+    }
     let mut python = json!({ "analysis": analysis });
     if let Some(interpreter) = context.toolchain.python() {
         python["pythonPath"] = json!(interpreter.to_string_lossy());
@@ -105,6 +157,25 @@ fn pyright_settings(context: &SettingsContext) -> Value {
         "python": python,
         "basedpyright": { "analysis": analysis },
         "pyright": {},
+    })
+}
+
+/// Ruff's own defaults include style rules (import order, simplifications,
+/// modernisations). For the essentials only what points at a mistake is
+/// asked for, without the two rules that mark every name a star import
+/// brings. A project's own ruff configuration is always the one followed.
+fn ruff_options(context: &SettingsContext) -> Value {
+    if context.strictness != Strictness::Essential {
+        return Value::Null;
+    }
+    json!({
+        "settings": {
+            "configurationPreference": "filesystemFirst",
+            "lint": {
+                "select": ["F", "E9"],
+                "ignore": ["F403", "F405"],
+            },
+        }
     })
 }
 
@@ -170,7 +241,7 @@ impl Registry {
                     root_markers: &["pyproject.toml", "ruff.toml", ".ruff.toml", "setup.py"],
                     install_hint:
                         "Install it into the project's virtual environment: pip install ruff",
-                    initialization_options: nothing,
+                    initialization_options: ruff_options,
                     settings: nothing,
                 },
                 ServerSpec {
@@ -377,6 +448,7 @@ mod tests {
         let registry = Registry::builtin();
         let spec = registry.server("basedpyright").unwrap();
         let settings = (spec.settings)(&SettingsContext {
+            strictness: Strictness::default(),
             root: folder.path(),
             toolchain: &tools,
         });

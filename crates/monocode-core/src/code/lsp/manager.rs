@@ -15,7 +15,9 @@ use super::client::{
     Launcher, ProcessLauncher,
 };
 use super::protocol::{self, Converter};
-use super::registry::{find_root, Language, Registry, Role, ServerSpec, SettingsContext};
+use super::registry::{
+    find_root, Language, Registry, Role, ServerSpec, SettingsContext, Strictness,
+};
 use super::types::{
     CompletionItem, CompletionList, Diagnostic, DocumentSymbol, Hover, Location, LspError,
     LspEvent, ServerId, ServerState, ServerStatus, SignatureHelp, Triggers,
@@ -84,6 +86,8 @@ pub struct ProjectSettings {
     pub disabled_servers: HashSet<String>,
     /// Executables by registry id; they win over `ManagerOptions::tool_paths`.
     pub tool_paths: HashMap<String, PathBuf>,
+    /// How much the servers report.
+    pub strictness: Strictness,
 }
 
 /// What one server says about a document, and for which of its versions.
@@ -560,6 +564,9 @@ impl Shared {
                 .or_else(|| self.options.tool_paths.get(entry.spec.id))
                 .cloned()
         });
+        let strictness = (state.entries.get(&id))
+            .and_then(|entry| state.projects.get(&entry.project))
+            .map_or_else(Strictness::default, |settings| settings.strictness);
         let Some(entry) = state.entries.get_mut(&id) else {
             return;
         };
@@ -580,6 +587,7 @@ impl Shared {
         let context = SettingsContext {
             root: &entry.key.root,
             toolchain: &entry.key.toolchain,
+            strictness,
         };
         let options = ClientOptions {
             root: entry.key.root.clone(),

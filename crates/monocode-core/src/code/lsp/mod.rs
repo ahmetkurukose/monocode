@@ -22,7 +22,7 @@ pub use manager::{
     ProjectSettings, ServerDiagnostics,
 };
 pub use position::{Encoding, LineIndex, Point, Position, Span};
-pub use registry::{Language, Registry, Role, ServerSpec};
+pub use registry::{Language, Registry, Role, ServerSpec, Strictness};
 pub use types::{
     CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentSymbol, Hover, Location,
     LspError, LspEvent, ParameterInfo, ServerId, ServerState, ServerStatus, Severity,

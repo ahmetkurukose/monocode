@@ -14,7 +14,7 @@ use crate::{
 use gpui::{
     App, AppContext, Context, Entity, Role, SharedString, Subscription, Window, div, prelude::*, px,
 };
-use monocode_core::code::lsp::{self, Language, ManagerOptions, Registry, ServerSpec};
+use monocode_core::code::lsp::{self, Language, ManagerOptions, Registry, ServerSpec, Strictness};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, rc::Rc, time::Duration};
 
@@ -35,6 +35,9 @@ pub(super) struct InsightSettings {
     /// Only Python has been run against real servers, so the rest stay off
     /// until a project asks for them.
     pub languages: Vec<String>,
+    /// How much the servers report (`lsp::Strictness::id`); empty for the
+    /// essentials, which is where a project starts.
+    pub diagnostics: String,
     pub idle_minutes: Option<u64>,
     pub max_servers: Option<usize>,
 }
@@ -57,6 +60,7 @@ impl InsightSettings {
             tool_paths: (self.tool_paths.iter())
                 .map(|(id, path)| (id.clone(), PathBuf::from(path)))
                 .collect(),
+            strictness: Strictness::from_id(&self.diagnostics),
         }
     }
 
@@ -134,6 +138,7 @@ pub(super) struct Page {
     project: String,
     host: PageHost,
     disabled: bool,
+    level: Strictness,
     servers: Vec<ServerRow>,
     idle: Entity<Input>,
     cap: Entity<Input>,
@@ -218,6 +223,7 @@ impl Page {
             project: page.project,
             host: page.host,
             disabled: saved.disabled,
+            level: Strictness::from_id(&saved.diagnostics),
             servers,
             idle,
             cap,
@@ -250,6 +256,10 @@ impl Page {
                 .filter(|row| row.unverified && !row.off)
                 .map(|row| row.id.to_owned())
                 .collect(),
+            diagnostics: match self.level {
+                Strictness::Essential => String::new(),
+                level => level.id().to_owned(),
+            },
             tool_paths: (self.servers.iter())
                 .filter_map(|row| {
                     let path = row.path.read(cx).content.trim().to_owned();
@@ -455,7 +465,33 @@ impl Render for Page {
                     )),
             )
             .when(enabled, |d| {
-                d.child(section_label("Servers"))
+                let levels = [
+                    (
+                        Strictness::Essential,
+                        "Essential: syntax, names and imports that do not exist, unused imports and variables",
+                    ),
+                    (
+                        Strictness::Standard,
+                        "Standard: also what the type checker infers is wrong, and the linter's own rule set",
+                    ),
+                    (
+                        Strictness::Strict,
+                        "Strict: everything the servers report, written for fully annotated code",
+                    ),
+                ];
+                d.child(section_label("Diagnostics"))
+                    .children(levels.into_iter().enumerate().map(|(n, (level, label))| {
+                        check(("code-insight-level", n), label.into(), self.level == level).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.level = level;
+                                this.save(window, cx);
+                            }),
+                        )
+                    }))
+                    .child(hint(
+                        "A project's own ruff or pyright configuration is followed whichever is chosen.",
+                    ))
+                    .child(section_label("Servers"))
                     .children(servers)
                     .child(hint(
                         "A path set here is used as it is; when it is not there, nothing else is tried.",
