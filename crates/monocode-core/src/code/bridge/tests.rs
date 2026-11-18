@@ -453,12 +453,16 @@ fn answers_are_cut_to_size_on_whole_characters() {
     );
     assert_eq!(one_line(" a\n\tb\r\n ", 20), "a  b");
     let memory = Memory::default();
-    assert_eq!(memory.unseen(1, 10), 10);
-    assert_eq!(memory.unseen(1, 25), 15);
-    assert_eq!(memory.unseen(1, 25), 0);
+    assert_eq!(memory.unseen(7, 1, 10), 10);
+    assert_eq!(memory.unseen(7, 1, 25), 15);
+    assert_eq!(memory.unseen(7, 1, 25), 0);
     // Output dropped from the front never counts backwards.
-    assert_eq!(memory.unseen(1, 5), 0);
-    assert_eq!(memory.unseen(2, 3), 3);
+    assert_eq!(memory.unseen(7, 1, 5), 0);
+    assert_eq!(memory.unseen(7, 2, 3), 3);
+    // What one agent was shown is still news to another, and a session
+    // that has printed far more than it keeps is still counted.
+    assert_eq!(memory.unseen(8, 1, 25), 25);
+    assert_eq!(memory.unseen(8, 1, 25 + (3 << 20)), 3 << 20);
 }
 
 fn with_configurations(context: &mut CodeContext) {

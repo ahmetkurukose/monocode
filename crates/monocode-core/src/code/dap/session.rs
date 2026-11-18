@@ -123,6 +123,9 @@ struct Cache {
     variables: HashMap<(i64, Option<Page>), Vec<Variable>>,
     output: VecDeque<Output>,
     output_bytes: usize,
+    /// Bytes of output ever received, kept or not: what a reader counts
+    /// "since I last looked" in, since the kept part stops growing.
+    output_total: u64,
     exit_code: Option<i32>,
     process_id: Option<u32>,
     failure: Option<String>,
@@ -187,6 +190,7 @@ impl Session {
                 variables: HashMap::new(),
                 output: VecDeque::new(),
                 output_bytes: 0,
+                output_total: 0,
                 exit_code: None,
                 process_id: None,
                 failure: None,
@@ -385,6 +389,15 @@ impl Session {
         lock(&self.cache).output.iter().cloned().collect()
     }
 
+    /// The kept output and, read at the same moment, how many bytes of
+    /// output the session has produced in all. Older output is dropped from
+    /// the front once there is a lot, so the total can be more than what is
+    /// kept.
+    pub fn output_with_total(&self) -> (Vec<Output>, u64) {
+        let cache = lock(&self.cache);
+        (cache.output.iter().cloned().collect(), cache.output_total)
+    }
+
     /// The terminal the adapter asked for and nobody has answered yet.
     pub fn pending_terminal(&self) -> Option<TerminalRequest> {
         let terminal = lock(&self.cache).terminal.clone()?;
@@ -538,7 +551,18 @@ impl Session {
     /// Waits until the debuggee is stopped or over and returns that state;
     /// at once when it already is.
     pub fn wait_for_stop(&self, timeout: Duration) -> Result<SessionState, DapError> {
-        self.wait(timeout, |cache| {
+        self.wait_for_stop_unless(timeout, &|| false)
+    }
+
+    /// `wait_for_stop` that gives up as soon as `abandon` says so (checked
+    /// about ten times a second), with `DapError::StillRunning` as for a
+    /// wait that ran out: the program is left as it is.
+    pub fn wait_for_stop_unless(
+        &self,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        self.wait(timeout, abandon, |cache| {
             matches!(
                 cache.state,
                 SessionState::Stopped(_) | SessionState::Terminated { .. }
@@ -548,7 +572,7 @@ impl Session {
 
     /// Waits until the session is over and returns the exit code, if any.
     pub fn wait_for_exit(&self, timeout: Duration) -> Result<Option<i32>, DapError> {
-        match self.wait(timeout, |cache| cache.state.is_terminated())? {
+        match self.wait(timeout, &|| false, |cache| cache.state.is_terminated())? {
             SessionState::Terminated { exit_code } => Ok(exit_code),
             _ => Ok(None),
         }
@@ -556,8 +580,18 @@ impl Session {
 
     /// Continues and waits for the next stop or the end.
     pub fn continue_and_wait(&self, timeout: Duration) -> Result<SessionState, DapError> {
+        self.continue_and_wait_unless(timeout, &|| false)
+    }
+
+    /// `continue_and_wait` that stops waiting, not the program, once
+    /// `abandon` says so.
+    pub fn continue_and_wait_unless(
+        &self,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
         let stops = self.run("continue", None)?;
-        self.wait_after(stops, timeout)
+        self.wait_after(stops, timeout, abandon)
     }
 
     pub fn step_and_wait(
@@ -565,12 +599,26 @@ impl Session {
         kind: StepKind,
         timeout: Duration,
     ) -> Result<SessionState, DapError> {
-        let stops = self.run(kind.command(), None)?;
-        self.wait_after(stops, timeout)
+        self.step_and_wait_unless(kind, timeout, &|| false)
     }
 
-    fn wait_after(&self, stops: u64, timeout: Duration) -> Result<SessionState, DapError> {
-        self.wait(timeout, |cache| {
+    pub fn step_and_wait_unless(
+        &self,
+        kind: StepKind,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        let stops = self.run(kind.command(), None)?;
+        self.wait_after(stops, timeout, abandon)
+    }
+
+    fn wait_after(
+        &self,
+        stops: u64,
+        timeout: Duration,
+        abandon: &dyn Fn() -> bool,
+    ) -> Result<SessionState, DapError> {
+        self.wait(timeout, abandon, |cache| {
             cache.stops > stops || cache.state.is_terminated()
         })
     }
@@ -578,6 +626,7 @@ impl Session {
     fn wait(
         &self,
         timeout: Duration,
+        abandon: &dyn Fn() -> bool,
         done: impl Fn(&Cache) -> bool,
     ) -> Result<SessionState, DapError> {
         let deadline = Instant::now() + timeout;
@@ -589,9 +638,12 @@ impl Session {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(DapError::StillRunning);
             };
+            if abandon() {
+                return Err(DapError::StillRunning);
+            }
             cache = self
                 .changed
-                .wait_timeout(cache, left)
+                .wait_timeout(cache, left.min(Duration::from_millis(100)))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -915,6 +967,7 @@ impl Session {
         {
             let mut cache = lock(&self.cache);
             cache.output_bytes += output.text.len();
+            cache.output_total = cache.output_total.saturating_add(output.text.len() as u64);
             cache.output.push_back(output.clone());
             while cache.output_bytes > OUTPUT_KEPT && cache.output.len() > 1 {
                 if let Some(old) = cache.output.pop_front() {

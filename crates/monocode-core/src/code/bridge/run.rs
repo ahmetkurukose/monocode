@@ -222,7 +222,7 @@ fn report(call: &Call, info: &RunInfo, cursor: Option<u64>) -> String {
             while !output.text.is_char_boundary(cut) {
                 cut -= 1;
             }
-            next -= (output.text.len() - cut) as u64;
+            next = next.saturating_sub((output.text.len() - cut) as u64);
             text.push_str("\nMore output follows: call again with the cursor.");
             output.text[..cut].to_owned()
         }
@@ -258,7 +258,7 @@ pub(super) fn start(call: &Call) -> Result<String, String> {
         let Some(info) = runs.get(id) else {
             return Err("The run was removed.".into());
         };
-        if !info.state.is_running() || Instant::now() >= deadline {
+        if !info.state.is_running() || Instant::now() >= deadline || (call.abandoned)() {
             break info;
         }
         std::thread::sleep(Duration::from_millis(40));

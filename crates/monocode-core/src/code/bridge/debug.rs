@@ -111,11 +111,12 @@ fn variable_line(variable: &Variable) -> String {
 fn source(path: &Path, line: u32) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let first = line.saturating_sub(AROUND).max(1);
+    let shown = (line.saturating_sub(first) as usize).saturating_add(AROUND as usize + 1);
     let lines: Vec<String> = (text.lines().enumerate())
-        .skip(first as usize - 1)
-        .take((line - first + AROUND + 1) as usize)
+        .skip((first as usize).saturating_sub(1))
+        .take(shown)
         .map(|(index, content)| {
-            let number = index as u32 + 1;
+            let number = u32::try_from(index).map_or(u32::MAX, |index| index.saturating_add(1));
             let mark = if number == line { "->" } else { "  " };
             format!("{mark} {number:>4}  {}", head(content, 200))
         })
@@ -138,7 +139,10 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
         ));
     }
     if stack.len() > MAX_FRAMES {
-        text.push_str(&format!("  … and {} more\n", stack.len() - MAX_FRAMES));
+        text.push_str(&format!(
+            "  … and {} more\n",
+            stack.len().saturating_sub(MAX_FRAMES)
+        ));
     }
     for (index, entry) in stack.iter().take(with_locals).enumerate() {
         if entry.locals.is_empty() {
@@ -154,7 +158,7 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
         if entry.locals.len() > MAX_LOCALS {
             text.push_str(&format!(
                 "  … and {} more\n",
-                entry.locals.len() - MAX_LOCALS
+                entry.locals.len().saturating_sub(MAX_LOCALS)
             ));
         }
     }
@@ -163,11 +167,13 @@ fn frames(call: &Call, stack: &[FrameLocals], with_locals: usize) -> String {
 
 /// What the program printed since this agent was last told, if anything.
 fn new_output(call: &Call, session: &Session) -> Option<String> {
-    let text: String = (session.output().iter())
-        .map(|output| output.text.as_str())
-        .collect();
-    let unseen = call.memory.unseen(session.id(), text.len());
-    let mut start = text.len() - unseen;
+    let (kept, total) = session.output_with_total();
+    let text: String = kept.iter().map(|output| output.text.as_str()).collect();
+    // Counted in what the session has ever printed: what it still keeps
+    // stops growing once it is full.
+    let unseen = call.memory.unseen(call.scope.session, session.id(), total);
+    let shown = usize::try_from(unseen).map_or(text.len(), |unseen| unseen.min(text.len()));
+    let mut start = text.len() - shown;
     while !text.is_char_boundary(start) {
         start += 1;
     }
@@ -288,7 +294,7 @@ pub(super) fn start(call: &Call) -> Result<String, String> {
         .dap()
         .start(&spawn, &toolchain, &options, me(call))
         .map_err(|error| error.to_string())?;
-    let outcome = session.wait_for_stop(wait);
+    let outcome = session.wait_for_stop_unless(wait, call.abandoned);
     report(call, &session, outcome, wait)
 }
 
@@ -296,8 +302,8 @@ pub(super) fn resume(call: &Call) -> Result<String, String> {
     let wait = call.wait("timeout_s", 30, super::MAX_WAIT)?;
     let session = steered(call)?;
     let outcome = match session.state() {
-        SessionState::Stopped(_) => session.continue_and_wait(wait),
-        _ => session.wait_for_stop(wait),
+        SessionState::Stopped(_) => session.continue_and_wait_unless(wait, call.abandoned),
+        _ => session.wait_for_stop_unless(wait, call.abandoned),
     };
     report(call, &session, outcome, wait)
 }
@@ -322,7 +328,7 @@ pub(super) fn step(call: &Call) -> Result<String, String> {
             )
         }
     }
-    let outcome = session.step_and_wait(kind, wait);
+    let outcome = session.step_and_wait_unless(kind, wait, call.abandoned);
     report(call, &session, outcome, wait)
 }
 
@@ -371,7 +377,7 @@ pub(super) fn variables(call: &Call) -> Result<String, String> {
     if found.len() as u64 == count {
         text.push_str(&format!(
             "There may be more: ask again with start={}.",
-            start + count
+            start.saturating_add(count)
         ));
     }
     Ok(text.trim_end().to_owned())

@@ -715,6 +715,21 @@ can be expanded) and what the program printed since the last report. An end is t
 code and that output. A wait that runs out says the program is still running and changes
 nothing.
 
+**Calls and connections.** The stdio server answers `tools/call` on a thread per call
+(at most 16 at once), so `debug_stop` is not held up behind a `debug_continue` that waits, and
+`notifications/cancelled` closes that call's connection to the app: the call gets no answer,
+and the app, noticing the hang-up, ends its wait (the program or run it waited for is left
+as it is). A tool that panics answers with an error and frees its connection slot (a drop
+guard); a request must be complete within 10 s whatever the pace it arrives at. The accept
+loop logs and backs off on an error and carries on; the cached hub listens again, on the
+same address if it can, with the sessions already issued, if its thread ever ends.
+`bridge::revoke(session)` ends a session's token (nothing in the app calls it yet; neither
+does the browser bridge's), and at most 512 sessions are remembered. A session needs an
+absolute folder and project to be given a capability, and a checkout that the app does not
+vouch for and that lies above both is replaced by the session's own folder.
+"Unseen output" of a debug session is counted per agent session in all the bytes the
+session ever printed.
+
 **Who steers.** Sessions an agent starts have `Actor::Agent(session id)` as origin and
 driver. `debug_continue`, `debug_step`, `debug_evaluate` and `debug_stop` check
 `Session::driver()` and refuse, saying so, once the user has taken the session over;

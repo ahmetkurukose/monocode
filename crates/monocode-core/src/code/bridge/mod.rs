@@ -13,13 +13,14 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, PoisonError,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod debug;
@@ -28,6 +29,8 @@ mod run;
 mod schema;
 mod tools;
 
+#[cfg(test)]
+mod hardening_tests;
 #[cfg(test)]
 mod real_tests;
 #[cfg(test)]
@@ -53,6 +56,12 @@ const MAX_WAIT: Duration = Duration::from_secs(300);
 const FORWARD_GRACE: Duration = Duration::from_secs(60);
 /// Calls waiting on a program each hold a connection.
 const MAX_CONNECTIONS: usize = 32;
+/// A connection says what it wants within this, however slowly it writes.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Calls the stdio server has in flight at once.
+const MAX_IN_FLIGHT: usize = 16;
+/// Sessions whose tokens are kept; the oldest go first beyond it.
+const MAX_SESSIONS: usize = 512;
 
 /// Said to the agent once, with the server.
 pub const INSTRUCTIONS: &str = "Monocode's code tools for this session's project: language \
@@ -89,43 +98,87 @@ struct Hub {
     endpoint: String,
     services: &'static Services,
     /// Each session's token and scope. A session keeps its token for the
-    /// app's run; its folders follow the latest start.
-    sessions: Mutex<HashMap<i64, (String, Scope)>>,
+    /// app's run unless `revoke` ends it; its folders follow the latest start.
+    sessions: Mutex<HashMap<i64, Issued>>,
     memory: tools::Memory,
+    /// False once the thread that accepts connections has ended.
+    listening: Arc<AtomicBool>,
+    /// Connections being served.
+    connections: Arc<AtomicUsize>,
+    issued: AtomicU64,
+}
+
+struct Issued {
+    token: String,
+    scope: Scope,
+    /// When it was first issued, to drop the oldest first.
+    order: u64,
+}
+
+/// Marks the accept thread as gone, however it ends.
+struct Listening(Arc<AtomicBool>);
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Frees a connection's place, however its thread ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Hub {
+    #[cfg(test)]
     fn start(services: &'static Services) -> Result<Arc<Hub>, String> {
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        Self::listen(services, "127.0.0.1:0", None)
+    }
+
+    /// A hub on `address` (the loopback), carrying over what `previous` knew.
+    fn listen(
+        services: &'static Services,
+        address: &str,
+        previous: Option<&Hub>,
+    ) -> Result<Arc<Hub>, String> {
+        let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
         let endpoint = listener
             .local_addr()
             .map_err(|e| e.to_string())?
             .to_string();
+        let sessions = previous.map_or_else(HashMap::new, |hub| {
+            let sessions = hub.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            sessions
+                .iter()
+                .map(|(id, issued)| {
+                    let issued = Issued {
+                        token: issued.token.clone(),
+                        scope: issued.scope.clone(),
+                        order: issued.order,
+                    };
+                    (*id, issued)
+                })
+                .collect()
+        });
         let hub = Arc::new(Hub {
             endpoint,
             services,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(sessions),
             memory: tools::Memory::default(),
+            listening: Arc::new(AtomicBool::new(true)),
+            connections: Arc::new(AtomicUsize::new(0)),
+            issued: AtomicU64::new(previous.map_or(0, |hub| hub.issued.load(Ordering::Relaxed))),
         });
         let owner = hub.clone();
-        let connections = Arc::new(AtomicUsize::new(0));
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else {
-                    break;
-                };
-                if connections.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
-                    connections.fetch_sub(1, Ordering::Relaxed);
-                    continue;
-                }
-                let owner = owner.clone();
-                let connections = connections.clone();
-                std::thread::spawn(move || {
-                    let _ = serve(stream, &owner);
-                    connections.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-        });
+        let alive = Listening(hub.listening.clone());
+        std::thread::Builder::new()
+            .name("code-bridge".into())
+            .spawn(move || accept(listener, owner, alive))
+            .map_err(|e| e.to_string())?;
         Ok(hub)
     }
 
@@ -136,6 +189,10 @@ impl Hub {
         project: &Path,
         executable: &Path,
     ) -> Result<HashMap<String, String>, String> {
+        // A relative or empty folder would confine to nothing at all.
+        if !tools::usable_root(cwd) || !tools::usable_root(project) {
+            return Err("The code tools need an absolute folder for the session".into());
+        }
         let scope = Scope {
             session,
             cwd: cwd.to_path_buf(),
@@ -145,18 +202,31 @@ impl Hub {
             .sessions
             .lock()
             .map_err(|_| "Code session unavailable")?;
+        if !sessions.contains_key(&session) && sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, issued)| issued.order)
+                .map(|(id, _)| *id)
+            {
+                sessions.remove(&oldest);
+            }
+        }
         let entry = sessions.entry(session).or_insert_with(|| {
             let token = format!(
                 "{:032x}{:032x}",
                 rand::random::<u128>(),
                 rand::random::<u128>()
             );
-            (token, scope.clone())
+            Issued {
+                token,
+                scope: scope.clone(),
+                order: self.issued.fetch_add(1, Ordering::Relaxed),
+            }
         });
-        entry.1 = scope;
+        entry.scope = scope;
         Ok(HashMap::from([
             (ENV_ENDPOINT.into(), self.endpoint.clone()),
-            (ENV_TOKEN.into(), entry.0.clone()),
+            (ENV_TOKEN.into(), entry.token.clone()),
             (ENV_SESSION.into(), session.to_string()),
             (
                 ENV_EXECUTABLE.into(),
@@ -165,13 +235,22 @@ impl Hub {
         ]))
     }
 
+    /// Ends a session's capability: its token opens nothing any more.
+    fn revoke(&self, session: i64) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&session);
+    }
+
     /// The scope a token opens, if it is that session's token.
     fn admit(&self, session: i64, token: &str) -> Result<Scope, String> {
         let sessions = self
             .sessions
             .lock()
             .map_err(|_| "Code session unavailable")?;
-        let (secret, scope) = sessions.get(&session).ok_or("Invalid code capability")?;
+        let issued = sessions.get(&session).ok_or("Invalid code capability")?;
+        let secret = &issued.token;
         let equal = token.len() == secret.len()
             && token
                 .bytes()
@@ -179,24 +258,98 @@ impl Hub {
                 .fold(0u8, |diff, (a, b)| diff | a ^ b)
                 == 0;
         match equal {
-            true => Ok(scope.clone()),
+            true => Ok(issued.scope.clone()),
             false => Err("Invalid code capability".into()),
         }
     }
 }
 
-fn hub() -> Result<Arc<Hub>, String> {
+/// Takes connections until the listener is gone. A failed accept (too many
+/// open files, a connection aborted before it was taken) is waited out, not
+/// the end of the bridge.
+fn accept(listener: TcpListener, hub: Arc<Hub>, _alive: Listening) {
+    let connections = hub.connections.clone();
+    let mut failures = 0u32;
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => {
+                failures = 0;
+                stream
+            }
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures % 100 == 0 {
+                    eprintln!("code bridge: accepting a connection failed: {error}");
+                }
+                let pause = 20u64.saturating_mul(1 << failures.min(6));
+                std::thread::sleep(Duration::from_millis(pause.min(1000)));
+                continue;
+            }
+        };
+        if connections.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            connections.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+        let slot = Slot(connections.clone());
+        let owner = hub.clone();
+        let spawned = std::thread::Builder::new()
+            .name("code-bridge-call".into())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = serve(stream, &owner);
+            });
+        if spawned.is_err() {
+            // The closure, and the slot in it, went with the failed spawn.
+            continue;
+        }
+    }
+}
+
+fn hub_slot() -> &'static Mutex<Option<Arc<Hub>>> {
     static HUB: OnceLock<Mutex<Option<Arc<Hub>>>> = OnceLock::new();
-    let mut slot = HUB
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| "Code bridge unavailable")?;
-    if let Some(hub) = &*slot {
+    HUB.get_or_init(Default::default)
+}
+
+fn hub() -> Result<Arc<Hub>, String> {
+    let mut slot = hub_slot().lock().map_err(|_| "Code bridge unavailable")?;
+    live_hub(&mut slot, services())
+}
+
+/// The hub in `slot` if it still listens, else a new one. First use, or the
+/// thread that accepted connections has ended: listen again, on the old
+/// address if it can be had so that sessions already handed it keep
+/// working, and with the sessions already issued.
+fn live_hub(slot: &mut Option<Arc<Hub>>, services: &'static Services) -> Result<Arc<Hub>, String> {
+    if let Some(hub) = slot
+        .as_ref()
+        .filter(|hub| hub.listening.load(Ordering::SeqCst))
+    {
         return Ok(hub.clone());
     }
-    let hub = Hub::start(services())?;
+    let previous = slot.take();
+    let old = previous.as_ref().map(|hub| hub.endpoint.clone());
+    let hub = match old
+        .as_deref()
+        .map(|address| Hub::listen(services, address, previous.as_deref()))
+    {
+        Some(Ok(hub)) => hub,
+        _ => Hub::listen(services, "127.0.0.1:0", previous.as_deref())?,
+    };
     *slot = Some(hub.clone());
     Ok(hub)
+}
+
+/// Ends a session's capability, as when the session is deleted: what it was
+/// handed opens nothing afterwards. A session started again is issued a new
+/// token.
+pub fn revoke(session: i64) {
+    let hub = hub_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(hub) = hub {
+        hub.revoke(session);
+    }
 }
 
 /// What a session's agent process needs to reach the bridge. `cwd` is the
@@ -238,14 +391,40 @@ fn capped(mut text: String) -> String {
     text
 }
 
+/// A stream read under one deadline for all of it: a peer that writes a
+/// byte at a time cannot hold the connection beyond it.
+struct ByDeadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for ByDeadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        self.stream.set_read_timeout(Some(left))?;
+        let mut stream = self.stream;
+        stream.read(buffer)
+    }
+}
+
 fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new((&stream).take((MAX_WIRE_BYTES + 1) as u64))
+    let reader = ByDeadline {
+        stream: &stream,
+        until: Instant::now() + REQUEST_DEADLINE,
+    };
+    BufReader::new(reader.take((MAX_WIRE_BYTES + 1) as u64))
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
+    // The caller going away (it gave up on the call) ends a wait the tool
+    // is in; nothing the call started is stopped by it.
+    let hung_up = Arc::new(AtomicBool::new(false));
+    watch(&stream, &hung_up);
+    let abandoned = || hung_up.load(Ordering::Relaxed);
     let answer = (|| -> Result<String, String> {
         if line.len() > MAX_WIRE_BYTES || !line.ends_with('\n') {
             return Err("Invalid code request".into());
@@ -255,13 +434,19 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
         if !TOOLS.iter().any(|tool| tool.name == wire.tool) {
             return Err("Unknown code tool".into());
         }
-        tools::call(
-            hub.services,
-            &scope,
-            &hub.memory,
-            &wire.tool,
-            &wire.arguments,
-        )
+        // A tool that panics is that call's failure, not the connection's
+        // slot for ever and not silence for the agent.
+        catch_unwind(AssertUnwindSafe(|| {
+            tools::call(
+                hub.services,
+                &scope,
+                &hub.memory,
+                &wire.tool,
+                &wire.arguments,
+                &abandoned,
+            )
+        }))
+        .unwrap_or_else(|_| Err("The tool failed unexpectedly. Try something else.".into()))
     })();
     let body = match answer {
         Ok(text) => json!({"ok": capped(text)}),
@@ -270,7 +455,27 @@ fn serve(mut stream: TcpStream, hub: &Hub) -> Result<(), String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    writeln!(stream, "{body}").map_err(|e| e.to_string())
+    let written = writeln!(stream, "{body}").map_err(|e| e.to_string());
+    // Ends the watcher's read.
+    let _ = stream.shutdown(Shutdown::Both);
+    written
+}
+
+/// Sets `hung_up` once the peer has closed its end of `stream`.
+fn watch(stream: &TcpStream, hung_up: &Arc<AtomicBool>) {
+    let Ok(mut watched) = stream.try_clone() else {
+        return;
+    };
+    let hung_up = hung_up.clone();
+    let _ = std::thread::Builder::new()
+        .name("code-bridge-watch".into())
+        .spawn(move || {
+            let _ = watched.set_read_timeout(None);
+            let mut scratch = [0u8; 256];
+            // Anything more the peer writes is not part of the protocol.
+            while matches!(watched.read(&mut scratch), Ok(count) if count > 0) {}
+            hung_up.store(true, Ordering::Relaxed);
+        });
 }
 
 fn current_environment() -> HashMap<String, String> {
@@ -284,11 +489,50 @@ pub fn configured(environment: &HashMap<String, String>) -> bool {
     ENV_KEYS.iter().all(|key| environment.contains_key(*key))
 }
 
+/// A call the stdio server can give up on: the model interrupted it.
+#[derive(Default)]
+struct Cancel {
+    done: AtomicBool,
+    stream: Mutex<Option<TcpStream>>,
+}
+
+impl Cancel {
+    /// Abandons the wait: the connection to the app is closed, which also
+    /// tells the app to stop waiting for whatever the call waits on.
+    fn cancel(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(stream) = &*self.stream.lock().unwrap_or_else(PoisonError::into_inner) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    fn attach(&self, stream: &TcpStream) {
+        *self.stream.lock().unwrap_or_else(PoisonError::into_inner) = stream.try_clone().ok();
+        if self.cancelled() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
 /// Sends one call to the app and waits for its answer.
+#[cfg(test)]
 fn forward(
     environment: &HashMap<String, String>,
     tool: &str,
     arguments: Value,
+) -> Result<String, String> {
+    forward_cancellable(environment, tool, arguments, &Cancel::default())
+}
+
+fn forward_cancellable(
+    environment: &HashMap<String, String>,
+    tool: &str,
+    arguments: Value,
+    cancel: &Cancel,
 ) -> Result<String, String> {
     if !configured(environment) {
         return Err("The code tools are only available inside a Monocode session".into());
@@ -301,6 +545,7 @@ fn forward(
         .map_err(|_| "Invalid code session")?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
         .map_err(|_| "Monocode's code tools are not reachable. Is the app still running?")?;
+    cancel.attach(&stream);
     let request = json!({
         "session": session, "token": environment[ENV_TOKEN], "tool": tool, "arguments": arguments,
     });
@@ -312,6 +557,9 @@ fn forward(
     BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|_| "Monocode did not answer in time".to_string())?;
+    if cancel.cancelled() {
+        return Err("The call was cancelled.".into());
+    }
     let answer: Value = serde_json::from_str(&line).map_err(|_| "Invalid code answer")?;
     match answer.get("error").and_then(Value::as_str) {
         Some(error) => Err(error.to_owned()),
@@ -370,7 +618,22 @@ pub fn claude_allowed_tools() -> &'static str {
     })
 }
 
+fn call_result(outcome: Result<String, String>) -> Value {
+    match outcome {
+        Ok(text) => json!({"content":[{"type":"text","text":text}],"isError":false}),
+        Err(error) => json!({"content":[{"type":"text","text":error}],"isError":true}),
+    }
+}
+
 fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option<Value> {
+    mcp_answer(request, environment, &Cancel::default())
+}
+
+fn mcp_answer(
+    request: Value,
+    environment: &HashMap<String, String>,
+    cancel: &Cancel,
+) -> Option<Value> {
     let id = request.get("id")?.clone();
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(json!({
@@ -384,10 +647,12 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
         "tools/call" => {
             let tool = request["params"]["name"].as_str().unwrap_or("");
             let arguments = request["params"]["arguments"].clone();
-            Ok(match forward(environment, tool, arguments) {
-                Ok(text) => json!({"content":[{"type":"text","text":text}],"isError":false}),
-                Err(error) => json!({"content":[{"type":"text","text":error}],"isError":true}),
-            })
+            Ok(call_result(forward_cancellable(
+                environment,
+                tool,
+                arguments,
+                cancel,
+            )))
         }
         _ => Err(json!({"code":-32601,"message":"Method not found"})),
     };
@@ -398,42 +663,103 @@ fn mcp_response(request: Value, environment: &HashMap<String, String>) -> Option
 }
 
 /// The MCP server over a pair of streams: one JSON-RPC frame per line.
+/// A tool call is answered on a thread of its own, so a call that waits for
+/// a program does not hold up the others (`debug_stop` while `debug_continue`
+/// waits), and `notifications/cancelled` abandons the wait of the call it
+/// names, which then gets no answer.
 fn mcp_serve(
     mut input: impl BufRead,
-    mut output: impl Write,
+    output: impl Write + Send,
     environment: &HashMap<String, String>,
 ) -> Result<(), String> {
-    loop {
-        let mut line = String::new();
-        (&mut input)
-            .take((MAX_WIRE_BYTES + 1) as u64)
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        if line.is_empty() {
-            return Ok(());
-        }
-        if line.len() > MAX_WIRE_BYTES || !line.ends_with('\n') {
-            return Err("Oversized or incomplete MCP frame".into());
-        }
-        let response = match serde_json::from_str(&line) {
-            Ok(request) => mcp_response(request, environment),
-            Err(_) => Some(
-                json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
-            ),
-        };
-        if let Some(response) = response {
-            writeln!(output, "{response}")
-                .and_then(|_| output.flush())
+    let output = Mutex::new(output);
+    let in_flight: Mutex<HashMap<String, Arc<Cancel>>> = Mutex::new(HashMap::new());
+    let write = |frame: &Value| -> Result<(), String> {
+        let mut output = output.lock().unwrap_or_else(PoisonError::into_inner);
+        writeln!(output, "{frame}")
+            .and_then(|_| output.flush())
+            .map_err(|e| e.to_string())
+    };
+    std::thread::scope(|scope| {
+        loop {
+            let mut line = String::new();
+            (&mut input)
+                .take((MAX_WIRE_BYTES + 1) as u64)
+                .read_line(&mut line)
                 .map_err(|e| e.to_string())?;
+            if line.is_empty() {
+                return Ok(());
+            }
+            if line.len() > MAX_WIRE_BYTES || !line.ends_with('\n') {
+                return Err("Oversized or incomplete MCP frame".into());
+            }
+            let request: Value = match serde_json::from_str(&line) {
+                Ok(request) => request,
+                Err(_) => {
+                    write(
+                        &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
+                    )?;
+                    continue;
+                }
+            };
+            match request["method"].as_str() {
+                Some("notifications/cancelled") => {
+                    let key = request["params"]["requestId"].to_string();
+                    let found = in_flight
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&key)
+                        .cloned();
+                    if let Some(cancel) = found {
+                        cancel.cancel();
+                    }
+                }
+                Some("tools/call") if request.get("id").is_some() => {
+                    let key = request["id"].to_string();
+                    let cancel = Arc::new(Cancel::default());
+                    let crowded = {
+                        let mut calls = in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+                        let crowded = calls.len() >= MAX_IN_FLIGHT;
+                        if !crowded {
+                            calls.insert(key.clone(), cancel.clone());
+                        }
+                        crowded
+                    };
+                    if crowded {
+                        let busy = call_result(Err(
+                            "Too many calls are waiting at once. Let some finish first.".into(),
+                        ));
+                        write(&json!({"jsonrpc":"2.0","id":request["id"],"result":busy}))?;
+                        continue;
+                    }
+                    let (write, in_flight) = (&write, &in_flight);
+                    scope.spawn(move || {
+                        let response = mcp_answer(request, environment, &cancel);
+                        in_flight
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&key);
+                        // A cancelled call is not answered.
+                        if let (Some(response), false) = (response, cancel.cancelled()) {
+                            let _ = write(&response);
+                        }
+                    });
+                }
+                _ => {
+                    if let Some(response) = mcp_response(request, environment) {
+                        write(&response)?;
+                    }
+                }
+            }
         }
-    }
+    })
 }
 
 /// Runs before GUI initialization. stdout contains MCP JSON-RPC frames only.
 pub fn mcp_stdio() -> Result<(), String> {
     mcp_serve(
         std::io::stdin().lock(),
-        std::io::stdout().lock(),
+        std::io::stdout(),
         &current_environment(),
     )
 }

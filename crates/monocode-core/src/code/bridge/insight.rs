@@ -260,14 +260,14 @@ fn place(call: &Call, text: &str) -> Result<(usize, String), String> {
     let start = index.offset_of(
         text,
         Point {
-            line: line - 1,
+            line: line.saturating_sub(1),
             column: 0,
         },
     );
     let end = index.offset_of(
         text,
         Point {
-            line: line - 1,
+            line: line.saturating_sub(1),
             column: u32::MAX,
         },
     );
