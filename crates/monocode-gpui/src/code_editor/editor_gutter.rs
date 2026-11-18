@@ -42,6 +42,13 @@ impl Input {
         let Some((slot, row)) = self.gutter_hit(e.position) else {
             return false;
         };
+        // A press opens something of its own (a menu the provider draws, a
+        // toggle): the tip of the mark would only lie under it.
+        if let Some(ext) = self.code.as_mut().and_then(|code| code.ext.as_mut())
+            && ext.gutter_tip.take().is_some()
+        {
+            cx.notify();
+        }
         let Some(code) = &self.code else {
             return false;
         };
