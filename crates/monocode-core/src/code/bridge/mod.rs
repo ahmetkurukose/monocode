@@ -278,7 +278,7 @@ fn accept(listener: TcpListener, hub: Arc<Hub>, _alive: Listening) {
             }
             Err(error) => {
                 failures = failures.saturating_add(1);
-                if failures == 1 || failures % 100 == 0 {
+                if failures == 1 || failures.is_multiple_of(100) {
                     eprintln!("code bridge: accepting a connection failed: {error}");
                 }
                 let pause = 20u64.saturating_mul(1 << failures.min(6));

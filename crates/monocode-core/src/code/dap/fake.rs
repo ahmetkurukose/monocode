@@ -69,6 +69,7 @@ pub struct Peer {
 
 impl Peer {
     /// The next message from the client, or `None` once it hung up.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Value> {
         let body = wire::read_message(&mut self.reader).ok()??;
         serde_json::from_slice(&body).ok()
