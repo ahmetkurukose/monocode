@@ -903,13 +903,16 @@ fn the_chip_counts_what_is_running_and_lists_agents_runs_with_their_output(
         "Local: http://localhost:5173/\n"
     );
 
-    // Stopped from the list, the chip goes and the row stays for a while.
+    // Stopped from the list, the chip stays, quiet, so that the row stays
+    // reachable.
     fx.feature(|window, cx| chip::pick(&format!("stop:{}", id.0), window, cx));
     assert_eq!(fx.wait_for_end(id).state, RunState::Stopped);
     fx.visual.run_until_parked();
     let (state, items) = chip_state(&mut fx);
-    assert!(state.is_none());
-    assert!(fx.visual.debug_bounds(chip::CHIP).is_none());
+    let state = state.expect("a finished run keeps the chip");
+    assert_eq!(state.text, "1 run");
+    assert_eq!(state.tone, chips::Tone::Quiet);
+    assert!(fx.visual.debug_bounds(chip::CHIP).is_some());
     assert!(items[0].detail.clone().unwrap().starts_with("Stopped"));
     let last = items[0].actions.last().unwrap().1.clone();
     assert_eq!(last, "Remove from this list");
