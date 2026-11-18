@@ -19,7 +19,7 @@ use monocode_core::{
     },
     files::path_key,
 };
-use std::{cell::RefCell, ops::Range, path::Path, rc::Rc, time::Instant};
+use std::{cell::RefCell, path::Path, rc::Rc, time::Instant};
 
 pub(super) fn init(cx: &mut App) {
     cx.set_global(Cache::default());
@@ -33,7 +33,7 @@ struct Place {
     checkout: Checkout,
     /// The focused file: its path and pane, the caret, the selection and
     /// the hub's version of its text.
-    file: Option<(String, i64, usize, Range<usize>, u64)>,
+    file: Option<targets::FileKey>,
     runs: ProjectRuns,
 }
 
@@ -67,21 +67,9 @@ fn offered(checkout: &Checkout, cx: &App) -> (RunContext, targets::Choices) {
     // The focused file counts when it is one of this checkout's.
     let focused = context::focused_file(cx)
         .filter(|file| path_key(&file.checkout.folder) == path_key(&checkout.folder));
-    let file = focused.as_ref().and_then(|file| {
-        let editor = file.editor.upgrade()?;
-        let input = editor.read(cx).input.read(cx);
-        let version = cx
-            .try_global::<targets::Shared>()
-            .and_then(|shared| shared.hub.read(cx).document(Path::new(&file.path)))
-            .map_or(0, |open| open.version);
-        Some((
-            file.path.clone(),
-            file.pane,
-            input.caret(),
-            input.selection_range(),
-            version,
-        ))
-    });
+    let file = focused
+        .as_ref()
+        .and_then(|file| targets::file_key(file, cx));
     let place = Place {
         checkout: checkout.clone(),
         file,

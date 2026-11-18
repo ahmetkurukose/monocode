@@ -20,6 +20,7 @@ use monocode_core::code::{
 use std::{
     cell::RefCell,
     collections::HashMap,
+    ops::Range,
     path::Path,
     time::{Duration, Instant},
 };
@@ -59,6 +60,27 @@ pub(super) fn toolchain(checkout: &Checkout, cx: &App) -> Toolchain {
     let toolchain = context::toolchain(checkout, cx);
     known.insert(checkout.folder.clone(), (Instant::now(), toolchain.clone()));
     toolchain
+}
+
+/// What of the focused file a value derived from it depends on: its path
+/// and pane, the caret, the selection and the hub's version of its text.
+pub(super) type FileKey = (String, i64, usize, Range<usize>, u64);
+
+/// The `FileKey` of a focused file, `None` once its editor is gone.
+pub(super) fn file_key(file: &context::FocusedFile, cx: &App) -> Option<FileKey> {
+    let editor = file.editor.upgrade()?;
+    let input = editor.read(cx).input.read(cx);
+    let version = cx
+        .try_global::<Shared>()
+        .and_then(|shared| shared.hub.read(cx).document(Path::new(&file.path)))
+        .map_or(0, |open| open.version);
+    Some((
+        file.path.clone(),
+        file.pane,
+        input.caret(),
+        input.selection_range(),
+        version,
+    ))
 }
 
 /// The checkout a file belongs to: the one the shell knows, else the folder
