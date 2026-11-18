@@ -944,3 +944,76 @@ fn a_stop_on_system_exit_is_the_program_ending_unless_raised_is_on(cx: &mut Test
     breakpoints::store().set_exceptions(ExceptionFilters::default());
     finish(&session, script);
 }
+
+#[gpui::test]
+fn a_new_start_begins_with_an_empty_console_and_a_restart_goes_on_under_a_divider(
+    cx: &mut TestAppContext,
+) {
+    let (_window, mut visual, _) = shell(cx);
+    let visual = &mut visual;
+    let (_dir, path) = app_file();
+    let plan = Plan {
+        app: path,
+        system_exit: true,
+        ..Plan::default()
+    };
+    let ended = |model: &Entity<Model>, cx: &mut VisualTestContext| -> Vec<(Tone, String)> {
+        model.read_with(cx, |model, _| {
+            (model.console.iter())
+                .map(|line| (line.tone, line.text.to_string()))
+                .collect()
+        })
+    };
+    let end = "The program ended with exit code 3.".to_string();
+    // What one run of the scripted program prints.
+    let run = vec![
+        (Tone::Stdout, "hello".to_string()),
+        (Tone::Info, end.clone()),
+    ];
+
+    let (first, script) = start(plan.clone(), Actor::User, "internalConsole");
+    wait(visual, "the first run to end", |_| {
+        first.state().is_terminated()
+    });
+    let model = model_of(&first, visual).unwrap();
+    wait(visual, "its last line", |cx| {
+        ended(&model, cx)
+            .last()
+            .is_some_and(|(_, text)| *text == end)
+    });
+    finish(&first, script);
+
+    // Started again from the button: the same tab, an empty console.
+    let (second, script) = start(plan.clone(), Actor::User, "internalConsole");
+    wait(visual, "the second run to end", |_| {
+        second.state().is_terminated()
+    });
+    wait(visual, "its last line", |cx| {
+        model_of(&second, cx)
+            .is_some_and(|again| again.entity_id() == model.entity_id() && ended(&again, cx) == run)
+    });
+    finish(&second, script);
+
+    // A restart: what was printed stays, with a divider before the new run.
+    app(visual, |cx| {
+        let debugger = sessions::debugger(cx).unwrap();
+        debugger.update(cx, |debugger, _| debugger.expect_restart(second.id()));
+    });
+    let (third, script) = start(plan, Actor::User, "internalConsole");
+    wait(visual, "the restarted run's end", |cx| {
+        ended(&model, cx).len() == 5
+            && ended(&model, cx)
+                .last()
+                .is_some_and(|(_, text)| *text == end)
+    });
+    assert_eq!(
+        ended(&model, visual),
+        [
+            run.clone(),
+            vec![(Tone::Divider, "Restarted".to_string())],
+            run
+        ]
+        .concat()
+    );
+    finish(&third, script);
+}

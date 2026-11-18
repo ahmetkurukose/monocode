@@ -16,7 +16,7 @@ use monocode_core::code::{
     dap::{Actor, ManagerEvent, Session, SessionId},
     services::services,
 };
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 struct Entry {
     model: Entity<Model>,
@@ -27,6 +27,8 @@ pub(super) struct Debugger {
     entries: Vec<Entry>,
     /// The session the keys act on: the last one started here or paused.
     current: Option<EntityId>,
+    /// Sessions the user is restarting; what replaces one continues its console.
+    restarting: HashSet<SessionId>,
     _follow: Task<()>,
     _context: Subscription,
 }
@@ -93,6 +95,7 @@ impl Debugger {
         let mut this = Self {
             entries: Vec::new(),
             current: None,
+            restarting: HashSet::new(),
             _follow: follow,
             // A session that began before the window was up gets its tab
             // once there is a dock to put it in.
@@ -140,7 +143,9 @@ impl Debugger {
         });
         if let Some(entry) = ended {
             let model = entry.model.clone();
-            model.update(cx, |model, cx| model.adopt(session, cx));
+            let before = model.read(cx).root().id();
+            let restart = self.restarting.remove(&before);
+            model.update(cx, |model, cx| model.adopt(session, restart, cx));
             if user {
                 self.current = Some(model.entity_id());
                 self.reveal(&model, cx);
@@ -236,15 +241,22 @@ impl Debugger {
             .detach();
     }
 
+    #[cfg(test)]
+    pub(super) fn expect_restart(&mut self, session: SessionId) {
+        self.restarting.insert(session);
+    }
+
     fn restart(&mut self, model: &Entity<Model>, cx: &mut Context<Self>) {
         let id = model.read(cx).root().id();
         self.current = Some(model.entity_id());
+        self.restarting.insert(id);
         let model = model.downgrade();
         let started = cx
             .background_executor()
             .spawn(async move { services().dap().restart(id).map(|_| ()) });
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             if let Err(error) = started.await {
+                let _ = this.update(cx, |this, _| this.restarting.remove(&id));
                 let _ = model.update(cx, |model, cx| model.fail(&error.to_string(), cx));
             }
         })

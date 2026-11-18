@@ -13,8 +13,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, ClipboardItem, Context, ElementId, Focusable, FontWeight, Hsla, KeyDownEvent, Role,
-    SharedString, Stateful, Window, div, prelude::*, px, relative, rgb, uniform_list,
+    AnyElement, ClipboardItem, Context, Div, ElementId, Focusable, FontWeight, Hsla, KeyDownEvent,
+    Role, SharedString, Stateful, Window, div, prelude::*, px, relative, rgb, uniform_list,
 };
 use monocode_core::code::dap::{Breakpoint, ExceptionFilters, SessionState};
 use std::path::{Path, PathBuf};
@@ -82,11 +82,16 @@ fn checkbox(id: impl Into<ElementId>, label: &'static str, on: bool) -> Stateful
         })
 }
 
+/// Half of a divider line in the console.
+fn rule() -> Div {
+    div().flex_1().h(px(1.)).bg(content(0.15))
+}
+
 fn tone_color(tone: Tone) -> Hsla {
     match tone {
         Tone::Stdout => content(0.85),
         Tone::Stderr | Tone::Error => rgb(0xf87171).into(),
-        Tone::Info => content(0.45),
+        Tone::Info | Tone::Divider => content(0.45),
         Tone::Input => accent_color(),
         Tone::Result => content(1.),
     }
@@ -595,7 +600,9 @@ impl DebugTab {
                                 .font_family("monospace")
                                 .text_color(tone_color(line.tone))
                                 .when(line.tone == Tone::Input, |row| row.child("›"))
+                                .when(line.tone == Tone::Divider, |row| row.w_full().child(rule()))
                                 .child(line.text)
+                                .when(line.tone == Tone::Divider, |row| row.child(rule()))
                         })
                         .collect::<Vec<_>>()
                 })
