@@ -3,7 +3,7 @@
 //! background thread with a cancel token that is cancelled when the editor
 //! drops the task it was handed, so a burst of typing leaves no queue of
 //! requests behind it.
-use super::{convert, sync::served};
+use super::{convert, sync::serves};
 use crate::code_editor::{
     self, CompletionItem, CompletionProvider, CompletionRequest, CompletionTrigger, DocumentInfo,
     Hover, HoverProvider, LinkProvider, LinkTarget, Position, ReferencesProvider, Signature,
@@ -20,11 +20,11 @@ use std::{
     rc::Rc,
 };
 
-/// Installs the providers on every file a language server is registered for.
+/// Installs the providers on every file a language server may run for.
 pub(super) fn register(manager: lsp::Manager, cx: &mut App) {
     let provider = Rc::new(Provider { manager });
-    code_editor::register(cx, move |doc, providers, _| {
-        if !served(&doc.path) {
+    code_editor::register(cx, move |doc, providers, cx| {
+        if !serves(doc, cx) {
             return;
         }
         providers.completion = Some(provider.clone());

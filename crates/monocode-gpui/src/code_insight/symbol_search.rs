@@ -40,6 +40,13 @@ pub(super) fn register(cx: &mut App) {
             id: "code-symbols",
             prefix: '@',
             hint: "Type to search symbols",
+            // Only with a file in front that has symbols: anywhere else
+            // `@` is a character of a file name.
+            applies: Rc::new(|cx| {
+                context::focused_file(cx).is_some_and(|file| {
+                    editor_syntax::language_id(&file.path).is_some_and(symbols::has_rules)
+                })
+            }),
             search: Rc::new(search),
         },
         cx,

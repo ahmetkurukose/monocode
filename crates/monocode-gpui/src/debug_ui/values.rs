@@ -67,7 +67,9 @@ fn shorten(value: &str) -> String {
 /// its `def` down to the stop: each line gets the values of the locals it
 /// names. Lines below the stop have not run, so they get none.
 pub(super) fn inline_notes(text: &str, line: u32, locals: &[Variable]) -> Vec<InlineNote> {
-    let lines: Vec<&str> = text.split('\n').collect();
+    // Only the lines down to the stop are read: this runs at every pause and
+    // the file may be long.
+    let lines: Vec<&str> = text.split('\n').take(line.max(1) as usize).collect();
     let stop = (line.saturating_sub(1) as usize).min(lines.len().saturating_sub(1));
     let Some(stop_line) = lines.get(stop) else {
         return Vec::new();

@@ -394,6 +394,37 @@ fn the_gutter_edits_the_store_and_an_edit_above_moves_the_breakpoint(cx: &mut Te
         .unwrap();
     visual.run_until_parked();
     assert_eq!(lines(&path), [6, 10]);
+    // A breakpoint an agent added whose change is not drawn yet survives a
+    // line typed above, and the ones that moved keep their conditions.
+    breakpoints::store().set(&path, Breakpoint::at(20));
+    window
+        .update(visual, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.replace_bytes(0..0, "# new\n", 6, cx))
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let kept = lines(&path);
+    assert!(kept.contains(&7) && kept.contains(&11), "{kept:?}");
+    assert!(kept.iter().any(|line| *line >= 20), "{kept:?}");
+    assert_eq!(kept.len(), 3);
+    assert_eq!(
+        breakpoints::store().in_file(&path)[1].condition.as_deref(),
+        Some("n > 1")
+    );
+    visual.update(|_, cx| assert_eq!(mark_rows(&path, cx).len(), 3));
+    window
+        .update(visual, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.replace_bytes(0..6, "", 0, cx))
+        })
+        .unwrap();
+    visual.run_until_parked();
+    for line in lines(&path).into_iter().filter(|line| *line > 12) {
+        breakpoints::store().remove(&path, line);
+    }
+    visual.run_until_parked();
+    assert_eq!(lines(&path), [6, 10]);
 
     // A right press opens the breakpoint's form; a left press removes it.
     let first = center(5, visual).unwrap();

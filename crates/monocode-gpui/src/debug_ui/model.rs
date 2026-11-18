@@ -715,6 +715,10 @@ impl Model {
     }
 
     fn print(&mut self, category: OutputCategory, text: &str) {
+        // Nothing was written: the line being written stays open as it was.
+        if text.is_empty() {
+            return;
+        }
         let tone = match category {
             OutputCategory::Stdout => Tone::Stdout,
             OutputCategory::Stderr => Tone::Stderr,

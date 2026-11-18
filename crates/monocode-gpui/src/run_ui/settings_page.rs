@@ -14,11 +14,14 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Window, div,
+    App, Context, Entity, FocusHandle, Focusable, SharedString, Subscription, Task, Window, div,
     prelude::*, px, rgb,
 };
 use monocode_core::{
-    code::run::{self, ProjectRuns, RunConfig, TestRunner, Variable},
+    code::{
+        run::{self, ProjectRuns, RunConfig, TestRunner, Variable},
+        toolchain::Toolchain,
+    },
     files::path_key,
     terminal_setup::invalid_lines,
 };
@@ -70,7 +73,29 @@ pub(crate) struct RunsPage {
     /// Told when the test runner changes, since the gutter's marks depend
     /// on it.
     marks: Option<Entity<Marks>>,
+    /// The command line shown under the form, worked out off the UI thread
+    /// for what it was asked about.
+    preview: Option<Preview>,
+    /// How often the preview was worked out, for the tests.
+    #[cfg(test)]
+    previews: usize,
     _events: Vec<Subscription>,
+}
+
+/// What the preview depends on: the configuration and the focused file's
+/// place and text version.
+#[derive(PartialEq)]
+struct PreviewKey {
+    config: RunConfig,
+    file: Option<targets::FileKey>,
+}
+
+struct Preview {
+    key: PreviewKey,
+    /// The answer for `key`, or for the key before while the new one is
+    /// being worked out.
+    shown: Option<Result<String, String>>,
+    _task: Task<()>,
 }
 
 impl Focusable for RunsPage {
@@ -126,6 +151,9 @@ impl RunsPage {
             unsaved: false,
             filling: false,
             marks,
+            preview: None,
+            #[cfg(test)]
+            previews: 0,
             _events: events,
         };
         let first = this.runs.configs.first().map(|config| config.id.clone());
@@ -298,12 +326,37 @@ impl RunsPage {
     }
 
     /// The command line the selected configuration comes to for the focused
-    /// file, or the sentence saying what it lacks.
-    pub(crate) fn preview(&self, cx: &App) -> Option<Result<String, String>> {
-        let config = self.selected()?;
+    /// file, or the sentence saying what it lacks. Nothing until the first
+    /// answer is in.
+    pub(crate) fn preview(&self) -> Option<Result<String, String>> {
+        self.preview.as_ref()?.shown.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn previews(&self) -> usize {
+        self.previews
+    }
+
+    /// Works the preview out again when what it depends on has changed.
+    /// Finding the interpreter reads the disk, so that runs on a background
+    /// thread; drawing only compares keys.
+    pub(super) fn refresh_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.selected().cloned() else {
+            self.preview = None;
+            return;
+        };
         let project = path_key(&self.project);
         let focused =
             context::focused_file(cx).filter(|file| path_key(&file.checkout.project) == project);
+        let key = PreviewKey {
+            config,
+            file: focused
+                .as_ref()
+                .and_then(|file| targets::file_key(file, cx)),
+        };
+        if self.preview.as_ref().is_some_and(|known| known.key == key) {
+            return;
+        }
         let (checkout, context) = match focused {
             Some(file) => {
                 let context =
@@ -319,15 +372,46 @@ impl RunsPage {
                 (checkout, context)
             }
         };
-        let toolchain = targets::toolchain(&checkout, cx);
-        Some(match run::resolve(config, &context, &toolchain) {
-            Ok(spawn) => Ok(std::iter::once(&spawn.command)
-                .chain(&spawn.args)
-                .map(|word| quoted(word))
-                .collect::<Vec<_>>()
-                .join(" ")),
-            Err(unresolved) => Err(unresolved.to_string()),
-        })
+        #[cfg(test)]
+        {
+            self.previews += 1;
+        }
+        let setup = context::terminal_setup(&checkout.project, cx);
+        let config = key.config.clone();
+        let asked = cx.background_executor().spawn(async move {
+            let toolchain = Toolchain::for_folder(
+                &setup,
+                Path::new(&checkout.folder),
+                Path::new(&checkout.project),
+            );
+            match run::resolve(&config, &context, &toolchain) {
+                Ok(spawn) => Ok(std::iter::once(&spawn.command)
+                    .chain(&spawn.args)
+                    .map(|word| quoted(word))
+                    .collect::<Vec<_>>()
+                    .join(" ")),
+                Err(unresolved) => Err(unresolved.to_string()),
+            }
+        });
+        // What was shown stays until the new answer is in.
+        let shown = self.preview.take().and_then(|old| old.shown);
+        let (config, file) = (key.config.clone(), key.file.clone());
+        self.preview = Some(Preview {
+            key,
+            shown,
+            _task: cx.spawn(async move |this, cx| {
+                let answer = asked.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(known) = &mut this.preview
+                        && known.key.config == config
+                        && known.key.file == file
+                    {
+                        known.shown = Some(answer);
+                        cx.notify();
+                    }
+                });
+            }),
+        });
     }
 }
 
@@ -456,10 +540,10 @@ impl RunsPage {
             })
     }
 
-    fn form_fields(&self, cx: &App) -> gpui::Div {
+    fn form_fields(&self) -> gpui::Div {
         let config = self.selected().cloned().unwrap_or_default();
         let invalid = invalid_lines(&config.env);
-        let preview = self.preview(cx).map(|preview| {
+        let preview = self.preview().map(|preview| {
             let (text, color): (String, gpui::Hsla) = match preview {
                 Ok(line) => (line, content(0.85)),
                 Err(sentence) => (sentence, rgb(0xfbbf24).into()),
@@ -552,6 +636,7 @@ impl RunsPage {
 
 impl Render for RunsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_preview(cx);
         let runner = self.runs.test_runner;
         let choice = |id: &'static str, text: &'static str, value: TestRunner| {
             button(id, text)
@@ -592,7 +677,7 @@ impl Render for RunsPage {
             .child(self.list(cx))
             .child(div().flex().child(add))
             .when(self.selected().is_some(), |d| {
-                d.child(self.form_fields(cx)).child(
+                d.child(self.form_fields()).child(
                     div()
                         .flex()
                         .items_center()

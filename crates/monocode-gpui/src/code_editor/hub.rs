@@ -47,7 +47,12 @@ pub(crate) enum HubEvent {
         path: PathBuf,
         source: SharedString,
     },
-    Gutter(PathBuf),
+    /// One column's marks of a file were replaced; the other column's are
+    /// not meant by it.
+    Gutter {
+        path: PathBuf,
+        slot: GutterSlot,
+    },
     Decorations(PathBuf),
     /// Scroll this row (zero-based) into view in editors showing the file.
     Reveal {
@@ -104,6 +109,8 @@ impl EventEmitter<HubEvent> for Hub {}
 impl Hub {
     /// An editor loaded the file. Two editors on one file share a document:
     /// only the first opens it, and the last one to edit defines its text.
+    /// Loading is not editing, so a later editor's text (from disk, maybe)
+    /// does not replace what an earlier one has typed.
     pub(crate) fn document_opened(
         &mut self,
         doc: Rc<DocumentInfo>,
@@ -112,7 +119,7 @@ impl Hub {
     ) -> u64 {
         if let Some(open) = self.open.get_mut(&doc.path) {
             open.editors += 1;
-            return self.document_changed(&doc.path, text, cx);
+            return open.version;
         }
         self.open.insert(
             doc.path.clone(),
@@ -265,7 +272,10 @@ impl Hub {
         marks.dedup_by_key(|mark| mark.row);
         self.file(path).marks[slot.index()] = marks;
         self.forget_if_empty(path);
-        cx.emit(HubEvent::Gutter(path.to_owned()));
+        cx.emit(HubEvent::Gutter {
+            path: path.to_owned(),
+            slot,
+        });
     }
     pub(crate) fn gutter_marks(&self, path: &Path, slot: GutterSlot) -> &[GutterMark] {
         self.files

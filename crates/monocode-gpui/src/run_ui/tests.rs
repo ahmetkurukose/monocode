@@ -707,11 +707,14 @@ fn the_configurations_page_edits_the_projects_list_in_the_workspace(cx: &mut Tes
             page.set_field(Field::Arguments, "--loud", cx);
             page.set_field(Field::Folder, "sub", cx);
             page.set_field(Field::Environment, "MODE=dev", cx);
-            // Without a focused file the preview says what is missing.
-            assert_eq!(page.preview(cx), Some(Err("No file is focused.".into())));
+            page.refresh_preview(cx);
             page.save(window, cx);
         }),
     );
+    // Without a focused file the preview says what is missing.
+    page.read_with(&fx.visual, |page, _| {
+        assert_eq!(page.preview(), Some(Err("No file is focused.".into())));
+    });
     let runs = saved(&mut fx).expect("the project has an entry now");
     assert_eq!(runs.configs.len(), 1);
     let echo = runs.configs[0].clone();
@@ -730,9 +733,15 @@ fn the_configurations_page_edits_the_projects_list_in_the_workspace(cx: &mut Tes
 
     // With a file focused the preview is the command line it comes to.
     fx.open("hello.py");
-    page.read_with(&fx.visual, |page, cx| {
-        assert_eq!(page.preview(cx), Some(Ok("echo hello.py --loud".into())));
+    edit(&mut fx, Box::new(|page, _, cx| page.refresh_preview(cx)));
+    page.read_with(&fx.visual, |page, _| {
+        assert_eq!(page.preview(), Some(Ok("echo hello.py --loud".into())));
     });
+    // Drawing again asks again, and nothing is worked out twice for it.
+    let worked = page.read_with(&fx.visual, |page, _| page.previews());
+    edit(&mut fx, Box::new(|page, _, cx| page.refresh_preview(cx)));
+    edit(&mut fx, Box::new(|page, _, cx| page.refresh_preview(cx)));
+    page.read_with(&fx.visual, |page, _| assert_eq!(page.previews(), worked));
 
     // Duplicate, move, remove and the test runner are saved as they happen.
     edit(
@@ -944,6 +953,25 @@ fn quick_open_runs_what_is_offered_reruns_the_last_and_stops_what_runs(cx: &mut 
     );
 
     pick(&mut fx, "Run: Current file");
+    // Typing in quick open asks again and again; what is offered is
+    // worked out once for where the caret is, and again when it moves.
+    let built = fx.visual.update(|_, cx| super::commands::times_built(cx));
+    titles(&mut fx);
+    titles(&mut fx);
+    assert_eq!(
+        fx.visual.update(|_, cx| super::commands::times_built(cx)),
+        built
+    );
+    fx.visual.update(|_, cx| {
+        let editor = context::focused_file(cx).unwrap().editor.upgrade().unwrap();
+        let input = editor.read(cx).input.clone();
+        input.update(cx, |input, cx| input.select_range(3..3, cx));
+    });
+    titles(&mut fx);
+    assert_eq!(
+        fx.visual.update(|_, cx| super::commands::times_built(cx)),
+        built + 1
+    );
     fx.wait("the picked run", |_| fx_runs(&root).len() == 1);
     let first = fx.runs()[0].id;
     fx.wait_for_end(first);

@@ -534,7 +534,8 @@ impl Input {
         let Some(code) = &mut self.code else {
             return;
         };
-        let doc = code.document();
+        // Most editors have no extension: nothing below is built for them,
+        // and the document is only named once a provider is to be told.
         let Some(ext) = &mut code.ext else {
             return;
         };
@@ -544,7 +545,8 @@ impl Input {
                 && let Some(decor) = &code.decor
             {
                 let marks = decor.marks[slot.index()].clone();
-                let doc = doc.clone();
+                let doc =
+                    (ext.doc.clone()).unwrap_or_else(|| Rc::new(DocumentInfo::new(&code.path, "")));
                 // The provider may reach back into the editor's owner.
                 cx.defer(move |cx| provider.moved(&doc, &marks, cx));
             }

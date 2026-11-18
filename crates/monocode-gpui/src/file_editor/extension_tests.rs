@@ -237,6 +237,133 @@ fn hub_diagnostics_and_marks_reach_the_editor_at_open_and_after_at_their_version
     assert_eq!(ranges(cx), ["os"]);
 }
 
+#[gpui::test]
+fn one_columns_new_marks_do_not_bring_back_the_other_columns_old_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_app.py");
+    std::fs::write(&path, "def test_a():\n    pass\n").unwrap();
+    let mark = |row, kind| GutterMark {
+        row,
+        kind,
+        tooltip: "mark".into(),
+    };
+    let breakpoint = |row| {
+        mark(
+            row,
+            GutterMarkKind::Breakpoint(code_editor::Breakpoint::Enabled),
+        )
+    };
+    cx.update(|cx| {
+        code_editor::hub(cx).update(cx, |hub, cx| {
+            hub.set_gutter_marks(&path, GutterSlot::Breakpoint, vec![breakpoint(1)], cx);
+            hub.set_gutter_marks(
+                &path,
+                GutterSlot::Run,
+                vec![mark(0, GutterMarkKind::Run)],
+                cx,
+            );
+        });
+    });
+    let window = open(&path, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.select_range(0..0, cx))
+        })
+        .unwrap();
+    type_text(window, "import os\n", cx);
+    let rows = |cx: &mut VisualTestContext, slot| {
+        window
+            .update(cx, |view, _, cx| {
+                let input = view.input.read(cx);
+                (input.gutter_marks(slot).iter().map(|mark| mark.row)).collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    // The editor moved both columns itself.
+    assert_eq!(rows(cx, GutterSlot::Breakpoint), [2]);
+    assert_eq!(rows(cx, GutterSlot::Run), [1]);
+    // The breakpoint column reports the move; the hub still holds the run
+    // marks of before the edit and says nothing about them.
+    cx.update(|_, cx| {
+        code_editor::hub(cx).update(cx, |hub, cx| {
+            hub.set_gutter_marks(&path, GutterSlot::Breakpoint, vec![breakpoint(2)], cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(cx, GutterSlot::Breakpoint), [2]);
+    assert_eq!(rows(cx, GutterSlot::Run), [1]);
+}
+
+#[gpui::test]
+fn two_editors_on_one_file_follow_the_one_edited_last(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.py");
+    std::fs::write(&path, "value = 1\n").unwrap();
+    let hub_text = |cx: &mut VisualTestContext, path: &Path| {
+        cx.update(|_, cx| {
+            let hub = code_editor::hub(cx);
+            let open = hub
+                .read(cx)
+                .document(path)
+                .map(|open| open.text.to_string());
+            (
+                open,
+                hub.read(cx).document(path).map_or(0, |open| open.version),
+            )
+        })
+    };
+    let first = open(&path, cx);
+    let first_cx = &mut VisualTestContext::from_window(first.into(), cx);
+    first_cx.run_until_parked();
+    first
+        .update(first_cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.select_range(0..0, cx))
+        })
+        .unwrap();
+    type_text(first, "# typed in the first\n", first_cx);
+    settle(first_cx, 250);
+    let typed = "# typed in the first\nvalue = 1\n";
+    assert_eq!(hub_text(first_cx, &path).0.as_deref(), Some(typed));
+
+    // A second pane opens the file from disk: that is not an edit.
+    let second = open(&path, cx);
+    let second_cx = &mut VisualTestContext::from_window(second.into(), cx);
+    second_cx.run_until_parked();
+    let (text, version) = hub_text(second_cx, &path);
+    assert_eq!(text.as_deref(), Some(typed));
+    // Nor is it when the second one is asked to report what it has not
+    // changed, as a hover or a completion does.
+    let reported = second
+        .update(second_cx, |view, _, cx| view.sync_document(cx))
+        .unwrap();
+    assert_eq!(reported, version);
+    assert_eq!(
+        hub_text(second_cx, &path),
+        (Some(typed.to_owned()), version)
+    );
+
+    // Editing in the second one makes it the one the document follows, and
+    // the first one's unchanged buffer no longer disturbs it.
+    second
+        .update(second_cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.select_range(0..0, cx))
+        })
+        .unwrap();
+    type_text(second, "# typed in the second\n", second_cx);
+    settle(second_cx, 250);
+    let newest = "# typed in the second\nvalue = 1\n";
+    assert_eq!(hub_text(second_cx, &path).0.as_deref(), Some(newest));
+    first
+        .update(second_cx, |view, _, cx| view.sync_document(cx))
+        .unwrap();
+    assert_eq!(hub_text(second_cx, &path).0.as_deref(), Some(newest));
+}
+
 struct Feature {
     lib: PathBuf,
 }

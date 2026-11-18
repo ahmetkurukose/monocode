@@ -17,6 +17,8 @@ use monocode_core::code::{
 
 /// The most lines kept on screen; the registry's tail is about this much.
 const MAX_LINES: usize = 20_000;
+/// The most of a line without its end that is held back before it is listed.
+const MAX_PARTIAL: usize = 64 * 1024;
 
 pub(crate) struct OutputView {
     id: RunId,
@@ -84,6 +86,12 @@ impl OutputView {
                 let line: String = self.partial.drain(..=end).collect();
                 self.lines
                     .push(line.trim_end_matches('\n').to_owned().into());
+            }
+            // A program that never ends its line would grow this without end.
+            if self.partial.len() > MAX_PARTIAL {
+                let cut = self.partial.floor_char_boundary(MAX_PARTIAL);
+                let line: String = self.partial.drain(..cut).collect();
+                self.lines.push(line.into());
             }
             if self.lines.len() > MAX_LINES {
                 let extra = self.lines.len() - MAX_LINES;

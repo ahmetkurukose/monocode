@@ -256,6 +256,17 @@ impl DebugTab {
                         (this.console_scroll).scroll_to_item(lines - 1, ScrollStrategy::Nearest);
                     }
                 }
+                // A variable being edited belongs to the stop it was shown
+                // at: its reference is dead once the program has moved.
+                if let Some(editing) = &this.editing {
+                    let rows = &model.read(cx).var_rows;
+                    let there = rows
+                        .iter()
+                        .any(|row| row.path == editing.path && row.parent == editing.parent);
+                    if !there {
+                        this.editing = None;
+                    }
+                }
                 cx.notify();
             }),
             cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.submit(cx)),
@@ -323,6 +334,11 @@ impl DebugTab {
         } else {
             (event.position.x - bounds.left()) / bounds.size.width
         };
+        // A tab that has no size yet divides by nothing; the dividers keep
+        // where they were rather than turning into NaN.
+        if !share.is_finite() {
+            return;
+        }
         let (first, second) = self.split;
         self.split = if divider == 0 {
             (share.clamp(MIN_SHARE, second - MIN_SHARE), second)

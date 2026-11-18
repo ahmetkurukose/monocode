@@ -167,7 +167,10 @@ servers. `lsp::Manager` is the only way in, for the editor and for the agents' t
 (based)pyright gets the interpreter as `python.pythonPath` and `diagnosticMode:
 openFilesOnly` through `workspace/configuration`, so a monorepo is not analysed whole.
 A path the user set for a server id (`ManagerOptions::tool_paths`) is used or nothing is.
-Only Python has been run against real servers; the others are registered and untested.
+Only Python has been run against real servers; the others are registered and untested, so
+they are off by default and a project switches each on in its "Code insight" settings page
+(group "Other languages - not yet verified"). A language that is off has no server, no
+providers, no chip entry and no missing-tool notice, for the editor and for the agents' tools.
 
 **Root and identity.** The root is the nearest folder at or above the file, inside the
 checkout, holding one of the server's markers (`pyproject.toml`, `setup.py`,
@@ -419,7 +422,7 @@ and features meet.
 |---|---|---|
 | `completion` | `CompletionProvider` | 100 ms after a word character or one of its trigger characters, or Ctrl+Space; answers the caret has left are dropped; items are narrowed and ordered by the editor |
 | `hover` | `HoverProvider` | mouse at rest 350 ms on a word, or F1 at the caret |
-| `signature` | `SignatureProvider` | on `(` and `,`, then at every caret move until it answers `None`; Cmd+Shift+Space |
+| `signature` | `SignatureProvider` | on `(` and `,`, then at every caret move until it answers `None`; Ctrl+Shift+Space (Cmd+Shift+Space is the quick composer's) |
 | `links` | `LinkProvider` | Cmd-hover (underline), Cmd-click, F12, context menu |
 | `references` | `ReferencesProvider` | Shift+F12, context menu |
 | `breakpoints`, `run_markers` | `GutterProvider` | a press in its gutter column (`menu` first: a `GutterMenu` the editor opens at the press, else `click`); an edit moved its marks |
@@ -555,6 +558,10 @@ markers for Go, Rust and JavaScript (their file tasks are in the header menu).
   language: a breadth-first walk skipping dot folders and vendored ones, at most 1,500
   files of 512 KiB and 700 ms. Prefix matches first, then inside the name, then letters
   in order.
+  A mode registers `applies`: `@` applies only with a file of a language that has an
+  outline in front, and never on quick open's Content tab; where it does not apply, or finds
+  nothing, the whole query (the `@` included) ranks files as usual, so `@types` still finds
+  the folder.
 - **Chip** (`chip.rs`, `code-servers`). The servers of the checkout in front and of the
   file in front: hidden with none, quiet when ready (`2 servers`), busy while starting or
   indexing, a warning for a missing tool or a failed server. Its list has a row per
@@ -563,8 +570,9 @@ markers for Go, Rust and JavaScript (their file tasks are in the header menu).
   install hint, a failed one its message, both copyable, and "Set its path…" opens the
   settings. "Look again" on either rebuilds the checkout's context from disk first.
   Running servers are registered with `code_shell::processes`.
-- **Settings** (`settings.rs`, page `code-insight`). Per project: on or off, each server
-  on or off, an executable per server. Saving applies it: the project's documents are
+- **Settings** (`settings.rs`, page `code-insight`). Per project: on or off, each Python
+  server on or off, the other languages' servers (off until listed under `languages`), an
+  executable per server. Saving applies it: the project's documents are
   closed, its servers stopped, and what may be open is opened again. The idle minutes
   and the server cap are the app's; saving them writes them to every open project.
 - **Lifecycle.** `CheckoutRemoved` and `ProjectClosed` close the checkout's documents

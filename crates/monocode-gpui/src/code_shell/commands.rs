@@ -41,6 +41,7 @@ pub(crate) struct Item {
 }
 
 type CommandSource = Rc<dyn Fn(&Scope, &App) -> Vec<Command>>;
+type Applies = Rc<dyn Fn(&App) -> bool>;
 type Search = Rc<dyn Fn(String, Scope, &mut App) -> Task<Vec<Item>>>;
 
 #[derive(Clone)]
@@ -51,6 +52,10 @@ pub(crate) struct Mode {
     pub prefix: char,
     /// Shown while the mode has nothing to list: "Type to search symbols".
     pub hint: &'static str,
+    /// Whether the mode has something to search right now. While it has
+    /// not, its prefix is an ordinary character of the query, so `@types`
+    /// still finds the folder.
+    pub applies: Applies,
     /// The rows for the text after the prefix. Called on the UI thread a
     /// moment after typing stops; the work belongs in the task. A newer
     /// query drops the task of the one before.
@@ -103,6 +108,7 @@ pub(crate) fn commands(scope: &Scope, cx: &App) -> Vec<Command> {
 /// The mode `query` is in, with what follows its prefix.
 pub(crate) fn mode_for(query: &str, cx: &App) -> Option<(Mode, String)> {
     let prefix = query.chars().next()?;
-    let mode = (cx.try_global::<Registry>()?.modes.iter()).find(|mode| mode.prefix == prefix)?;
+    let mode = (cx.try_global::<Registry>()?.modes.iter())
+        .find(|mode| mode.prefix == prefix && (mode.applies)(cx))?;
     Some((mode.clone(), query[prefix.len_utf8()..].trim().to_owned()))
 }

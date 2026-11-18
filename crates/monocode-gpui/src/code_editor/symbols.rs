@@ -63,6 +63,23 @@ pub(crate) struct Runnable {
     pub row: usize,
 }
 
+/// Whether `outline` knows what a symbol is in `language`.
+pub(crate) fn has_rules(language: &str) -> bool {
+    matches!(
+        language,
+        "python"
+            | "javascript"
+            | "typescript"
+            | "typescriptreact"
+            | "rust"
+            | "go"
+            | "java"
+            | "c"
+            | "cpp"
+            | "ruby"
+    )
+}
+
 /// The outline of a file in source order, parsed from scratch. Empty for a
 /// language without a grammar or without symbol rules.
 pub(crate) fn outline(path: &str, text: &str) -> Vec<Symbol> {

@@ -216,7 +216,7 @@ pub(crate) fn usages_shown(cx: &App) -> Option<(String, usize, Vec<String>)> {
 
 /// The Outline tab's rows, each marked when the caret is in it.
 pub(crate) fn outline_listed(cx: &App) -> Vec<(String, bool)> {
-    outline::shown(cx).map_or_else(Vec::new, |view| view.read(cx).listed(cx))
+    outline::shown(cx).map_or_else(Vec::new, |view| view.read(cx).listed())
 }
 
 pub(crate) fn outline_filter(text: &str, cx: &mut App) {
@@ -245,6 +245,12 @@ fn with_settings_page(
 pub(crate) fn set_tool_path(server: &str, path: &str, window: &mut gpui::Window, cx: &mut App) {
     with_settings_page(window, cx, |page, window, cx| {
         page.set_tool_path(server, path, window, cx)
+    });
+}
+
+pub(crate) fn set_language(server: &str, on: bool, window: &mut gpui::Window, cx: &mut App) {
+    with_settings_page(window, cx, |page, window, cx| {
+        page.set_language(server, on, window, cx)
     });
 }
 

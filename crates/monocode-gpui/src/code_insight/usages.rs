@@ -8,8 +8,9 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, Global, HighlightStyle,
-    KeyDownEvent, Role, ScrollHandle, SharedString, StyledText, Window, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, FontWeight, Global,
+    HighlightStyle, KeyDownEvent, Role, ScrollStrategy, SharedString, StyledText,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use std::{collections::HashSet, ops::Range, path::PathBuf};
 
@@ -112,7 +113,7 @@ pub(super) struct Usages {
     /// Where the last opened row left from, for the history.
     last: Location,
     focus: FocusHandle,
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
 }
 
 impl Focusable for Usages {
@@ -164,7 +165,7 @@ impl Usages {
             selected,
             last: found.origin.clone(),
             focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -187,7 +188,7 @@ impl Usages {
         if let Some(next) = next {
             self.selected = Some(next);
             let shown = (0..next).filter(|index| self.visible(*index)).count();
-            self.scroll.scroll_to_item(shown);
+            self.scroll.scroll_to_item(shown, ScrollStrategy::Nearest);
             cx.notify();
         }
     }
@@ -250,6 +251,106 @@ impl Usages {
     }
 }
 
+impl Usages {
+    /// One row of the list, a file's heading or a usage.
+    fn row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.selected;
+        match &self.rows[index] {
+            Row::File {
+                group,
+                shown,
+                count,
+            } => {
+                let group = *group;
+                div()
+                    .id(("usages-file", index))
+                    .role(Role::Button)
+                    .aria_label(shown.clone())
+                    .cursor_pointer()
+                    .h(px(24.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .hover(|s| s.bg(content(0.06)))
+                    .child(icon(
+                        match self.collapsed.contains(&group) {
+                            true => "chevron-right",
+                            false => "chevron-down",
+                        },
+                        12.,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(content(0.85))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(shown.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(content(0.4))
+                            .child(count.to_string()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(group, cx)))
+                    .into_any_element()
+            }
+            Row::Usage {
+                location,
+                text,
+                mark,
+                ..
+            } => {
+                let line =
+                    StyledText::new(text.clone()).with_highlights(mark.clone().map(|range| {
+                        (
+                            range,
+                            HighlightStyle {
+                                color: Some(accent_color()),
+                                font_weight: Some(FontWeight::BOLD),
+                                ..Default::default()
+                            },
+                        )
+                    }));
+                div()
+                    .id(("usages-row", index))
+                    .role(Role::Link)
+                    .aria_label(format!("Line {}: {text}", location.line))
+                    .cursor_pointer()
+                    .h(px(24.))
+                    .pl(px(22.))
+                    .pr_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(selected == Some(index), |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.06)))
+                    .child(
+                        div()
+                            .w(px(34.))
+                            .flex_shrink_0()
+                            .text_color(content(0.4))
+                            .child(location.line.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::fonts::mono())
+                            .text_color(content(0.75))
+                            .child(line),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.open(index, window, cx)))
+                    .into_any_element()
+            }
+        }
+    }
+}
+
 impl Render for Usages {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let summary = format!(
@@ -259,105 +360,10 @@ impl Render for Usages {
             self.files,
             if self.files == 1 { "file" } else { "files" },
         );
-        let selected = self.selected;
-        let rows: Vec<gpui::AnyElement> = (0..self.rows.len())
+        let visible: Vec<usize> = (0..self.rows.len())
             .filter(|index| self.visible(*index))
-            .map(|index| match &self.rows[index] {
-                Row::File {
-                    group,
-                    shown,
-                    count,
-                } => {
-                    let group = *group;
-                    div()
-                        .id(("usages-file", index))
-                        .role(Role::Button)
-                        .aria_label(shown.clone())
-                        .cursor_pointer()
-                        .h(px(24.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .hover(|s| s.bg(content(0.06)))
-                        .child(icon(
-                            match self.collapsed.contains(&group) {
-                                true => "chevron-right",
-                                false => "chevron-down",
-                            },
-                            12.,
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(content(0.85))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(shown.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(content(0.4))
-                                .child(count.to_string()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| this.toggle(group, cx)))
-                        .into_any_element()
-                }
-                Row::Usage {
-                    location,
-                    text,
-                    mark,
-                    ..
-                } => {
-                    let line =
-                        StyledText::new(text.clone()).with_highlights(mark.clone().map(|range| {
-                            (
-                                range,
-                                HighlightStyle {
-                                    color: Some(accent_color()),
-                                    font_weight: Some(FontWeight::BOLD),
-                                    ..Default::default()
-                                },
-                            )
-                        }));
-                    div()
-                        .id(("usages-row", index))
-                        .role(Role::Link)
-                        .aria_label(format!("Line {}: {text}", location.line))
-                        .cursor_pointer()
-                        .h(px(22.))
-                        .pl(px(22.))
-                        .pr_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(selected == Some(index), |d| d.bg(content(0.1)))
-                        .hover(|s| s.bg(content(0.06)))
-                        .child(
-                            div()
-                                .w(px(34.))
-                                .flex_shrink_0()
-                                .text_color(content(0.4))
-                                .child(location.line.to_string()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(crate::fonts::mono())
-                                .text_color(content(0.75))
-                                .child(line),
-                        )
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.open(index, window, cx)),
-                        )
-                        .into_any_element()
-                }
-            })
             .collect();
+        let entity = cx.entity();
         div()
             .id("code-usages")
             .debug_selector(|| "code-usages".into())
@@ -402,9 +408,24 @@ impl Render for Usages {
                     .id("code-usages-list")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(rows)
+                    .flex()
+                    .flex_col()
+                    // Only the rows in view are built.
+                    .child(
+                        uniform_list("code-usages-rows", visible.len(), move |range, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                range
+                                    .filter_map(|at| {
+                                        let index = *visible.get(at)?;
+                                        Some(this.row(index, cx))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .track_scroll(&self.scroll)
+                        .flex_1()
+                        .min_h_0(),
+                    )
                     .when(self.total > MAX_ROWS, |d| {
                         d.child(
                             div()
