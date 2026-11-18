@@ -280,19 +280,44 @@ fn marks_moved(path: &Path, marks: &[GutterMark], cx: &mut App) {
         return;
     }
     let before = store().in_file(path);
-    let after: Vec<Breakpoint> = (moved.iter())
-        .filter_map(|(old_line, (_, line))| {
-            let mut breakpoint = before.iter().find(|known| known.line == *old_line)?.clone();
-            breakpoint.line = *line;
+    // Only what the gutter drew is touched. A breakpoint added through the
+    // store whose change is not drawn yet is not in `shown` and stays as it
+    // is, and the ones that did not move keep their ids and answers.
+    let leaving: Vec<u32> = (shown.iter())
+        .map(|(_, line)| *line)
+        .filter(|line| {
+            !moved
+                .iter()
+                .any(|(old, (_, new))| old == line && new == line)
+        })
+        .collect();
+    let arriving: Vec<Breakpoint> = (moved.iter())
+        .filter(|(old, (_, new))| old != new)
+        .filter_map(|(old, (_, new))| {
+            let mut breakpoint = before.iter().find(|known| known.line == *old)?.clone();
+            breakpoint.line = *new;
             Some(breakpoint)
         })
         .collect();
     let state = cx.default_global::<State>();
     state.shown.insert(path.to_owned(), now);
-    *state.own_writes.entry(path.to_owned()).or_default() += 1;
-    // One replacement of the file's list, so breakpoints trading lines
-    // never meet halfway.
-    store().load_json(&json!({ "files": { path.to_string_lossy(): after } }));
+    // Every write that changes the store comes back as a change that is
+    // already drawn; they are counted to be skipped. All leave first, so
+    // breakpoints trading lines never meet halfway.
+    let mut writes = 0;
+    for line in leaving {
+        writes += usize::from(store().remove(path, line));
+    }
+    for breakpoint in arriving {
+        store().set(path, breakpoint);
+        writes += 1;
+    }
+    if writes > 0 {
+        *cx.default_global::<State>()
+            .own_writes
+            .entry(path.to_owned())
+            .or_default() += writes;
+    }
     // The editor that was typed in is already right; the hub's copy serves
     // the others and editors opened later.
     let marks = marks.to_vec();
