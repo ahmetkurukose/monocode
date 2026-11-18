@@ -53,11 +53,19 @@ def processes():
     return found
 
 
-def fresh_world():
+def fresh_world(venv=VENV):
     for name in ("data", "home"):
         shutil.rmtree(f"{ROOT}/{name}", ignore_errors=True)
         os.makedirs(f"{ROOT}/{name}")
-    subprocess.run([sys.executable, f"{HERE}/sample.py", PROJECT, VENV], check=True)
+    subprocess.run([sys.executable, f"{HERE}/sample.py", PROJECT, venv], check=True)
+
+
+def venv_without_debugpy():
+    """A virtual environment with nothing in it, for the missing-adapter step."""
+    path = f"{ROOT}/venv-nodebugpy"
+    shutil.rmtree(path, ignore_errors=True)
+    subprocess.run(["uv", "venv", "-q", path], check=True)
+    return path
 
 
 def start_app(extra, log):
@@ -131,7 +139,7 @@ def main():
     parser.add_argument(
         "--only",
         default="",
-        help="comma list of insight,run,debug,idle (in the window) and agent,sigterm,sigkill",
+        help="comma list of insight,run,debug,idle (in the window), nodebugpy, agent, sigkill",
     )
     args = parser.parse_args()
     if not os.path.exists(APP):
@@ -148,15 +156,17 @@ def main():
     os.makedirs(SHOTS)
     steps = []
 
-    if not wanted or in_app:
-        fresh_world()
+    def window(only, venv=VENV):
+        """One run of the app in its window, driving itself through `only`."""
+        out = []
+        fresh_world(venv)
         result = f"{ROOT}/result.json"
         if os.path.exists(result):
             os.remove(result)
         extra = {
             "MONOCODE_CODE_SELFTEST": result,
             "MONOCODE_CODE_SELFTEST_SHOTS": SHOTS,
-            "MONOCODE_CODE_SELFTEST_ONLY": ",".join(in_app),
+            "MONOCODE_CODE_SELFTEST_ONLY": ",".join(only),
         }
         app = start_app(extra, f"{ROOT}/app.log")
         try:
@@ -172,15 +182,21 @@ def main():
         time.sleep(1.5)
         left = sweep(before)
         show(report)
-        steps += report.get("steps", [])
+        out += report.get("steps", [])
         if not report.get("finished"):
             print("NOT FINISHED; the app's log ends with:")
             print("".join(open(f"{ROOT}/app.log").readlines()[-25:]))
         ok = quit_itself and not left
         print(f"{'PASS' if ok else 'FAIL'}   12a quitting leaves no process behind",
               json.dumps({"quit_by_itself": quit_itself, "left": left}))
-        steps.append({"step": "12a", "name": "quitting leaves no process behind", "pass": ok,
-                      "detail": {"quit_by_itself": quit_itself, "left": left}})
+        out.append({"step": "12a", "name": "quitting leaves no process behind", "pass": ok,
+                    "detail": {"quit_by_itself": quit_itself, "left": left}})
+        return out
+
+    if not wanted or in_app:
+        steps += window(in_app)
+    if do("nodebugpy"):
+        steps += window(["nodebugpy"], venv_without_debugpy())
 
     if do("agent"):
         fresh_world()

@@ -80,6 +80,10 @@ impl Driver {
         }
         let only = std::env::var("MONOCODE_CODE_SELFTEST_ONLY").unwrap_or_default();
         let wanted = |part: &str| only.is_empty() || only.split(',').any(|name| name == part);
+        if only.split(',').any(|name| name == "nodebugpy") {
+            self.missing_adapter(cx).await;
+            return;
+        }
         if wanted("insight") {
             self.insight(cx).await;
         }

@@ -12,6 +12,35 @@ impl Driver {
         self.debug_test(cx).await;
     }
 
+    /// Step 14, in a project whose environment has no debugpy: Debug says
+    /// so and offers the command that installs it.
+    pub(super) async fn missing_adapter(&mut self, cx: &mut Cx) {
+        let opened = self.open(cx, SCRIPT).await;
+        self.calm(cx).await;
+        let clicked = self.click_on(cx, "file-header-debug-file").await;
+        let shown = self
+            .until(cx, 20_000, |window, _| {
+                window.debug_bounds("debug-start-notice").is_some()
+            })
+            .await;
+        self.pause(cx, 500).await;
+        let command_drawn = self.bounds(cx, "debug-install-command").is_some();
+        let copy_drawn = self.bounds(cx, "debug-copy-command").is_some();
+        let notice = self.app(cx, |_, cx| crate::run_ui::probe::last_notice(cx));
+        let sessions = self.debug_sessions(cx).len();
+        self.shot(cx, "debugpy-missing").await;
+        self.record(
+            "14",
+            "Debug in a project whose environment has no debugpy shows why, with the command that installs it",
+            opened && clicked && shown && command_drawn && copy_drawn && sessions == 0,
+            json!({
+                "debug_clicked": clicked, "notice_tab_drawn": shown,
+                "install_command_drawn": command_drawn, "copy_button_drawn": copy_drawn,
+                "sessions": sessions, "notice": notice,
+            }),
+        );
+    }
+
     pub(super) fn debug_sessions(&self, cx: &mut Cx) -> Vec<Value> {
         self.app(cx, |_, cx| probe::sessions(cx))
             .unwrap_or_default()
