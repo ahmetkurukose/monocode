@@ -297,13 +297,38 @@ impl Driver {
             })
             .await;
         let back = self.place(cx);
+
+        // The same by key: the caret in the name, F12.
+        let mut by_key = None;
+        if let Some((_, at)) = self.glyph(cx, "apply_discount(order, 80)") {
+            self.click(cx, at + point(px(20.), px(0.))).await;
+            self.keys(cx, "f12").await;
+            let target = self.path("shop/models.py").to_string_lossy().into_owned();
+            self.until(cx, 8000, |_, cx| {
+                context::focused_file(cx).is_some_and(|file| file.path == target)
+            })
+            .await;
+            self.pause(cx, 500).await;
+            by_key = self.place(cx);
+            self.shot(cx, "definition-by-f12").await;
+        }
+        let key_ok = by_key.as_ref().is_some_and(|(path, line, _)| {
+            path.ends_with("shop/models.py") && Some(*line) == definition_line
+        });
+        self.keys(cx, "ctrl--").await;
+        let returned_again = self
+            .until(cx, 5000, |_, cx| {
+                context::focused_file(cx).is_some_and(|file| file.path == origin)
+            })
+            .await;
         self.record(
             "4",
-            "hover shows the type; Cmd-click opens the definition in the other module; Back returns",
-            hover_ok && definition_ok && returned,
+            "hover shows the type; Cmd-click and F12 open the definition in the other module; Back returns",
+            hover_ok && definition_ok && returned && key_ok && returned_again,
             json!({
                 "hover": hover, "link_tried": underlined, "from": from,
                 "landed": landed, "definition_line": definition_line, "back": back,
+                "by_f12": by_key, "back_again": returned_again,
             }),
         );
     }
