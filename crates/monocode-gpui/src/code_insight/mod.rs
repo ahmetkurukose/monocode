@@ -8,6 +8,8 @@
 mod chip;
 mod convert;
 mod outline;
+#[cfg(feature = "selftest")]
+pub(crate) mod probe;
 mod providers;
 mod settings;
 mod symbol_search;

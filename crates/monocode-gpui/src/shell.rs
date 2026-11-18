@@ -6,6 +6,8 @@ mod automation_runs;
 mod browser_agent;
 mod browser_panes;
 mod browser_selftest;
+#[cfg(feature = "selftest")]
+mod code_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -9162,6 +9164,8 @@ impl Render for Shell {
         if !std::mem::replace(&mut self.browser_selftest_started, true) {
             self.start_browser_agent(window, cx);
             self.start_browser_selftest(window, cx);
+            #[cfg(feature = "selftest")]
+            self.start_code_selftest(window, cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);

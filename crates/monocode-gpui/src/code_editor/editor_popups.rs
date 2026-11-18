@@ -454,13 +454,13 @@ impl Input {
         }
         cx.notify();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn gutter_menu_open(&self) -> bool {
         (self.code.as_ref())
             .and_then(|code| code.ext.as_ref())
             .is_some_and(|ext| ext.gutter_menu.is_some())
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn picker_targets(&self) -> Option<&[ResolvedTarget]> {
         let picker = self.code.as_ref()?.ext.as_ref()?.picker.as_ref()?;
         Some(&picker.targets)
@@ -586,7 +586,7 @@ impl Input {
         ext.hover_probe = Some(range.clone());
         self.request_hover(at, range, Duration::ZERO, window, cx);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn hover_text(&self) -> Option<(Range<usize>, SharedString)> {
         let hover = self.code.as_ref()?.ext.as_ref()?.hover.as_ref()?;
         Some((hover.range.clone(), hover.doc.text.clone()))
@@ -642,7 +642,7 @@ impl Input {
             cx.propagate();
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn signature_shown(&self) -> Option<&Signature> {
         let popup = self.code.as_ref()?.ext.as_ref()?.signature.as_ref()?;
         Some(&popup.signature)

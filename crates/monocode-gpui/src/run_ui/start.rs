@@ -198,7 +198,7 @@ pub(crate) fn agent_name(session: i64, cx: &App) -> SharedString {
 }
 
 /// The last sentence a start showed the user.
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 pub(crate) fn last_notice(cx: &App) -> Option<String> {
     cx.global::<State>().notice.clone()
 }

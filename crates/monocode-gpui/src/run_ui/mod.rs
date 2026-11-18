@@ -9,6 +9,8 @@ mod commands;
 mod gutter;
 mod header;
 mod output;
+#[cfg(feature = "selftest")]
+pub(crate) mod probe;
 mod settings_page;
 mod start;
 mod targets;

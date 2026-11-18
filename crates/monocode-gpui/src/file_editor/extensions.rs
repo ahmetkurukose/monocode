@@ -413,7 +413,9 @@ impl FileEditor {
             on_pick,
         } = action;
         let tip = tooltip.clone();
+        let selector = id.clone();
         let button = icon_action(id.clone(), tooltip, path, enabled)
+            .debug_selector(move || format!("file-header-{selector}"))
             .when(active, |d| d.bg(content(0.15)))
             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
             .when(enabled, |d| {
@@ -427,8 +429,10 @@ impl FileEditor {
         let (Some(menu), Some(on_pick)) = (menu, on_pick) else {
             return button.into_any_element();
         };
+        let selector = id.clone();
         let dropdown = div()
             .id(SharedString::from(format!("{id}-menu")))
+            .debug_selector(move || format!("file-header-{selector}-menu"))
             .role(gpui::Role::Button)
             .aria_label("More")
             .cursor_pointer()

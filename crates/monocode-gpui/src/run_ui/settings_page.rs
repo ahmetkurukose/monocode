@@ -42,7 +42,7 @@ pub(super) fn init(marks: Entity<Marks>, cx: &mut App) {
 
 /// The fields of the selected configuration's form, for a test to type
 /// into.
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Field {
     Name,
@@ -140,7 +140,7 @@ impl RunsPage {
     pub(crate) fn selected(&self) -> Option<&RunConfig> {
         self.runs.get(self.selected.as_deref()?)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     fn field(&self, field: Field) -> &Entity<Input> {
         match field {
             Field::Name => &self.name,
@@ -151,7 +151,7 @@ impl RunsPage {
         }
     }
     /// Types `text` into a field of the form, as the keyboard would.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn set_field(&mut self, field: Field, text: &str, cx: &mut Context<Self>) {
         let input = self.field(field).clone();
         input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));

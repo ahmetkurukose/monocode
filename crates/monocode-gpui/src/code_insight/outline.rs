@@ -45,7 +45,7 @@ pub(super) fn install(cx: &mut App) {
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 pub(super) fn shown(cx: &App) -> Option<Entity<Outline>> {
     cx.try_global::<Shown>().map(|shown| shown.0.clone())
 }
@@ -244,7 +244,7 @@ impl Outline {
     }
 
     /// The names listed, each marked when it is the caret's symbol.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn listed(&self, cx: &App) -> Vec<(String, bool)> {
         let current = self.current();
         (self.rows(cx).into_iter())
@@ -252,14 +252,14 @@ impl Outline {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn filter_by(&mut self, text: &str, cx: &mut Context<Self>) {
         (self.filter).update(cx, |filter, cx| filter.set_text(text.to_owned(), cx));
         self.selected = None;
         cx.notify();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn jump_to_named(
         &mut self,
         name: &str,

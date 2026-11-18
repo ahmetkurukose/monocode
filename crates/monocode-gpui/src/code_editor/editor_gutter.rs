@@ -145,7 +145,7 @@ impl Input {
                 .into_any_element(),
         )
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn gutter_slot_center(&self, slot: GutterSlot, row: usize) -> Option<Point<Pixels>> {
         let code = self.code.as_ref()?;
         let bounds = self.bounds?;
@@ -155,6 +155,14 @@ impl Input {
             bounds.top() + px(code.top(row, self.line_height) + self.line_height / 2.)
                 - self.scroll_y,
         ))
+    }
+    /// A window position inside the character at `offset`, for the self-test
+    /// that points at text in a real window.
+    #[cfg(feature = "selftest")]
+    pub(crate) fn glyph_center(&self, offset: usize) -> Option<Point<Pixels>> {
+        let origin = self.bounds?.origin;
+        let at = self.code_position(offset) - point(self.scroll_x, self.scroll_y);
+        Some(origin + at + point(px(3.), px(self.line_height / 2.)))
     }
 }
 

@@ -53,6 +53,12 @@ tree-sitter-zig = "1.1"
 # Settings → Mobile draws the pairing code from the module matrix.
 qrcode = { version = "0.14", default-features = false }
 
+[features]
+# The unattended self-test of run, code insight and debug in a real window
+# (shell/code_selftest.rs, scripts/code-selftest): GPUI's test support gives
+# it the bounds of what was drawn and the frame as an image.
+selftest = ["gpui/test-support", "dep:gpui_macos"]
+
 [build-dependencies]
 embed-resource = "3"
 
@@ -65,6 +71,8 @@ monocode-core = { path = "../monocode-core", features = ["test-support"] }
 # The vendored renderer's backdrop-blur marker for frosted popovers.
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_apple = { package = "gpui-pre-apple", version = "=0.3.9" }
+# Only named so that the self-test can turn on the window's render-to-image.
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.9", optional = true, features = ["test-support"] }
 # Pins the native traffic lights to the Tauri app's spacing.
 objc2 = "0.6"
 block2 = "0.6"

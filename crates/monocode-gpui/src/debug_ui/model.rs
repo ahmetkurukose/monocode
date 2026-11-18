@@ -334,7 +334,7 @@ impl Model {
         Some((frame.path?, frame.line))
     }
     /// The terminal tab the debuggee runs in.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(super) fn terminal(&self) -> Option<Entity<Run>> {
         self.terminal.clone()
     }

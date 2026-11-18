@@ -5,7 +5,7 @@ pub(super) struct Open {
     restore: Option<FocusHandle>,
     _events: Subscription,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "selftest"))]
 impl Open {
     pub(super) fn picker(&self) -> &Entity<QuickOpen> {
         &self.picker
