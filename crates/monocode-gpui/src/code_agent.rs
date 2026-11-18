@@ -6,14 +6,63 @@
 //! the resolver that answers from it, and ends the services at quit.
 use crate::shell::Shell;
 use crate::workspace::Workspace;
-use gpui::{App, Entity};
+use gpui::{App, BackgroundExecutor, Entity, Task};
 use monocode_core::code::run::ProjectRuns;
 use monocode_core::code::services::{self, CodeContext};
 use monocode_core::files::path_key;
 use monocode_core::terminal_setup::TerminalSetup;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
+
+/// How long quitting waits for the services to stop. A server that will not
+/// die must not keep the app open.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Stops the language servers, the debug sessions and the headless runs off
+/// the UI thread, and finishes once they have stopped or `SHUTDOWN_WAIT` is
+/// over. Quitting waits for it before the app exits (the framework's own
+/// quit hooks only get a fraction of a second), and the hook below asks again
+/// for the quits that do not come through there; the second ask is free.
+pub(crate) fn shutdown(cx: &App) -> Task<()> {
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return Task::ready(());
+    }
+    let executor = cx.background_executor();
+    let stopping = executor.spawn(async { services::shutdown() });
+    bounded(executor, stopping, SHUTDOWN_WAIT)
+}
+
+/// Finishes when `work` does or after `limit`, whichever is first. The work
+/// is left to finish by itself when the limit comes first.
+fn bounded(
+    executor: &BackgroundExecutor,
+    work: impl Future<Output = ()> + Send + 'static,
+    limit: Duration,
+) -> Task<()> {
+    let (done, finished) = async_channel::bounded::<()>(2);
+    let (by_work, by_timer) = (done.clone(), done);
+    executor
+        .spawn(async move {
+            work.await;
+            let _ = by_work.send(()).await;
+        })
+        .detach();
+    let timer = executor.timer(limit);
+    executor
+        .spawn(async move {
+            timer.await;
+            let _ = by_timer.send(()).await;
+        })
+        .detach();
+    executor.spawn(async move {
+        let _ = finished.recv().await;
+    })
+}
 
 /// What the resolver needs of the workspace.
 #[derive(Clone, Default, PartialEq)]
@@ -105,11 +154,7 @@ pub(crate) fn install(shell: &Entity<Shell>, cx: &mut App) {
             .unwrap_or_else(PoisonError::into_inner)
             .context(path)
     });
-    cx.on_app_quit(|_| {
-        services::shutdown();
-        async {}
-    })
-    .detach();
+    cx.on_app_quit(|cx| shutdown(cx)).detach();
 }
 
 #[cfg(test)]
@@ -117,6 +162,36 @@ mod tests {
     use super::*;
     use monocode_core::code::run::RunConfig;
     use monocode_core::terminal_setup::Venv;
+
+    #[gpui::test]
+    fn quitting_waits_for_the_work_but_only_so_long(cx: &mut gpui::TestAppContext) {
+        let executor = cx.executor();
+        let ended = |waited: Task<()>, cx: &mut gpui::TestAppContext| {
+            let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = flag.clone();
+            cx.update(|cx| {
+                cx.spawn(async move |_| {
+                    waited.await;
+                    seen.set(true);
+                })
+                .detach()
+            });
+            cx.run_until_parked();
+            flag
+        };
+        // Work that is done at once ends the wait before the limit.
+        let quick = ended(bounded(&executor, async {}, Duration::from_secs(60)), cx);
+        assert!(quick.get());
+        // Work that never ends is left behind when the limit passes.
+        let stuck = ended(
+            bounded(&executor, std::future::pending(), Duration::from_secs(2)),
+            cx,
+        );
+        assert!(!stuck.get());
+        executor.advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert!(stuck.get());
+    }
 
     #[test]
     fn a_path_is_placed_in_its_project_with_the_projects_setup_and_runs() {

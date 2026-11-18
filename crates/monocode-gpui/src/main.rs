@@ -137,8 +137,12 @@ fn quit(cx: &mut App) {
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
+    // The language servers and debug sessions are waited for too: the quit
+    // hooks of the framework are given too little time to do it.
+    let services = code_agent::shutdown(cx);
     cx.spawn(async move |cx| {
         shutdown.await;
+        services.await;
         cx.update(|cx| cx.quit());
     })
     .detach();
@@ -149,8 +153,10 @@ fn restart(cx: &mut App) {
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
+    let services = code_agent::shutdown(cx);
     cx.spawn(async move |cx| {
         shutdown.await;
+        services.await;
         cx.update(|cx| cx.restart());
     })
     .detach();
