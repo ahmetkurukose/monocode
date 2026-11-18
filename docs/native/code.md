@@ -689,8 +689,9 @@ count from 1.
 
 | Tool | Does | Asks first (Claude) |
 |---|---|---|
-| `code_diagnostics` | Errors and warnings for up to 20 files once the servers have settled (20 s default) | no |
-| `code_definition` | Definition of the symbol at `file` + `line` + `column`, or + `symbol` (a name on that line): path, line, the line's text | no |
+| `code_servers_start` | Starts the language servers for a file's project and waits until they are ready, or reports the missing tool with its install hint; they stay up (a lease of 15 minutes from the agent's last use, renewed by each insight call) | yes |
+| `code_diagnostics` | Errors and warnings for up to 20 files once the running servers have settled (20 s default); columns are characters from 1 | no |
+| `code_definition` | Definition of the symbol at `file` + `line` + `column` (in characters), or + `symbol` (a name on that line): path, line, column, the line's text | no |
 | `code_references` | Every use, the same way; at most 120 listed | no |
 | `code_hover` | Type, signature and documentation | no |
 | `code_symbols` | A file's outline with line ranges | no |
@@ -719,6 +720,16 @@ driver. `debug_continue`, `debug_step`, `debug_evaluate` and `debug_stop` check
 `Session::driver()` and refuse, saying so, once the user has taken the session over;
 `debug_stack`, `debug_variables` and `debug_sessions` keep working. A run is stopped only
 by whoever started it.
+
+**Language servers are started only on request.** A language server is a program from the
+project's own environment, so a pre-allowed tool must not start one (an agent allowed to edit
+but not to run commands could plant `.venv/bin/basedpyright-langserver`). The `code_*` insight
+tools join only servers that already run (the editor's, or those `code_servers_start`
+started: `lsp::Manager::with_running_file`) and otherwise answer that no server is running
+and which tool to call. The question is put in the text the manager holds for the file,
+which is the editor's when it has the file open with unsaved changes. Servers started for an
+agent carry a lease of 15 minutes (`Manager::start_servers`, renewed by that agent's
+later calls) that the idle sweep respects.
 
 **Trust.** Program output, variable values, evaluation results and hover text are the
 project's own text and can be written to steer an agent. They are returned under a line
