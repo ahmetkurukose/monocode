@@ -162,9 +162,7 @@ impl Driver {
                 let shown = input.read(cx).signature_shown()?;
                 Some((shown.label.clone(), shown.active))
             };
-            let helped = self
-                .until(cx, 8000, |_, cx| signature(cx).is_some())
-                .await;
+            let helped = self.until(cx, 8000, |_, cx| signature(cx).is_some()).await;
             let signature = self.app(cx, |_, cx| signature(cx)).flatten();
             self.shot(cx, "signature-help").await;
             let line = (self.text(cx).lines())
@@ -173,7 +171,9 @@ impl Driver {
             pass = listed
                 && accepted
                 && helped
-                && signature.as_ref().is_some_and(|(label, _)| label.contains("factor"));
+                && signature
+                    .as_ref()
+                    .is_some_and(|(label, _)| label.contains("factor"));
             detail = json!({
                 "typed": " + order.sc", "popup_has_scaled": listed, "popup": shown,
                 "accepted_with_enter": accepted, "line_after": line,
@@ -304,7 +304,9 @@ impl Driver {
 
     async fn outline_and_symbols(&mut self, cx: &mut Cx) {
         let revealed = self
-            .app(cx, |window, cx| panel_tabs::reveal("code-outline", window, cx))
+            .app(cx, |window, cx| {
+                panel_tabs::reveal("code-outline", window, cx)
+            })
             .unwrap_or(false);
         self.pause(cx, 600).await;
         let names: Vec<String> = self
@@ -333,7 +335,9 @@ impl Driver {
         };
         let mut listed = Vec::new();
         for _ in 0..50 {
-            listed = self.shell(cx, |shell, _, cx| rows(shell, cx)).unwrap_or_default();
+            listed = self
+                .shell(cx, |shell, _, cx| rows(shell, cx))
+                .unwrap_or_default();
             if listed.iter().any(|(title, _)| title == "Order") {
                 break;
             }
@@ -356,7 +360,9 @@ impl Driver {
         let place = self.place(cx);
         let class_line = self.row(cx, "class Order").map(|row| row + 1);
         let symbol_ok = opened
-            && place.as_ref().is_some_and(|(_, line, _)| Some(*line) == class_line);
+            && place
+                .as_ref()
+                .is_some_and(|(_, line, _)| Some(*line) == class_line);
         self.record(
             "6",
             "the Outline tab lists the file's symbols and @ in quick open finds a class of another file",

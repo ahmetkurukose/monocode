@@ -43,6 +43,7 @@ pub(super) fn init(marks: Entity<Marks>, cx: &mut App) {
 /// The fields of the selected configuration's form, for a test to type
 /// into.
 #[cfg(any(test, feature = "selftest"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Field {
     Name,

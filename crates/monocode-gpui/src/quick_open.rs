@@ -403,7 +403,7 @@ impl QuickOpen {
             .map(|row| (row.label.clone(), row.detail.clone()))
             .collect()
     }
-    #[cfg(any(test, feature = "selftest"))]
+    #[cfg(test)]
     pub(crate) fn pick_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.pick(ix, cx)
     }

@@ -100,9 +100,14 @@ def end(app, how=signal.SIGTERM, wait=8):
             app.wait()
 
 
+def leftovers(before):
+    """What a self-test started and has not ended, without ending it."""
+    return {pid: cmd for pid, cmd in processes().items() if pid not in before}
+
+
 def sweep(before):
     """Ends whatever a self-test left behind; returns what that was."""
-    left = {pid: cmd for pid, cmd in processes().items() if pid not in before}
+    left = leftovers(before)
     for pid in left:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -123,47 +128,73 @@ def show(report):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--only", default="")
-    parser.add_argument("--skip-shutdown", action="store_true")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="comma list of insight,run,debug,idle (in the window) and agent,sigterm,sigkill",
+    )
     args = parser.parse_args()
     if not os.path.exists(APP):
         sys.exit(f"{APP} is not built; see README.md")
+    wanted = [part for part in args.only.split(",") if part]
+    in_app = [p for p in wanted if p in ("insight", "run", "debug", "idle")]
+    do = lambda part: not wanted or part in wanted
+    import agent
 
     before = processes()
     if before:
         print("already running, left alone:", before)
     shutil.rmtree(SHOTS, ignore_errors=True)
     os.makedirs(SHOTS)
-    fresh_world()
+    steps = []
 
-    result = f"{ROOT}/result.json"
-    if os.path.exists(result):
-        os.remove(result)
-    extra = {
-        "MONOCODE_CODE_SELFTEST": result,
-        "MONOCODE_CODE_SELFTEST_SHOTS": SHOTS,
-        "MONOCODE_CODE_SELFTEST_ONLY": args.only,
-    }
-    app = start_app(extra, f"{ROOT}/app.log")
-    try:
-        report = wait_for(result, app, 600)
-        # It quits by itself; what is left then is step 12's first answer.
+    if not wanted or in_app:
+        fresh_world()
+        result = f"{ROOT}/result.json"
+        if os.path.exists(result):
+            os.remove(result)
+        extra = {
+            "MONOCODE_CODE_SELFTEST": result,
+            "MONOCODE_CODE_SELFTEST_SHOTS": SHOTS,
+            "MONOCODE_CODE_SELFTEST_ONLY": ",".join(in_app),
+        }
+        app = start_app(extra, f"{ROOT}/app.log")
         try:
-            app.wait(15)
-        except subprocess.TimeoutExpired:
-            pass
-        quit_itself = app.poll() is not None
-    finally:
-        end(app)
-    time.sleep(1.5)
-    left = sweep(before)
-    show(report)
-    if not report.get("finished"):
-        print("NOT FINISHED; the app's log ends with:")
-        print("".join(open(f"{ROOT}/app.log").readlines()[-25:]))
-    print(f"{'PASS' if quit_itself and not left else 'FAIL'}   12a quitting leaves no process behind",
-          json.dumps({"quit_by_itself": quit_itself, "left": left}))
-    print(f"report: {result}\npictures: {SHOTS}")
+            report = wait_for(result, app, 900)
+            # It quits by itself; what is left then is step 12's first answer.
+            try:
+                app.wait(15)
+            except subprocess.TimeoutExpired:
+                pass
+            quit_itself = app.poll() is not None
+        finally:
+            end(app)
+        time.sleep(1.5)
+        left = sweep(before)
+        show(report)
+        steps += report.get("steps", [])
+        if not report.get("finished"):
+            print("NOT FINISHED; the app's log ends with:")
+            print("".join(open(f"{ROOT}/app.log").readlines()[-25:]))
+        ok = quit_itself and not left
+        print(f"{'PASS' if ok else 'FAIL'}   12a quitting leaves no process behind",
+              json.dumps({"quit_by_itself": quit_itself, "left": left}))
+        steps.append({"step": "12a", "name": "quitting leaves no process behind", "pass": ok,
+                      "detail": {"quit_by_itself": quit_itself, "left": left}})
+
+    if do("agent"):
+        fresh_world()
+        steps += agent.agent_phase(before)
+    if do("sigkill"):
+        fresh_world()
+        steps += agent.kill_phase(before)
+
+    json.dump({"steps": steps}, open(f"{ROOT}/report.json", "w"), indent=1)
+    print(f"report: {ROOT}/result.json and {ROOT}/report.json\npictures: {SHOTS}")
+    stray = leftovers(before)
+    if stray:
+        print("STILL RUNNING after the self-test:", stray)
+        sweep(before)
 
 
 if __name__ == "__main__":

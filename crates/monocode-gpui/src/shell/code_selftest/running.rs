@@ -89,7 +89,9 @@ impl Driver {
                 && output.contains("order total 42.0")
                 && output.contains("done 42.0")
         };
-        let first_ok = first.as_ref().is_some_and(|info| ok(info, &self.output(info)));
+        let first_ok = first
+            .as_ref()
+            .is_some_and(|info| ok(info, &self.output(info)));
         let tab = first
             .as_ref()
             .and_then(|info| self.app(cx, |_, cx| probe::has_tab(info.id, cx)))
@@ -101,7 +103,9 @@ impl Driver {
         // Run again, from the keyboard.
         self.keys(cx, "ctrl-alt-r").await;
         let again = self.next_run(cx, known + 1, 30_000).await;
-        let again_ok = again.as_ref().is_some_and(|info| ok(info, &self.output(info)));
+        let again_ok = again
+            .as_ref()
+            .is_some_and(|info| ok(info, &self.output(info)));
         let again_told = again.as_ref().map(|info| self.told(info, cx));
         let chip = self.running_chip(cx);
         self.record(
@@ -123,8 +127,10 @@ impl Driver {
         let mut marker = None;
         for _ in 0..50 {
             marker = row.and_then(|row| {
-                self.input(cx, |input, _| input.gutter_slot_center(GutterSlot::Run, row))
-                    .flatten()
+                self.input(cx, |input, _| {
+                    input.gutter_slot_center(GutterSlot::Run, row)
+                })
+                .flatten()
             });
             if marker.is_some() {
                 break;
@@ -146,9 +152,11 @@ impl Driver {
         let failed = run.as_ref().is_some_and(|info| {
             info.state == RunState::Exited(Some(1)) && self.output(info).contains("1 failed")
         });
-        let shown = told
-            .as_ref()
-            .is_some_and(|told| told["chip_row"][1].as_str().is_some_and(|d| d.contains("Exit 1")));
+        let shown = told.as_ref().is_some_and(|told| {
+            told["chip_row"][1]
+                .as_str()
+                .is_some_and(|d| d.contains("Exit 1"))
+        });
         // The list of the footer's chip, where a finished run stays reachable.
         let chip = self.running_chip(cx);
         let chip_clicked = self.click_on(cx, "code-running").await;
@@ -170,7 +178,13 @@ impl Driver {
         let added = {
             let project = project.clone();
             self.app(cx, move |window, cx| {
-                probe::add_configuration(&project, "Pytest quiet", "$PYTHON -m pytest -q", window, cx)
+                probe::add_configuration(
+                    &project,
+                    "Pytest quiet",
+                    "$PYTHON -m pytest -q",
+                    window,
+                    cx,
+                )
             })
             .flatten()
         };
@@ -208,7 +222,9 @@ impl Driver {
                 && info.state == RunState::Exited(Some(1))
                 && output.contains("1 failed, 2 passed")
         };
-        let menu_ok = from_menu.as_ref().is_some_and(|info| ran(info, &self.output(info)));
+        let menu_ok = from_menu
+            .as_ref()
+            .is_some_and(|info| ran(info, &self.output(info)));
         let menu_told = from_menu.as_ref().map(|info| self.told(info, cx));
         self.keys(cx, "escape").await;
 
@@ -226,7 +242,9 @@ impl Driver {
             })
             .unwrap_or_default();
         self.shot(cx, "quick-open-run-commands").await;
-        let listed = rows.first().is_some_and(|(title, _)| title == "Run: Pytest quiet");
+        let listed = rows
+            .first()
+            .is_some_and(|(title, _)| title == "Run: Pytest quiet");
         self.keys(cx, "enter").await;
         let from_palette = self.next_run(cx, known, 90_000).await;
         let palette_ok = from_palette

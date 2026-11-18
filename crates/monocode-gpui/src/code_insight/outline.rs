@@ -252,14 +252,14 @@ impl Outline {
             .collect()
     }
 
-    #[cfg(any(test, feature = "selftest"))]
+    #[cfg(test)]
     pub(super) fn filter_by(&mut self, text: &str, cx: &mut Context<Self>) {
         (self.filter).update(cx, |filter, cx| filter.set_text(text.to_owned(), cx));
         self.selected = None;
         cx.notify();
     }
 
-    #[cfg(any(test, feature = "selftest"))]
+    #[cfg(test)]
     pub(super) fn jump_to_named(
         &mut self,
         name: &str,

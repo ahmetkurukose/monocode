@@ -242,7 +242,7 @@ impl Usages {
         (self.symbol.to_string(), self.total, lines)
     }
 
-    #[cfg(any(test, feature = "selftest"))]
+    #[cfg(test)]
     pub(super) fn usage_rows(&self) -> Vec<usize> {
         (0..self.rows.len())
             .filter(|index| matches!(self.rows[*index], Row::Usage { .. }))

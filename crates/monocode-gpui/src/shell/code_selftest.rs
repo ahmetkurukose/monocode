@@ -89,9 +89,6 @@ impl Driver {
         if wanted("debug") {
             self.debugging(cx).await;
         }
-        if wanted("agent") {
-            self.agent(cx).await;
-        }
         if wanted("idle") {
             self.idle(cx).await;
         }
@@ -114,6 +111,7 @@ impl Driver {
             }
         });
         self.pause(cx, 800).await;
+        self.calm(cx).await;
         let state = self.shell(cx, |shell, window, cx| {
             let size = window.viewport_size();
             let snapshot = context::snapshot(cx);
@@ -132,7 +130,12 @@ impl Driver {
         let ready = state.as_ref().is_some_and(|state| {
             state["session"].is_i64() && state["project"].as_str() == self.root.to_str()
         });
-        self.record("0", "the sample project is open with a session", ready, json!(state));
+        self.record(
+            "0",
+            "the sample project is open with a session",
+            ready,
+            json!(state),
+        );
         ready
     }
 
@@ -374,8 +377,9 @@ impl Driver {
     async fn open(&self, cx: &mut Cx, name: &str) -> bool {
         let path = self.path(name).to_string_lossy().into_owned();
         let opened = path.clone();
-        if self.app(cx, move |window, cx| context::open_file(&opened, None, window, cx))
-            != Some(true)
+        if self.app(cx, move |window, cx| {
+            context::open_file(&opened, None, window, cx)
+        }) != Some(true)
         {
             return false;
         }
