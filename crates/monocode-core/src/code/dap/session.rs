@@ -156,7 +156,7 @@ pub struct Session {
     children: Mutex<Vec<Arc<Session>>>,
     /// The adapter has been told goodbye; it is not told twice.
     goodbye: AtomicBool,
-    /// The adapter is being, or has been, let go of.
+    /// The adapter is being, or has been, let go of (never for a subprocess's).
     retired: AtomicBool,
     this: Weak<Session>,
 }
@@ -300,6 +300,12 @@ impl Session {
     /// The session whose debuggee started this one's process.
     pub fn parent(&self) -> Option<SessionId> {
         self.parent
+    }
+
+    /// The adapter's process, until it has been ended.
+    #[cfg(test)]
+    pub(crate) fn adapter_process_id(&self) -> Option<u32> {
+        self.client.process_id()
     }
 
     pub fn label(&self) -> &str {
@@ -1029,6 +1035,12 @@ impl Session {
     /// the background, since the goodbye waits a moment for it to leave.
     fn retire(&self) {
         if self.retired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A subprocess is another connection to its parent's adapter, which
+        // goes on serving the parent: hanging up on it would end the
+        // parent's debugging too. The parent lets go of it with itself.
+        if self.parent.is_some() {
             return;
         }
         // No owner left means the session is being dropped, and `close`

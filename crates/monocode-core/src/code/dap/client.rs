@@ -276,6 +276,7 @@ impl Client {
 
     /// The adapter process this client started, if it started one and has
     /// not ended it yet.
+    #[cfg(test)]
     pub fn process_id(&self) -> Option<u32> {
         lock(&self.shared.process).as_ref().map(Child::id)
     }
