@@ -18,11 +18,11 @@ use crate::{
         launch, settings,
     },
     popover::{MenuAction, MenuItem},
-    workspace::ProjectAction,
 };
-use gpui::{App, SharedString, Window};
+use gpui::{App, Window};
 use monocode_core::{
     code::{
+        dap::SessionState,
         run::{RunConfig, RunId},
         services::services,
     },
@@ -34,22 +34,6 @@ use std::time::Duration;
 /// was a run and not a saved action. Action ids are hex numbers, so this is
 /// never one, and upstream's own lookups skip an id that is no action.
 pub(crate) const LAST_RUN: &str = "@last-run";
-
-/// What the button's main part shows and repeats.
-pub(crate) enum Main {
-    /// The saved action at this index.
-    Action(usize),
-    Run(RunPart),
-    /// Nothing to repeat and nothing offered: the plain "Actions" label.
-    Empty,
-}
-
-pub(crate) struct RunPart {
-    pub label: SharedString,
-    /// What the button will do, for assistive technology.
-    pub aria: SharedString,
-    pub command: SharedString,
-}
 
 /// The checkout the footer starts things in: the one in front when it is
 /// this project's, else the project's own folder.
@@ -70,41 +54,64 @@ fn choices(project: &str, max_age: Duration, cx: &App) -> (Checkout, targets::Ch
     (checkout, choices)
 }
 
-/// A built-in task is already called "Run main.py".
-fn said(label: &str) -> String {
-    format!("Run {}", label.strip_prefix("Run ").unwrap_or(label))
+/// What is going on in the project: its runs still running and the debug
+/// sessions that have not ended, as menu rows that end them.
+fn running(project: &str, cx: &App) -> Vec<MenuItem> {
+    let key = path_key(project);
+    let mut rows: Vec<MenuItem> = Vec::new();
+    for info in services().runs().list() {
+        if info.state.is_running() && path_key(&chip::checkout_of(&info, cx).project) == key {
+            rows.push(
+                MenuAction::new(
+                    format!("stop:{}", info.id.0),
+                    format!("Stop {}", info.label),
+                )
+                .icon("square")
+                .into(),
+            );
+        }
+    }
+    // A debug session belongs to no project here: one that is alive is
+    // worth ending from wherever the user is.
+    for session in services().dap().sessions() {
+        if session.parent().is_none() && !matches!(session.state(), SessionState::Terminated { .. })
+        {
+            rows.push(
+                MenuAction::new(
+                    format!("stop-debug:{}", session.id()),
+                    format!("Stop debugging {}", session.label()),
+                )
+                .icon("square")
+                .into(),
+            );
+        }
+    }
+    rows
 }
 
-fn part(config: &RunConfig) -> RunPart {
-    let label = config.label();
-    RunPart {
-        aria: said(&label).into(),
-        label: label.into(),
-        command: config.command.clone().into(),
-    }
+/// How many things the menu can stop, for the button's label.
+pub(crate) fn running_count(project: &str, cx: &App) -> usize {
+    running(project, cx).len()
 }
 
-/// What the main part shows: the most recent thing started in the project,
-/// whichever kind it was; before anything was, the default run target of
-/// what is focused, else the first saved action. Asked on every draw, so it
-/// works from what the run side has cached.
-pub(crate) fn main(project: &str, last: Option<&str>, actions: &[ProjectAction], cx: &App) -> Main {
-    if let Some(ix) = last.and_then(|id| actions.iter().position(|a| a.id == id)) {
-        return Main::Action(ix);
-    }
-    let runs = settings::runs(project, cx);
-    let (_, offered) = choices(project, Duration::MAX, cx);
-    // A task keeps the name it was remembered under, unless the file in
-    // front has one of the same kind, which then names that file.
-    let shown = match runs.last_used() {
-        Some(used) => Some(offered.get(&used.id).unwrap_or(used)),
-        None => offered.default(&runs),
+/// Ends a debug session: asks the debuggee to end, and cuts the session
+/// off when it has not within a few seconds (a program that ignores the
+/// request, an adapter that hangs).
+fn stop_debugging(id: u64) {
+    let Some(session) = (services().dap().sessions().into_iter()).find(|s| s.id() == id) else {
+        return;
     };
-    match shown {
-        Some(config) => Main::Run(part(config)),
-        None if !actions.is_empty() => Main::Action(0),
-        None => Main::Empty,
+    if session.state() == SessionState::Starting {
+        session.disconnect();
+        return;
     }
+    session.terminate();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        if !matches!(session.state(), SessionState::Terminated { .. }) {
+            session.disconnect();
+        }
+    });
 }
 
 /// What a project's latest start was: a run now comes before the saved
@@ -122,6 +129,11 @@ pub(crate) fn remember(project: &str, window: &mut Window, cx: &mut App) {
 pub(crate) fn menu_items(project: &str, cx: &App) -> Vec<MenuItem> {
     let (_, offered) = choices(project, targets::TOOLCHAIN_AGE, cx);
     let mut items: Vec<MenuItem> = Vec::new();
+    let running = running(project, cx);
+    if !running.is_empty() {
+        items.push(MenuItem::Header("Running".into()));
+        items.extend(running);
+    }
     let mut list = |title: &'static str, configs: &[RunConfig]| {
         if configs.is_empty() {
             return;
@@ -157,19 +169,6 @@ pub(crate) fn menu_items(project: &str, cx: &App) -> Vec<MenuItem> {
                 .into(),
         );
     }
-    let key = path_key(project);
-    for info in services().runs().list() {
-        if info.state.is_running() && path_key(&chip::checkout_of(&info, cx).project) == key {
-            more.push(
-                MenuAction::new(
-                    format!("stop:{}", info.id.0),
-                    format!("Stop {}", info.label),
-                )
-                .icon("square")
-                .into(),
-            );
-        }
-    }
     if !items.is_empty() && !more.is_empty() {
         items.push(MenuItem::Separator);
     }
@@ -194,7 +193,7 @@ pub(crate) fn has_items(project: &str, cx: &App) -> bool {
 /// of its rows. Called inside the shell's update, so the work waits.
 pub(crate) fn pick(id: &str, project: &str, window: &mut Window, cx: &mut App) -> bool {
     let known = matches!(id, "rerun" | "run-settings")
-        || ["go:", "debug:", "stop:"]
+        || ["go:", "debug:", "stop:", "stop-debug:"]
             .iter()
             .any(|prefix| id.starts_with(prefix));
     if !known {
@@ -211,7 +210,9 @@ pub(crate) fn pick(id: &str, project: &str, window: &mut Window, cx: &mut App) -
             settings::open(&project, PAGE, window, cx);
         }
         _ => {
-            if let Some(run) = id.strip_prefix("stop:").and_then(|run| run.parse().ok()) {
+            if let Some(session) = (id.strip_prefix("stop-debug:")).and_then(|id| id.parse().ok()) {
+                stop_debugging(session);
+            } else if let Some(run) = id.strip_prefix("stop:").and_then(|run| run.parse().ok()) {
                 start::stop(RunId(run));
             } else if let Some(config) = id.strip_prefix("go:") {
                 go(config, &project, false, window, cx);
@@ -236,32 +237,4 @@ fn go(id: &str, project: &str, debug: bool, window: &mut Window, cx: &mut App) {
         }
         None => start::notice("This can no longer be run here.", window, cx),
     }
-}
-
-/// The main part was clicked while it shows a run: do that again. What was
-/// last started goes again with the file in front; when that cannot be
-/// resolved here (it names a file that is not focused), the very process
-/// goes again. Without any history, the default target starts. Called inside
-/// the shell's update, so the work waits.
-pub(crate) fn click(project: &str, window: &mut Window, cx: &mut App) {
-    let project = project.to_owned();
-    window.defer(cx, move |window, cx| {
-        let runs = settings::runs(&project, cx);
-        let checkout = checkout_of(&project, cx);
-        let (context, offered) = offered(&checkout, targets::TOOLCHAIN_AGE, cx);
-        let config = match runs.last_used() {
-            Some(used) => offered.get(&used.id),
-            None => offered.default(&runs),
-        };
-        if let Some(config) = config.cloned() {
-            start::start(config, context, checkout, cx);
-            return;
-        }
-        let again = runs.last_used().is_some()
-            && start::last_project(cx).is_some_and(|last| path_key(&last) == path_key(&project))
-            && start::rerun_last(cx);
-        if !again {
-            start::notice("This can no longer be run here.", window, cx);
-        }
-    });
 }

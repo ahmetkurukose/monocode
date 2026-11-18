@@ -66,16 +66,25 @@ impl Driver {
 
     /// What the footer's Actions button shows as its main part.
     fn footer_main(&self, cx: &mut Cx) -> String {
-        use crate::run_ui::footer::{self, Main};
+        use crate::run_ui::footer;
         self.shell(cx, |shell, _, cx| {
             let project = shell.workspace.project.clone();
             let actions = shell.workspace.actions.get(&project);
             let actions = actions.map_or(&[][..], Vec::as_slice);
-            let last = shell.workspace.last_actions.get(&project);
-            match footer::main(&project, last.map(String::as_str), actions, cx) {
-                Main::Action(ix) => format!("action {}", actions[ix].name),
-                Main::Run(run) => format!("run {} ({})", run.label, run.aria),
-                Main::Empty => "Actions".to_owned(),
+            match shell
+                .workspace
+                .last_actions
+                .get(&project)
+                .map(String::as_str)
+            {
+                Some(footer::LAST_RUN) => {
+                    let runs = crate::code_shell::settings::runs(&project, cx);
+                    let used = runs.last_used().map(|config| config.label());
+                    used.map_or("Actions".to_owned(), |label| format!("run {label}"))
+                }
+                Some(id) => (actions.iter().find(|a| a.id == id))
+                    .map_or("Actions".to_owned(), |a| format!("action {}", a.name)),
+                None => "Actions".to_owned(),
             }
         })
         .unwrap_or_default()

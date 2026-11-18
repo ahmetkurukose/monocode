@@ -3,7 +3,7 @@
 //! rest and opens the editor.
 use super::*;
 use crate::{
-    run_ui::footer::{self, Main},
+    run_ui::footer,
     workspace::{ACTION_ICONS, ProjectAction},
 };
 
@@ -185,13 +185,7 @@ impl Shell {
             return None;
         }
         let classic = self.workspace.boxy_layout();
-        let project = self.workspace.project.clone();
-        let last = self
-            .workspace
-            .last_actions
-            .get(&project)
-            .map(String::as_str);
-        let shown = footer::main(&project, last, self.project_actions(), cx);
+        let running = footer::running_count(&self.workspace.project, cx);
         let menu_open = self.menu_open(&MenuTarget::Actions);
         // Each part rounds fully inside the frame's 2px inset.
         let outer = if classic { 6. } else { 10. };
@@ -211,51 +205,32 @@ impl Shell {
                 .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
         };
         let pad = px(if classic { 4. } else { 6. });
-        let main = match shown {
-            Main::Action(ix) => {
-                let action = self.project_actions()[ix].clone();
-                let id = action.id.clone();
-                segment("footer-action-run")
-                    .aria_label(SharedString::from(format!("Run {}", action.name)))
-                    .aria_description(SharedString::from(action.command.clone()))
-                    .px(pad)
-                    .gap(px(6.))
-                    .max_w(px(180.))
-                    .min_w_0()
-                    .child(icon(action.icon(), 12.).text_color(content(0.55)))
-                    .child(div().min_w_0().truncate().child(action.name.clone()))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.run_action(&id, window, cx)),
-                    )
-            }
-            Main::Run(run) => segment("footer-action-run")
-                .aria_label(run.aria)
-                .aria_description(run.command)
-                .px(pad)
-                .gap(px(6.))
-                .max_w(px(180.))
-                .min_w_0()
-                .child(icon("play", 12.).text_color(content(0.55)))
-                .child(div().min_w_0().truncate().child(run.label))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    footer::click(&this.workspace.project, window, cx)
-                })),
-            // Without a run or an action to repeat, the menu is the way in,
-            // unless it would offer only to add one.
-            Main::Empty => segment("footer-action-add")
-                .aria_label("Actions")
-                .px(pad)
-                .gap(px(6.))
-                .child(icon("play", 12.).text_color(content(0.55)))
-                .child("Actions")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if footer::has_items(&this.workspace.project, cx) {
-                        this.toggle_actions_menu(window, cx);
-                    } else {
-                        this.open_action_dialog(None, window, cx);
-                    }
-                })),
-        };
+        // A press opens the menu: what can be started, what is running and
+        // how to stop it. Only a project with nothing to list goes straight
+        // to adding an action.
+        let main = segment("footer-action-run")
+            .aria_label("Actions")
+            .px(pad)
+            .gap(px(6.))
+            .child(icon("play", 12.).text_color(if running > 0 {
+                accent_color()
+            } else {
+                content(0.55)
+            }))
+            .child(if running > 0 {
+                SharedString::from(format!("{running} running"))
+            } else {
+                SharedString::from("Actions")
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                let listed = footer::has_items(&this.workspace.project, cx)
+                    || !this.project_actions().is_empty();
+                if listed {
+                    this.toggle_actions_menu(window, cx);
+                } else {
+                    this.open_action_dialog(None, window, cx);
+                }
+            }));
         let chevron = segment("footer-action-menu")
             .aria_label("Actions")
             .aria_expanded(menu_open)

@@ -1,11 +1,8 @@
 //! The footer's Actions button as the run part of it works: what its menu
-//! offers with and without a file, what its main part shows after each kind
-//! of start, what a click on it repeats, and what the menu's other rows do.
+//! offers with and without a file, which start the project remembers as
+//! its latest, that a press on it opens the menu, and what the rows do.
 use super::*;
-use crate::{
-    run_ui::footer::{self, Main},
-    workspace::ProjectAction,
-};
+use crate::{run_ui::footer, workspace::ProjectAction};
 use gpui::Modifiers;
 
 const TOOL: [(&str, &str); 2] = [("pkg/__init__.py", ""), ("pkg/tool.py", "print('tool')\n")];
@@ -55,19 +52,27 @@ impl Fixture {
         ids
     }
 
-    /// What the button's main part shows, as `run:Name`, `action:Name` or
-    /// `empty`.
+    /// The project's latest start, as `run:Name`, `action:Name` or `empty`.
     fn shown(&mut self) -> String {
         let project = self.project.clone();
         (self.window)
             .update(&mut self.visual, |shell, _, cx| {
                 let actions = shell.workspace.actions.get(&project);
                 let actions = actions.map_or(&[][..], Vec::as_slice);
-                let last = shell.workspace.last_actions.get(&project);
-                match footer::main(&project, last.map(String::as_str), actions, cx) {
-                    Main::Action(ix) => format!("action:{}", actions[ix].name),
-                    Main::Run(run) => format!("run:{}", run.label),
-                    Main::Empty => "empty".to_owned(),
+                match shell
+                    .workspace
+                    .last_actions
+                    .get(&project)
+                    .map(String::as_str)
+                {
+                    Some(footer::LAST_RUN) => {
+                        let runs = crate::code_shell::settings::runs(&project, cx);
+                        let used = runs.last_used().map(|config| config.label());
+                        used.map_or("empty".to_owned(), |label| format!("run:{label}"))
+                    }
+                    Some(id) => (actions.iter().find(|a| a.id == id))
+                        .map_or("empty".to_owned(), |a| format!("action:{}", a.name)),
+                    None => "empty".to_owned(),
                 }
             })
             .unwrap()
@@ -193,8 +198,8 @@ fn picking_a_configuration_runs_it_and_the_button_then_shows_it_until_something_
     let mut fx = Fixture::new(&TOOL, cx);
     let root = fx.root.clone();
     let ids = fx.configure(&[("Plain", "sh -c 'echo plain'")]);
-    // Before anything was started, the button offers the default target.
-    assert_eq!(fx.shown(), "run:Plain");
+    // Nothing has been started yet.
+    assert_eq!(fx.shown(), "empty");
     assert!(fx.visual.debug_bounds("footer-action-run").is_some());
 
     fx.pick(&format!("go:{}", ids[0]));
@@ -229,8 +234,9 @@ fn picking_a_configuration_runs_it_and_the_button_then_shows_it_until_something_
     let second = fx.runs()[1].id;
     fx.wait_for_end(second);
 
-    // A click on the main part repeats it.
+    // A press on the main part opens the menu; Rerun last repeats it.
     fx.click("footer-action-run");
+    fx.click("menu-action-rerun");
     fx.started(3);
     assert_eq!(fx.runs()[2].label, "Plain");
     assert_eq!(fx_runs(&root).len(), 3);
@@ -284,11 +290,12 @@ fn a_run_in_progress_has_a_stop_and_the_last_run_can_be_rerun(cx: &mut TestAppCo
     assert_eq!(
         menu,
         [
+            "[Running]",
+            "Stop Sleeper",
             "[Run configurations]",
             "Sleeper",
             "-",
-            "Rerun last",
-            "Stop Sleeper"
+            "Rerun last"
         ]
     );
 
@@ -309,7 +316,7 @@ fn a_run_in_progress_has_a_stop_and_the_last_run_can_be_rerun(cx: &mut TestAppCo
 fn an_empty_project_opens_the_add_action_dialog(cx: &mut TestAppContext) {
     let mut fx = Fixture::new(&[], cx);
     assert_eq!(fx.shown(), "empty");
-    fx.click("footer-action-add");
+    fx.click("footer-action-run");
     assert!(
         (fx.window)
             .update(&mut fx.visual, |shell, _, _| shell.action_dialog_open())
