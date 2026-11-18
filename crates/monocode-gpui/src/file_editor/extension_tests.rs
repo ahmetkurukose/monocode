@@ -237,6 +237,66 @@ fn hub_diagnostics_and_marks_reach_the_editor_at_open_and_after_at_their_version
     assert_eq!(ranges(cx), ["os"]);
 }
 
+#[gpui::test]
+fn one_columns_new_marks_do_not_bring_back_the_other_columns_old_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_app.py");
+    std::fs::write(&path, "def test_a():\n    pass\n").unwrap();
+    let mark = |row, kind| GutterMark {
+        row,
+        kind,
+        tooltip: "mark".into(),
+    };
+    let breakpoint = |row| {
+        mark(
+            row,
+            GutterMarkKind::Breakpoint(code_editor::Breakpoint::Enabled),
+        )
+    };
+    cx.update(|cx| {
+        code_editor::hub(cx).update(cx, |hub, cx| {
+            hub.set_gutter_marks(&path, GutterSlot::Breakpoint, vec![breakpoint(1)], cx);
+            hub.set_gutter_marks(
+                &path,
+                GutterSlot::Run,
+                vec![mark(0, GutterMarkKind::Run)],
+                cx,
+            );
+        });
+    });
+    let window = open(&path, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.select_range(0..0, cx))
+        })
+        .unwrap();
+    type_text(window, "import os\n", cx);
+    let rows = |cx: &mut VisualTestContext, slot| {
+        window
+            .update(cx, |view, _, cx| {
+                let input = view.input.read(cx);
+                (input.gutter_marks(slot).iter().map(|mark| mark.row)).collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    // The editor moved both columns itself.
+    assert_eq!(rows(cx, GutterSlot::Breakpoint), [2]);
+    assert_eq!(rows(cx, GutterSlot::Run), [1]);
+    // The breakpoint column reports the move; the hub still holds the run
+    // marks of before the edit and says nothing about them.
+    cx.update(|_, cx| {
+        code_editor::hub(cx).update(cx, |hub, cx| {
+            hub.set_gutter_marks(&path, GutterSlot::Breakpoint, vec![breakpoint(2)], cx)
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(rows(cx, GutterSlot::Breakpoint), [2]);
+    assert_eq!(rows(cx, GutterSlot::Run), [1]);
+}
+
 struct Feature {
     lib: PathBuf,
 }

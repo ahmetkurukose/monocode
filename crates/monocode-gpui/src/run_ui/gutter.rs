@@ -277,7 +277,7 @@ impl GutterProvider for RunMarkers {
     }
 
     fn moved(&self, doc: &DocumentInfo, marks: &[GutterMark], cx: &mut App) {
-        self.0.update(cx, |this, _| {
+        self.0.update(cx, |this, cx| {
             // The marks keep their order through an edit; with as many as
             // before, each runnable follows its own. Otherwise lines were
             // joined, and the search after the edit sorts it out.
@@ -288,6 +288,11 @@ impl GutterProvider for RunMarkers {
                     runnable.row = mark.row as u32;
                 }
             }
+            // The hub's copy serves the other editors of the file and the
+            // ones opened later, so it follows the edit as well.
+            this.hub.update(cx, |hub, cx| {
+                hub.set_gutter_marks(&doc.path, GutterSlot::Run, marks.to_vec(), cx)
+            });
         });
     }
 }

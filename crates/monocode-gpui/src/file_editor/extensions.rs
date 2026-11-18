@@ -127,7 +127,9 @@ impl FileEditor {
         for source in hub.read(cx).diagnostic_sources(&doc.path) {
             self.mirror_diagnostics(&source, cx);
         }
-        self.mirror_gutter(cx);
+        for slot in GutterSlot::ALL {
+            self.mirror_gutter(slot, cx);
+        }
         self.mirror_decorations(cx);
     }
     /// Reports the buffer if it differs from the last report. Returns the
@@ -184,7 +186,7 @@ impl FileEditor {
             HubEvent::Diagnostics { path: file, source } if file == path => {
                 self.mirror_diagnostics(source, cx)
             }
-            HubEvent::Gutter(file) if file == path => self.mirror_gutter(cx),
+            HubEvent::Gutter { path: file, slot } if file == path => self.mirror_gutter(*slot, cx),
             HubEvent::Decorations(file) if file == path => self.mirror_decorations(cx),
             HubEvent::Reveal { path: file, row } if file == path => {
                 let row = *row;
@@ -210,15 +212,17 @@ impl FileEditor {
             input.set_external_diagnostics(source, items, cx)
         });
     }
-    fn mirror_gutter(&mut self, cx: &mut Context<Self>) {
+    /// Copies one column's marks. The editor shifts both columns itself as
+    /// it is typed in; a feature that rewrote one column must not bring back
+    /// the hub's older rows of the other.
+    fn mirror_gutter(&mut self, slot: GutterSlot, cx: &mut Context<Self>) {
         let path = &self.extensions.doc.path;
-        let hub = code_editor::hub(cx);
-        let marks = GutterSlot::ALL.map(|slot| hub.read(cx).gutter_marks(path, slot).to_vec());
-        self.input.update(cx, |input, cx| {
-            for (slot, marks) in GutterSlot::ALL.into_iter().zip(marks) {
-                input.set_gutter_marks(slot, marks, cx);
-            }
-        });
+        let marks = code_editor::hub(cx)
+            .read(cx)
+            .gutter_marks(path, slot)
+            .to_vec();
+        self.input
+            .update(cx, |input, cx| input.set_gutter_marks(slot, marks, cx));
     }
     fn mirror_decorations(&mut self, cx: &mut Context<Self>) {
         let path = &self.extensions.doc.path;
