@@ -479,6 +479,7 @@ impl Shared {
             root: entry.key.root.clone(),
             initialization_options: (entry.spec.initialization_options)(&context),
             settings: (entry.spec.settings)(&context),
+            patience: None,
         };
         entry.command = std::iter::once(launch.program.to_string_lossy().into_owned())
             .chain(launch.args.iter().cloned())
@@ -687,12 +688,11 @@ impl Shared {
                 // While starting, the handshake's failure reports it instead.
                 if let Some(client) = entry.running().cloned() {
                     let name = entry.spec.id;
-                    self.fail_entry(
-                        &mut state,
-                        id,
-                        format!("{name} stopped unexpectedly."),
-                        client.log_tail(LOG_TAIL_LINES),
-                    );
+                    let message = match client.failure() {
+                        Some(reason) => format!("{name} was stopped. {reason}"),
+                        None => format!("{name} stopped unexpectedly."),
+                    };
+                    self.fail_entry(&mut state, id, message, client.log_tail(LOG_TAIL_LINES));
                 }
             }
         }

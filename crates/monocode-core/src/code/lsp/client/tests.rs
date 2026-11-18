@@ -14,6 +14,7 @@ fn start(fake: &FakeServer) -> (Client, Arc<Mutex<Vec<ClientEvent>>>) {
             root: PathBuf::from("/work/app"),
             initialization_options: json!({ "hello": true }),
             settings: json!({ "python": { "pythonPath": "/venv/bin/python" } }),
+            patience: None,
         },
         Box::new(move |event| lock(&sink).push(event)),
     )
@@ -358,6 +359,167 @@ fn a_real_process_is_spawned_logged_and_killed_with_its_children() {
     assert!(alive(pid) && alive(child));
     drop(client);
     wait_until(|| !alive(pid) && !alive(child));
+}
+
+fn change(uri: &str, text: &str, version: i64) -> Value {
+    json!({
+        "textDocument": { "uri": uri, "version": version },
+        "contentChanges": [{ "text": text }],
+    })
+}
+
+#[test]
+fn a_documents_pending_change_is_replaced_by_its_newest() {
+    let outgoing = Outgoing::default();
+    let push = |method: &str, uri: &str, version: i64| {
+        let message =
+            json!({ "jsonrpc": "2.0", "method": method, "params": change(uri, "x", version) });
+        outgoing.push(&message, PATIENCE).unwrap();
+    };
+    push("textDocument/didOpen", "file:///a.py", 1);
+    for version in 2..50 {
+        push("textDocument/didChange", "file:///a.py", version);
+    }
+    push("textDocument/didChange", "file:///b.py", 2);
+    // Open, one change of a, one of b.
+    assert_eq!(outgoing.queued(), 3);
+    outgoing.next();
+    let newest = outgoing.next().unwrap();
+    assert!(String::from_utf8(newest)
+        .unwrap()
+        .contains("\"version\":49"));
+    // A change never takes the place of one that a close or open came after.
+    push("textDocument/didChange", "file:///a.py", 50);
+    push("textDocument/didClose", "file:///a.py", 0);
+    push("textDocument/didOpen", "file:///a.py", 1);
+    push("textDocument/didChange", "file:///a.py", 2);
+    assert_eq!(outgoing.queued(), 5);
+}
+
+#[test]
+fn a_queue_that_is_not_read_is_bounded() {
+    let outgoing = Outgoing::default();
+    let big = "y".repeat(1 << 20);
+    let mut refused = None;
+    for index in 0..100 {
+        let message = json!({
+            "jsonrpc": "2.0", "method": "workspace/executeCommand",
+            "params": { "text": big, "n": index },
+        });
+        if let Err(error) = outgoing.push(&message, PATIENCE) {
+            refused = Some(error);
+            break;
+        }
+    }
+    assert!(matches!(refused, Some(Refused::Stuck(_))), "{refused:?}");
+    outgoing.close();
+    assert_eq!(outgoing.push(&json!({}), PATIENCE), Err(Refused::Closed));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_that_stops_reading_is_killed_and_says_why() {
+    let folder = tempfile::tempdir().unwrap();
+    let transport = ProcessLauncher
+        .launch(&Launch {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "sleep 60".into()],
+            cwd: folder.path().to_path_buf(),
+            env: Vec::new(),
+        })
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let client = Client::start(
+        transport,
+        ClientOptions {
+            patience: Some(Duration::from_millis(800)),
+            ..ClientOptions::default()
+        },
+        Box::new(move |event| lock(&sink).push(event)),
+    )
+    .unwrap();
+    let pid = client.pid().unwrap();
+    let text = "z".repeat(256 * 1024);
+    let uri = "file:///a.py";
+    // Typing: far more text than the pipe holds, and the writer is stuck on
+    // the first of it. What is queued stays one text.
+    for version in 1..20 {
+        client.notify("textDocument/didChange", change(uri, &text, version));
+    }
+    assert!(client.shared.outgoing.queued() <= 2);
+    assert_eq!(client.failure(), None);
+    std::thread::sleep(Duration::from_millis(900));
+    client.notify("textDocument/didChange", change(uri, &text, 200));
+    let reason = client.failure().expect("the stalled server is given up");
+    assert!(reason.contains("has not read its input"), "{reason}");
+    wait_until(|| client.is_closed() && lock(&events).contains(&ClientEvent::Closed));
+    let alive = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    wait_until(|| !alive(pid));
+}
+
+#[test]
+fn a_server_that_answers_nothing_and_says_nothing_is_given_up() {
+    let fake = FakeServer::new(json!({}));
+    fake.on("test/never", |_, _| {});
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let client = Client::start(
+        fake.transport(),
+        ClientOptions {
+            patience: Some(Duration::from_millis(100)),
+            ..ClientOptions::default()
+        },
+        Box::new(move |event| lock(&sink).push(event)),
+    )
+    .unwrap();
+    for _ in 0..3 {
+        let asked = client.request(
+            "test/never",
+            Value::Null,
+            Duration::from_millis(60),
+            &CancelToken::new(),
+        );
+        assert_eq!(asked, Err(LspError::Timeout));
+    }
+    let reason = client.failure().expect("given up");
+    assert!(reason.contains("3 requests in a row"), "{reason}");
+    wait_until(|| lock(&events).contains(&ClientEvent::Closed));
+}
+
+#[test]
+fn a_busy_server_that_still_answers_is_left_alone() {
+    let fake = FakeServer::new(json!({}));
+    let client = Client::start(
+        fake.transport(),
+        ClientOptions {
+            patience: Some(Duration::from_millis(100)),
+            ..ClientOptions::default()
+        },
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    fake.on("test/never", |_, _| {});
+    fake.on("test/echo", |message, out| out.result(message, json!(1)));
+    for _ in 0..2 {
+        let _ = client.request(
+            "test/never",
+            Value::Null,
+            Duration::from_millis(60),
+            &CancelToken::new(),
+        );
+        // An answer in between starts the count again.
+        client
+            .request("test/echo", Value::Null, LONG, &CancelToken::new())
+            .unwrap();
+    }
+    let _ = client.request(
+        "test/never",
+        Value::Null,
+        Duration::from_millis(150),
+        &CancelToken::new(),
+    );
+    assert_eq!(client.failure(), None);
 }
 
 #[test]

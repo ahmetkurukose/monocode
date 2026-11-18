@@ -8,18 +8,25 @@
 use super::position::Encoding;
 use super::types::LspError;
 use crate::code::{child, wire};
+use outgoing::{Outgoing, Refused};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 const LOG_LINES: usize = 200;
 const LOG_LINE_BYTES: usize = 1000;
 const METHOD_NOT_FOUND: i64 = -32601;
+/// How long a server may sit on a write, or stay silent while requests go
+/// unanswered, before it counts as hung.
+const PATIENCE: Duration = Duration::from_secs(20);
+/// Requests in a row that timed out, with nothing heard from the server
+/// meanwhile, before it counts as hung.
+const TIMEOUTS_BEFORE_HUNG: u32 = 3;
 
 /// A poisoned lock only means another thread panicked mid-update; the data
 /// here stays usable, and a language server must not take the app down.
@@ -179,6 +186,9 @@ pub struct ClientOptions {
     pub initialization_options: Value,
     /// Answers `workspace/configuration`, looked up by dotted section.
     pub settings: Value,
+    /// How long a server may not read its input, or not answer while
+    /// silent, before it is killed as hung. Default 20 s.
+    pub patience: Option<Duration>,
 }
 
 /// How a server wants `textDocument/diagnostic` asked.
@@ -193,7 +203,15 @@ type Reply = mpsc::Sender<Result<Value, LspError>>;
 
 struct Shared {
     options: ClientOptions,
-    outgoing: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    outgoing: Outgoing,
+    process: Mutex<Option<Child>>,
+    /// Why the client ended the server, when it did.
+    failure: Mutex<Option<String>>,
+    /// Requests in a row that ran out of time.
+    timeouts: AtomicU32,
+    /// When the server last wrote anything.
+    heard: Mutex<Instant>,
+    me: Weak<Shared>,
     pending: Mutex<HashMap<i64, Reply>>,
     next_id: AtomicI64,
     closed: AtomicBool,
@@ -206,7 +224,6 @@ struct Shared {
 
 pub struct Client {
     shared: Arc<Shared>,
-    process: Mutex<Option<Child>>,
     pid: Option<u32>,
 }
 
@@ -311,9 +328,60 @@ impl Shared {
         }
     }
 
+    fn patience(&self) -> Duration {
+        self.options.patience.unwrap_or(PATIENCE)
+    }
+
+    /// Queues a message for the server. Never blocks, and is made with the
+    /// manager's lock held, so a server found hung is ended on a thread of
+    /// its own.
     fn send(&self, message: &Value) {
-        if let Some(outgoing) = lock(&self.outgoing).as_ref() {
-            let _ = outgoing.send(message.to_string().into_bytes());
+        if let Err(Refused::Stuck(reason)) = self.outgoing.push(message, self.patience()) {
+            self.fail(format!("The server {reason}."));
+        }
+    }
+
+    /// Ends a server that has stopped working, saying why.
+    fn fail(&self, reason: String) {
+        {
+            let mut failure = lock(&self.failure);
+            if failure.is_some() {
+                return;
+            }
+            *failure = Some(reason.clone());
+        }
+        self.log(&format!("[client] {reason}"));
+        self.outgoing.close();
+        let Some(shared) = self.me.upgrade() else {
+            return;
+        };
+        let work = {
+            let shared = shared.clone();
+            move || {
+                if let Some(mut child) = lock(&shared.process).take() {
+                    child::kill_group(&mut child);
+                }
+                shared.close();
+            }
+        };
+        if spawn_thread("lsp-failed", work).is_err() {
+            if let Some(mut child) = lock(&shared.process).take() {
+                child::kill_group(&mut child);
+            }
+        }
+    }
+
+    /// Counts a request that ran out of time; the server that has answered
+    /// none of the last few and said nothing at all is hung.
+    fn timed_out(&self, method: &str) {
+        let count = self.timeouts.fetch_add(1, Ordering::SeqCst) + 1;
+        let silent = lock(&self.heard).elapsed();
+        if count >= TIMEOUTS_BEFORE_HUNG && silent > self.patience() {
+            self.fail(format!(
+                "The server stopped answering: {count} requests in a row ({method} last) \
+                 timed out and it has said nothing for {} s.",
+                silent.as_secs()
+            ));
         }
     }
 
@@ -333,7 +401,7 @@ impl Shared {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        *lock(&self.outgoing) = None;
+        self.outgoing.close();
         let pending = std::mem::take(&mut *lock(&self.pending));
         for (_, reply) in pending {
             let _ = reply.send(Err(LspError::Closed));
@@ -359,6 +427,7 @@ impl Shared {
             }
             (Some(method), None) => self.notified(method, &params),
             (None, Some(id)) => {
+                self.timeouts.store(0, Ordering::SeqCst);
                 let Some(reply) = id.as_i64().and_then(|id| lock(&self.pending).remove(&id)) else {
                     // Late answers to requests we gave up on end here.
                     return;
@@ -533,10 +602,14 @@ impl Client {
             stderr,
             process,
         } = transport;
-        let (outgoing, queue) = mpsc::channel::<Vec<u8>>();
-        let shared = Arc::new(Shared {
+        let shared = Arc::new_cyclic(|me| Shared {
             options,
-            outgoing: Mutex::new(Some(outgoing)),
+            outgoing: Outgoing::default(),
+            process: Mutex::new(process),
+            failure: Mutex::new(None),
+            timeouts: AtomicU32::new(0),
+            heard: Mutex::new(Instant::now()),
+            me: me.clone(),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             closed: AtomicBool::new(false),
@@ -545,15 +618,17 @@ impl Client {
             registrations: Mutex::new(HashMap::new()),
             handler,
         });
-        let pid = process.as_ref().map(Child::id);
+        let pid = lock(&shared.process).as_ref().map(Child::id);
         let client = Self {
             shared: shared.clone(),
-            process: Mutex::new(process),
             pid,
         };
+        let queue = shared.clone();
         spawn_thread("lsp-writer", move || {
-            for body in queue {
-                if wire::write_message(&mut writer, &body).is_err() {
+            while let Some(body) = queue.outgoing.next() {
+                let written = wire::write_message(&mut writer, &body);
+                queue.outgoing.written();
+                if written.is_err() {
                     break;
                 }
             }
@@ -566,10 +641,15 @@ impl Client {
             let mut reader = BufReader::new(reader);
             loop {
                 match wire::read_message(&mut reader) {
-                    Ok(Some(body)) => match serde_json::from_slice::<Value>(&body) {
-                        Ok(message) => shared.dispatch(message),
-                        Err(error) => shared.log(&format!("[client] unreadable message: {error}")),
-                    },
+                    Ok(Some(body)) => {
+                        *lock(&shared.heard) = Instant::now();
+                        match serde_json::from_slice::<Value>(&body) {
+                            Ok(message) => shared.dispatch(message),
+                            Err(error) => {
+                                shared.log(&format!("[client] unreadable message: {error}"))
+                            }
+                        }
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         // Without a length there is no finding the next message.
@@ -650,6 +730,7 @@ impl Client {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 shared.abandon(id, LspError::Timeout);
+                shared.timed_out(method);
                 Err(LspError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(LspError::Closed),
@@ -718,6 +799,11 @@ impl Client {
         })
     }
 
+    /// Why the client ended the server, when it was found hung.
+    pub fn failure(&self) -> Option<String> {
+        lock(&self.shared.failure).clone()
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -751,7 +837,7 @@ impl Client {
                 self.notify("exit", Value::Null);
             }
         }
-        let mut process = lock(&self.process);
+        let mut process = lock(&self.shared.process);
         if let Some(child) = process.as_mut() {
             let deadline = Instant::now() + Duration::from_secs(1);
             // Looked at without reaping: a launcher that has left may have
@@ -763,7 +849,7 @@ impl Client {
         }
         *process = None;
         drop(process);
-        *lock(&self.shared.outgoing) = None;
+        self.shared.outgoing.close();
     }
 }
 
@@ -773,8 +859,8 @@ impl Client {
     pub fn kill(&self) {
         // Closing its input lets a well-behaved server leave by itself; the
         // kill is for the rest.
-        *lock(&self.shared.outgoing) = None;
-        if let Some(mut child) = lock(&self.process).take() {
+        self.shared.outgoing.close();
+        if let Some(mut child) = lock(&self.shared.process).take() {
             child::kill_group(&mut child);
         }
     }
@@ -798,11 +884,13 @@ fn read_stderr(stderr: Box<dyn Read + Send>, shared: &Weak<Shared>) {
                 let Some(shared) = shared.upgrade() else {
                     break;
                 };
+                *lock(&shared.heard) = Instant::now();
                 shared.log(String::from_utf8_lossy(&line).trim_end());
             }
         }
     }
 }
 
+mod outgoing;
 #[cfg(test)]
 mod tests;
