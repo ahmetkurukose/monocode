@@ -798,7 +798,7 @@ started (it lists them by the sample project's path, so it leaves other work alo
   configuration, whatever file is open (the menu chooses); the run tab's header has no
   "Open in browser" (the dock's header seam has no controls for a run tab; the chip list
   has it); the debug console shows debugpy's own "Server[1] disconnected unexpectedly"
-  line when a session ends; the Run configurations dialog shows no tab order or key hint.
+  line (in the error colour) when a session ends.
 
 ### Code insight
 
