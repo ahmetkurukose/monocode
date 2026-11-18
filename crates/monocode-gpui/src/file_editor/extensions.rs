@@ -36,6 +36,10 @@ pub(super) struct Extensions {
     pub(super) doc: Rc<DocumentInfo>,
     /// Whether the hub has been told this document is open.
     opened: bool,
+    /// The text this editor last gave the hub, or loaded. A flush of an
+    /// editor whose buffer is still that must not put its older text over
+    /// what another editor of the same file has reported since.
+    reported: Option<SharedString>,
     sync: Option<Task<()>>,
     header: Vec<Rc<dyn HeaderProvider>>,
     /// The file's symbols as of the last analysis, for the crumbs.
@@ -95,6 +99,7 @@ impl Extensions {
         Self {
             doc,
             opened: false,
+            reported: None,
             sync: None,
             header,
             outline: Arc::default(),
@@ -122,6 +127,7 @@ impl FileEditor {
         let doc = self.extensions.doc.clone();
         let text = self.input.read(cx).content.clone();
         let hub = code_editor::hub(cx);
+        self.extensions.reported = Some(text.clone());
         hub.update(cx, |hub, cx| hub.document_opened(doc.clone(), text, cx));
         // What features already know about the file shows from the start.
         for source in hub.read(cx).diagnostic_sources(&doc.path) {
@@ -139,9 +145,14 @@ impl FileEditor {
             return 0;
         }
         self.extensions.sync = None;
-        let text = self.input.read(cx).content.clone();
         let path = self.extensions.doc.path.clone();
-        code_editor::hub(cx).update(cx, |hub, cx| hub.document_changed(&path, text, cx))
+        let hub = code_editor::hub(cx);
+        let text = self.input.read(cx).content.clone();
+        if self.extensions.reported.as_ref() == Some(&text) {
+            return hub.read(cx).document(&path).map_or(0, |open| open.version);
+        }
+        self.extensions.reported = Some(text.clone());
+        hub.update(cx, |hub, cx| hub.document_changed(&path, text, cx))
     }
     /// Typing reports once it pauses, so a burst is one change.
     pub(super) fn schedule_document_sync(&mut self, cx: &mut Context<Self>) {

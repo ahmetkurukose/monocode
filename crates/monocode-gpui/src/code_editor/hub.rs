@@ -109,6 +109,8 @@ impl EventEmitter<HubEvent> for Hub {}
 impl Hub {
     /// An editor loaded the file. Two editors on one file share a document:
     /// only the first opens it, and the last one to edit defines its text.
+    /// Loading is not editing, so a later editor's text (from disk, maybe)
+    /// does not replace what an earlier one has typed.
     pub(crate) fn document_opened(
         &mut self,
         doc: Rc<DocumentInfo>,
@@ -117,7 +119,7 @@ impl Hub {
     ) -> u64 {
         if let Some(open) = self.open.get_mut(&doc.path) {
             open.editors += 1;
-            return self.document_changed(&doc.path, text, cx);
+            return open.version;
         }
         self.open.insert(
             doc.path.clone(),
