@@ -127,6 +127,9 @@ struct Cache {
     /// "since I last looked" in, since the kept part stops growing.
     output_total: u64,
     exit_code: Option<i32>,
+    /// The debuggee has exited; what the adapter writes to stderr after that
+    /// (debugpy: "Server[1] disconnected unexpectedly") is its own shutdown.
+    exited: bool,
     process_id: Option<u32>,
     failure: Option<String>,
     terminal: Option<TerminalRequest>,
@@ -192,6 +195,7 @@ impl Session {
                 output_bytes: 0,
                 output_total: 0,
                 exit_code: None,
+                exited: false,
                 process_id: None,
                 failure: None,
                 terminal: None,
@@ -814,7 +818,9 @@ impl Session {
             }
             "exited" => {
                 let code = body.get("exitCode").and_then(Value::as_i64);
-                lock(&self.cache).exit_code = code.and_then(|code| i32::try_from(code).ok());
+                let mut cache = lock(&self.cache);
+                cache.exit_code = code.and_then(|code| i32::try_from(code).ok());
+                cache.exited = true;
             }
             "terminated" => self.finish(),
             "breakpoint" => self.on_breakpoint(body.get("breakpoint").unwrap_or(&Value::Null)),
@@ -966,6 +972,13 @@ impl Session {
         if text.is_empty() {
             return;
         }
+        // Not an error of the run: the adapter reporting that the debuggee it
+        // watched is gone. Its stderr before that, and a failed start, stay.
+        if category == OutputCategory::Stderr
+            && (lock(&self.cache).exited || self.state().is_terminated())
+        {
+            return;
+        }
         let output = Output {
             category,
             text: text.to_string(),
@@ -1083,7 +1096,12 @@ impl Session {
         let job = Job::Run(Box::new(move |session: &Session| {
             if let Err(error) = job(session) {
                 // A request cut off by the end of the session is not news.
-                if !session.state().is_terminated() {
+                // Nor is a refresh of the paused view that fails once the program
+                // runs on or is exiting: debugpy answers it with "Server[1]
+                // disconnected unexpectedly" as the debuggee goes away.
+                let state = session.state();
+                let stale = action == "refresh" && state.stop().is_none();
+                if !state.is_terminated() && !stale {
                     session.emit(SessionEvent::Failed {
                         action: action.into(),
                         message: error.to_string(),

@@ -227,6 +227,11 @@ impl Driver {
             .as_ref()
             .and_then(|session| session["terminal"]["tail"].as_str().map(str::to_owned))
             .unwrap_or_default();
+        // The adapter's shutdown chatter is not shown as an error line.
+        let console_clean = finished.as_ref().is_some_and(|session| {
+            (session["console"].as_array())
+                .is_some_and(|lines| lines.iter().all(|line| line[0] != "Error"))
+        });
         let output_ok = output.contains("order total 42.0") && output.contains("done 42.0");
         self.pause(cx, 500).await;
         let cleared = self.decorations(cx, &path);
@@ -248,6 +253,7 @@ impl Driver {
             "a breakpoint set in the gutter stops the script debugged from the header: arrow, stack, locals, console, step over, continue to exit 0, output in its terminal tab, decorations cleared",
             opened && set == [line] && clicked && at_breakpoint && arrow_ok && frame_ok
                 && locals_ok && tab_ok && evaluate_ok && step_ok && exit_ok && output_ok
+                && console_clean
                 && cleared.is_empty(),
             json!({
                 "breakpoint_lines_after_click": set, "expected_line": line,
@@ -257,7 +263,7 @@ impl Driver {
                     "frame": frame_ok, "locals": locals_ok, "tab": tab_ok,
                     "console_input_clicked": typed, "evaluate": evaluate_ok,
                     "step_button_clicked": stepped_click, "step_over": step_ok,
-                    "exit_0": exit_ok, "output_in_terminal": output_ok,
+                    "exit_0": exit_ok, "output_in_terminal": output_ok, "console_without_errors": console_clean,
                     "decorations_cleared": cleared.is_empty(),
                 },
                 "decorations_at_stop": arrow, "drawn": drawn,
