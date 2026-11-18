@@ -42,7 +42,7 @@ macro_rules! place {
 
 macro_rules! target {
     () => {
-        r#""name":{"type":"string","description":"A run configuration's name or a task id, as run_list shows them."},"command":{"type":"string","description":"Instead of name: a command line. It is split by shell rules but no shell runs it (use sh -c '...' for pipes). $PYTHON is the project's interpreter; a bare python means the same."},"cwd":{"type":"string","description":"For command: the folder to run in. Default: the checkout."},"env":{"type":"object","additionalProperties":{"type":"string"},"description":"For command: extra environment variables."},"file":{"type":"string","description":"The file a task or a $FILE variable is about."},"symbol":{"type":"string","description":"A test in that file: test_name or TestClass::test_name."}"#
+        r#""name":{"type":"string","description":"A run configuration's name or a task id, as run_list shows them."},"command":{"type":"string","description":"Instead of name: a command line. It is split by shell rules but no shell runs it (use sh -c '...' for pipes). The only variable is $PYTHON, the project's interpreter; a bare python means the same. Everything else, $FILE included, is left as typed."},"cwd":{"type":"string","description":"For command: the folder to run in. Default: the checkout."},"env":{"type":"object","additionalProperties":{"type":"string"},"description":"For command: extra environment variables; names are letters, digits and underscores."},"file":{"type":"string","description":"The file a task or a $FILE variable is about."},"symbol":{"type":"string","description":"A test in that file: test_name or TestClass::test_name."}"#
     };
 }
 

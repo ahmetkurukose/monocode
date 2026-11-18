@@ -299,3 +299,49 @@ fn calls_are_answered_while_another_waits_and_a_cancelled_one_is_not() {
     assert_eq!(frames[0]["id"], "two");
     stage.ok("run_stop", json!({"run": 1}));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_command_an_agent_typed_is_not_a_template() {
+    let stage = Stage::new(&[("notes.txt", "x\n")], |_| {});
+    // `$FILE` is the shell's, not a variable of ours: no "No file is focused".
+    let said = stage.ok(
+        "run_start",
+        json!({"command": "/bin/sh -c 'echo \"[$FILE][$$]\"'", "env": {"FILE": "mine"}, "wait_s": 20}),
+    );
+    assert!(said.contains("[mine]["), "{said}");
+    assert!(!said.contains("No file"), "{said}");
+    let bare = stage.ok(
+        "run_start",
+        json!({"command": "/bin/sh -c 'echo \"[$FILE_DIR$RELATIVE_FILE]\"'", "wait_s": 20}),
+    );
+    assert!(bare.contains("[]"), "{bare}");
+    // Names that are not variable names are said so, not dropped.
+    for key in ["BAD-NAME", "A=B", "1ST", "", "with space"] {
+        let said = stage.refused("run_start", json!({"command": "true", "env": {key: "x"}}));
+        assert!(said.contains("is not a variable name"), "{key}: {said}");
+    }
+    let said = stage.refused(
+        "run_start",
+        json!({"command": "true", "env": {"A": "one\ntwo"}}),
+    );
+    assert!(said.contains("cannot hold a line break"), "{said}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_crafted_symbol_cannot_move_the_folder_out_of_the_project() {
+    let stage = Stage::new(&[("test_a.py", "def test_x(): pass\n")], |_| {});
+    // A folder whose name looks like a variable, and a symbol that would
+    // climb out of the project if the folder were filled in like a template.
+    let tricky = stage.root.join("$SYMBOL");
+    std::fs::create_dir_all(&tricky).unwrap();
+    let said = stage.ok(
+        "run_start",
+        json!({
+            "command": "/bin/pwd", "cwd": "$SYMBOL", "symbol": "../../..",
+            "file": "test_a.py", "wait_s": 20,
+        }),
+    );
+    assert!(said.contains("/project/$SYMBOL"), "{said}");
+}
