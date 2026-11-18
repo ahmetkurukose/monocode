@@ -747,7 +747,58 @@ agent's run in a tab. With `MONOCODE_TEST_PYTHON`, one test runs real pytest fro
 in the running app: the page's and the output tab's layout, the right-click menu on a
 marker and opening a detected address in the browser pane are untested beyond compiling.
 
-_To be filled in: what was run, by hand and by test._
+### The self-test in a real window
+
+The statements above that nothing was looked at in the running app are about the
+tests; the self-test below did look. `scripts/code-selftest/run.py` starts the development
+build (built with `--features selftest`) against a sample Python project and a throwaway
+data directory under `/private/tmp/code-selftest`, and the app drives itself through the
+window's own event path (`shell/code_selftest.rs`, `window.dispatch_event` with real
+mouse and key events; clicks go to where `debug_selector` says the element was drawn).
+It never touches the user's data or the installed app, and ends every process it
+started (it lists them by the sample project's path, so it leaves other work alone).
+
+- The code exists only with the cargo feature `selftest` of `monocode-gpui` (off by
+  default: the ordinary and release builds compile none of it and gain no dependency).
+  The feature turns on GPUI's `test-support` for `Window::debug_bounds` (a Monocode
+  addition to the vendored GPUI, listed in `NOTICE`) and `Window::render_to_image`.
+  The probes (`code_insight/probe.rs`, `run_ui/probe.rs`, `debug_ui/probe.rs`) are
+  read-only accessors it uses to observe each feature.
+- Pictures are the frame drawn again off screen (`render_to_image`): no screen recording
+  permission, and they work behind a locked screen. They show no backdrop blur, so a
+  popover looks a little more see-through than on screen. They are saved to
+  `/tmp/code-selftest/shots/`.
+- Steps, each writing pass or fail with its details to `result.json` (`report.json` for the
+  agent and shutdown steps): 0 the project opens with a session; 1 servers go from
+  starting to ready; 2 the type error and the unused import on their lines and in the
+  header count; 3 member completion, accepting one, signature help; 4 hover, Cmd-click to
+  another module, Back; 5 find usages and opening one; 6 the Outline tab and `@` symbol
+  search; 7 Run from the header and rerun, a failing test from its gutter marker; 8 a
+  configuration made through the settings page's model, in the header menu and quick open;
+  9 a breakpoint set by a gutter click, Debug from the header's menu, stop with the arrow,
+  stack, locals, console evaluation, step over, continue to exit 0, the debuggee's output
+  in its tab, decorations cleared; 10 a single test debugged from the marker's menu; 11
+  the agents' tools through `monocode-gpui code-mcp` with a session's environment
+  (diagnostics, definition, run with wait, debug to a breakpoint, variables, step,
+  continue), the app showing the agent's stopped session and rail status, Take over by a
+  click and the tool refusing; 12 shutdown: the app quitting by itself, ended by SIGTERM
+  in the middle of a debug session, and by SIGKILL (nothing survived either way); 13 idle
+  time one minute, closing the file panes stops both servers (about a minute); 14 a
+  project whose environment has no debugpy shows the install command.
+- Run it: `cargo build --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui
+  --profile native-dev --features selftest`, then `python3 scripts/code-selftest/run.py`
+  (all steps, about six minutes) or `--only insight,run,debug,idle,nodebugpy,agent,sigkill`.
+  It needs `~/Dev/socode-ide-fixture/.venv` (basedpyright, ruff, debugpy, pytest) and `uv`.
+- Found and fixed by it: Debug or Run chosen in a gutter marker's menu aborted the app;
+  Escape did not close a project's dialog while a field had focus; the runs chip hid
+  finished runs; hover popovers cut the end of a type; the marker's tip covered its own
+  menu; the debugpy hint was wrong for an environment made by `uv venv`.
+- Left as it is, by design or too large for one night: the header's Run and Debug buttons
+  start the project's last run, so after running a user configuration they start that
+  configuration, whatever file is open (the menu chooses); the run tab's header has no
+  "Open in browser" (the dock's header seam has no controls for a run tab; the chip list
+  has it); the debug console shows debugpy's own "Server[1] disconnected unexpectedly"
+  line when a session ends; the Run configurations dialog shows no tab order or key hint.
 
 ### Code insight
 
