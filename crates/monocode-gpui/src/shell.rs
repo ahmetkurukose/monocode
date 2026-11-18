@@ -9719,6 +9719,13 @@ impl Render for Shell {
                     this.close_action_dialog(window, cx);
                     return;
                 }
+                // The project's dialogs (run configurations, the terminal
+                // setup) close on Escape from whatever field has focus; the
+                // key reaches this action before their own handler.
+                if this.background_dialog.is_some() {
+                    this.close_project_dialog(window, cx);
+                    return;
+                }
                 if let Some(settings) = this.settings.clone() {
                     if !settings.update(cx, |s, cx| s.dismiss_transient(window, cx)) {
                         this.close_settings(window, cx);
