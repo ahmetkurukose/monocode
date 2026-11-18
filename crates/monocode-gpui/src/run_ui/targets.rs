@@ -83,6 +83,13 @@ pub(super) fn file_key(file: &context::FocusedFile, cx: &App) -> Option<FileKey>
     ))
 }
 
+/// The version of a file's text the hub last heard of, 0 when it is not open.
+pub(super) fn document_version(path: &Path, cx: &App) -> u64 {
+    (cx.try_global::<Shared>())
+        .and_then(|shared| shared.hub.read(cx).document(path))
+        .map_or(0, |open| open.version)
+}
+
 /// The checkout a file belongs to: the one the shell knows, else the folder
 /// its editor was opened from.
 pub(super) fn checkout_of(path: &Path, root: &Path, cx: &App) -> Option<Checkout> {

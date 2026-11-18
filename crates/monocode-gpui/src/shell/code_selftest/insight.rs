@@ -137,21 +137,8 @@ impl Driver {
             self.click(cx, at).await;
             self.keys(cx, "end").await;
             self.type_text(cx, " + order.sc").await;
-            let labels = |input: &mut Input| input.completion_labels();
-            let listed = self
-                .until(cx, 12_000, |_, cx| {
-                    context::focused_file(cx)
-                        .and_then(|file| file.editor.upgrade())
-                        .is_some_and(|editor| {
-                            let input = editor.read(cx).input.clone();
-                            input.update(cx, |input, _| {
-                                labels(input).iter().any(|label| label == "scaled")
-                            })
-                        })
-                })
-                .await;
-            let shown = self.input(cx, |input, _| labels(input)).unwrap_or_default();
-            self.shot(cx, "completion-popup").await;
+            let (listed, shown, narrow) =
+                self.completion_popup(cx, "completion-popup-narrow").await;
             self.keys(cx, "enter").await;
             self.pause(cx, 300).await;
             let accepted = self.text(cx).contains("text = \"\" + order.scaled");
@@ -168,7 +155,27 @@ impl Driver {
             let line = (self.text(cx).lines())
                 .find(|line| line.contains("order.scaled"))
                 .map(str::to_owned);
+            // The same list in a window with room: the sidebar put away.
+            self.keys(cx, "escape escape").await;
+            self.input(cx, |input, cx| input.set_text(before.clone(), cx));
+            self.shell(cx, |shell, _, cx| shell.set_sidebar_visible(false, cx));
+            self.pause(cx, 600).await;
+            let mut wide = None;
+            if let Some((_, at)) = self.glyph(cx, "text = \"\"") {
+                self.click(cx, at).await;
+                // On a line of its own, where the pane has room on the right.
+                self.keys(cx, "end enter").await;
+                self.type_text(cx, "order.sc").await;
+                wide = Some(self.completion_popup(cx, "completion-popup-wide").await);
+            }
+            self.shell(cx, |shell, _, cx| shell.set_sidebar_visible(true, cx));
+            self.pause(cx, 400).await;
+            let wide_ok = wide
+                .as_ref()
+                .is_some_and(|(listed, _, placed)| *listed && placed["documentation"] == "right");
             pass = listed
+                && narrow["clear"] == true
+                && wide_ok
                 && accepted
                 && helped
                 && signature
@@ -177,6 +184,7 @@ impl Driver {
             detail = json!({
                 "typed": " + order.sc", "popup_has_scaled": listed, "popup": shown,
                 "accepted_with_enter": accepted, "line_after": line,
+                "narrow_pane": narrow, "wide_pane": wide.map(|(_, _, placed)| placed),
                 "signature": signature,
             });
         }
@@ -191,6 +199,49 @@ impl Driver {
             pass,
             detail,
         );
+    }
+
+    /// Types nothing: waits for the member list that is being typed for, saves
+    /// the picture, and says where the documentation box is against the list.
+    async fn completion_popup(&mut self, cx: &mut Cx, shot: &str) -> (bool, Vec<String>, Value) {
+        let labels = |input: &mut Input| input.completion_labels();
+        let listed = self
+            .until(cx, 12_000, |_, cx| {
+                context::focused_file(cx)
+                    .and_then(|file| file.editor.upgrade())
+                    .is_some_and(|editor| {
+                        let input = editor.read(cx).input.clone();
+                        input.update(cx, |input, _| {
+                            labels(input).iter().any(|label| label == "scaled")
+                        })
+                    })
+            })
+            .await;
+        let shown = self.input(cx, |input, _| labels(input)).unwrap_or_default();
+        self.pause(cx, 1200).await;
+        self.shot(cx, shot).await;
+        let list = self.bounds(cx, "editor-completions");
+        let doc = self.bounds(cx, "editor-completion-documentation");
+        let placed = match (list, doc) {
+            (Some(list), Some(doc)) => {
+                let apart = list.intersect(&doc).size.width.as_f32() <= 0.
+                    || list.intersect(&doc).size.height.as_f32() <= 0.;
+                let side = if doc.origin.x >= list.right() {
+                    "right"
+                } else if doc.right() <= list.origin.x {
+                    "left"
+                } else {
+                    "above or below"
+                };
+                json!({
+                    "documentation": side,
+                    "clear": apart, "list": format!("{list:?}"), "doc": format!("{doc:?}"),
+                })
+            }
+            (Some(_), None) => json!({ "documentation": "none", "clear": true }),
+            _ => json!({ "documentation": "no list", "clear": false }),
+        };
+        (listed, shown, placed)
     }
 
     async fn hover_and_definition(&mut self, cx: &mut Cx) {
@@ -246,13 +297,38 @@ impl Driver {
             })
             .await;
         let back = self.place(cx);
+
+        // The same by key: the caret in the name, F12.
+        let mut by_key = None;
+        if let Some((_, at)) = self.glyph(cx, "apply_discount(order, 80)") {
+            self.click(cx, at + point(px(20.), px(0.))).await;
+            self.keys(cx, "f12").await;
+            let target = self.path("shop/models.py").to_string_lossy().into_owned();
+            self.until(cx, 8000, |_, cx| {
+                context::focused_file(cx).is_some_and(|file| file.path == target)
+            })
+            .await;
+            self.pause(cx, 500).await;
+            by_key = self.place(cx);
+            self.shot(cx, "definition-by-f12").await;
+        }
+        let key_ok = by_key.as_ref().is_some_and(|(path, line, _)| {
+            path.ends_with("shop/models.py") && Some(*line) == definition_line
+        });
+        self.keys(cx, "ctrl--").await;
+        let returned_again = self
+            .until(cx, 5000, |_, cx| {
+                context::focused_file(cx).is_some_and(|file| file.path == origin)
+            })
+            .await;
         self.record(
             "4",
-            "hover shows the type; Cmd-click opens the definition in the other module; Back returns",
-            hover_ok && definition_ok && returned,
+            "hover shows the type; Cmd-click and F12 open the definition in the other module; Back returns",
+            hover_ok && definition_ok && returned && key_ok && returned_again,
             json!({
                 "hover": hover, "link_tried": underlined, "from": from,
                 "landed": landed, "definition_line": definition_line, "back": back,
+                "by_f12": by_key, "back_again": returned_again,
             }),
         );
     }

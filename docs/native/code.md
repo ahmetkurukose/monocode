@@ -812,7 +812,7 @@ started (it lists them by the sample project's path, so it leaves other work alo
 - Steps, each writing pass or fail with its details to `result.json` (`report.json` for the
   agent and shutdown steps): 0 the project opens with a session; 1 servers go from
   starting to ready; 2 the type error and the unused import on their lines and in the
-  header count; 3 member completion, accepting one, signature help; 4 hover, Cmd-click to
+  header count; 3 member completion, accepting one, signature help; 4 hover, Cmd-click and F12 to
   another module, Back; 5 find usages and opening one; 6 the Outline tab and `@` symbol
   search; 7 Run from the header and rerun, a failing test from its gutter marker; 8 a
   configuration made through the settings page's model, in the header menu and quick open;
@@ -834,12 +834,27 @@ started (it lists them by the sample project's path, so it leaves other work alo
   Escape did not close a project's dialog while a field had focus; the runs chip hid
   finished runs; hover popovers cut the end of a type; the marker's tip covered its own
   menu; the debugpy hint was wrong for an environment made by `uv venv`.
+- Found by looking at its pictures and fixed: the completion documentation box covered the
+  list in a narrow pane (it is placed beside the list, else above or below, never over the
+  list or the caret's line, and left out without room; `code_editor/popup_place.rs`, both a
+  narrow and a wide picture are taken); the Run configurations page was taller than the
+  window with its Save under the fold (project settings pages now sit in
+  `code_shell::settings::page_frame`: the body scrolls, the footer with Save stays); the
+  debug console showed debugpy's "Server[1] disconnected unexpectedly" as an error (it is the
+  error answer to a thread refresh made as the program goes away, not stderr; a refresh that
+  fails while the program is not paused is dropped, as is adapter stderr after the exit); a
+  restarted or newly started session of the same program shared the old console (a restart
+  keeps it under a ruled "Restarted" line, any other start begins empty); the Run and Debug
+  buttons did not say what they start (their tooltips name the target, the menu ticks it);
+  a marker's tip stayed under its own menu.
 - Left as it is, by design or too large for one night: the header's Run and Debug buttons
   start the project's last run, so after running a user configuration they start that
-  configuration, whatever file is open (the menu chooses); the run tab's header has no
-  "Open in browser" (the dock's header seam has no controls for a run tab; the chip list
-  has it); the debug console shows debugpy's own "Server[1] disconnected unexpectedly"
-  line (in the error colour) when a session ends.
+  configuration, whatever file is open (the tooltip says which; the menu chooses); the run
+  tab's header has no "Open in browser" (the dock's header seam has no controls for a run
+  tab; the chip list has it); a Usages row longer than the right panel is cut at its edge
+  without an ellipsis; inline values at a stop are cut at the pane's edge; the editor's
+  soft wrap can split `->` between its two characters; section labels of the Code insight
+  page sit a little right of the checkboxes under them.
 
 ### Code insight
 

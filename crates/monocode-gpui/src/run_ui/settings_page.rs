@@ -669,7 +669,7 @@ impl Render for RunsPage {
         let save = button("run-configurations-save", "Save")
             .when(!self.unsaved, |b| b.opacity(0.5))
             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx)));
-        div()
+        let body = div()
             .id("run-configurations-page")
             .debug_selector(|| "run-configurations-page".into())
             .flex()
@@ -677,16 +677,17 @@ impl Render for RunsPage {
             .gap_4()
             .child(self.list(cx))
             .child(div().flex().child(add))
-            .when(self.selected().is_some(), |d| {
-                d.child(self.form_fields()).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(save)
-                        .when(self.unsaved, |d| d.child(hint("Not saved yet."))),
-                )
-            })
-            .child(runners)
+            .when(self.selected().is_some(), |d| d.child(self.form_fields()))
+            .child(runners);
+        // Under the scrolling body, so it is there however long the form is.
+        let footer = self.selected().is_some().then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(save)
+                .when(self.unsaved, |d| d.child(hint("Not saved yet.")))
+        });
+        crate::code_shell::settings::page_frame("run-configurations-scroll", body, footer)
     }
 }

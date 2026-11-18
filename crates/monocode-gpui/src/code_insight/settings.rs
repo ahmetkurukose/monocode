@@ -428,7 +428,7 @@ impl Render for Page {
                 servers.push(element);
             }
         }
-        div()
+        let body = div()
             .id("code-insight-settings")
             .debug_selector(|| "code-insight-settings".into())
             .flex()
@@ -491,20 +491,26 @@ impl Render for Page {
                             .child(hint("Servers alive at most"))
                             .child(boxed(&self.cap)),
                     ),
-            )
-            .when_some(self.problem.clone(), |d, problem| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(gpui::rgb(0xf87171))
-                        .child(problem),
-                )
-            })
+            );
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_3()
             .child(
-                div().flex().justify_end().child(
-                    button("code-insight-save", "Save")
-                        .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .children(self.problem.clone().map(|problem| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(gpui::rgb(0xf87171))
+                            .child(problem)
+                    })),
             )
+            .child(
+                button("code-insight-save", "Save")
+                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+            );
+        crate::code_shell::settings::page_frame("code-insight-scroll", body, Some(footer))
     }
 }

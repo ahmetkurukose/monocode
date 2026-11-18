@@ -1,7 +1,7 @@
 //! The editor shares native selection/IME handling with Input and retains glyph
 //! runs for visible lines. Scroll position is independent of the caret.
 use super::*;
-use crate::code_editor::{CompletionItem, Decor, Severity};
+use crate::code_editor::{CompletionItem, Decor, Severity, popup_place::Area};
 use crate::{
     editor_analysis::Analysis,
     editor_scrollbar::{Metrics, WIDTH},
@@ -481,7 +481,8 @@ impl Input {
         }
         let p = self.code_position(self.cursor());
         let gutter = code.gutter();
-        let height = (code.completions.len().min(10) as f32 * 22.).min(240.);
+        // Rows, the list's own padding and its border.
+        let height = code.completions.len().min(10) as f32 * 22. + 10.;
         let viewport = self.bounds.map_or(400., |b| b.size.height.as_f32());
         let y = (p.y - self.scroll_y).as_f32();
         let top = if y + self.line_height + height > viewport {
@@ -500,9 +501,15 @@ impl Input {
             .min((viewport_width - 8.).max(1.));
         let left = (gutter + (p.x - self.scroll_x).as_f32())
             .clamp(4., (viewport_width - width - 4.).max(4.));
-        let documentation = self.completion_documentation(left, top, width, viewport_width);
+        let container = (viewport_width, viewport);
+        let documentation = self.completion_documentation(
+            container,
+            Area::new(left, top, width, height),
+            Area::new(0., y, viewport_width, self.line_height),
+        );
         let list = div()
             .id("editor-completions")
+            .debug_selector(|| "editor-completions".into())
             .role(Role::List)
             .aria_label("Autocomplete")
             .absolute()

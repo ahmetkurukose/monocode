@@ -45,6 +45,8 @@ pub(super) enum Tone {
     Input,
     Result,
     Error,
+    /// A rule with a word in it, between one run's lines and the next's.
+    Divider,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,8 +234,9 @@ impl Model {
         this
     }
 
-    /// Takes the session a restart made in place of this one.
-    pub(super) fn adopt(&mut self, root: Arc<Session>, cx: &mut Context<Self>) {
+    /// Takes the session that follows this one in its tab. After a restart
+    /// the console goes on under a divider; a new start begins with an empty one.
+    pub(super) fn adopt(&mut self, root: Arc<Session>, restart: bool, cx: &mut Context<Self>) {
         self.tasks.clear();
         self.children.clear();
         self.session = root.id();
@@ -243,7 +246,12 @@ impl Model {
         self.requested_scopes.clear();
         self.initial.clear();
         self.terminal_asked = false;
-        self.line(Tone::Info, "Restarted.");
+        if restart {
+            self.line(Tone::Divider, "Restarted");
+        } else {
+            self.console.clear();
+            self.open_line = None;
+        }
         self.follow(root, cx);
         self.refresh(cx);
     }

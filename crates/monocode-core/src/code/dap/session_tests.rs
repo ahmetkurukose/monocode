@@ -31,6 +31,9 @@ struct Plan {
     die_on_continue: bool,
     /// Refuse `continue`, after a moment.
     refuse_continue: bool,
+    /// At the end the thread list is refused as the program goes, the way
+    /// debugpy does before it reports the exit.
+    vanish_on_exit: bool,
 }
 
 /// An adapter with one thread in `/p/app.py`. The first `continue` runs
@@ -41,6 +44,7 @@ fn python_like(peer: &mut Peer, log: &Log, plan: Plan) {
     let mut continues = 0;
     let mut n = "1".to_string();
     let mut child_port = plan.child_port;
+    let mut vanishing = false;
     while let Some(message) = peer.next() {
         log.lock().unwrap().push(message.clone());
         if message["type"] != json!("request") {
@@ -113,6 +117,12 @@ fn python_like(peer: &mut Peer, log: &Log, plan: Plan) {
                 if plan.stop_at_start {
                     peer.event("stopped", json!({ "reason": "breakpoint", "threadId": 1 }));
                 }
+            }
+            "threads" if vanishing => {
+                peer.refuse(&message, "Server[1] disconnected unexpectedly");
+                peer.event("exited", json!({ "exitCode": 0 }));
+                peer.event("terminated", json!({}));
+                vanishing = false;
             }
             "threads" => {
                 peer.respond(
@@ -201,9 +211,17 @@ fn python_like(peer: &mut Peer, log: &Log, plan: Plan) {
                         "stopped",
                         json!({ "reason": "exception", "threadId": 1, "text": "ValueError" }),
                     );
+                } else if plan.vanish_on_exit {
+                    peer.event("thread", json!({ "reason": "exited", "threadId": 1 }));
+                    vanishing = true;
                 } else {
                     peer.event("output", json!({ "category": "stderr", "output": "bye\n" }));
                     peer.event("exited", json!({ "exitCode": 3 }));
+                    // debugpy's own chatter once the program is gone.
+                    peer.event(
+                        "output",
+                        json!({ "category": "stderr", "output": "Server[1] disconnected unexpectedly\n" }),
+                    );
                     peer.event("terminated", json!({}));
                 }
             }
@@ -457,6 +475,11 @@ fn a_session_starts_stops_steps_and_ends() {
         "{seen:?}"
     );
     assert!(seen.contains(&"output bye".to_string()));
+    // What the adapter says after the program exited is not the program's.
+    assert!(
+        !seen.iter().any(|line| line.contains("disconnected")),
+        "{seen:?}"
+    );
 
     // Over is over.
     assert_eq!(
@@ -768,6 +791,26 @@ fn a_refused_launch_ends_the_session_with_the_reason() {
     assert_eq!(
         session.wait_for_stop(SOON),
         Ok(SessionState::Terminated { exit_code: None })
+    );
+    started.end();
+}
+
+#[test]
+fn a_refresh_refused_as_the_program_exits_is_not_a_failure() {
+    let started = stopped(Plan {
+        vanish_on_exit: true,
+        ..Plan::default()
+    });
+    let session = &started.session;
+    let events = session.subscribe();
+    // The exception stop, then on to the end.
+    session.continue_and_wait(SOON).unwrap();
+    let state = session.continue_and_wait(SOON).unwrap();
+    assert_eq!(state, SessionState::Terminated { exit_code: Some(0) });
+    let seen = drain(&events);
+    assert!(
+        !seen.iter().any(|line| line.starts_with("failed")),
+        "{seen:?}"
     );
     started.end();
 }

@@ -135,6 +135,27 @@ impl Driver {
             })
             .unwrap_or_default();
         let script = menu.iter().find(|(_, label, _)| label.contains("main.py"));
+        // The buttons say what they start: the project's last run.
+        let (tip_path, tip_root) = (path.clone(), self.root.clone());
+        let tooltips = self
+            .app(cx, move |_, cx| {
+                crate::run_ui::probe::header_tooltips(&tip_path, &tip_root, cx)
+            })
+            .unwrap_or_default();
+        if let Some(bounds) = self.bounds(cx, "file-header-debug-file") {
+            self.move_to(cx, bounds.center(), Modifiers::default())
+                .await;
+            self.pause(cx, 1500).await;
+            self.shot(cx, "header-debug-tooltip").await;
+            self.move_to(cx, point(px(5.), px(5.)), Modifiers::default())
+                .await;
+        }
+        let tooltips_ok = tooltips
+            .iter()
+            .any(|(id, tip)| id == "debug-file" && tip.starts_with("Debug Pytest quiet"))
+            && tooltips
+                .iter()
+                .any(|(id, tip)| id == "run-file" && tip.starts_with("Run Pytest quiet"));
         let opened_menu = self.click_on(cx, "file-header-debug-file-menu").await;
         self.pause(cx, 300).await;
         let clicked = match script {
@@ -227,10 +248,71 @@ impl Driver {
             .as_ref()
             .and_then(|session| session["terminal"]["tail"].as_str().map(str::to_owned))
             .unwrap_or_default();
+        // The adapter's shutdown chatter is not shown as an error line.
+        let console_clean = finished.as_ref().is_some_and(|session| {
+            (session["console"].as_array())
+                .is_some_and(|lines| lines.iter().all(|line| line[0] != "Error"))
+        });
         let output_ok = output.contains("order total 42.0") && output.contains("done 42.0");
         self.pause(cx, 500).await;
         let cleared = self.decorations(cx, &path);
         self.shot(cx, "debug-ended").await;
+
+        // Debug again from the button's menu: a new start, so an empty console.
+        let mut known_again = self.session_ids(cx);
+        let again_menu = self.click_on(cx, "file-header-debug-file-menu").await;
+        self.pause(cx, 300).await;
+        let again_row = match script {
+            Some((id, _, _)) => again_menu && self.click_on(cx, &format!("menu-action-{id}")).await,
+            None => false,
+        };
+        let again = self.session_when(cx, 60_000, &known_again, paused).await;
+        self.pause(cx, 500).await;
+        self.shot(cx, "debug-new-start-empty-console").await;
+        let again = self
+            .session_when(cx, 0, &known_again, |_| true)
+            .await
+            .or(again);
+        let fresh_console = again.as_ref().is_some_and(|session| {
+            (session["console"].as_array()).is_some_and(|lines| {
+                !lines
+                    .iter()
+                    .any(|line| line[1] == "43.0" || line[0] == "Divider")
+            })
+        });
+        // Restart, with its button: the console goes on, under a divider.
+        known_again.extend(
+            again
+                .iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_owned)),
+        );
+        let restart_clicked = self.click_on(cx, "debug-restart").await;
+        let restarted = self.session_when(cx, 60_000, &known_again, paused).await;
+        self.pause(cx, 500).await;
+        self.shot(cx, "debug-restart-divider").await;
+        let restarted = self
+            .session_when(cx, 0, &known_again, |_| true)
+            .await
+            .or(restarted);
+        let divider = restarted.as_ref().is_some_and(|session| {
+            (session["console"].as_array()).is_some_and(|lines| {
+                lines
+                    .iter()
+                    .any(|line| line == &json!(["Divider", "Restarted"]))
+            })
+        });
+        let stop_again = self.click_on(cx, "debug-stop").await;
+        let mut after = known_again.clone();
+        after.extend(
+            restarted
+                .iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_owned)),
+        );
+        let stopped_again = |session: &Value| session["state"] == "ended";
+        self.session_when(cx, 20_000, &known_again, stopped_again)
+            .await;
+        let _ = after;
+        let console_ok = again_row && fresh_console && restart_clicked && divider && stop_again;
 
         let short = |session: &Option<Value>| {
             session.as_ref().map(|session| {
@@ -248,16 +330,19 @@ impl Driver {
             "a breakpoint set in the gutter stops the script debugged from the header: arrow, stack, locals, console, step over, continue to exit 0, output in its terminal tab, decorations cleared",
             opened && set == [line] && clicked && at_breakpoint && arrow_ok && frame_ok
                 && locals_ok && tab_ok && evaluate_ok && step_ok && exit_ok && output_ok
+                && console_clean && console_ok && tooltips_ok
                 && cleared.is_empty(),
             json!({
                 "breakpoint_lines_after_click": set, "expected_line": line,
-                "debug_button_clicked": clicked,
+                "debug_button_clicked": clicked, "button_tooltips": tooltips,
                 "checks": {
                     "stopped_on_breakpoint": at_breakpoint, "arrow": arrow_ok,
                     "frame": frame_ok, "locals": locals_ok, "tab": tab_ok,
                     "console_input_clicked": typed, "evaluate": evaluate_ok,
                     "step_button_clicked": stepped_click, "step_over": step_ok,
-                    "exit_0": exit_ok, "output_in_terminal": output_ok,
+                    "exit_0": exit_ok, "output_in_terminal": output_ok, "console_without_errors": console_clean,
+                    "button_tooltips_name_their_target": tooltips_ok,
+                    "new_start_console_empty_and_restart_divider": console_ok,
                     "decorations_cleared": cleared.is_empty(),
                 },
                 "decorations_at_stop": arrow, "drawn": drawn,

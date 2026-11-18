@@ -16,6 +16,47 @@ pub(super) const SCRIPT: &str = "main.py";
 pub(super) const TESTS: &str = "tests/test_orders.py";
 
 impl Driver {
+    /// A project settings page in its dialog: the dialog inside the window,
+    /// the page's Save drawn inside both, and the body moving when the wheel
+    /// turns over it. Saves a picture of the body scrolled to its end.
+    async fn page_fits(&mut self, cx: &mut Cx, scroll: &str, content: &str, shot: &str) -> Value {
+        let window = self
+            .shell(cx, |_, window, _| window.viewport_size())
+            .unwrap_or_default();
+        let dialog = self.bounds(cx, "project-code-settings-dialog");
+        let body = self.bounds(cx, scroll);
+        let save_before = self.bounds(cx, &format!("{scroll}-footer"));
+        let content_height = self.bounds(cx, content).map(|b| b.size.height);
+        let top_before = self.bounds(cx, content).map(|b| b.origin.y);
+        if let Some(body) = body {
+            // On the page's own padding: a field under the mouse would take the wheel.
+            self.scroll(cx, body.origin + point(px(6.), px(6.)), 40.)
+                .await;
+        }
+        // Bounds are those of the last frame drawn, which the picture draws.
+        self.shot(cx, shot).await;
+        let save_after = self.bounds(cx, &format!("{scroll}-footer"));
+        let top_after = self.bounds(cx, content).map(|b| b.origin.y);
+        // A page taller than its body moves up when the wheel turns.
+        let taller = matches!((content_height, body), (Some(c), Some(b)) if c > b.size.height);
+        let moved = matches!((top_before, top_after), (Some(a), Some(b)) if b < a) || !taller;
+        let inside = |inner: Option<Bounds<Pixels>>, outer: Option<Bounds<Pixels>>| {
+            matches!((inner, outer), (Some(inner), Some(outer))
+                if inner.origin.y >= outer.origin.y && inner.bottom() <= outer.bottom())
+        };
+        let screen = Bounds::new(point(px(0.), px(0.)), window);
+        let fits = inside(dialog, Some(screen))
+            && inside(save_before, dialog)
+            && inside(save_after, dialog)
+            && save_before == save_after
+            && moved;
+        json!({
+            "fits": fits, "scrolled": moved, "content_top": format!("{top_before:?} then {top_after:?}"), "window": format!("{window:?}"), "dialog": format!("{dialog:?}"),
+            "body": format!("{body:?}"), "save": format!("{save_before:?}"),
+            "save_after_scroll": format!("{save_after:?}"),
+        })
+    }
+
     pub(super) async fn running(&mut self, cx: &mut Cx) {
         self.run_script(cx).await;
         self.run_test(cx).await;
@@ -264,6 +305,14 @@ impl Driver {
         self.pause(cx, 600).await;
         let page_drawn = self.bounds(cx, "run-configurations-page").is_some();
         self.shot(cx, "run-configurations-page").await;
+        let run_page = self
+            .page_fits(
+                cx,
+                "run-configurations-scroll",
+                "run-configurations-page",
+                "run-configurations-page-bottom",
+            )
+            .await;
         let focus_in_dialog = self.shell(cx, |shell, window, cx| {
             shell.background_dialog.is_some()
                 && shell.code_page_dialog().is_some_and(|dialog| {
@@ -280,16 +329,37 @@ impl Driver {
             escapes += 1;
         }
         let page_closed = self.bounds(cx, "run-configurations-page").is_none();
+        // The code insight page, the other one built on the same frame.
+        let insight_open = {
+            let project = project.clone();
+            self.app(cx, move |window, cx| {
+                settings::open(&project, "code-insight", window, cx)
+            })
+            .unwrap_or(false)
+        };
+        self.pause(cx, 600).await;
+        let insight_page = self
+            .page_fits(
+                cx,
+                "code-insight-scroll",
+                "code-insight-settings",
+                "code-insight-page-bottom",
+            )
+            .await;
+        self.keys(cx, "escape").await;
+        self.pause(cx, 300).await;
         self.record(
             "8",
             "a configuration made through the settings page is in the header's menu and in quick open, and runs from both",
             added.is_some() && in_menu && dropdown && picked && menu_ok && listed && palette_ok
-                && page && page_drawn,
+                && page && page_drawn && run_page["fits"] == true
+                && insight_open && insight_page["fits"] == true,
             json!({
                 "saved": saved, "header_menu": menu, "dropdown_clicked": dropdown,
                 "menu_row_clicked": picked, "run_from_menu": menu_told,
                 "quick_open_rows": rows, "run_from_quick_open": palette_told,
                 "page_opened": page, "page_drawn": page_drawn,
+                "run_page": run_page, "code_insight_page": insight_page,
                 "page_closed_by_escape": page_closed, "focus_in_dialog": focus_in_dialog, "escapes_needed": escapes,
             }),
         );
