@@ -843,3 +843,68 @@ fn a_feature_puts_a_status_on_a_sessions_rail_row_and_clears_it(cx: &mut TestApp
         assert_eq!(rail::status(session, cx), None);
     });
 }
+
+/// A form far taller than any window, in the frame the project pages use.
+struct TallPage;
+impl Render for TallPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let body = div()
+            .debug_selector(|| "tall-page-form".into())
+            .h(px(3000.))
+            .child("a very tall form");
+        let footer = div().h(px(30.)).child("Save");
+        settings::page_frame("tall-page-scroll", body, Some(footer))
+    }
+}
+
+#[gpui::test]
+fn a_tall_settings_page_scrolls_inside_the_window_and_keeps_its_footer(cx: &mut TestAppContext) {
+    let (window, mut visual, _) = shell(cx);
+    let visual = &mut visual;
+    visual.update(|_, cx| {
+        settings::register(
+            SettingsPage {
+                id: "tall-page",
+                title: "Tall page",
+                icon: "play",
+                build: Rc::new(|_, _, cx| cx.new(|_| TallPage).into()),
+            },
+            cx,
+        );
+    });
+    assert!(feature(window, visual, |window, cx| {
+        settings::open(PROJECT, "tall-page", window, cx)
+    }));
+    // The dialog is placed by the height it measured in the frame before.
+    for _ in 0..3 {
+        visual.run_until_parked();
+        visual.update(|window, _| window.refresh());
+    }
+    visual.run_until_parked();
+    let viewport = visual.update(|window, _| window.viewport_size());
+    let dialog = visual.debug_bounds("project-code-settings-dialog").unwrap();
+    let body = visual.debug_bounds("tall-page-scroll").unwrap();
+    let footer = visual.debug_bounds("tall-page-scroll-footer").unwrap();
+    assert!(
+        dialog.bottom() <= viewport.height,
+        "{dialog:?} in {viewport:?}"
+    );
+    assert!(footer.bottom() <= dialog.bottom() && footer.origin.y >= body.bottom() - px(1.));
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: body.origin + gpui::point(px(6.), px(6.)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-300.))),
+        modifiers: Default::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    // The form moved under the footer, which stayed where it was.
+    assert_eq!(
+        visual.debug_bounds("tall-page-scroll-footer").unwrap(),
+        footer
+    );
+    let form = visual.debug_bounds("tall-page-form").unwrap();
+    assert!(
+        form.origin.y < body.origin.y,
+        "the form did not scroll: {form:?}"
+    );
+}

@@ -15,7 +15,7 @@ use super::*;
 use crate::{code_editor, code_shell::context, file_editor::FileEditor, input::Input};
 use gpui::{
     AsyncWindowContext, Keystroke, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, WeakEntity, point,
+    PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, WeakEntity, point,
 };
 use serde_json::{Value, json};
 use std::{
@@ -308,6 +308,24 @@ impl Driver {
             }),
         );
         self.pause(cx, 150).await;
+    }
+
+    /// The wheel turned by `lines` (positive scrolls the content up) with the
+    /// mouse at `position`.
+    async fn scroll(&self, cx: &mut Cx, position: Point<Pixels>, lines: f32) {
+        self.move_to(cx, position, Modifiers::default()).await;
+        // The wheel goes to what a frame drew under the mouse.
+        self.pause(cx, 500).await;
+        self.event(
+            cx,
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-lines * 20.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            }),
+        );
+        self.pause(cx, 300).await;
     }
 
     async fn click(&self, cx: &mut Cx, position: Point<Pixels>) {

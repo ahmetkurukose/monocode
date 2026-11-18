@@ -128,6 +128,42 @@ pub(crate) enum DialogEvent {
     Close,
 }
 
+/// A page's layout inside `PageDialog`: `body` scrolls and `footer` (the
+/// page's Save and what it says) stays at the bottom however tall the body is.
+pub(crate) fn page_frame(
+    id: &'static str,
+    body: impl IntoElement,
+    footer: Option<gpui::Div>,
+) -> gpui::Div {
+    use gpui::{InteractiveElement, StatefulInteractiveElement};
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .id(id)
+                .debug_selector(|| id.to_owned())
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p_4()
+                .child(body),
+        )
+        .when_some(footer, |d, footer| {
+            d.child(
+                footer
+                    .debug_selector(|| format!("{id}-footer"))
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(content(0.08)),
+            )
+        })
+}
+
 /// The project dialog's frame around a page: its title, the project it is
 /// for, and a close button over the feature's form.
 pub(crate) struct PageDialog {
@@ -223,14 +259,8 @@ impl Render for PageDialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Close))),
                     ),
             )
-            .child(
-                div()
-                    .id("project-code-settings-page")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .child(self.view.clone()),
-            )
+            // The page fills what is left under the header; it scrolls its own
+            // body and keeps its footer, so neither depends on the dialog.
+            .child(self.view.clone())
     }
 }
