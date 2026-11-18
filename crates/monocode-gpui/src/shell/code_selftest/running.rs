@@ -61,6 +61,114 @@ impl Driver {
         self.run_script(cx).await;
         self.run_test(cx).await;
         self.run_configuration(cx).await;
+        self.run_from_footer(cx).await;
+    }
+
+    /// What the footer's Actions button shows as its main part.
+    fn footer_main(&self, cx: &mut Cx) -> String {
+        use crate::run_ui::footer::{self, Main};
+        self.shell(cx, |shell, _, cx| {
+            let project = shell.workspace.project.clone();
+            let actions = shell.workspace.actions.get(&project);
+            let actions = actions.map_or(&[][..], Vec::as_slice);
+            let last = shell.workspace.last_actions.get(&project);
+            match footer::main(&project, last.map(String::as_str), actions, cx) {
+                Main::Action(ix) => format!("action {}", actions[ix].name),
+                Main::Run(run) => format!("run {} ({})", run.label, run.aria),
+                Main::Empty => "Actions".to_owned(),
+            }
+        })
+        .unwrap_or_default()
+    }
+
+    /// Step 8b: the footer's Actions button starts a run and a debug session,
+    /// first with no file in front, then with one.
+    async fn run_from_footer(&mut self, cx: &mut Cx) {
+        let project = self.root.to_string_lossy().into_owned();
+        // The chat in front: no file is focused.
+        let session = self
+            .shell(cx, |shell, _, _| {
+                shell
+                    .terminal_owner()
+                    .or_else(|| shell.project_session_for_terminal())
+            })
+            .flatten();
+        if let Some(session) = session {
+            self.shell(cx, move |shell, window, cx| {
+                shell.activate_session(session, window, cx)
+            });
+        }
+        self.calm(cx).await;
+        let no_file = self
+            .app(cx, |_, cx| context::focused_file(cx).is_none())
+            .unwrap_or(false);
+        let id = {
+            let project = project.clone();
+            self.app(cx, move |_, cx| {
+                (settings::runs(&project, cx).configs.iter())
+                    .find(|config| config.name == "Pytest quiet")
+                    .map(|config| config.id.clone())
+            })
+            .flatten()
+        };
+
+        let known = self.runs().len();
+        let opened = self.click_on(cx, "footer-action-menu").await;
+        self.pause(cx, 400).await;
+        self.shot(cx, "footer-menu-no-file").await;
+        let offered = match &id {
+            Some(id) => self.bounds(cx, &format!("menu-action-go:{id}")).is_some(),
+            None => false,
+        };
+        let no_this_file = self
+            .bounds(cx, "menu-action-go:builtin:python:file:main.py")
+            .is_none();
+        let picked = match &id {
+            Some(id) => self.click_on(cx, &format!("menu-action-go:{id}")).await,
+            None => false,
+        };
+        let run = self.next_run(cx, known, 90_000).await;
+        let ran = run.as_ref().is_some_and(|info| {
+            info.label == "Pytest quiet"
+                && info.state == RunState::Exited(Some(1))
+                && self.output(info).contains("1 failed, 2 passed")
+        });
+        let told = run.as_ref().map(|info| self.told(info, cx));
+        let main = self.footer_main(cx);
+        self.pause(cx, 300).await;
+        self.shot(cx, "footer-after-run").await;
+
+        // With a file in front: every group, and the Debug submenu open.
+        let file = self.open(cx, SCRIPT).await;
+        self.calm(cx).await;
+        let sessions = self.session_ids(cx);
+        let menu = self.click_on(cx, "footer-action-menu").await;
+        self.pause(cx, 400).await;
+        let this_file = self
+            .bounds(cx, "menu-action-go:builtin:python:file:main.py")
+            .is_some();
+        let debug_row = self.click_on(cx, "menu-action-debug").await;
+        self.pause(cx, 400).await;
+        self.shot(cx, "footer-menu-file-debug").await;
+        let debug_pick = self
+            .click_on(cx, "menu-action-debug:builtin:python:file:main.py")
+            .await;
+        let session = self.session_when(cx, 30_000, &sessions, |_| true).await;
+        self.pause(cx, 1500).await;
+        self.shot(cx, "footer-after-debug").await;
+        self.record(
+            "8b",
+            "the footer's Actions button runs the project's configuration with no file in front, shows it as its main part, and debugs the open file from its Debug submenu",
+            no_file && opened && offered && no_this_file && picked && ran
+                && main.starts_with("run Pytest quiet")
+                && file && menu && this_file && debug_row && debug_pick && session.is_some(),
+            json!({
+                "no_file_in_front": no_file, "menu_opened": opened, "configuration_offered": offered,
+                "this_file_group_absent": no_this_file, "picked": picked, "run": told,
+                "main_part": main, "file_menu_opened": menu, "this_file_group": this_file,
+                "debug_row": debug_row, "debug_picked": debug_pick, "debug_session": session,
+            }),
+        );
     }
 
     /// The registry's runs of the sample project, oldest first.

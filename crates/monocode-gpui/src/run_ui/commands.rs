@@ -19,7 +19,12 @@ use monocode_core::{
     },
     files::path_key,
 };
-use std::{cell::RefCell, path::Path, rc::Rc, time::Instant};
+use std::{
+    cell::RefCell,
+    path::Path,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 pub(super) fn init(cx: &mut App) {
     cx.set_global(Cache::default());
@@ -63,7 +68,14 @@ pub(super) fn times_built(cx: &App) -> usize {
 /// The run context and the choices for quick open in `checkout`. Building
 /// them reads the disk (the interpreter, the packages a file is in), so
 /// they are kept between keystrokes.
-fn offered(checkout: &Checkout, cx: &App) -> (RunContext, targets::Choices) {
+///
+/// Kept for `max_age` at most: quick open passes the toolchain's age, the
+/// footer, which asks while drawing, never lets a place go stale by time.
+pub(super) fn offered(
+    checkout: &Checkout,
+    max_age: Duration,
+    cx: &App,
+) -> (RunContext, targets::Choices) {
     // The focused file counts when it is one of this checkout's.
     let focused = context::focused_file(cx)
         .filter(|file| path_key(&file.checkout.folder) == path_key(&checkout.folder));
@@ -79,7 +91,7 @@ fn offered(checkout: &Checkout, cx: &App) -> (RunContext, targets::Choices) {
     if let Some(cache) = cache
         && let Some(known) = cache.offered.borrow().as_ref()
         && known.place == place
-        && known.at.elapsed() < targets::TOOLCHAIN_AGE
+        && known.at.elapsed() < max_age
     {
         return (known.context.clone(), known.choices.clone());
     }
@@ -109,7 +121,7 @@ fn list(scope: &Scope, cx: &App) -> Vec<Command> {
         project: scope.project.clone(),
         folder: scope.folder.clone(),
     };
-    let (context, choices) = offered(&checkout, cx);
+    let (context, choices) = offered(&checkout, targets::TOOLCHAIN_AGE, cx);
     let mut list = Vec::new();
     let user = choices.user.len();
     for (n, config) in choices.all().enumerate() {

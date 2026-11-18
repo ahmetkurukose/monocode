@@ -3,6 +3,8 @@
 //! exercised without Python: the dock tab, the registry, the last run, the
 //! header's menu, the gutter's markers, the settings page, the chip and
 //! quick open. One test, gated on `MONOCODE_TEST_PYTHON`, runs real pytest.
+mod footer;
+
 use super::{
     chip, gutter,
     header::{self, PAGE},

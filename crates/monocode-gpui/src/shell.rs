@@ -5906,8 +5906,8 @@ impl Shell {
             | MenuTarget::FooterChip(_) => ("".into(), Vec::new(), 160., MenuStyle::Explorer),
             MenuTarget::Actions => (
                 "Actions".into(),
-                self.actions_menu(),
-                200.,
+                self.actions_menu(cx),
+                240.,
                 MenuStyle::Explorer,
             ),
             MenuTarget::RailSessions => (

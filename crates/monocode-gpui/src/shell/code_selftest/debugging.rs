@@ -46,7 +46,7 @@ impl Driver {
             .unwrap_or_default()
     }
 
-    fn session_ids(&self, cx: &mut Cx) -> Vec<String> {
+    pub(super) fn session_ids(&self, cx: &mut Cx) -> Vec<String> {
         (self.debug_sessions(cx).iter())
             .filter_map(|session| session["id"].as_str().map(str::to_owned))
             .collect()

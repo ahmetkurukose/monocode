@@ -756,6 +756,17 @@ impl Shell {
         cx.notify();
     }
 
+    /// Notes that the project's latest start was a run, so the footer's
+    /// Actions button repeats it and not the saved action it showed.
+    pub(crate) fn code_remember_run(&mut self, project: &str, cx: &mut Context<Self>) {
+        let last = &mut self.workspace.last_actions;
+        if last.get(project).map(String::as_str) != Some(crate::run_ui::footer::LAST_RUN) {
+            last.insert(project.to_owned(), crate::run_ui::footer::LAST_RUN.into());
+            self.persist(cx);
+        }
+        self.code_refresh(cx);
+    }
+
     /// A sentence from a feature, shown where the shell shows its own.
     pub(crate) fn code_notice(&mut self, text: String, cx: &mut Context<Self>) {
         self.error = Some(text);

@@ -1,11 +1,13 @@
 //! Run in the interface (docs/native/code.md §3 and §6): the file header's
 //! Run and Debug buttons, the gutter's run markers, runs in dock tabs kept
 //! in step with the core's registry, the footer's chip for running work,
-//! the project's run configurations page and the `Run:` commands of quick
-//! open. Everything is attached through the shell's and the editor's
-//! extension points; `start` is the one way a run begins.
+//! the project's run configurations page, the `Run:` commands of quick
+//! open and the run part of the footer's Actions button. Everything is
+//! attached through the shell's and the editor's extension points; `start`
+//! is the one way a run begins.
 mod chip;
 mod commands;
+pub(crate) mod footer;
 mod gutter;
 mod header;
 mod output;

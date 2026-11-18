@@ -4,6 +4,7 @@
 //! does (process id, output, exit) so agents and the footer see the same
 //! runs. A stop asked for through the registry stops the tab. Starting what
 //! is already in a tab restarts it there instead of opening another.
+use super::footer;
 use crate::{
     code_shell::{
         self,
@@ -178,6 +179,12 @@ pub(crate) fn has_last(cx: &App) -> bool {
     (cx.try_global::<State>()).is_some_and(|state| state.last.is_some())
 }
 
+/// The project of the last run, whose process Rerun last would start.
+pub(crate) fn last_project(cx: &App) -> Option<String> {
+    let last = cx.try_global::<State>()?.last.as_ref()?;
+    Some(last.checkout.project.clone())
+}
+
 /// Asks for a run to end, whoever started it and wherever it runs.
 pub(crate) fn stop(id: RunId) {
     services().runs().stop(id);
@@ -319,6 +326,8 @@ fn started(
     if by != StartedBy::User {
         return Ok(id);
     }
+    // The footer's button repeats the latest start, of either kind.
+    footer::remember(&checkout.project, window, cx);
     if !debug {
         cx.global_mut::<State>().last = Some(Last {
             spawn,
