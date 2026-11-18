@@ -612,6 +612,19 @@ fn the_header_offers_what_can_run_in_the_file_and_its_button_runs_the_default(
         })
     };
     assert_eq!(buttons(&mut fx, &inside), ["run-file"], "no debugger yet");
+    // Each button says what it will start.
+    let tooltips = |fx: &mut Fixture, doc: &DocumentInfo| -> Vec<String> {
+        fx.visual.update(|_, cx| {
+            (super::test_header(cx).actions(doc, cx).iter())
+                .map(|action| action.tooltip.to_string())
+                .collect()
+        })
+    };
+    let run_key = header::shown_key(header::RUN_KEY);
+    assert_eq!(
+        tooltips(&mut fx, &inside),
+        [format!("Run tool.py ({run_key})")]
+    );
     fx.visual.update(|_, cx| {
         assert_eq!(
             actions(&header::menu(&inside, None, cx)),
@@ -657,6 +670,10 @@ fn the_header_offers_what_can_run_in_the_file_and_its_button_runs_the_default(
     });
     fx.visual.run_until_parked();
     assert_eq!(buttons(&mut fx, &notes), ["run-file"]);
+    assert_eq!(
+        tooltips(&mut fx, &notes),
+        [format!("Run Serve ({run_key})")]
+    );
     fx.visual.update(|_, cx| {
         assert_eq!(
             actions(&header::menu(&notes, None, cx)),
@@ -690,11 +707,16 @@ fn the_header_offers_what_can_run_in_the_file_and_its_button_runs_the_default(
     fx.wait_for_end(info.id);
     assert_eq!(fx.output_of(info.id).trim(), "serving notes.txt");
 
-    // Having been run, it is what the button repeats in a Python file too.
+    // Having been run, it is what the button repeats in a Python file too,
+    // and the tooltip and the ticked row say so.
     fx.visual.update(|_, cx| {
         let listed = actions(&header::menu(&inside, None, cx));
         assert!(listed[0].2 && !listed[1].2, "{listed:?}");
     });
+    assert_eq!(
+        tooltips(&mut fx, &inside),
+        [format!("Run Serve ({run_key})")]
+    );
     // With a debugger installed the Debug button joins it.
     fx.visual.update(|_, cx| {
         launch::set_debugger(Rc::new(|_, _, _, _| {}), cx);
@@ -702,6 +724,13 @@ fn the_header_offers_what_can_run_in_the_file_and_its_button_runs_the_default(
     });
     fx.open("script.py");
     assert_eq!(buttons(&mut fx, &outside), ["run-file", "debug-file"]);
+    assert_eq!(
+        tooltips(&mut fx, &outside),
+        [
+            format!("Run Serve ({run_key})"),
+            format!("Debug Serve ({})", header::shown_key(header::DEBUG_KEY)),
+        ]
+    );
 
     // The key runs the focused file's default as the button does.
     fx.visual.simulate_keystrokes(header::RUN_KEY);

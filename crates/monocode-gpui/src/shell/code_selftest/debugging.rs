@@ -135,6 +135,27 @@ impl Driver {
             })
             .unwrap_or_default();
         let script = menu.iter().find(|(_, label, _)| label.contains("main.py"));
+        // The buttons say what they start: the project's last run.
+        let (tip_path, tip_root) = (path.clone(), self.root.clone());
+        let tooltips = self
+            .app(cx, move |_, cx| {
+                crate::run_ui::probe::header_tooltips(&tip_path, &tip_root, cx)
+            })
+            .unwrap_or_default();
+        if let Some(bounds) = self.bounds(cx, "file-header-debug-file") {
+            self.move_to(cx, bounds.center(), Modifiers::default())
+                .await;
+            self.pause(cx, 1500).await;
+            self.shot(cx, "header-debug-tooltip").await;
+            self.move_to(cx, point(px(5.), px(5.)), Modifiers::default())
+                .await;
+        }
+        let tooltips_ok = tooltips
+            .iter()
+            .any(|(id, tip)| id == "debug-file" && tip.starts_with("Debug Pytest quiet"))
+            && tooltips
+                .iter()
+                .any(|(id, tip)| id == "run-file" && tip.starts_with("Run Pytest quiet"));
         let opened_menu = self.click_on(cx, "file-header-debug-file-menu").await;
         self.pause(cx, 300).await;
         let clicked = match script {
@@ -309,17 +330,18 @@ impl Driver {
             "a breakpoint set in the gutter stops the script debugged from the header: arrow, stack, locals, console, step over, continue to exit 0, output in its terminal tab, decorations cleared",
             opened && set == [line] && clicked && at_breakpoint && arrow_ok && frame_ok
                 && locals_ok && tab_ok && evaluate_ok && step_ok && exit_ok && output_ok
-                && console_clean && console_ok
+                && console_clean && console_ok && tooltips_ok
                 && cleared.is_empty(),
             json!({
                 "breakpoint_lines_after_click": set, "expected_line": line,
-                "debug_button_clicked": clicked,
+                "debug_button_clicked": clicked, "button_tooltips": tooltips,
                 "checks": {
                     "stopped_on_breakpoint": at_breakpoint, "arrow": arrow_ok,
                     "frame": frame_ok, "locals": locals_ok, "tab": tab_ok,
                     "console_input_clicked": typed, "evaluate": evaluate_ok,
                     "step_button_clicked": stepped_click, "step_over": step_ok,
                     "exit_0": exit_ok, "output_in_terminal": output_ok, "console_without_errors": console_clean,
+                    "button_tooltips_name_their_target": tooltips_ok,
                     "new_start_console_empty_and_restart_divider": console_ok,
                     "decorations_cleared": cleared.is_empty(),
                 },

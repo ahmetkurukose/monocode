@@ -13,7 +13,7 @@ use crate::{
 };
 use gpui::{App, KeyBinding, Window, actions};
 use monocode_core::{
-    code::run::{self, RunConfig, TestRunner},
+    code::run::{self, ProjectRuns, RunConfig, TestRunner},
     files::path_key,
 };
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
@@ -26,6 +26,16 @@ pub(crate) const PAGE: &str = "run-configurations";
 pub(crate) const RUN_KEY: &str = "alt-shift-r";
 pub(crate) const DEBUG_KEY: &str = "alt-shift-d";
 pub(crate) const RERUN_KEY: &str = "ctrl-alt-r";
+
+/// What a header button says it will start: "Run Pytest quiet (key)".
+fn tooltip(name: &str, target: Option<&str>, key: &str) -> String {
+    // A built-in task is already called "Run main.py".
+    let target = target.map(|label| label.strip_prefix("Run ").unwrap_or(label));
+    match target {
+        Some(target) => format!("{name} {target} ({})", shown_key(key)),
+        None => format!("{name} ({})", shown_key(key)),
+    }
+}
 
 /// A key as the tooltips and quick open write it.
 pub(super) fn shown_key(key: &str) -> String {
@@ -190,10 +200,22 @@ type Carets = Rc<RefCell<HashMap<PathBuf, usize>>>;
 pub(super) struct RunHeader {
     files: RefCell<HashMap<PathBuf, Known>>,
     carets: Carets,
+    /// What the buttons of each file would start, with what that was worked
+    /// out from: asked on every draw, worked out when the inputs change.
+    targets: RefCell<HashMap<PathBuf, (TargetKey, Option<String>)>>,
 }
 
+/// The caret, the text's version and the project's run settings: what the
+/// default run depends on.
+type TargetKey = (Option<usize>, u64, ProjectRuns);
+
 impl RunHeader {
-    fn button(doc: &Rc<DocumentInfo>, carets: &Carets, debug: bool) -> HeaderAction {
+    fn button(
+        doc: &Rc<DocumentInfo>,
+        carets: &Carets,
+        debug: bool,
+        target: Option<&str>,
+    ) -> HeaderAction {
         let (id, icon, name, key) = match debug {
             false => ("run-file", "play", "Run", RUN_KEY),
             true => ("debug-file", "bug", "Debug", DEBUG_KEY),
@@ -205,7 +227,7 @@ impl RunHeader {
         HeaderAction::new(
             id,
             icon,
-            format!("{name} ({})", shown_key(key)),
+            tooltip(name, target, key),
             move |click, window, cx| {
                 let (doc, offset) = (clicked.clone(), click.offset);
                 window.defer(cx, move |window, cx| {
@@ -251,9 +273,24 @@ impl HeaderProvider for RunHeader {
         if !known.tasks && !has_configurations(&checkout.project, cx) {
             return Vec::new();
         }
-        let mut actions = vec![Self::button(&known.doc, &self.carets, false)];
+        // What a click starts, for the tooltips.
+        let key: TargetKey = (
+            self.carets.borrow().get(&doc.path).copied(),
+            targets::document_version(&doc.path, cx),
+            settings::runs(&checkout.project, cx),
+        );
+        let mut named = self.targets.borrow_mut();
+        let current = named.get(&doc.path).is_some_and(|(known, _)| *known == key);
+        if !current {
+            let context = targets::document_context(&doc.path, &checkout, key.0, cx);
+            let choices = targets::choices(&checkout, &context, cx);
+            let label = choices.default(&key.2).map(|config| config.label());
+            named.insert(doc.path.clone(), (key, label));
+        }
+        let target = named.get(&doc.path).and_then(|(_, label)| label.as_deref());
+        let mut actions = vec![Self::button(&known.doc, &self.carets, false, target)];
         if launch::can_debug(cx) {
-            actions.push(Self::button(&known.doc, &self.carets, true));
+            actions.push(Self::button(&known.doc, &self.carets, true, target));
         }
         actions
     }

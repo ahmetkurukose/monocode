@@ -45,6 +45,15 @@ pub(crate) fn header_menu(path: &Path, root: &Path, cx: &App) -> Vec<(String, St
         .collect()
 }
 
+/// The tooltips of the header's buttons for a file, as `(id, tooltip)`.
+pub(crate) fn header_tooltips(path: &Path, root: &Path, cx: &App) -> Vec<(String, String)> {
+    use crate::code_editor::HeaderProvider;
+    let doc = DocumentInfo::new(path, root);
+    (header::RunHeader::default().actions(&doc, cx).iter())
+        .map(|action| (action.id.to_string(), action.tooltip.to_string()))
+        .collect()
+}
+
 /// Adds a configuration through the settings page's own model, as filling
 /// in its form and pressing Save does, and returns its id.
 pub(crate) fn add_configuration(
