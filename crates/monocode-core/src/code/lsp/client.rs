@@ -10,7 +10,7 @@ use super::types::LspError;
 use crate::code::wire;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -804,8 +804,9 @@ fn read_stderr(stderr: Box<dyn Read + Send>, shared: &Weak<Shared>) {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        // Capped: a server that writes on without a line end is logged in
+        // pieces instead of being buffered whole.
+        match wire::read_line_capped(&mut reader, &mut line, wire::MAX_LINE_BYTES) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let Some(shared) = shared.upgrade() else {
