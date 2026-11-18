@@ -944,6 +944,25 @@ fn quick_open_runs_what_is_offered_reruns_the_last_and_stops_what_runs(cx: &mut 
     );
 
     pick(&mut fx, "Run: Current file");
+    // Typing in quick open asks again and again; what is offered is
+    // worked out once for where the caret is, and again when it moves.
+    let built = fx.visual.update(|_, cx| super::commands::times_built(cx));
+    titles(&mut fx);
+    titles(&mut fx);
+    assert_eq!(
+        fx.visual.update(|_, cx| super::commands::times_built(cx)),
+        built
+    );
+    fx.visual.update(|_, cx| {
+        let editor = context::focused_file(cx).unwrap().editor.upgrade().unwrap();
+        let input = editor.read(cx).input.clone();
+        input.update(cx, |input, cx| input.select_range(3..3, cx));
+    });
+    titles(&mut fx);
+    assert_eq!(
+        fx.visual.update(|_, cx| super::commands::times_built(cx)),
+        built + 1
+    );
     fx.wait("the picked run", |_| fx_runs(&root).len() == 1);
     let first = fx.runs()[0].id;
     fx.wait_for_end(first);

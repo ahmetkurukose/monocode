@@ -5,7 +5,7 @@
 use crate::{
     code_editor::{
         self, Hub,
-        symbols::{self, SymbolKind},
+        symbols::{self, Symbol, SymbolKind},
     },
     code_shell::{
         context::{self, Checkout},
@@ -26,7 +26,7 @@ use std::{
 
 /// How long a checkout's toolchain is reused by the lists that are built
 /// while drawing or typing; a run always looks afresh.
-const TOOLCHAIN_AGE: Duration = Duration::from_secs(5);
+pub(super) const TOOLCHAIN_AGE: Duration = Duration::from_secs(5);
 
 /// The hub, kept so code that only has `&App` can read a document, and the
 /// toolchains the menus and quick open last looked up.
@@ -81,10 +81,16 @@ pub(super) fn bare_context(checkout: &Checkout) -> RunContext {
 /// The symbol a caret is in, as `$SYMBOL` and the built-in tasks take it:
 /// the classes around it and the first function, joined with `::`.
 pub(super) fn symbol_at(path: &str, text: &str, offset: usize) -> Option<String> {
+    symbol_in(&symbols::outline(path, text), offset)
+}
+
+/// `symbol_at` from an outline that exists already, such as the one a file's
+/// editor keeps: nothing is parsed.
+pub(super) fn symbol_in(outline: &[Symbol], offset: usize) -> Option<String> {
     let mut names = Vec::new();
-    for symbol in symbols::enclosing(path, text, offset) {
+    for symbol in symbols::chain_at(outline, offset) {
         let ends = matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method);
-        names.push(symbol.name);
+        names.push(symbol.name.as_str());
         // A function inside a function cannot be addressed by a test runner.
         if ends {
             break;
@@ -94,14 +100,25 @@ pub(super) fn symbol_at(path: &str, text: &str, offset: usize) -> Option<String>
 }
 
 /// Fills in what a caret at `offset` of `text` says: line, column, symbol.
-fn place(run: &mut RunContext, shown: &str, text: &str, offset: Option<usize>) {
+/// The symbol comes from `outline` when the caller has the file's, else the
+/// text is parsed for it.
+fn place(
+    run: &mut RunContext,
+    shown: &str,
+    text: &str,
+    offset: Option<usize>,
+    outline: Option<&[Symbol]>,
+) {
     let Some(offset) = offset.filter(|offset| *offset <= text.len()) else {
         return;
     };
     let (line, column) = code_editor::position_at(text, offset);
     run.row = Some(line as u32 + 1);
     run.column = Some(column as u32 + 1);
-    run.symbol = symbol_at(shown, text, offset);
+    run.symbol = match outline {
+        Some(outline) => symbol_in(outline, offset),
+        None => symbol_at(shown, text, offset),
+    };
 }
 
 /// The context of a file as the hub last heard of it, with the caret at
@@ -119,7 +136,7 @@ pub(super) fn document_context(
         .and_then(|shared| shared.hub.read(cx).document(path))
         .map(|open| open.text.clone());
     if let Some(text) = known {
-        place(&mut run, &path.to_string_lossy(), &text, offset);
+        place(&mut run, &path.to_string_lossy(), &text, offset, None);
     }
     run
 }
@@ -142,7 +159,11 @@ pub(super) fn editor_context(
         return document_context(path, checkout, offset, cx);
     };
     let mut run = bare_context(checkout).with_file(path);
-    let input = editor.read(cx).input.read(cx);
+    let editor = editor.read(cx);
+    // The editor names its symbols after every edit; quick open and the
+    // settings page ask here while typing and drawing.
+    let outline = editor.outline();
+    let input = editor.input.read(cx);
     let selection = input.selection_range();
     if !selection.is_empty()
         && let Some(selected) = input.content.get(selection)
@@ -150,7 +171,13 @@ pub(super) fn editor_context(
         run.selected_text = Some(selected.to_owned());
     }
     let offset = offset.unwrap_or(input.caret());
-    place(&mut run, &shown, &input.content, Some(offset));
+    place(
+        &mut run,
+        &shown,
+        &input.content,
+        Some(offset),
+        Some(&outline),
+    );
     run
 }
 
