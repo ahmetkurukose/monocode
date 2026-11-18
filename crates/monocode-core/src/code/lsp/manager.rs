@@ -36,6 +36,12 @@ const REACHED_LIMIT: usize = 4096;
 /// The server gave up on a request because the document moved on.
 const CONTENT_MODIFIED: i64 = -32801;
 const SERVER_CANCELLED: i64 = -32802;
+/// How long a server started for an agent is kept after its last use by
+/// that agent, whatever the idle period says.
+pub const LEASE_PERIOD: Duration = Duration::from_secs(15 * 60);
+/// Most paths whose last document version is remembered, so that a reopened
+/// document never goes back to a version an earlier open used.
+const VERSIONS_KEPT: usize = 8192;
 
 /// The time the idle policy runs on; tests pass their own.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -93,7 +99,10 @@ pub struct ServerDiagnostics {
 /// An open document's diagnostics, kept apart by server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentDiagnostics {
-    /// The document's version now: 1 when opened, one more per changed text.
+    /// The document's version now. The first time a path is opened it is 1;
+    /// one more per changed text, and a path opened again carries on from
+    /// where its last open ended, so a late report from an earlier open can
+    /// never pass for one on the new text.
     pub version: i64,
     pub servers: Vec<ServerDiagnostics>,
 }
@@ -147,6 +156,12 @@ struct Entry {
     failures: u32,
     /// The document version each path's diagnostics were last reported for.
     reported: HashMap<PathBuf, i64>,
+    /// The ticket of the last `didOpen` or `didChange` queued per path: a
+    /// report that names no version is about the text only once that has
+    /// been written to the server.
+    synced: HashMap<PathBuf, u64>,
+    /// Who asked for this server to stay up, and until when.
+    leases: HashMap<String, Instant>,
     pulls: Option<mpsc::Sender<PathBuf>>,
 }
 
@@ -218,6 +233,8 @@ struct State {
     projects: HashMap<PathBuf, ProjectSettings>,
     /// The idle period and server cap, once changed from the options.
     limits: Option<(Duration, usize)>,
+    /// The version each path's document had when it was last closed.
+    versions: HashMap<PathBuf, i64>,
 }
 
 impl State {
@@ -308,7 +325,8 @@ impl State {
     }
 }
 
-fn send_open(client: &Client, path: &Path, document: &Document) {
+/// Tells the server about a document; the ticket says when it is written.
+fn send_open(client: &Client, path: &Path, document: &Document) -> u64 {
     client.notify(
         "textDocument/didOpen",
         json!({ "textDocument": {
@@ -317,7 +335,7 @@ fn send_open(client: &Client, path: &Path, document: &Document) {
             "version": document.version,
             "text": &*document.text,
         } }),
-    );
+    )
 }
 
 struct Shared {
@@ -328,6 +346,9 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled whenever a server changes phase or diagnostics arrive.
     changed: Condvar,
+    /// Clients still in their handshake, which nothing else holds yet: the
+    /// quit must be able to end them too.
+    handshaking: Mutex<Vec<Arc<Client>>>,
 }
 
 impl Drop for Shared {
@@ -357,6 +378,9 @@ impl Shared {
 
     /// The server of kind `spec` for `path`, started if need be. There is
     /// always an entry, so a missing tool has something to be reported on.
+    /// With `start` false nothing is started or made: only a server that is
+    /// already starting or running is joined, and there is `None` when there
+    /// is none.
     fn attach(
         self: &Arc<Self>,
         state: &mut State,
@@ -364,7 +388,8 @@ impl Shared {
         spec: &ServerSpec,
         context: &DocumentContext,
         now: Instant,
-    ) -> ServerId {
+        start: bool,
+    ) -> Option<ServerId> {
         // A virtual environment inside the checkout holds libraries too.
         let library = !path.starts_with(&context.checkout)
             || context
@@ -398,7 +423,7 @@ impl Shared {
                     .map(|(id, _)| *id)
             };
             if let Some(id) = from.or_else(recent) {
-                return id;
+                return Some(id);
             }
         }
         let key = ServerKey {
@@ -406,6 +431,11 @@ impl Shared {
             server: spec.id,
             toolchain: context.toolchain.clone(),
         };
+        let live =
+            |state: &State, id: &ServerId| state.entries.get(id).is_some_and(|entry| entry.live());
+        if !start {
+            return state.by_key.get(&key).filter(|id| live(state, id)).copied();
+        }
         let id = match state.by_key.get(&key) {
             Some(id) => *id,
             None => {
@@ -429,6 +459,8 @@ impl Shared {
                         progress: Vec::new(),
                         failures: 0,
                         reported: HashMap::new(),
+                        synced: HashMap::new(),
+                        leases: HashMap::new(),
                         pulls: None,
                     },
                 );
@@ -442,7 +474,81 @@ impl Shared {
         if !rest {
             self.start(state, id);
         }
-        id
+        Some(id)
+    }
+
+    /// The kinds of server that should serve a file of `language`, `None`
+    /// when the project has servers turned off.
+    fn specs_for(
+        &self,
+        state: &State,
+        language: Language,
+        context: &DocumentContext,
+    ) -> Option<Vec<ServerSpec>> {
+        let settings = state.projects.get(&context.project);
+        if settings.is_some_and(|settings| settings.disabled) {
+            return None;
+        }
+        Some(
+            self.registry
+                .for_language(language)
+                .filter(|spec| {
+                    settings.is_none_or(|settings| !settings.disabled_servers.contains(spec.id))
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Gives an open document the servers of kinds it was opened without,
+    /// as when a tool opened it before the editor needed it. Servers it
+    /// already has are left as they are, a stopped one stopped.
+    fn top_up(
+        self: &Arc<Self>,
+        state: &mut State,
+        path: &Path,
+        specs: &[ServerSpec],
+        context: &DocumentContext,
+        now: Instant,
+    ) {
+        let have = |state: &State, spec: &ServerSpec| {
+            let servers = state.documents.get(path).map(|document| &document.servers);
+            servers.into_iter().flatten().any(|id| {
+                state
+                    .entries
+                    .get(id)
+                    .is_some_and(|entry| entry.spec.id == spec.id)
+            })
+        };
+        for spec in specs {
+            if have(state, spec) {
+                continue;
+            }
+            let Some(id) = self.attach(state, path, spec, context, now, true) else {
+                continue;
+            };
+            let State {
+                entries, documents, ..
+            } = &mut *state;
+            let (Some(document), Some(entry)) = (documents.get_mut(path), entries.get_mut(&id))
+            else {
+                continue;
+            };
+            if document.servers.contains(&id) {
+                continue;
+            }
+            document.servers.push(id);
+            entry.documents.insert(path.to_path_buf());
+            entry.idle_since = None;
+            entry.last_used = now;
+            if let Some(client) = entry.running().cloned() {
+                let ticket = send_open(&client, path, document);
+                entry.synced.insert(path.to_path_buf(), ticket);
+                if client.pull_diagnostics().is_some() {
+                    self.pull(entry, id, &[path.to_path_buf()]);
+                }
+            }
+        }
     }
 
     fn start(self: &Arc<Self>, state: &mut State, id: ServerId) {
@@ -492,6 +598,7 @@ impl Shared {
         entry.generation += 1;
         entry.progress.clear();
         entry.reported.clear();
+        entry.synced.clear();
         let generation = entry.generation;
         self.enforce_cap(state, Some(id));
         state.status_changed(id);
@@ -533,7 +640,14 @@ impl Shared {
                     )
                 }
             };
-            match client.initialize(timeout) {
+            if let Some(shared) = weak.upgrade() {
+                lock(&shared.handshaking).push(client.clone());
+            }
+            let answered = client.initialize(timeout);
+            if let Some(shared) = weak.upgrade() {
+                lock(&shared.handshaking).retain(|known| !Arc::ptr_eq(known, &client));
+            }
+            match answered {
                 Ok(()) => match weak.upgrade() {
                     Some(shared) => shared.started(id, generation, client),
                     None => client.shutdown(),
@@ -610,7 +724,8 @@ impl Shared {
         entry.client = Some(client.clone());
         for path in &entry.documents {
             if let Some(document) = documents.get(path) {
-                send_open(&client, path, document);
+                let ticket = send_open(&client, path, document);
+                entry.synced.insert(path.clone(), ticket);
             }
         }
         if client.pull_diagnostics().is_some() {
@@ -744,6 +859,19 @@ impl Shared {
         if matches!((open, version), (Some(open), Some(version)) if version < open) {
             return;
         }
+        // A report that names no version is taken for one on the current
+        // text, which is only possible once the server has been sent it: an
+        // earlier open's late report must not settle the new one.
+        if version.is_none() && open.is_some() {
+            let unheard = state.entries.get(&id).is_some_and(|entry| {
+                let ticket = entry.synced.get(&path).copied();
+                let client = entry.client.as_ref();
+                matches!((ticket, client), (Some(ticket), Some(client)) if client.unwritten(ticket))
+            });
+            if unheard {
+                return;
+            }
+        }
         // A report on a newer text is news even when it says the same:
         // its positions are that text's.
         let mut advanced = false;
@@ -780,9 +908,21 @@ impl Shared {
     /// Stops a server on purpose. Its entry stays, as stopped, only while
     /// documents still point at it.
     fn stop(&self, state: &mut State, id: ServerId) {
-        let Some(entry) = state.entries.get_mut(&id) else {
-            return;
-        };
+        if let Some(client) = self.stop_entry(state, id) {
+            // The polite goodbye waits on the server, so not on this thread.
+            let goodbye = client.clone();
+            let spawned = std::thread::Builder::new()
+                .name("lsp-stop".into())
+                .spawn(move || goodbye.shutdown());
+            if spawned.is_err() {
+                client.kill();
+            }
+        }
+    }
+
+    /// `stop` without the goodbye: the client, left for the caller to end.
+    fn stop_entry(&self, state: &mut State, id: ServerId) -> Option<Arc<Client>> {
+        let entry = state.entries.get_mut(&id)?;
         let client = entry.client.take();
         entry.phase = Phase::Stopped;
         entry.generation += 1;
@@ -796,16 +936,7 @@ impl Shared {
             state.forget(id);
         }
         self.changed.notify_all();
-        if let Some(client) = client {
-            // The polite goodbye waits on the server, so not on this thread.
-            let goodbye = client.clone();
-            let spawned = std::thread::Builder::new()
-                .name("lsp-stop".into())
-                .spawn(move || goodbye.shutdown());
-            if spawned.is_err() {
-                client.kill();
-            }
-        }
+        client
     }
 
     /// Stops idle servers, least recently used first, while more than the
@@ -840,12 +971,16 @@ impl Shared {
         let period = state
             .limits
             .map_or(self.options.idle_period, |(period, _)| period);
+        for entry in state.entries.values_mut() {
+            entry.leases.retain(|_, until| *until > now);
+        }
         let idle: Vec<ServerId> = state
             .entries
             .iter()
             .filter(|(_, entry)| {
                 entry.live()
                     && entry.documents.is_empty()
+                    && entry.leases.is_empty()
                     && entry
                         .idle_since
                         .is_some_and(|since| now.duration_since(since) >= period)
@@ -1029,4 +1164,4 @@ fn pull_loop(weak: &Weak<Shared>, id: ServerId, generation: u64, queue: &mpsc::R
 
 mod api;
 mod settings;
-pub use api::Manager;
+pub use api::{Coverage, Manager};

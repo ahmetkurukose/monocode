@@ -335,9 +335,15 @@ impl Shared {
     /// Queues a message for the server. Never blocks, and is made with the
     /// manager's lock held, so a server found hung is ended on a thread of
     /// its own.
-    fn send(&self, message: &Value) {
-        if let Err(Refused::Stuck(reason)) = self.outgoing.push(message, self.patience()) {
-            self.fail(format!("The server {reason}."));
+    /// Returns the message's ticket, 0 when it was not queued.
+    fn send(&self, message: &Value) -> u64 {
+        match self.outgoing.push(message, self.patience()) {
+            Ok(ticket) => ticket,
+            Err(Refused::Stuck(reason)) => {
+                self.fail(format!("The server {reason}."));
+                0
+            }
+            Err(Refused::Closed) => 0,
         }
     }
 
@@ -385,8 +391,8 @@ impl Shared {
         }
     }
 
-    fn notify(&self, method: &str, params: Value) {
-        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    fn notify(&self, method: &str, params: Value) -> u64 {
+        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
     /// Stops waiting for request `id` and tells the server to stop too.
@@ -737,9 +743,16 @@ impl Client {
         }
     }
 
-    /// Queues a notification; never blocks.
-    pub fn notify(&self, method: &str, params: Value) {
-        self.shared.notify(method, params);
+    /// Queues a notification; never blocks. The ticket it returns is for
+    /// `unwritten`.
+    pub fn notify(&self, method: &str, params: Value) -> u64 {
+        self.shared.notify(method, params)
+    }
+
+    /// Whether the notification of `ticket` is still queued or being
+    /// written: until it is not, the server cannot have acted on it.
+    pub fn unwritten(&self, ticket: u64) -> bool {
+        self.shared.outgoing.unwritten(ticket)
     }
 
     /// What the server said it can do; `Null` before `initialize`.
@@ -826,20 +839,21 @@ impl Client {
     /// Asks the server to leave, then makes sure it has. Blocks for up to
     /// about three seconds, so call it off the UI thread.
     pub fn shutdown(&self) {
+        self.shutdown_within(Duration::from_secs(2), Duration::from_secs(1));
+    }
+
+    /// `shutdown` with its own limits: `ask` for the answer to `shutdown`,
+    /// `exit` for the process to leave after it, then the group is killed.
+    pub fn shutdown_within(&self, ask: Duration, exit: Duration) {
         if !self.is_closed() {
-            let asked = self.request(
-                "shutdown",
-                Value::Null,
-                Duration::from_secs(2),
-                &CancelToken::new(),
-            );
+            let asked = self.request("shutdown", Value::Null, ask, &CancelToken::new());
             if asked.is_ok() {
                 self.notify("exit", Value::Null);
             }
         }
         let mut process = lock(&self.shared.process);
         if let Some(child) = process.as_mut() {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + exit;
             // Looked at without reaping: a launcher that has left may have
             // workers still in its group, and the kill must reach them.
             while Instant::now() < deadline && !child::exited(child) {

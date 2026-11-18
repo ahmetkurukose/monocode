@@ -36,6 +36,8 @@ enum Kind {
 struct Message {
     kind: Kind,
     body: Vec<u8>,
+    /// The ticket `push` gave for it.
+    ticket: u64,
 }
 
 #[derive(Default)]
@@ -43,8 +45,10 @@ struct Inner {
     queue: VecDeque<Message>,
     bytes: usize,
     closed: bool,
-    /// When the write now in progress began.
+    /// When the write now in progress began, and for which ticket.
     writing_since: Option<Instant>,
+    writing: u64,
+    last_ticket: u64,
 }
 
 #[derive(Default)]
@@ -75,9 +79,10 @@ fn kind_of(method: Option<&str>, params: Option<&Value>) -> Kind {
 }
 
 impl Outgoing {
-    /// Queues a message. `patience` is how long a write may take before the
-    /// server counts as not reading.
-    pub(super) fn push(&self, message: &Value, patience: Duration) -> Result<(), Refused> {
+    /// Queues a message and returns its ticket, which `unwritten` asks
+    /// about. `patience` is how long a write may take before the server
+    /// counts as not reading.
+    pub(super) fn push(&self, message: &Value, patience: Duration) -> Result<u64, Refused> {
         let kind = kind_of(
             message.get("method").and_then(Value::as_str),
             message.get("params"),
@@ -96,13 +101,15 @@ impl Outgoing {
                 since.elapsed().as_secs()
             )));
         }
+        inner.last_ticket += 1;
+        let ticket = inner.last_ticket;
         let replaced = match &kind {
-            Kind::Change(uri) => Self::replace(&mut inner, uri, &body),
+            Kind::Change(uri) => Self::replace(&mut inner, uri, &body, ticket),
             _ => false,
         };
         if !replaced {
             inner.bytes += body.len();
-            inner.queue.push_back(Message { kind, body });
+            inner.queue.push_back(Message { kind, body, ticket });
         }
         if inner.bytes > MAX_QUEUED_BYTES || inner.queue.len() > MAX_QUEUED_MESSAGES {
             return Err(Refused::Stuck(format!(
@@ -113,12 +120,13 @@ impl Outgoing {
         }
         drop(inner);
         self.ready.notify_one();
-        Ok(())
+        Ok(ticket)
     }
 
     /// Puts `body` in place of the newest queued `didChange` of `uri` that
-    /// no open or close of it follows.
-    fn replace(inner: &mut Inner, uri: &str, body: &[u8]) -> bool {
+    /// no open or close of it follows. The message takes the new ticket: who
+    /// held the old one has been superseded by the caller of this push.
+    fn replace(inner: &mut Inner, uri: &str, body: &[u8], ticket: u64) -> bool {
         let found = inner.queue.iter().rposition(|message| match &message.kind {
             Kind::Change(other) | Kind::Barrier(other) => other == uri,
             Kind::Other => false,
@@ -127,6 +135,7 @@ impl Outgoing {
             return false;
         };
         let old = std::mem::replace(&mut inner.queue[at].body, body.to_vec());
+        inner.queue[at].ticket = ticket;
         inner.bytes = inner.bytes - old.len() + body.len();
         true
     }
@@ -146,6 +155,7 @@ impl Outgoing {
             if let Some(message) = inner.queue.pop_front() {
                 inner.bytes -= message.body.len();
                 inner.writing_since = Some(Instant::now());
+                inner.writing = message.ticket;
                 return Some(message.body);
             }
             if inner.closed {
@@ -160,6 +170,17 @@ impl Outgoing {
 
     pub(super) fn written(&self) {
         lock(&self.inner).writing_since = None;
+    }
+
+    /// Whether the message of `ticket` is still waiting or being written,
+    /// so the server cannot have heard it yet. A ticket of 0, a message
+    /// that was replaced, or one on a closed queue counts as gone.
+    pub(super) fn unwritten(&self, ticket: u64) -> bool {
+        let inner = lock(&self.inner);
+        ticket != 0
+            && !inner.closed
+            && (inner.queue.iter().any(|message| message.ticket == ticket)
+                || (inner.writing_since.is_some() && inner.writing == ticket))
     }
 
     #[cfg(test)]

@@ -397,6 +397,22 @@ fn a_documents_pending_change_is_replaced_by_its_newest() {
 }
 
 #[test]
+fn a_ticket_is_unwritten_until_the_message_has_been_written() {
+    let outgoing = Outgoing::default();
+    let open = json!({
+        "method": "textDocument/didOpen", "params": change("file:///a.py", "x", 1),
+    });
+    let ticket = outgoing.push(&open, PATIENCE).unwrap();
+    assert!(outgoing.unwritten(ticket));
+    outgoing.next();
+    // Taken by the writer is not yet written.
+    assert!(outgoing.unwritten(ticket));
+    outgoing.written();
+    assert!(!outgoing.unwritten(ticket));
+    assert!(!outgoing.unwritten(0));
+}
+
+#[test]
 fn a_queue_that_is_not_read_is_bounded() {
     let outgoing = Outgoing::default();
     let big = "y".repeat(1 << 20);
