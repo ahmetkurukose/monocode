@@ -29,6 +29,8 @@ struct Plan {
     child_port: Option<u16>,
     /// Hang up instead of answering `continue`.
     die_on_continue: bool,
+    /// Refuse `continue`, after a moment.
+    refuse_continue: bool,
 }
 
 /// An adapter with one thread in `/p/app.py`. The first `continue` runs
@@ -185,6 +187,11 @@ fn python_like(peer: &mut Peer, log: &Log, plan: Plan) {
             "continue" => {
                 if plan.die_on_continue {
                     return;
+                }
+                if plan.refuse_continue {
+                    std::thread::sleep(Duration::from_millis(200));
+                    peer.refuse(&message, "The thread cannot continue.");
+                    continue;
                 }
                 peer.respond(&message, json!({ "allThreadsContinued": true }));
                 continues += 1;
@@ -775,6 +782,37 @@ fn an_adapter_that_dies_ends_the_session() {
     assert_eq!(session.continue_and_wait(SOON), Err(DapError::Closed));
     assert_eq!(session.wait_for_exit(SOON), Ok(None));
     assert_eq!(session.threads(), Err(DapError::Closed));
+    started.end();
+}
+
+#[test]
+fn a_refused_continue_wakes_who_waits_for_the_stop() {
+    let started = stopped(Plan {
+        refuse_continue: true,
+        ..Plan::default()
+    });
+    let session = started.session.clone();
+    let events = session.subscribe();
+    let steering = session.clone();
+    let asked = std::thread::spawn(move || steering.continue_and_wait(SOON));
+    // Shown as running until the adapter says no.
+    wait_until("running", || session.state() == SessionState::Running);
+    let waited = std::time::Instant::now();
+    let state = session.wait_for_stop(SOON).unwrap();
+    assert!(state.stop().is_some(), "{state:?}");
+    assert!(
+        waited.elapsed() < Duration::from_secs(3),
+        "woken by the refusal, not by the timeout"
+    );
+    assert_eq!(
+        asked.join().unwrap(),
+        Err(DapError::Adapter {
+            command: "continue".into(),
+            message: "The thread cannot continue.".into()
+        })
+    );
+    assert_eq!(drain(&events), ["state running", "state stopped"]);
+    drop(session);
     started.end();
 }
 

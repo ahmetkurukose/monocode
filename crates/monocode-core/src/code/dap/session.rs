@@ -694,8 +694,11 @@ impl Session {
             let mut cache = lock(&self.cache);
             if cache.stops == stops && cache.state == SessionState::Running {
                 cache.state = before.clone();
-                drop(cache);
+                // Announced like every other transition, under the lock
+                // and with the waiters woken: the debuggee is stopped
+                // again, and who waits for a stop must not sleep on.
                 self.emit(SessionEvent::StateChanged(before));
+                self.changed.notify_all();
             }
             return Err(error);
         }
