@@ -486,6 +486,23 @@ listed from the document and the caret of the last draw, so a configuration that
 | Alt+Shift+D | Debug it | file editor |
 | Ctrl+Alt+R | Run the last run again | anywhere |
 
+**Footer** (`footer.rs`). The Actions button at the foot of the window is the place to start
+work in the project in front, with or without a file open. Its menu lists, with captions,
+"This file" (the focused file's built-in tasks), "Run configurations" (the project's, as
+offered for what is focused), a Debug submenu of the same targets while a debugger is
+installed, "Rerun last" for this project and a "Stop" for each of its running runs, then
+the saved actions, "Edit run configurations…", "Edit action" and "Add action". The main part
+shows and repeats the most recent start of either kind: a saved action keeps its icon, a run
+target shows the play icon and its name. Every user start (header, gutter, quick open, key,
+footer) counts, through `workspace.last_actions` holding the reserved `@last-run` for the
+project, while the run itself is `ProjectRuns::last_used`. Before anything was started it
+offers the default target of the focused file, else the first saved action, else the word
+"Actions", whose click opens the menu if it has something to show and the Add action dialog
+otherwise. The button is drawn and its menu built inside the shell's update, so `footer.rs`
+reads only globals and the quick open cache (never `with_shell`), and a pick or click starts
+after the update (`window.defer`). A configuration can therefore be started from the file
+header's dropdown, the footer, quick open, a gutter marker or a key.
+
 **Gutter** (`gutter.rs`). Python documents are searched off the UI thread on every open
 and change (`symbols::python_runnables`), mapped to the core's `Runnable`s (tests only in
 `test_*.py` / `*_test.py`, the `__main__` guard anywhere, nothing the project's test runner

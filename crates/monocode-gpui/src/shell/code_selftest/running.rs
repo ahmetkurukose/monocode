@@ -85,19 +85,21 @@ impl Driver {
     /// first with no file in front, then with one.
     async fn run_from_footer(&mut self, cx: &mut Cx) {
         let project = self.root.to_string_lossy().into_owned();
-        // The chat in front: no file is focused.
-        let session = self
-            .shell(cx, |shell, _, _| {
-                shell
-                    .terminal_owner()
-                    .or_else(|| shell.project_session_for_terminal())
-            })
-            .flatten();
-        if let Some(session) = session {
-            self.shell(cx, move |shell, window, cx| {
-                shell.activate_session(session, window, cx)
-            });
-        }
+        // Close the files the earlier steps left open: none is focused.
+        self.shell(cx, |shell, _, cx| {
+            let review = shell
+                .workspace
+                .active
+                .and_then(|pane| shell.reviews.get(&pane).cloned());
+            for _ in 0..20 {
+                match &review {
+                    Some(review) if review.read(cx).active_editor().is_some() => {
+                        review.update(cx, |review, cx| review.close_active(cx))
+                    }
+                    _ => break,
+                }
+            }
+        });
         self.calm(cx).await;
         let no_file = self
             .app(cx, |_, cx| context::focused_file(cx).is_none())
