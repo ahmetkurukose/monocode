@@ -13,7 +13,8 @@ impl Driver {
     }
 
     pub(super) fn debug_sessions(&self, cx: &mut Cx) -> Vec<Value> {
-        self.app(cx, |_, cx| probe::sessions(cx)).unwrap_or_default()
+        self.app(cx, |_, cx| probe::sessions(cx))
+            .unwrap_or_default()
     }
 
     fn session_ids(&self, cx: &mut Cx) -> Vec<String> {
@@ -86,12 +87,33 @@ impl Driver {
         let path = self.path(SCRIPT);
         let opened = self.open(cx, SCRIPT).await;
         self.calm(cx).await;
-        let line = self.row(cx, "print(\"order total\"").map_or(0, |row| row as u32 + 1);
-        let set = self.toggle_breakpoint(cx, SCRIPT, "print(\"order total\"").await;
+        let line = self
+            .row(cx, "print(\"order total\"")
+            .map_or(0, |row| row as u32 + 1);
+        let set = self
+            .toggle_breakpoint(cx, SCRIPT, "print(\"order total\"")
+            .await;
         self.shot(cx, "breakpoint-in-gutter").await;
 
         let known = self.session_ids(cx);
-        let clicked = self.click_on(cx, "file-header-debug-file").await;
+        // The Debug button starts the project's last run, and the last run
+        // is the configuration of step 8: the script is chosen in the
+        // button's menu, as a user with several configurations would.
+        let (menu_path, menu_root) = (path.clone(), self.root.clone());
+        let menu = self
+            .app(cx, move |_, cx| {
+                crate::run_ui::probe::header_menu(&menu_path, &menu_root, cx)
+            })
+            .unwrap_or_default();
+        let script = menu.iter().find(|(_, label, _)| label.contains("main.py"));
+        let opened_menu = self.click_on(cx, "file-header-debug-file-menu").await;
+        self.pause(cx, 300).await;
+        let clicked = match script {
+            Some((id, _, _)) => {
+                opened_menu && self.click_on(cx, &format!("menu-action-{id}")).await
+            }
+            None => false,
+        };
         let paused = |session: &Value| session["state"] == "paused";
         let stopped = self.session_when(cx, 60_000, &known, paused).await;
         // The variables are asked for once the stop is shown.
@@ -139,7 +161,9 @@ impl Driver {
         .map(|selector| (selector, self.bounds(cx, selector).is_some()))
         .collect();
         let tab_ok = drawn.iter().all(|(_, drawn)| *drawn)
-            && stopped.as_ref().is_some_and(|session| session["tab_open"] == true);
+            && stopped
+                .as_ref()
+                .is_some_and(|session| session["tab_open"] == true);
 
         // An expression typed into the console.
         let typed = self.click_on(cx, "debug-console-input").await;
@@ -216,7 +240,8 @@ impl Driver {
         );
         // The breakpoint is taken away again, by the same click.
         self.open(cx, SCRIPT).await;
-        self.toggle_breakpoint(cx, SCRIPT, "print(\"order total\"").await;
+        self.toggle_breakpoint(cx, SCRIPT, "print(\"order total\"")
+            .await;
     }
 
     async fn debug_test(&mut self, cx: &mut Cx) {
@@ -230,8 +255,10 @@ impl Driver {
         let known = self.session_ids(cx);
         let row = self.row(cx, "def test_discount_is_wrong");
         let marker = row.and_then(|row| {
-            self.input(cx, |input, _| input.gutter_slot_center(GutterSlot::Run, row))
-                .flatten()
+            self.input(cx, |input, _| {
+                input.gutter_slot_center(GutterSlot::Run, row)
+            })
+            .flatten()
         });
         if let Some(marker) = marker {
             self.press(cx, marker, MouseButton::Right, Modifiers::default())
