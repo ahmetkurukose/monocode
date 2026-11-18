@@ -700,7 +700,8 @@ count from 1.
 | `run_stop` | Stops a run this session started | no |
 | `run_status` | Running and recently ended runs of the checkout, the user's included, with local addresses | no |
 | `debug_start` | `run_start`'s targets under debugpy (`internalConsole`), `breakpoints` set first; returns at the first stop or the end | yes |
-| `debug_breakpoints` | `list` / `set` / `clear` by file and line, with a condition; the editor's store | no |
+| `debug_breakpoints` | `list` / `set` / `clear` plain line breakpoints by file and line; the editor's store. A condition, hit condition or log message is refused here | no |
+| `debug_breakpoint_condition` | A breakpoint with a `condition`, `hit_condition` or `log_message`: the debuggee evaluates them, so it is like `debug_evaluate` | yes |
 | `debug_continue`, `debug_step` | Continue (or keep waiting), step `over` / `in` / `out`; return the next stop or the end | no |
 | `debug_stack` | Frames with ids and the locals of the top 1 to 5 | no |
 | `debug_variables` | The children of one `ref`, paged | no |
@@ -723,11 +724,11 @@ by whoever started it.
 project's own text and can be written to steer an agent. They are returned under a line
 saying they are data, and the server's instructions and each such tool's description say
 the same. Claude is given the reading and steering tools ahead of its permission mode
-(`bridge::claude_allowed_tools()`); `run_start`, `debug_start` and `debug_evaluate` run the
+(`bridge::claude_allowed_tools()`); `run_start`, `debug_start`, `debug_evaluate` and `debug_breakpoint_condition` run the
 project's code and go through the session's permission mode like a shell command.
 
 **Not there.** Completion and signature help (an editor's needs), attach to a process,
-exception filters, log points, and remembering what an agent ran as the project's last
+exception filters, and remembering what an agent ran as the project's last
 run. A file the editor shows under another spelling of its path than the resolved one is
 opened a second time by a tool rather than joined.
 

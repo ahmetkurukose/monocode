@@ -80,6 +80,7 @@ pub(super) fn call(
         "run_status" => run::status(&call),
         "debug_start" => debug::start(&call),
         "debug_breakpoints" => debug::breakpoints(&call),
+        "debug_breakpoint_condition" => debug::breakpoint_condition(&call),
         "debug_continue" => debug::resume(&call),
         "debug_step" => debug::step(&call),
         "debug_stack" => debug::stack(&call),
@@ -125,6 +126,11 @@ pub(super) fn settled(path: &Path) -> PathBuf {
 }
 
 impl Call<'_> {
+    /// Whether the agent gave `key` at all, whatever its value.
+    pub fn arguments_has(&self, key: &str) -> bool {
+        self.argument(key).is_some()
+    }
+
     fn argument(&self, key: &str) -> Option<&Value> {
         self.arguments.get(key).filter(|value| !value.is_null())
     }

@@ -347,7 +347,12 @@ fn every_listed_tool_is_answered_and_described() {
     let allowed = claude_allowed_tools();
     assert!(allowed.contains("mcp__monocode_code__code_diagnostics"));
     assert!(allowed.contains("mcp__monocode_code__debug_step"));
-    for asks in ["run_start", "debug_start", "debug_evaluate"] {
+    for asks in [
+        "run_start",
+        "debug_start",
+        "debug_evaluate",
+        "debug_breakpoint_condition",
+    ] {
         assert!(!allowed.contains(asks), "{asks}");
     }
 }
@@ -629,15 +634,41 @@ fn breakpoints_are_shared_with_the_editor_and_kept_to_the_project() {
         stage.ok("debug_breakpoints", json!({})),
         "No breakpoints are set in this project."
     );
+    // What the program would evaluate is not for the pre-allowed tool.
+    for key in ["condition", "hit_condition", "log_message"] {
+        let said = stage.refused(
+            "debug_breakpoints",
+            json!({"action": "set", "file": "app.py", "line": 2, key: "b > 1"}),
+        );
+        assert!(said.contains("debug_breakpoint_condition"), "{said}");
+    }
+    assert!(store.files().iter().all(|file| !file.ends_with("app.py")));
+    assert!(stage
+        .refused(
+            "debug_breakpoint_condition",
+            json!({"file": "app.py", "line": 2})
+        )
+        .contains("Give a `condition`"));
     let set = stage.ok(
-        "debug_breakpoints",
-        json!({"action": "set", "file": "app.py", "line": 2, "condition": "b > 1"}),
+        "debug_breakpoint_condition",
+        json!({"file": "app.py", "line": 2, "condition": "b > 1"}),
     );
     assert_eq!(set, "Set app.py:2.\nBreakpoints:\n  app.py:2  when b > 1");
     // The editor's gutter reads the same store.
     let kept = store.in_file(&stage.root.join("app.py"));
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].condition.as_deref(), Some("b > 1"));
+    stage.ok(
+        "debug_breakpoint_condition",
+        json!({"file": "app.py", "line": 3, "hit_condition": ">= 3", "log_message": "c={c}"}),
+    );
+    let both = store.in_file(&stage.root.join("app.py"));
+    assert_eq!(both[1].hit_condition.as_deref(), Some(">= 3"));
+    assert_eq!(both[1].log_message.as_deref(), Some("c={c}"));
+    stage.ok(
+        "debug_breakpoints",
+        json!({"action": "clear", "file": "app.py", "line": 3}),
+    );
     stage.ok(
         "debug_breakpoints",
         json!({"action": "set", "file": "lib/util.py", "line": 1}),

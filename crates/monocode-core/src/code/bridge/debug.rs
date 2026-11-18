@@ -474,20 +474,24 @@ pub(super) fn sessions(call: &Call) -> Result<String, String> {
     }
 }
 
+/// A breakpoint's expression, hit condition or log message: text the
+/// debuggee evaluates. Only `breakpoint_condition` takes them.
+const CODE_KEYS: [&str; 3] = ["condition", "hit_condition", "log_message"];
+
 pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
+    // This tool is let through ahead of the permission mode, which is only
+    // sound while it cannot make the program evaluate anything.
+    if let Some(key) = CODE_KEYS.iter().find(|key| call.arguments_has(key)) {
+        return Err(format!(
+            "`{key}` is code the program evaluates, so debug_breakpoint_condition sets it,              and asks first. debug_breakpoints only sets plain line breakpoints."
+        ));
+    }
     let store = call.services.breakpoints();
     let file = match call.text("file")? {
         Some(file) => Some(call.path(file)?),
         None => None,
     };
     let line = call.ordinal("line")?;
-    let mine = || -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = (store.files().into_iter())
-            .filter(|path| call.owns(path))
-            .collect();
-        files.sort();
-        files
-    };
     let mut done = String::new();
     match call.text("action")?.unwrap_or("list") {
         "list" => {}
@@ -495,17 +499,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
             let (Some(file), Some(line)) = (&file, line) else {
                 return Err("set needs a `file` and a `line`.".into());
             };
-            if !file.is_file() {
-                return Err(format!("{} is not a file.", call.shown(file)));
-            }
-            let mut breakpoint = Breakpoint::at(line);
-            if let Some(condition) = call.text("condition")? {
-                breakpoint = breakpoint.with_condition(condition);
-            }
-            store.set(file, breakpoint);
-            // A running session answers whether it took the line.
-            std::thread::sleep(Duration::from_millis(150));
-            done = format!("Set {}:{line}.\n", call.shown(file));
+            done = put(call, file, Breakpoint::at(line))?;
         }
         "clear" => match (&file, line) {
             (Some(file), Some(line)) => {
@@ -520,7 +514,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
             }
             (None, Some(_)) => return Err("clear with a `line` needs its `file`.".into()),
             (None, None) => {
-                for file in mine() {
+                for file in mine(call) {
                     store.clear(Some(&file));
                 }
                 done = "Cleared this project's breakpoints.\n".into();
@@ -528,12 +522,72 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
         },
         other => return Err(format!("`action` is list, set or clear, not {other}.")),
     }
+    Ok(listing(call, &done))
+}
+
+/// A breakpoint with a condition, a hit condition or a log message. They are
+/// evaluated by the program, in its frame, so this runs code like
+/// `debug_evaluate` does.
+pub(super) fn breakpoint_condition(call: &Call) -> Result<String, String> {
+    let file = call.required_text("file")?;
+    let file = call.path(file)?;
+    let line = call
+        .ordinal("line")?
+        .ok_or("`line` is required (from 1).")?;
+    let mut breakpoint = Breakpoint::at(line);
+    breakpoint.condition = call.text("condition")?.map(str::to_owned);
+    breakpoint.hit_condition = call.text("hit_condition")?.map(str::to_owned);
+    breakpoint.log_message = call.text("log_message")?.map(str::to_owned);
+    if breakpoint.condition.is_none()
+        && breakpoint.hit_condition.is_none()
+        && breakpoint.log_message.is_none()
+    {
+        return Err(
+            "Give a `condition`, a `hit_condition` or a `log_message`; debug_breakpoints sets              a plain breakpoint."
+                .into(),
+        );
+    }
+    let done = put(call, &file, breakpoint)?;
+    Ok(listing(call, &done))
+}
+
+/// Sets one breakpoint, once its file is known to be one.
+fn put(call: &Call, file: &Path, breakpoint: Breakpoint) -> Result<String, String> {
+    if !file.is_file() {
+        return Err(format!("{} is not a file.", call.shown(file)));
+    }
+    let line = breakpoint.line;
+    call.services.breakpoints().set(file, breakpoint);
+    // A running session answers whether it took the line.
+    std::thread::sleep(Duration::from_millis(150));
+    Ok(format!("Set {}:{line}.\n", call.shown(file)))
+}
+
+/// The project's files that have breakpoints, in a stable order.
+fn mine(call: &Call) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = (call.services.breakpoints().files().into_iter())
+        .filter(|path| call.owns(path))
+        .collect();
+    files.sort();
+    files
+}
+
+/// `done`, then every breakpoint of the project with what the debugger made
+/// of it.
+fn listing(call: &Call, done: &str) -> String {
+    let store = call.services.breakpoints();
     let mut lines = Vec::new();
-    for path in mine() {
+    for path in mine(call) {
         for breakpoint in store.in_file(&path) {
             let mut text = format!("  {}:{}", call.shown(&path), breakpoint.line);
             if let Some(condition) = &breakpoint.condition {
                 text.push_str(&format!("  when {}", one_line(condition, 120)));
+            }
+            if let Some(hits) = &breakpoint.hit_condition {
+                text.push_str(&format!("  on hits {}", one_line(hits, 60)));
+            }
+            if let Some(message) = &breakpoint.log_message {
+                text.push_str(&format!("  logs {}", one_line(message, 120)));
             }
             if !breakpoint.enabled {
                 text.push_str("  (disabled)");
@@ -555,7 +609,7 @@ pub(super) fn breakpoints(call: &Call) -> Result<String, String> {
         }
     }
     match lines.is_empty() {
-        true => Ok(format!("{done}No breakpoints are set in this project.")),
-        false => Ok(format!("{done}Breakpoints:\n{}", lines.join("\n"))),
+        true => format!("{done}No breakpoints are set in this project."),
+        false => format!("{done}Breakpoints:\n{}", lines.join("\n")),
     }
 }
