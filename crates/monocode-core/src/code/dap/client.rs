@@ -4,7 +4,7 @@
 //! requests to the owner. The adapter process, when this started it, dies
 //! with the client.
 use super::types::DapError;
-use crate::code::wire;
+use crate::code::{child, wire};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -140,13 +140,11 @@ impl Client {
             Transport::Stdio => command.stdin(Stdio::piped()).stdout(Stdio::piped()),
             Transport::Tcp { .. } => command.stdin(Stdio::null()).stdout(Stdio::null()),
         };
-        crate::process::configure_child(&mut command);
-        #[cfg(unix)]
-        {
-            // Its own group, so that helpers the adapter starts die with it.
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        // The adapter starts the debuggee, which inherits how it is
+        // scheduled: the user's program runs at the user's priority.
+        crate::process::configure_user_child(&mut command);
+        // Its own group, so that helpers the adapter starts die with it.
+        child::lead_group(&mut command);
         let mut child = command.spawn().map_err(|error| {
             DapError::Start(format!(
                 "Could not start {}: {error}.",
@@ -177,7 +175,7 @@ impl Client {
         match &start.transport {
             Transport::Stdio => {
                 let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-                    kill(&mut child);
+                    child::kill_group(&mut child);
                     return Err(DapError::Start(
                         "The debug adapter has no standard streams.".into(),
                     ));
@@ -199,9 +197,8 @@ impl Client {
                             return Self::over_socket(socket, Some(child), Some(stderr));
                         }
                         Err(error) => {
-                            let exited = matches!(child.try_wait(), Ok(Some(_)));
-                            if exited || Instant::now() >= deadline {
-                                kill(&mut child);
+                            if child::exited(&mut child) || Instant::now() >= deadline {
+                                child::kill_group(&mut child);
                                 return Err(error);
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -340,10 +337,12 @@ impl Shared {
     fn shutdown(&self, grace: Duration) {
         if let Some(mut child) = lock(&self.process).take() {
             let deadline = Instant::now() + grace;
-            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            // Looked at without reaping, so the group is still the
+            // adapter's own when it is killed.
+            while Instant::now() < deadline && !child::exited(&mut child) {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            kill(&mut child);
+            child::kill_group(&mut child);
         }
         if let Some(socket) = &self.socket {
             socket.shutdown(Shutdown::Both).ok();
@@ -365,18 +364,6 @@ impl Routes {
             reply.send(Err(DapError::Closed)).ok();
         }
     }
-}
-
-fn kill(child: &mut Child) {
-    #[cfg(unix)]
-    if let Ok(group) = libc::pid_t::try_from(child.id()) {
-        // The whole group; the child leads it (see `Client::start`).
-        unsafe {
-            libc::killpg(group, libc::SIGKILL);
-        }
-    }
-    child.kill().ok();
-    child.wait().ok();
 }
 
 fn open_socket(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, DapError> {

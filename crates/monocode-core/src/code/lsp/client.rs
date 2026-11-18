@@ -7,7 +7,7 @@
 //! servers are launchers that do their work in a child.
 use super::position::Encoding;
 use super::types::LspError;
-use crate::code::wire;
+use crate::code::{child, wire};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
@@ -65,17 +65,15 @@ impl Launcher for ProcessLauncher {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Its own group, so the launcher's children die with it.
-            command.process_group(0);
-        }
+        // Its own group, so the launcher's children die with it.
+        child::lead_group(&mut command);
+        // A language server is background work: it keeps the scheduling
+        // hints that runs and debuggers go without.
         crate::process::configure_child(&mut command);
         let mut child = command.spawn()?;
         let streams = (child.stdout.take(), child.stdin.take());
         let (Some(stdout), Some(stdin)) = streams else {
-            kill(&mut child);
+            child::kill_group(&mut child);
             return Err(io::Error::other("the server's streams could not be opened"));
         };
         let stderr = child.stderr.take();
@@ -86,20 +84,6 @@ impl Launcher for ProcessLauncher {
             process: Some(child),
         })
     }
-}
-
-fn kill(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        #[cfg(unix)]
-        if let Ok(group) = libc::pid_t::try_from(child.id()) {
-            // Safe to call on a child we have not reaped: its id is still ours.
-            unsafe {
-                libc::killpg(group, libc::SIGKILL);
-            }
-        }
-        let _ = child.kill();
-    }
-    let _ = child.wait();
 }
 
 type Hook = Box<dyn FnOnce() + Send>;
@@ -770,10 +754,12 @@ impl Client {
         let mut process = lock(&self.process);
         if let Some(child) = process.as_mut() {
             let deadline = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            // Looked at without reaping: a launcher that has left may have
+            // workers still in its group, and the kill must reach them.
+            while Instant::now() < deadline && !child::exited(child) {
                 std::thread::sleep(Duration::from_millis(15));
             }
-            kill(child);
+            child::kill_group(child);
         }
         *process = None;
         drop(process);
@@ -789,7 +775,7 @@ impl Client {
         // kill is for the rest.
         *lock(&self.shared.outgoing) = None;
         if let Some(mut child) = lock(&self.process).take() {
-            kill(&mut child);
+            child::kill_group(&mut child);
         }
     }
 }
