@@ -416,7 +416,7 @@ and features meet.
 |---|---|---|
 | `completion` | `CompletionProvider` | 100 ms after a word character or one of its trigger characters, or Ctrl+Space; answers the caret has left are dropped; items are narrowed and ordered by the editor |
 | `hover` | `HoverProvider` | mouse at rest 350 ms on a word, or F1 at the caret |
-| `signature` | `SignatureProvider` | on `(` and `,`, then at every caret move until it answers `None`; Cmd+Shift+Space |
+| `signature` | `SignatureProvider` | on `(` and `,`, then at every caret move until it answers `None`; Ctrl+Shift+Space (Cmd+Shift+Space is the quick composer's) |
 | `links` | `LinkProvider` | Cmd-hover (underline), Cmd-click, F12, context menu |
 | `references` | `ReferencesProvider` | Shift+F12, context menu |
 | `breakpoints`, `run_markers` | `GutterProvider` | a press in its gutter column (`menu` first: a `GutterMenu` the editor opens at the press, else `click`); an edit moved its marks |

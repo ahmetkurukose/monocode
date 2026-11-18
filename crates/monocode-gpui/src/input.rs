@@ -139,11 +139,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("f12", GoToDefinition, Some("CodeEditor")),
         KeyBinding::new("shift-f12", FindUsages, Some("CodeEditor")),
         KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
-        KeyBinding::new(
-            &format!("{modifier}-shift-space"),
-            ShowSignature,
-            Some("CodeEditor"),
-        ),
+        // Not Cmd+Shift+Space: the quick composer takes that system-wide.
+        KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
     ]);
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-a"), SelectAll, Some("Composer")),
@@ -2555,5 +2552,19 @@ mod native_input_tests {
                 assert_eq!(input.take(cx).as_deref(), Some("line one\nline two"));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn signature_help_keeps_off_the_quick_composers_system_wide_key(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            bind(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let keys: Vec<String> = keymap
+                .bindings_for_action(&ShowSignature)
+                .filter_map(|binding| Some(binding.keystrokes().first()?.unparse()))
+                .collect();
+            assert_eq!(keys, ["ctrl-shift-space"]);
+        });
     }
 }
