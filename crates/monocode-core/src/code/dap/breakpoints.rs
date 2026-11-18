@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What a running debugger said about a breakpoint. Not persisted.
@@ -98,14 +99,19 @@ pub enum BreakpointChange {
     Exceptions,
 }
 
-type Listener = Box<dyn FnMut(&BreakpointChange) -> bool + Send>;
+/// One listener: called without the store's lock, by any number of threads
+/// at once, and remembered as gone once it has said so.
+struct Listener {
+    call: Box<dyn Fn(&BreakpointChange) -> bool + Send + Sync>,
+    gone: AtomicBool,
+}
 
 #[derive(Default)]
 struct Inner {
     files: BTreeMap<PathBuf, Vec<Breakpoint>>,
     exceptions: ExceptionFilters,
     next_id: u64,
-    listeners: Vec<Listener>,
+    listeners: Vec<Arc<Listener>>,
 }
 
 /// A handle to the store; clones share it. Every call is cheap and safe on
@@ -145,16 +151,38 @@ impl BreakpointStore {
     }
 
     /// Calls `listener` on every change, on the thread that made it, until
-    /// it returns false. It must not call back into the store.
-    pub(crate) fn listen(&self, listener: impl FnMut(&BreakpointChange) -> bool + Send + 'static) {
-        lock(&self.inner).listeners.push(Box::new(listener));
+    /// it returns false. It runs after the store's lock is let go, so it may
+    /// use the store, and whatever it drops may too (a session that ends in
+    /// its listener's hands resets the statuses here).
+    pub(crate) fn listen(
+        &self,
+        listener: impl Fn(&BreakpointChange) -> bool + Send + Sync + 'static,
+    ) {
+        lock(&self.inner).listeners.push(Arc::new(Listener {
+            call: Box::new(listener),
+            gone: AtomicBool::new(false),
+        }));
     }
 
     fn change<T>(&self, edit: impl FnOnce(&mut Inner) -> (T, Vec<BreakpointChange>)) -> T {
-        let mut inner = lock(&self.inner);
-        let (result, changes) = edit(&mut inner);
+        let (result, changes, listeners) = {
+            let mut inner = lock(&self.inner);
+            let (result, changes) = edit(&mut inner);
+            inner
+                .listeners
+                .retain(|listener| !listener.gone.load(Ordering::Relaxed));
+            let listeners = match changes.is_empty() {
+                true => Vec::new(),
+                false => inner.listeners.clone(),
+            };
+            (result, changes, listeners)
+        };
         for change in &changes {
-            inner.listeners.retain_mut(|listener| listener(change));
+            for listener in &listeners {
+                if !listener.gone.load(Ordering::Relaxed) && !(listener.call)(change) {
+                    listener.gone.store(true, Ordering::Relaxed);
+                }
+            }
         }
         result
     }
@@ -496,5 +524,47 @@ mod tests {
         store.reset_status();
         assert_eq!(store.in_file(path)[0].status, BreakpointStatus::Idle);
         assert_eq!(drain(&changes), [BreakpointChange::Status(path.into())]);
+    }
+
+    /// What a session does when it ends in its listener's hands: it resets
+    /// the statuses from inside the listener. Under the store's lock that
+    /// never came back.
+    #[test]
+    fn a_listener_may_change_the_store_and_leaves_when_it_says_so() {
+        let store = BreakpointStore::new();
+        let path = PathBuf::from("/p/a.py");
+        let id = store.set(&path, Breakpoint::at(4));
+        store.report(&path, &[(id, BreakpointStatus::Verified { line: 4 })]);
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let (inner, log) = (store.clone(), heard.clone());
+        store.listen(move |change| {
+            log.lock().unwrap().push(change.clone());
+            if matches!(change, BreakpointChange::File(_)) {
+                inner.reset_status();
+            }
+            // Gone after the first status change it hears.
+            !matches!(change, BreakpointChange::Status(_))
+        });
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        let edited = path.clone();
+        std::thread::spawn(move || {
+            worker.toggle(&edited, 9);
+            done.send(()).ok();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the edit came back");
+        assert_eq!(store.in_file(&path)[0].status, BreakpointStatus::Idle);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [
+                BreakpointChange::File(path.clone()),
+                BreakpointChange::Status(path.clone())
+            ]
+        );
+        store.toggle(&path, 12);
+        assert_eq!(heard.lock().unwrap().len(), 2, "the listener had left");
+        assert!(lock(&store.inner).listeners.is_empty());
     }
 }
