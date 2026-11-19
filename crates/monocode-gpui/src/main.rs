@@ -215,6 +215,13 @@ fn main() {
         }
         return;
     }
+    if cli_args.first().is_some_and(|a| a == "db-mcp") {
+        if let Err(error) = monocode_core::db_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if cli_args.first().is_some_and(|a| a == "app-mcp") {
         if let Err(error) = monocode_core::mono::bridge::mcp_stdio() {
             eprintln!("{error}");
@@ -345,6 +352,8 @@ fn main() {
         }
         return;
     }
+    // Agents reach the Database view's data sources through this directory.
+    monocode_core::db_bridge::configure(data_dir().join("db"));
     monocode_core::checkpoint::init(
         database
             .parent()

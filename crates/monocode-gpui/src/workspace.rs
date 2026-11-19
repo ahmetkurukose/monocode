@@ -185,6 +185,11 @@ pub(crate) struct Workspace {
     pub project_rail_expanded: HashSet<String>,
     /// Worktrees opened under their project in the rail's tree view.
     pub project_rail_worktrees_expanded: HashSet<String>,
+    /// Projects put to sleep, with when (ms). A sleeping project keeps its
+    /// chats, tabs and terminal list but runs no shells, warm agents or pages
+    /// until it is opened again.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub slept_projects: HashMap<String, u64>,
     pub project_rail_groups: Vec<ProjectRailGroup>,
     pub project_rail_assignments: HashMap<String, String>,
     pub classic_sidebar_tabs: HashMap<String, String>,
@@ -440,6 +445,7 @@ impl Default for Workspace {
             project_rail_pinned: HashSet::new(),
             project_rail_expanded: HashSet::new(),
             project_rail_worktrees_expanded: HashSet::new(),
+            slept_projects: HashMap::new(),
             project_rail_groups: Vec::new(),
             project_rail_assignments: HashMap::new(),
             classic_sidebar_tabs: HashMap::new(),
@@ -715,6 +721,11 @@ impl Workspace {
         }
         state.add_project(&state.project.clone());
         state.preferences.migrate();
+        // Only listed local projects can sleep; anything else would hide work.
+        let projects: HashSet<String> = state.projects.iter().cloned().collect();
+        state
+            .slept_projects
+            .retain(|project, _| projects.contains(project) && !project.starts_with("remote://"));
         state.project_browser_urls.retain(|project, url| {
             let trimmed = url.trim();
             if project.trim().is_empty() || trimmed.is_empty() {

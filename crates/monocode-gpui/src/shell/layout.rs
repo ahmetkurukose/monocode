@@ -809,11 +809,13 @@ impl Shell {
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
             .map(|d| {
+                let databases = self.databases_button(cx);
                 let branch = self.git_branch_button(cx);
                 let pressure = self.pressure_chip(cx);
                 let terminal = self.terminal_footer(cx);
                 let between = pressure.is_some() && terminal.is_some();
-                d.children(branch)
+                d.children(databases)
+                    .children(branch)
                     .children(pressure)
                     .when(between, |d| {
                         d.child(

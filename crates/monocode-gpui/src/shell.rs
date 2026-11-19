@@ -10,6 +10,7 @@ mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
+mod database_footer;
 mod database_send;
 mod file_panes;
 mod github_star;
@@ -33,6 +34,7 @@ mod project_rail_tree;
 mod project_rail_worktrees;
 mod project_removal;
 mod project_settings;
+mod project_sleep;
 mod quick_composer;
 mod quick_open;
 mod rails;
@@ -131,6 +133,8 @@ actions!(
         NextProject,
         MoveProjectBack,
         MoveProjectForward,
+        SleepProject,
+        SleepOtherProjects,
         SwitchModel,
         ToggleRightPanel,
         SplitRight,
@@ -415,6 +419,10 @@ pub(crate) enum MenuTarget {
     RunningTerminals,
     /// The footer Actions button's list of saved commands.
     Actions,
+    /// The footer Databases button's data sources.
+    Databases,
+    /// Connections found elsewhere, offered for import.
+    DatabaseImport,
     /// The title strip's new-tab button, when terminals open in the title bar.
     NewTab,
 }
@@ -721,6 +729,8 @@ pub(crate) struct Shell {
     link_dialog: Option<session_groups::LinkDialog>,
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
+    databases_anchor: AnchorSlot,
+    db_footer: database_footer::DbFooter,
     new_tab_anchor: AnchorSlot,
     git_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
@@ -882,6 +892,8 @@ pub(crate) struct Shell {
     browser_agent_stopped: HashSet<i64>,
     /// The page each session's agent used last.
     browser_agent_last: HashMap<i64, i64>,
+    /// What sleeping projects gave back, and the pages to reopen on waking.
+    project_sleep: project_sleep::ProjectSleep,
     /// Addresses pages asked to open in windows of their own.
     pending_browser_pages: Vec<String>,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
@@ -1163,6 +1175,8 @@ impl Shell {
             link_dialog: None,
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
+            databases_anchor: AnchorSlot::default(),
+            db_footer: Default::default(),
             new_tab_anchor: AnchorSlot::default(),
             git_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
@@ -1285,6 +1299,7 @@ impl Shell {
             browser_selftest_started: false,
             browser_agent_stopped: HashSet::new(),
             browser_agent_last: HashMap::new(),
+            project_sleep: Default::default(),
             pending_browser_pages: Vec::new(),
             dock_slide: None,
             dock_resize: None,
@@ -1447,7 +1462,8 @@ impl Shell {
                 if !self.app_view_open()
                     && self.settings.is_none()
                     && !self.search_page()
-                    && !self.mono_active(cx) =>
+                    && !self.mono_active(cx)
+                    && !self.project_asleep(&self.workspace.project) =>
             {
                 self.workspace.layout(tab).leaf_ids().into_iter().collect()
             }
@@ -1633,8 +1649,16 @@ impl Shell {
             state
         };
         let provider = session.summary.provider.clone();
+        let waking = (busy || attention).then(|| session.summary.cwd.clone());
         self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
         self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
+        if let Some(project) = waking.filter(|project| self.project_asleep(project)) {
+            // Waking reaches every chat; let this one finish updating first.
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| this.wake_project(&project, cx));
+            })
+            .detach();
+        }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
         if !self.archiving.insert(id) {
@@ -2781,6 +2805,9 @@ impl Shell {
         if let Some(view) = self.app_view_body() {
             return view;
         }
+        if let Some(screen) = self.project_sleep_screen(cx) {
+            return screen;
+        }
         let Some(id) = self.workspace.active else {
             return div().size_full().into_any_element();
         };
@@ -3421,7 +3448,7 @@ impl Shell {
     }
     /// A restored dock reopens its tabs as fresh shells once it is shown.
     fn ensure_terminals(&mut self, project: &str, cx: &mut Context<Self>) {
-        if project.starts_with("remote://") {
+        if project.starts_with("remote://") || self.project_asleep(project) {
             return;
         }
         let Some(dock) = self.workspace.docks.get(project) else {
@@ -3482,6 +3509,8 @@ impl Shell {
         if self.refuse_terminal_in_removed_worktree(&self.terminal_cwd(cx), cx) {
             return;
         }
+        let project = self.workspace.project.clone();
+        self.wake_project(&project, cx);
         // The dock is not drawn under an app view: go back to the session
         // first, so the new terminal is the one you see.
         if self.app_view_open() {
@@ -3525,6 +3554,8 @@ impl Shell {
             cx.notify();
             return;
         }
+        let project = self.workspace.project.clone();
+        self.wake_project(&project, cx);
         if self.terminal_in_panel(cx) {
             if self.panel_terminal_shown(cx) {
                 self.set_right_panel_open(false, window, cx);
@@ -3719,8 +3750,9 @@ impl Shell {
                 terminal.update(cx, |t, _| t.visible = shown);
             }
         }
-        // The right panel's Terminal tab hosts the shells instead.
-        if self.terminal_in_panel(cx) {
+        // The right panel's Terminal tab hosts the shells instead, and a
+        // sleeping project has none until it wakes.
+        if self.terminal_in_panel(cx) || self.project_asleep(&project) {
             return body;
         }
         let Some(dock) = self.workspace.docks.get(&project).cloned() else {
@@ -4804,7 +4836,11 @@ impl Shell {
             .project_focus
             .insert(self.workspace.project.clone(), id);
         self.workspace.collapsed.remove(&self.workspace.project);
-        view.update(cx, |v, cx| v.load(cx));
+        // A chat opened in a sleeping project waits behind its sleep screen;
+        // Wake shows it and loads its history then.
+        if !self.project_asleep(&self.workspace.project) {
+            view.update(cx, |v, cx| v.load(cx));
+        }
         self.record_worktree_session(id, cx);
         self.remember_title_tab(TitleTab::Session(self.workspace.tab_of(id).unwrap()));
         self.reveal_active_tab(cx);
@@ -5021,7 +5057,12 @@ impl Shell {
         cx.notify();
     }
     fn ensure_project_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.active.is_some() || self.mono_active(cx) {
+        // A sleeping project shows its sleep screen instead of a blank chat;
+        // placing one must not wake it. Waking places one if still needed.
+        if self.workspace.active.is_some()
+            || self.mono_active(cx)
+            || self.project_asleep(&self.workspace.project)
+        {
             return;
         }
         if let Some(id) = self.order.iter().copied().find(|id| {
@@ -5102,6 +5143,9 @@ impl Shell {
     ) {
         let store = self.store.clone();
         let cwd = self.workspace.project.clone();
+        // Only an explicit new chat gets here while asleep: placing a blank
+        // one stays off for sleeping projects.
+        self.wake_project(&cwd, cx);
         let focus = self.worktree_focus.get(&cwd).cloned();
         // The project folder as a selected checkout is not a separate worktree.
         let copy = focus.clone().filter(|f| {
@@ -5872,6 +5916,20 @@ impl Shell {
                     menu.update(cx, |menu, cx| menu.replace_items(items, cx));
                     return;
                 }
+                // Ticking a found connection keeps the import menu open.
+                if let MenuEvent::Picked(id, _) = event
+                    && let Some(open) = this
+                        .menu
+                        .as_ref()
+                        .filter(|m| m.target == MenuTarget::DatabaseImport)
+                    && id.starts_with("pick:")
+                {
+                    let menu = open.menu.clone();
+                    this.toggle_found(id);
+                    let items = this.database_import_menu();
+                    menu.update(cx, |menu, cx| menu.replace_items(items, cx));
+                    return;
+                }
                 // A project row opens or closes its sessions, here and in
                 // the rail's own tree; the menu stays.
                 if let MenuEvent::Picked(id, _) = event
@@ -5946,6 +6004,18 @@ impl Shell {
                 "Actions".into(),
                 self.actions_menu(),
                 200.,
+                MenuStyle::Explorer,
+            ),
+            MenuTarget::Databases => (
+                "Databases".into(),
+                self.databases_menu(cx),
+                300.,
+                MenuStyle::Explorer,
+            ),
+            MenuTarget::DatabaseImport => (
+                "Import connections".into(),
+                self.database_import_menu(),
+                380.,
                 MenuStyle::Explorer,
             ),
             MenuTarget::RailSessions => (
@@ -6298,12 +6368,15 @@ impl Shell {
                     vec![
                         MenuItem::Custom(controls.clone().into(), controls.read(cx).focus(cx)),
                         MenuItem::Separator,
-                        MenuAction::new("delete-project-group", "Delete group")
-                            .icon("trash")
-                            .description("Projects will become ungrouped")
-                            .danger()
-                            .into(),
-                    ],
+                    ]
+                    .into_iter()
+                    .chain(self.project_group_sleep_menu(id, cx))
+                    .chain([MenuAction::new("delete-project-group", "Delete group")
+                        .icon("trash")
+                        .description("Projects will become ungrouped")
+                        .danger()
+                        .into()])
+                    .collect(),
                     260.,
                     MenuStyle::Group,
                 )
@@ -6403,6 +6476,10 @@ impl Shell {
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
                     MenuItem::Separator,
+                ]);
+                items.extend(self.project_sleep_menu(path, cx));
+                items.extend([
+                    MenuItem::Separator,
                     MenuAction::new("archive", "Archive").icon("archive").into(),
                     MenuAction::new("delete", "Delete")
                         .icon("trash")
@@ -6443,6 +6520,8 @@ impl Shell {
             MenuTarget::TerminalTab(ix) => self.run_terminal_tab_menu(ix, action, window, cx),
             MenuTarget::RunningTerminals => self.run_running_terminals_menu(action, window, cx),
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
+            MenuTarget::Databases => self.run_databases_menu(action, window, cx),
+            MenuTarget::DatabaseImport => self.run_database_import_menu(action, window, cx),
             MenuTarget::NewTab => match action {
                 "terminal" => self.new_title_terminal(window, cx),
                 "browser" => self.new_browser_pane(None, window, cx),
@@ -6489,7 +6568,8 @@ impl Shell {
                 }
             }
             MenuTarget::ProjectRailGroup(id) => {
-                if action == "delete-project-group" {
+                if self.run_project_group_sleep_menu(&id, action, window, cx) {
+                } else if action == "delete-project-group" {
                     self.workspace.project_rail_groups.retain(|g| g.id != id);
                     self.workspace
                         .project_rail_assignments
@@ -6515,7 +6595,8 @@ impl Shell {
                 }
             }
             MenuTarget::Project { path, .. } => {
-                if action == "pin" {
+                if self.run_project_sleep_menu(&path, action, window, cx) {
+                } else if action == "pin" {
                     self.toggle_project_rail_pin(&path, cx);
                 } else if action == "project-group:new" {
                     let id = self.create_project_rail_group(Some(&path), cx);
@@ -7675,6 +7756,9 @@ impl Shell {
                             .text_color(content(1.))
                             .child(self.project_label(&path)),
                     )
+                    .when(self.project_asleep(&path), |d| {
+                        d.child(div().text_color(content(0.55)).child("Asleep"))
+                    })
                     .when(!shortcuts.is_empty(), |d| {
                         d.child(div().text_color(content(0.55)).child(shortcuts.clone()))
                     }),
@@ -7737,7 +7821,7 @@ impl Shell {
                             .when(active || dragging, |d| d.bg(content(0.1)))
                             .when(dragging, |d| d.cursor(CursorStyle::ClosedHand))
                             .hover(|s| s.opacity(1.).bg(content(if active { 0.1 } else { 0.05 })))
-                            .child(self.project_mark(&path, 12.))
+                            .child(self.with_sleep_badge(&path, self.project_mark(&path, 12.), 12.))
                             .when(hovered, |d| d.child(self.space_anchor.probe()))
                             .on_hover({
                                 let path = path.clone();
@@ -9215,6 +9299,7 @@ impl Render for Shell {
         }
         if !std::mem::replace(&mut self.browser_selftest_started, true) {
             self.start_browser_agent(window, cx);
+            self.start_database_footer(window, cx);
             self.start_browser_selftest(window, cx);
         }
         if let Some(m) = &self.monos {
@@ -9735,6 +9820,12 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &MoveProjectForward, _, cx| this.move_current_project(1, cx)),
             )
+            .on_action(cx.listener(|this, _: &SleepProject, window, cx| {
+                this.sleep_current_project(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SleepOtherProjects, window, cx| {
+                this.sleep_other_projects(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &SwitchModel, window, cx| {
                 if let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id)) {
                     view.update(cx, |v, cx| v.toggle_recent_models(window, cx));
@@ -9981,6 +10072,13 @@ impl Render for Shell {
                     .when(open.target == MenuTarget::Actions, |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
+                    .when(
+                        matches!(
+                            open.target,
+                            MenuTarget::Databases | MenuTarget::DatabaseImport
+                        ),
+                        |p| p.side(Side::Top).align(crate::popover::Align::End).max_height(560.),
+                    )
                     .when(open.target == MenuTarget::RunningTerminals, |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })

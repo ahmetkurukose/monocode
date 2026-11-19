@@ -256,6 +256,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project = self.workspace.project.clone();
+        if self.project_asleep(&project) {
+            return self.sleeping_terminal_panel(cx);
+        }
         // Never render the tab without a shell, whatever emptied the dock.
         self.ensure_panel_terminal(cx);
         let Some(dock) = self.workspace.docks.get(&project).cloned() else {

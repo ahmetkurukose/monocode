@@ -4218,6 +4218,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "shlex",
  "similar",
  "streaming-iterator",
  "syntect",

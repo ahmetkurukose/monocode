@@ -592,6 +592,18 @@ fn run_turn_using(
                 settings.environment.extend(environment);
             }
         }
+        // The user's Database-view data sources, scoped to the session's
+        // project. Sources belong to projects, and a session's worktree is
+        // usually not inside its project, so the project's path is the one
+        // given, not the worktree's. Transport only, like the browser's.
+        if !settings.text_only && !raw_native_command {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            if let Ok(environment) =
+                monocode_core::db_bridge::environment(summary.id, &summary.cwd, &executable)
+            {
+                settings.environment.extend(environment);
+            }
+        }
         if let Some(visual_bridge) = &visual_bridge {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             settings

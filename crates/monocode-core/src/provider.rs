@@ -39,6 +39,12 @@ pub fn configure_idle_agents(limit: usize) {
 pub fn keep_idle_agents(ids: Vec<i64>) {
     parked::keep(ids);
 }
+/// Stop the warm, idle provider processes these Monocode conversations left
+/// behind and return how many stopped. Their next turn resumes the saved
+/// provider session (`--resume`, `thread/resume`, `session/load`) cold.
+pub fn retire_idle_sessions(ids: &std::collections::HashSet<i64>) -> usize {
+    parked::retire_owners(ids)
+}
 pub fn discard_worktree(path: &Path) {
     parked::discard_worktree(path);
     opencode::discard_worktree(path);
@@ -1415,6 +1421,7 @@ fn run_operation(
             command.arg("app-server");
             crate::visual_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::browser_bridge::configure_codex(&mut command, &request.settings.environment);
+            crate::db_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::mono::bridge::configure_codex(
                 &mut command,
                 request.settings.mono.as_ref(),
@@ -1499,6 +1506,15 @@ fn run_operation(
             {
                 servers.insert(crate::browser_bridge::SERVER_NAME.into(), server);
                 allowed.push(crate::browser_bridge::CLAUDE_ALLOWED_TOOLS);
+            }
+            // The user's data sources. Reads are allowed up front; db_execute
+            // is not listed, so Claude asks the user before every write.
+            if let Some(server) = (!settings.text_only)
+                .then(|| crate::db_bridge::mcp_server(&settings.environment))
+                .flatten()
+            {
+                servers.insert(crate::db_bridge::SERVER_NAME.into(), server);
+                allowed.push(crate::db_bridge::CLAUDE_ALLOWED_TOOLS);
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);

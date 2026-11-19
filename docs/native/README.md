@@ -111,6 +111,14 @@ Create worktree**, or the composer's "New worktree".
 
 Design notes: [worktrees.md](worktrees.md).
 
+## Sleeping projects
+
+Right-click a project, or a rail group's header, and choose **Sleep** to stop
+its shells, warm agents and pages and release its loaded chats. Its chats,
+tabs and settings stay, and **Wake project** on its sleep screen brings it
+back. See
+[Sleeping projects](project-sleep.md).
+
 ## Develop
 
 From the repository root:

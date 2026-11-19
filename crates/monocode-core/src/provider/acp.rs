@@ -123,6 +123,12 @@ impl Protocol {
         ) {
             list.push(browser);
         }
+        if let (Some(list), Some(databases)) = (
+            servers.as_array_mut(),
+            crate::db_bridge::acp_server(&settings.environment),
+        ) {
+            list.push(databases);
+        }
         servers
     }
     pub(super) fn acp_cancel(&mut self, stdin: &mut impl Write) -> Result<(), String> {

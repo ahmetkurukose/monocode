@@ -78,6 +78,10 @@ impl Shell {
                     Command::WorkspaceStyle => {
                         window.dispatch_action(Box::new(ToggleWorkspaceStyle), cx)
                     }
+                    Command::SleepProject => window.dispatch_action(Box::new(SleepProject), cx),
+                    Command::SleepOtherProjects => {
+                        window.dispatch_action(Box::new(SleepOtherProjects), cx)
+                    }
                     Command::Plan | Command::Operator | Command::Orchestrator => {
                         if let Some(view) =
                             this.workspace.active.and_then(|id| this.sessions.get(&id))

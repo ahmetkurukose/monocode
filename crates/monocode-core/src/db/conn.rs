@@ -57,7 +57,7 @@ impl std::fmt::Display for DbError {
 }
 
 impl DbError {
-    pub(crate) fn plain(message: impl Into<String>) -> Self {
+    pub fn plain(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             ..Self::default()
@@ -339,8 +339,40 @@ fn postgres_only(what: &str) -> DbError {
     DbError::plain(format!("{what} exists only for PostgreSQL data sources"))
 }
 
+/// Where tunnels keep their logs, pid files and locks. Set by the app once;
+/// until then a source's tunnel is not opened on connect.
+static TUNNEL_DIR: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+pub fn set_tunnel_dir(dir: std::path::PathBuf) {
+    if let Ok(mut slot) = TUNNEL_DIR.write() {
+        *slot = Some(dir);
+    }
+}
+
+pub fn tunnel_dir() -> Option<std::path::PathBuf> {
+    TUNNEL_DIR.read().ok().and_then(|dir| dir.clone())
+}
+
+/// How long connecting waits for a tunnel to come up.
+const TUNNEL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Opens the source's tunnel when its port is not listening yet, so every
+/// way in (a console, the tree, Test Connection, an agent) gets one.
+async fn open_tunnel(source: &DataSource) -> Result<(), DbError> {
+    let (Some(tunnel), Some(dir)) = (source.tunnel.clone(), tunnel_dir()) else {
+        return Ok(());
+    };
+    let port = source.port;
+    let name = source.name.clone();
+    tokio::task::spawn_blocking(move || super::tunnel::ensure(&tunnel, port, &dir, TUNNEL_WAIT))
+        .await
+        .map_err(|e| DbError::plain(e.to_string()))?
+        .map_err(|error| DbError::plain(format!("The tunnel of {name} did not open: {error}")))
+}
+
 impl Connection {
     pub async fn connect(source: &DataSource, password: Option<&str>) -> Result<Self, DbError> {
+        open_tunnel(source).await?;
         Ok(match source.kind {
             DbKind::Postgres => Self::Postgres(PgConnection::connect(source, password).await?),
             DbKind::MongoDb => Self::Mongo(MongoConnection::connect(source, password).await?),
