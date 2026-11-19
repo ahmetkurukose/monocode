@@ -77,6 +77,19 @@ describe("languageForPath", () => {
     },
   );
 
+  it.each([
+    "config.cfg",
+    "setup.cfg",
+    "tox.ini",
+    "app.properties",
+    ".editorconfig",
+    "/home/me/.gitconfig",
+  ])("highlights INI-style config file %s as properties", async (path) => {
+    const config = await languageForPath(path);
+    expect(config).not.toBeNull();
+    expect(languageName(config!)).toBe("properties");
+  });
+
   it("does not treat .envrc as a dotenv file", async () => {
     await expect(languageForPath(".envrc")).resolves.toBeNull();
   });

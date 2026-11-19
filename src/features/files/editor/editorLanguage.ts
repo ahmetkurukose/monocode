@@ -112,6 +112,67 @@ function legacyLanguage(parser: StreamParser<unknown>): Extension {
   return StreamLanguage.define(parser);
 }
 
+/**
+ * The legacy `properties` mode (INI, `.cfg`, dotenv) as the palette needs it:
+ * keys come out as "def", which the palette leaves uncolored and the built-in
+ * token table won't let us remap, so they are renamed. With `typedValues`,
+ * quoted strings, numbers, booleans and trailing comments in a value are
+ * colored too; otherwise values stay plain.
+ */
+function keyValueParser(
+  properties: StreamParser<unknown>,
+  typedValues: boolean,
+): StreamParser<unknown> {
+  return {
+    ...properties,
+    token: (stream, state) => {
+      if (
+        typedValues &&
+        (state as { position: string }).position === "quote" &&
+        !stream.sol()
+      ) {
+        const style = keyValueValueToken(stream);
+        if (style !== undefined) return style;
+      }
+      const style = properties.token(stream, state);
+      return style === "def" ? "keyValueKey" : style;
+    },
+    tokenTable: { keyValueKey: tags.labelName },
+  };
+}
+
+/** One token of an INI value; `undefined` hands the character back to `properties`. */
+function keyValueValueToken(
+  stream: Parameters<StreamParser<unknown>["token"]>[0],
+): string | null | undefined {
+  if (stream.eatSpace()) {
+    if (stream.match(/^[#;].*/)) return "comment";
+    return null;
+  }
+  const quote = stream.peek();
+  if (quote === '"' || quote === "'") {
+    stream.next();
+    let escaped = false;
+    for (let ch = stream.next(); ch != null; ch = stream.next()) {
+      if (ch === quote && !escaped) break;
+      escaped = !escaped && ch === "\\";
+    }
+    return "string";
+  }
+  // A trailing backslash continues the value; `properties` tracks that.
+  if (quote === "\\") return undefined;
+  if (
+    stream.match(/^[-+]?(?:0x[\da-f]+|\d+(?:\.\d+)?(?:e[-+]?\d+)?)(?![\w.])/i)
+  ) {
+    return "number";
+  }
+  if (stream.match(/^(?:true|false|yes|no|on|off|none|null)(?![\w.-])/i)) {
+    return "atom";
+  }
+  stream.match(/^[^\s'"\\]+/) || stream.next();
+  return null;
+}
+
 export async function languageForPath(path: string): Promise<Extension | null> {
   const name = basename(path).toLowerCase();
   const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
@@ -242,16 +303,15 @@ export async function languageForPath(path: string): Promise<Extension | null> {
   if (name === ".env" || name.startsWith(".env.")) {
     const { properties } =
       await import("@codemirror/legacy-modes/mode/properties");
-    // Keys come out as "def", which the palette leaves uncolored and the
-    // built-in token table won't let us remap; rename them. Values stay plain.
-    return legacyLanguage({
-      ...properties,
-      token: (stream, state) => {
-        const style = properties.token(stream, state);
-        return style === "def" ? "envKey" : style;
-      },
-      tokenTable: { envKey: tags.labelName },
-    });
+    return legacyLanguage(keyValueParser(properties, false));
+  }
+  if (
+    [".cfg", ".ini", ".properties"].includes(extension) ||
+    [".editorconfig", ".gitconfig"].includes(name)
+  ) {
+    const { properties } =
+      await import("@codemirror/legacy-modes/mode/properties");
+    return legacyLanguage(keyValueParser(properties, true));
   }
   if (extension === ".toml") {
     const { toml } = await import("@codemirror/legacy-modes/mode/toml");

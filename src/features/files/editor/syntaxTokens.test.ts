@@ -61,6 +61,33 @@ describe("highlightSource", () => {
     expect(token(lines[1], "bucket")?.color).toBeUndefined();
   });
 
+  it("colors .cfg sections, keys, and typed values", async () => {
+    const language = await languageForPath("config.cfg");
+    const lines = highlightSource(
+      [
+        "[mail]",
+        "; note",
+        "MAIL_DEFAULT_REPLY_TO = 'support@example.com'",
+        "PORT = 8080 # inline",
+        "DEBUG = True",
+        "HOST = localhost:8080",
+      ].join("\n"),
+      language,
+    );
+    expect(token(lines[0], "[mail]")?.color).toBe(
+      "var(--color-markdown-heading)",
+    );
+    expect(token(lines[1], "; note")?.color).toBe(COMMENT);
+    expect(token(lines[2], "MAIL_DEFAULT_REPLY_TO")?.color).toBe(
+      "var(--syntax-callable)",
+    );
+    expect(token(lines[2], "'support@example.com'")?.color).toBe(STRING);
+    expect(token(lines[3], "8080")?.color).toBe("var(--syntax-number)");
+    expect(token(lines[3], "# inline")?.color).toBe(COMMENT);
+    expect(token(lines[4], "True")?.color).toBe(KEYWORD);
+    expect(token(lines[5], "localhost:8080")?.color).toBeUndefined();
+  });
+
   it("leaves unknown languages unstyled", () => {
     const lines = highlightSource("plain text", null);
     expect(lines).toEqual([[{ text: "plain text" }]]);
