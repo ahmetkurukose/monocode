@@ -108,6 +108,7 @@ impl AssetSource for Assets {
    "folder-open"=>include_bytes!("../assets/hugeicons/folder-open.svg"),
    "folder-tree"=>include_bytes!("../assets/hugeicons/folder-tree.svg"),
    "image-add"=>include_bytes!("../assets/hugeicons/image-add.svg"),
+   "image-01"=>include_bytes!("../assets/hugeicons/image-01.svg"),
    "pencil-edit"=>include_bytes!("../assets/hugeicons/pencil-edit.svg"),
    "pin"=>include_bytes!("../assets/hugeicons/pin.svg"),
    "pin-off"=>include_bytes!("../assets/hugeicons/pin-off.svg"),

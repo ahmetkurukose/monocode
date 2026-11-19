@@ -14,6 +14,7 @@ use gpui::{
     MouseButton, Render, Role, SharedString, Subscription, Task, Window, WindowHandle, div,
     prelude::*, px,
 };
+use monocode_core::composer::image_markers;
 use monocode_core::{
     agent::AccessMode, git::Snapshot, project_appearance::ProjectAppearance, provider::Kind,
 };
@@ -713,8 +714,22 @@ impl QuickComposer {
         }
         match monocode_core::composer::validate_attachments(&all) {
             Ok(()) => {
+                let before = self.attachments.len();
                 self.attachments = all;
                 self.error = None;
+                // New images get `[Image #N]` markers at the caret.
+                let numbers: Vec<usize> = image_markers::image_numbers(&self.attachments)
+                    .into_iter()
+                    .skip(before)
+                    .flatten()
+                    .collect();
+                if !numbers.is_empty() {
+                    let count = image_markers::image_count(&self.attachments);
+                    self.input.update(cx, |input, cx| {
+                        input.set_image_count(count, cx);
+                        input.insert_image_markers(&numbers, cx);
+                    });
+                }
             }
             Err(error) => self.error = Some(error),
         }
@@ -1097,6 +1112,10 @@ impl QuickComposer {
             )
     }
     fn attachment_chips(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let image_numbers = image_markers::image_numbers(&self.attachments);
+        let image_count = image_numbers.iter().flatten().count();
+        self.input
+            .update(cx, |input, cx| input.set_image_count(image_count, cx));
         if self.attachments.is_empty() {
             return None;
         }
@@ -1150,8 +1169,16 @@ impl QuickComposer {
                         .child(icon("close", 10.))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if ix < this.attachments.len() {
+                                let number = image_markers::image_numbers(&this.attachments)[ix];
+                                let count = image_markers::image_count(&this.attachments);
                                 let path = this.attachments.remove(ix);
                                 this.staged_attachments.retain(|staged| staged != &path);
+                                if let Some(number) = number {
+                                    this.input.update(cx, |input, cx| {
+                                        input.remove_image_markers(number, count, cx);
+                                        input.set_image_count(count - 1, cx);
+                                    });
+                                }
                                 cx.notify();
                             }
                         }));
@@ -1175,6 +1202,13 @@ impl QuickComposer {
                                 .into_any_element(),
                             None => crate::file_icons::file_type_icon(&label, false, false, 14.),
                         })
+                        .children(image_numbers[ix].map(|number| {
+                            div()
+                                .flex_shrink_0()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(content(0.55))
+                                .child(format!("#{number}"))
+                        }))
                         .child(div().max_w(px(190.)).truncate().child(label))
                         .when(!busy, |d| d.child(remove))
                 }))

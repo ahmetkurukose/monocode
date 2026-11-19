@@ -428,6 +428,32 @@ pub(crate) fn section_label(label: &'static str) -> Div {
         .text_color(content(0.5))
         .child(div().flex_1().child(label))
 }
+/// The `#N` an attached image's thumbnail carries: the number its
+/// `[Image #N]` markers use. Sits on the thumbnail's bottom-left corner.
+pub(crate) fn image_number_badge(number: usize) -> gpui::AnyElement {
+    image_number_badge_inset(number, 2.)
+}
+/// [`image_number_badge`] `inset` px in from a rounder corner.
+pub(crate) fn image_number_badge_inset(number: usize, inset: f32) -> gpui::AnyElement {
+    div()
+        .absolute()
+        .left(px(inset))
+        .bottom(px(inset))
+        .h(px(14.))
+        .min_w(px(14.))
+        .px(px(3.))
+        .rounded_full()
+        .bg(gpui::black().opacity(0.72))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(9.5))
+        .line_height(px(14.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(gpui::white())
+        .child(format!("#{number}"))
+        .into_any_element()
+}
 pub(crate) fn icon(path: &'static str, side: f32) -> Svg {
     svg()
         .path(path)

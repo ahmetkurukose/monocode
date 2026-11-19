@@ -1,4 +1,5 @@
 use super::*;
+use monocode_core::composer::image_markers;
 use std::path::PathBuf;
 pub(crate) struct StartOrchestration(pub monocode_core::orchestration::Plan);
 pub(crate) struct StopOrchestration;
@@ -284,7 +285,7 @@ impl Conversation {
         .detach();
         cx.notify();
     }
-    fn finish_attachment_read(
+    pub(super) fn finish_attachment_read(
         &mut self,
         result: Result<Vec<PathBuf>, String>,
         cx: &mut Context<Self>,
@@ -292,6 +293,7 @@ impl Conversation {
         self.attaching = false;
         match result {
             Ok(paths) => {
+                let before = self.attachments.len();
                 // Keep removals made while the background validation ran.
                 for path in paths {
                     if !self.attachments.contains(&path) {
@@ -299,6 +301,7 @@ impl Conversation {
                     }
                 }
                 self.attachment_error = None;
+                self.mark_new_images(before, cx);
             }
             Err(error) => self.attachment_error = Some(error),
         }
@@ -306,7 +309,45 @@ impl Conversation {
         self.add_attachments(pending, cx);
         cx.notify();
     }
+    /// Each image that joined the draft after its first `before` files gets
+    /// an `[Image #N]` marker at the caret, as Claude Code's own composer does.
+    fn mark_new_images(&mut self, before: usize, cx: &mut Context<Self>) {
+        let numbers: Vec<usize> = image_markers::image_numbers(&self.attachments)
+            .into_iter()
+            .skip(before)
+            .flatten()
+            .collect();
+        if numbers.is_empty() {
+            return;
+        }
+        let count = image_markers::image_count(&self.attachments);
+        self.input.update(cx, |input, cx| {
+            input.set_image_count(count, cx);
+            input.insert_image_markers(&numbers, cx);
+        });
+    }
+    /// Removes the draft's file at `ix`; an image takes its markers with it
+    /// and later images' markers are renumbered, matching their thumbnails.
+    pub(super) fn remove_attachment(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.attachments.len() {
+            return;
+        }
+        let number = image_markers::image_numbers(&self.attachments)[ix];
+        let count = image_markers::image_count(&self.attachments);
+        self.attachments.remove(ix);
+        if let Some(number) = number {
+            self.input.update(cx, |input, cx| {
+                input.remove_image_markers(number, count, cx);
+                input.set_image_count(count - 1, cx);
+            });
+        }
+        cx.notify();
+    }
     pub(super) fn attachment_chips(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let image_numbers = image_markers::image_numbers(&self.attachments);
+        let image_count = image_numbers.iter().flatten().count();
+        self.input
+            .update(cx, |input, cx| input.set_image_count(image_count, cx));
         // Removed chips release their thumbnail sprites with the entity.
         let attachments = &self.attachments;
         self.attachment_photos
@@ -371,10 +412,7 @@ impl Conversation {
                         .child(icon("close", if image { 12. } else { 10. }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if ix < this.attachments.len() {
-                                this.attachments.remove(ix);
-                                cx.notify();
-                            }
+                            this.remove_attachment(ix, cx);
                         }));
                     if image {
                         let preview = crate::image_lightbox::Open {
@@ -397,6 +435,7 @@ impl Conversation {
                                 window.dispatch_action(Box::new(preview.clone()), cx);
                             })
                             .children(photo)
+                            .children(image_numbers[ix].map(crate::theme::image_number_badge))
                             .child(remove)
                             .into_any_element();
                     }

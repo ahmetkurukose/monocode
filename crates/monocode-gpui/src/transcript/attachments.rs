@@ -1,6 +1,6 @@
 use super::*;
 use gpui::{AnyElement, ImageSource};
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 #[derive(Clone)]
 pub(crate) struct Attachment {
@@ -273,8 +273,10 @@ impl TranscriptView {
         &mut self,
         files: &[Attachment],
         key: &str,
+        numbered: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let numbers = image_numbers(files);
         div()
             .flex()
             .flex_wrap()
@@ -282,7 +284,13 @@ impl TranscriptView {
             .children(files.iter().enumerate().map(|(ix, file)| {
                 if file.image {
                     self.image_tile(file, key, ix, false, cx)
+                        .relative()
                         .size(px(36.))
+                        .children(
+                            numbers[ix]
+                                .filter(|_| numbered)
+                                .map(crate::theme::image_number_badge),
+                        )
                         .into_any_element()
                 } else {
                     div()
@@ -316,6 +324,7 @@ impl TranscriptView {
         &mut self,
         files: &[Attachment],
         key: &str,
+        numbered: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -326,7 +335,11 @@ impl TranscriptView {
             .gap_1p5()
             .children(files.iter().enumerate().map(|(ix, file)| {
                 self.image_tile(file, &format!("photo-{key}"), ix, true, cx)
+                    .relative()
                     .rounded(px(16.))
+                    .when(numbered, |d| {
+                        d.child(crate::theme::image_number_badge_inset(ix + 1, 6.))
+                    })
                     .into_any_element()
             }))
             .into_any_element()
@@ -416,6 +429,55 @@ impl TranscriptView {
             })
             .child(photo)
     }
+}
+
+/// Each file's image number, as the composer numbered them for
+/// `[Image #N]`; `None` for files that are not images.
+pub(super) fn image_numbers(files: &[Attachment]) -> Vec<Option<usize>> {
+    let mut next = 0;
+    files
+        .iter()
+        .map(|file| {
+            file.image.then(|| {
+                next += 1;
+                next
+            })
+        })
+        .collect()
+}
+
+pub(super) fn image_count(files: &[Attachment]) -> usize {
+    files.iter().filter(|file| file.image).count()
+}
+
+/// Number a message's images when it has several, or when its text names
+/// one by `[Image #N]`.
+pub(super) fn numbers_images(files: &[Attachment], text: &str) -> bool {
+    let images = image_count(files);
+    images > 1
+        || (images == 1
+            && !monocode_core::composer::image_markers::live_markers(text, images).is_empty())
+}
+
+/// The prompt's `[Image #N]` markers, drawn as quiet chips in the bubble.
+pub(super) fn marker_styles(
+    text: &str,
+    images: usize,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    monocode_core::composer::image_markers::live_markers(text, images)
+        .into_iter()
+        .map(|(range, _)| {
+            (
+                range,
+                gpui::HighlightStyle {
+                    color: Some(content(0.8)),
+                    // No weight change: bubble widths are measured unstyled.
+                    background_color: Some(content(0.1)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
 }
 
 /// Splits a Mono chat message's files into the images shown whole above its

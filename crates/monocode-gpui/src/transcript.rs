@@ -1963,8 +1963,15 @@ impl TranscriptView {
         let retry = message.id.clone();
         let discard = message.id.clone();
         let attachments = attachments::Attachment::from_paths(&message.attachments);
-        let attachment_body = (!attachments.is_empty())
-            .then(|| self.attachment_row(&attachments, &format!("pending-{}", message.id), cx));
+        let numbered = attachments::numbers_images(&attachments, &message.text);
+        let attachment_body = (!attachments.is_empty()).then(|| {
+            self.attachment_row(
+                &attachments,
+                &format!("pending-{}", message.id),
+                numbered,
+                cx,
+            )
+        });
         div()
             .id(SharedString::from(format!("mono-pending-{}", message.id)))
             .debug_selector(|| "mono-pending-message".into())
@@ -4874,10 +4881,23 @@ impl TranscriptView {
         } else {
             (Vec::new(), attachments.to_vec())
         };
+        let image_count = attachments::image_count(&attachments);
+        let numbered = user
+            && first
+            && self
+                .source
+                .get(message_start)
+                .is_some_and(|row| attachments::numbers_images(&attachments, &row.text));
         let photo_body = (!photos.is_empty())
-            .then(|| self.photo_row(&photos, &format!("sent-{message_start}"), cx));
-        let attachment_body = (user && first && !bubble_files.is_empty())
-            .then(|| self.attachment_row(&bubble_files, &format!("sent-{message_start}"), cx));
+            .then(|| self.photo_row(&photos, &format!("sent-{message_start}"), numbered, cx));
+        let attachment_body = (user && first && !bubble_files.is_empty()).then(|| {
+            self.attachment_row(
+                &bubble_files,
+                &format!("sent-{message_start}"),
+                numbered,
+                cx,
+            )
+        });
         let step_opacity = self
             .motions
             .get(&row.key)
@@ -5459,7 +5479,11 @@ impl TranscriptView {
                                         let styled = gpui::StyledText::new(text.clone())
                                             .with_highlights(markdown::mark_styles(
                                                 &text,
-                                                vec![],
+                                                if user {
+                                                    attachments::marker_styles(&text, image_count)
+                                                } else {
+                                                    Vec::new()
+                                                },
                                                 self.search_match
                                                     .as_ref()
                                                     .map_or("", |(_, q)| q.as_str()),

@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod code;
 mod command;
 mod context_menu;
+mod image_pills;
 mod mention;
 mod spelling;
 pub(crate) use command::{Command, CommandRemoved};
@@ -235,6 +236,8 @@ pub struct Input {
     reversed: bool,
     marked: Option<Range<usize>>,
     composer_tokens: Vec<Range<usize>>,
+    /// Attached images; their `[Image #N]` markers draw as pills.
+    image_count: usize,
     inline_commands: bool,
     selected_command: Option<Command>,
     lines: Vec<WrappedLine>,
@@ -288,6 +291,7 @@ impl Input {
             reversed: false,
             marked: None,
             composer_tokens: Vec::new(),
+            image_count: 0,
             inline_commands: false,
             selected_command: None,
             lines: Vec::new(),
@@ -680,6 +684,14 @@ impl Input {
         self.reveal_code();
         self.clear_completion();
         let offset = self.clip_offset(offset);
+        // The caret never rests inside an image pill.
+        let offset = self.image_around(offset).map_or(offset, |range| {
+            if offset - range.start <= range.end - offset {
+                range.start
+            } else {
+                range.end
+            }
+        });
         self.selection = offset..offset;
         self.reversed = false;
         cx.notify();
@@ -689,6 +701,8 @@ impl Input {
         self.reveal_pending = self.reveal_in_parent;
         self.reveal_code();
         let offset = self.clip_offset(offset);
+        // A selection takes an image pill whole.
+        let offset = self.outside_image(offset, offset >= self.cursor());
         self.selection = self.clip_range(self.selection.clone());
         if self.reversed {
             self.selection.start = offset;
@@ -705,6 +719,9 @@ impl Input {
         if let Some(at) = self.folded_boundary(at, true) {
             return at;
         }
+        if let Some(at) = self.image_step_back(at) {
+            return at;
+        }
         if self.code.is_some() {
             return self.content[..at]
                 .grapheme_indices(true)
@@ -719,6 +736,9 @@ impl Input {
     }
     fn next(&self, at: usize) -> usize {
         if let Some(at) = self.folded_boundary(at, false) {
+            return at;
+        }
+        if let Some(at) = self.image_step_forward(at) {
             return at;
         }
         if self.code.is_some() {
@@ -1595,6 +1615,15 @@ impl Element for InputElement {
         if let Some(command) = command {
             boundaries.extend([command.icon_range().end, command.name_range().end]);
         }
+        let pills: Vec<_> = if placeholder {
+            Vec::new()
+        } else {
+            layout.image_pills().map(|(pill, _)| pill).collect()
+        };
+        for pill in &pills {
+            boundaries.extend([pill.start, pill.end]);
+        }
+        boundaries.retain(|at| *at <= text.len());
         boundaries.sort_unstable();
         boundaries.dedup();
         let runs: Vec<_> = boundaries
@@ -1606,6 +1635,8 @@ impl Element for InputElement {
                     crate::theme::content(0.)
                 } else if let Some(command) = command.filter(|c| c.name_range().contains(&at)) {
                     command.mode.color()
+                } else if pills.iter().any(|pill| pill.contains(&at)) {
+                    crate::theme::content(0.8)
                 } else if let Some((_, mention)) =
                     highlights.iter().find(|(range, _)| range.contains(&at))
                 {
@@ -1766,7 +1797,15 @@ impl Element for InputElement {
                             sy += line_height;
                         }
                     }
+                    let painted = image_pills::PaintedLine {
+                        line,
+                        base,
+                        origin: point(x, y),
+                        line_height,
+                    };
+                    image_pills::paint_pills(&state.layout, &painted, true, w, cx);
                     let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, w, cx);
+                    image_pills::paint_pills(&state.layout, &painted, false, w, cx);
                     for (source, icon) in &state.layout.mentions {
                         let at = to_display(*source);
                         if at < base || at >= base + line.len() {
@@ -1988,10 +2027,11 @@ mod tests {
     #[::core::prelude::v1::test]
     fn mention_slots_map_offsets_both_ways() {
         let source = "see @a.rs and @b.md";
-        let layout = DisplayLayout {
-            command: None,
-            mentions: vec![(4, MentionIcon::Note), (14, MentionIcon::Note)],
-        };
+        let layout = DisplayLayout::new(
+            None,
+            vec![(4, MentionIcon::Note), (14, MentionIcon::Note)],
+            Vec::new(),
+        );
         let display = layout.apply(source.into());
         assert_eq!(
             display.as_ref(),
@@ -2003,6 +2043,37 @@ mod tests {
         // Clicking inside a blank lands on the nearer side of its `@`.
         assert_eq!(layout.to_source(4 + 3), 4);
         assert_eq!(layout.to_source(4 + 6), 5);
+    }
+    #[::core::prelude::v1::test]
+    fn image_pills_are_atoms_in_the_shaped_text() {
+        let source = "a [Image #1] @x.rs [Image #2]";
+        let layout = DisplayLayout::new(
+            None,
+            vec![(13, MentionIcon::Note)],
+            vec![(2..12, 1), (19..29, 2)],
+        );
+        let display = layout.apply(source.into());
+        let pill = |n: usize| {
+            format!(
+                "{0}\u{a0}\u{a0}\u{a0}\u{a0}Image\u{a0}#{n}{0}",
+                mention::PILL_PAD
+            )
+        };
+        assert_eq!(
+            display.as_ref(),
+            format!("a {} \u{2003}\u{2009}x.rs {}", pill(1), pill(2))
+        );
+        // Offsets outside pills survive the round trip; inside, they snap.
+        for at in (0..=2).chain(12..=19).chain([29]) {
+            assert_eq!(layout.to_source(layout.to_display(at)), at, "{at}");
+        }
+        assert_eq!(layout.to_display(3), layout.to_display(2));
+        assert_eq!(layout.to_display(11), layout.to_display(12));
+        let (first, icon) = layout.image_pills().next().unwrap();
+        assert_eq!(&display[first.clone()], pill(1));
+        assert_eq!(icon.start, first.start + mention::PILL_PAD.len());
+        assert_eq!(layout.to_source(first.start + 1), 2);
+        assert_eq!(layout.to_source(first.end - 1), 12);
     }
     #[::core::prelude::v1::test]
     fn utf16_and_bounded_paste_respect_unicode() {
@@ -2550,6 +2621,58 @@ mod native_input_tests {
                 assert!(input.content.is_empty());
                 input.replace_text_in_range(None, "line one\nline two", w, cx);
                 assert_eq!(input.take(cx).as_deref(), Some("line one\nline two"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn image_markers_edit_as_whole_pills_and_follow_their_images(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(Input::new))
+                .unwrap()
+        });
+        window
+            .update(cx, |input, w, cx| {
+                // Pasting two images into an empty draft, then typing between.
+                input.set_image_count(1, cx);
+                input.insert_image_markers(&[1], cx);
+                assert_eq!(input.content.as_ref(), "[Image #1] ");
+                input.replace_text_in_range(None, "vs", w, cx);
+                input.set_image_count(2, cx);
+                input.insert_image_markers(&[2], cx);
+                assert_eq!(input.content.as_ref(), "[Image #1] vs [Image #2] ");
+                let end = input.content.len();
+                assert_eq!(input.selection, end..end);
+                // The caret steps over a pill in one move, both ways.
+                input.left(&Left, w, cx);
+                assert_eq!(input.cursor(), end - 1);
+                input.left(&Left, w, cx);
+                assert_eq!(input.cursor(), 14);
+                input.right(&Right, w, cx);
+                assert_eq!(input.cursor(), 24);
+                // Clicks and word moves never leave the caret inside one.
+                input.move_to(17, cx);
+                assert_eq!(input.cursor(), 14);
+                input.move_to(22, cx);
+                assert_eq!(input.cursor(), 24);
+                input.move_to(14, cx);
+                input.select_to(16, cx);
+                assert_eq!(input.selection, 14..24);
+                // Backspace after a pill removes the whole marker.
+                input.move_to(24, cx);
+                input.backspace(&Backspace, w, cx);
+                assert_eq!(input.content.as_ref(), "[Image #1] vs  ");
+                // An `[Image #N]` naming no attached image is plain text.
+                input.set_text("[Image #1] [Image #3]".into(), cx);
+                let end = input.content.len();
+                input.left(&Left, w, cx);
+                assert_eq!(input.cursor(), end - 1);
+                // Removing image 1 of 2 drops its marker; #2 becomes #1.
+                input.set_text("[Image #1] then [Image #2] ok".into(), cx);
+                input.move_to(input.content.len(), cx);
+                input.remove_image_markers(1, 2, cx);
+                assert_eq!(input.content.as_ref(), "then [Image #1] ok");
+                assert_eq!(input.cursor(), input.content.len());
             })
             .unwrap();
     }

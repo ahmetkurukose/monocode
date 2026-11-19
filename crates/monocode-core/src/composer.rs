@@ -1,5 +1,7 @@
 //! Composer tokens and turn preparation, independent of the UI.
 use crate::{files::ProjectFile, skills::DiscoveredSkill};
+pub mod image_markers;
+
 use std::{
     io::Read,
     ops::Range,
@@ -268,8 +270,18 @@ pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<
             }
         }
     }
-    for path in attachments {
-        let mut block = format!("Attached file: {}", path.display());
+    let numbers = image_markers::image_numbers(attachments);
+    for (path, number) in attachments.iter().zip(numbers) {
+        // An image's line carries the `[Image #N]` the prompt can refer to it by;
+        // its pixels travel as the Nth image block of the message.
+        let mut block = match number {
+            Some(number) => format!(
+                "Attached image {}: {}",
+                image_markers::marker(number),
+                path.display()
+            ),
+            None => format!("Attached file: {}", path.display()),
+        };
         if image_mime(path).is_none() {
             if let Ok(body) = read_text(path, 128 * 1024) {
                 if !body.contains('\0') {
@@ -444,5 +456,26 @@ mod tests {
         assert!(prompt.contains("Inspect before edits."));
         assert!(prompt.contains("useful context"));
         assert!(prompt.ends_with("/native-test-skill do it"));
+    }
+    #[test]
+    fn images_are_listed_with_the_markers_the_prompt_uses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let first = root.join("first.png");
+        let notes = root.join("notes.txt");
+        let second = root.join("second.jpg");
+        for path in [&first, &notes, &second] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let prompt = prepare_prompt(
+            "[Image #1] vs [Image #2]",
+            root.to_str().unwrap(),
+            &[first.clone(), notes.clone(), second.clone()],
+        )
+        .unwrap();
+        assert!(prompt.contains(&format!("Attached image [Image #1]: {}", first.display())));
+        assert!(prompt.contains(&format!("Attached file: {}", notes.display())));
+        assert!(prompt.contains(&format!("Attached image [Image #2]: {}", second.display())));
+        assert!(prompt.ends_with("[Image #1] vs [Image #2]"));
     }
 }

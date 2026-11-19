@@ -54,7 +54,11 @@ fn image_lightbox_opens_from_composer_and_sent_images_and_restores_focus(cx: &mu
     window
         .update(visual, |shell, w, cx| {
             assert!(input.focus_handle(cx).is_focused(w));
-            assert_eq!(input.read(cx).content.as_ref(), "Keep this draft");
+            // The pasted image is named at the caret, as Claude Code does.
+            assert_eq!(
+                input.read(cx).content.as_ref(),
+                "Keep this draft [Image #1] "
+            );
             assert!(shell.image_lightbox.is_none());
         })
         .unwrap();
@@ -67,6 +71,12 @@ fn image_lightbox_opens_from_composer_and_sent_images_and_restores_focus(cx: &mu
     );
     assert!(visual.debug_bounds("composer-image-0").is_none());
     assert!(visual.debug_bounds("image-lightbox").is_none());
+    // Removing the image takes its marker, leaving the draft as it was.
+    window
+        .update(visual, |_, _, cx| {
+            assert_eq!(input.read(cx).content.as_ref(), "Keep this draft");
+        })
+        .unwrap();
 
     let data = base64::engine::general_purpose::STANDARD.encode(br##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"><rect width="640" height="480" fill="#4da3f5"/></svg>"##);
     window.update(visual, |shell, _, cx| {

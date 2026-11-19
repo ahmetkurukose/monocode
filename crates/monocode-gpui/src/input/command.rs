@@ -95,6 +95,9 @@ impl CommandLayout {
             at.saturating_sub(ICON_SLOT.len() - 1).max(1)
         }
     }
+    pub fn has_source_prefix(self) -> bool {
+        self.source_prefix == 1
+    }
     pub fn name_range(self) -> Range<usize> {
         ICON_SLOT.len()..ICON_SLOT.len() + self.mode.name().len()
     }

@@ -1,7 +1,7 @@
 use super::*;
 use gpui::{TestAppContext, WindowHandle};
 use monocode_core::{store::Store, transcript::attachments};
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
     let store = Store::open(Path::new(":memory:")).unwrap();
@@ -383,4 +383,43 @@ fn a_new_worktrees_creation_warnings_show_above_the_composer(cx: &mut TestAppCon
     visual.simulate_click(dismiss.center(), Default::default());
     visual.run_until_parked();
     assert!(visual.debug_bounds("worktree-notice").is_none());
+}
+
+#[gpui::test]
+fn attached_images_get_markers_that_follow_their_thumbnails(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.set_text("compare".into(), cx));
+            let (a, notes, b) = (
+                PathBuf::from("/tmp/a.png"),
+                PathBuf::from("/tmp/notes.txt"),
+                PathBuf::from("/tmp/b.jpg"),
+            );
+            view.finish_attachment_read(Ok(vec![a.clone(), notes.clone()]), cx);
+            view.input.update(cx, |input, cx| {
+                input.set_text(format!("{}with", input.content), cx)
+            });
+            view.finish_attachment_read(Ok(vec![b.clone()]), cx);
+            assert_eq!(
+                view.input.read(cx).content.as_ref(),
+                "compare [Image #1] with [Image #2] "
+            );
+            // A file that is not an image takes no number.
+            view.remove_attachment(1, cx);
+            assert_eq!(view.attachments, vec![a.clone(), b.clone()]);
+            assert_eq!(
+                view.input.read(cx).content.as_ref(),
+                "compare [Image #1] with [Image #2] "
+            );
+            // Removing the first image renumbers the second, like its thumbnail.
+            view.remove_attachment(0, cx);
+            assert_eq!(view.attachments, vec![b.clone()]);
+            assert_eq!(
+                view.input.read(cx).content.as_ref(),
+                "compare with [Image #1] "
+            );
+        })
+        .unwrap();
 }

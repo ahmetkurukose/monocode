@@ -21,12 +21,16 @@ impl Request {
         {
             return Ok(json!(prompt));
         }
-        let mut blocks = vec![json!({"type":"text","text":prompt})];
+        // As Claude Code sends them: the images in attachment order, so the
+        // prompt's `[Image #N]` is the Nth block, then the text. Claude reads
+        // the trailing text block as the prompt (slash commands included).
+        let mut blocks = Vec::new();
         for path in &self.settings.attachments {
             if let Some(mime) = crate::composer::image_mime(path) {
                 blocks.push(json!({"type":"image","source":{"type":"base64","media_type":mime,"data":crate::composer::image_data(path)?}}));
             }
         }
+        blocks.push(json!({"type":"text","text":prompt}));
         Ok(json!(blocks))
     }
     pub(super) fn acp_content(&self) -> Result<Value, String> {
@@ -72,10 +76,9 @@ mod tests {
             request.codex_input()[1],
             json!({"type":"localImage","path":path})
         );
-        assert_eq!(
-            request.claude_content("hello").unwrap()[1]["source"]["data"],
-            "iVBORw=="
-        );
+        let claude = request.claude_content("hello").unwrap();
+        assert_eq!(claude[0]["source"]["data"], "iVBORw==");
+        assert_eq!(claude[1], json!({"type":"text","text":"hello"}));
         assert_eq!(request.acp_content().unwrap()[1]["mimeType"], "image/png");
         assert_eq!(request.pi_images().unwrap()[0]["type"], "image");
     }
