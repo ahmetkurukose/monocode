@@ -1624,11 +1624,11 @@ impl Shell {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                // The options button takes the row's last 24px
-                                // on hover: the label gives them up unless the
-                                // app icons come after it.
-                                .when(!reordering && !has_app_icons, |d| {
-                                    d.group_hover("project-rail-row", |s| s.pr(px(24.)))
+                                // The options button always takes the row's
+                                // last 24px: the label gives them up unless the
+                                // app icons or the moon come after it.
+                                .when(!reordering && !has_app_icons && !asleep, |d| {
+                                    d.pr(px(24.))
                                 })
                                 .child(label),
                         )
@@ -1638,23 +1638,19 @@ impl Shell {
                                     .id(("rail-project-asleep", ix))
                                     .debug_selector(move || format!("rail-project-asleep-{ix}"))
                                     .flex_shrink_0()
-                                    .when(!reordering, |d| {
-                                        d.group_hover("project-rail-row", |s| s.invisible())
-                                    })
+                                    .when(!reordering, |d| d.mr(px(24.)))
                                     .child(icon("moon", 12.).text_color(content(0.5))),
                             )
                         })
                     })
                     .when_some(app_icons, |d, icons| {
                         d.child(
-                            // An id, so the hover padding below reaches layout.
                             div()
                                 .id(("rail-app-icons", ix))
                                 .debug_selector(move || format!("rail-app-icons-{ix}"))
                                 .flex_shrink_0()
-                                .when(!reordering, |d| {
-                                    d.group_hover("project-rail-row", |s| s.pr(px(24.)))
-                                })
+                                // Room for the always-shown options button.
+                                .when(!reordering, |d| d.pr(px(24.)))
                                 .child(icons),
                         )
                     })
@@ -1694,8 +1690,6 @@ impl Shell {
                                 .absolute()
                                 .right_1()
                                 .top(px(4.))
-                                .invisible()
-                                .group_hover("project-rail-row", |s| s.visible())
                                 .child(
                                     icon_button(
                                         "rail-project-options",
