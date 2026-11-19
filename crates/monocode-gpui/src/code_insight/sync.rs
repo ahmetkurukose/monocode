@@ -58,7 +58,9 @@ pub(super) fn serves(info: &DocumentInfo, cx: &App) -> bool {
         return false;
     }
     let project = services().context(&home_of(info, cx)).project;
-    served(&info.path, &settings::load(&project.to_string_lossy(), cx))
+    let project = project.to_string_lossy();
+    // A sleeping project's files wait for it to wake.
+    !context::asleep(&project, cx) && served(&info.path, &settings::load(&project, cx))
 }
 
 fn too_big(text: &str) -> bool {
@@ -168,6 +170,15 @@ impl Sync {
                     cx,
                 );
             }
+            // Its editors stay open; the servers and what they hold do not.
+            CodeEvent::ProjectSlept(project) => {
+                let key = path_key(project);
+                this.release(
+                    |home| path_key(&home.context.project.to_string_lossy()) == key,
+                    cx,
+                );
+            }
+            CodeEvent::ProjectWoke(_) => this.retry_skipped(cx),
             CodeEvent::CheckoutAdded(_) | CodeEvent::FocusedFileChanged(_) => {}
         });
         let mut this = Self {

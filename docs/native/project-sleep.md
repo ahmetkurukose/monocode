@@ -20,6 +20,7 @@ and **Wake project** brings it back.
 | Dock, side-panel and title-tab shells, with any job running in them | Closed (the shell and its jobs are hung up) | Fresh shells open in the same folders, as they are shown |
 | Warm, idle agent processes kept for fast follow-ups | Stopped | The next turn resumes the saved provider session (`--resume`, `thread/resume`, `session/load`) in a new process |
 | Web pages | Asleep, keeping their address | Pages that were open come back |
+| Language servers, debug sessions and runs (code insight, debug, run) | Stopped; the files stay open in their editors | The open files get their servers back; debug sessions and runs are started again by hand |
 | Loaded chat transcripts | Released | Reloaded from the database when the chat is shown |
 | Background images, GPU atlases | Released | Redrawn as needed |
 

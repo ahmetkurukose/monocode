@@ -622,6 +622,8 @@ fn a_feature_knows_its_projects_checkouts_and_focused_file_and_hears_them_change
             heard.borrow_mut().push(match event {
                 CodeEvent::ProjectOpened(project) => format!("opened {project}"),
                 CodeEvent::ProjectClosed(project) => format!("closed {project}"),
+                CodeEvent::ProjectSlept(project) => format!("slept {project}"),
+                CodeEvent::ProjectWoke(project) => format!("woke {project}"),
                 CodeEvent::CheckoutAdded(checkout) => format!("checkout {}", checkout.folder),
                 CodeEvent::CheckoutRemoved(checkout) => format!("gone {}", checkout.folder),
                 CodeEvent::FocusedFileChanged(file) => {

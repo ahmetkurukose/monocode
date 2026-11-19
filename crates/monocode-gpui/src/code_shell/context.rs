@@ -47,11 +47,18 @@ pub(crate) struct Snapshot {
     pub checkouts: Vec<Checkout>,
     /// The file editor of the pane in front, if it shows a file.
     pub focused: Option<FocusedFile>,
+    /// The open projects that are asleep: nothing may run for them.
+    pub asleep: Vec<String>,
 }
 
 pub(crate) enum CodeEvent {
     ProjectOpened(String),
     ProjectClosed(String),
+    /// The project was put to sleep: what the features run for it (language
+    /// servers, debug sessions, runs) is to stop and give its memory back.
+    ProjectSlept(String),
+    /// The project is awake again: what its open files need comes back.
+    ProjectWoke(String),
     CheckoutAdded(Checkout),
     CheckoutRemoved(Checkout),
     /// The pane in front shows another file, or none.
@@ -139,6 +146,16 @@ pub(super) fn track(shell: &mut Shell, cx: &mut Context<Shell>) {
     for project in &before.projects {
         if !next.projects.contains(project) {
             changes.push(CodeEvent::ProjectClosed(project.clone()));
+        }
+    }
+    for project in &next.asleep {
+        if !before.asleep.contains(project) {
+            changes.push(CodeEvent::ProjectSlept(project.clone()));
+        }
+    }
+    for project in &before.asleep {
+        if !next.asleep.contains(project) && next.projects.contains(project) {
+            changes.push(CodeEvent::ProjectWoke(project.clone()));
         }
     }
     if before.focused != next.focused {
@@ -259,4 +276,10 @@ pub(crate) fn notice(text: impl Into<String>, window: &mut Window, cx: &mut App)
 pub(crate) fn session_title(session: i64, cx: &App) -> Option<String> {
     let shell = cx.try_global::<super::Host>()?.shell.upgrade()?;
     shell.read(cx).code_session_title(session)
+}
+
+/// Whether the project at `project` is asleep.
+pub(crate) fn asleep(project: &str, cx: &App) -> bool {
+    let key = path_key(project);
+    (snapshot(cx).asleep.iter()).any(|asleep| path_key(asleep) == key)
 }
