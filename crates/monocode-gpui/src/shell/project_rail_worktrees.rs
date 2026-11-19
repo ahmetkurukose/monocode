@@ -22,7 +22,8 @@ const MAX_WORKTREE_SESSIONS: usize = 8;
 pub(super) struct RailWorktree {
     pub path: String,
     pub branch: Option<String>,
-    /// The meta's display name, else the branch, else the folder name.
+    /// The meta's display name when the user chose one, else the branch, else the
+    /// folder name.
     pub name: String,
     pub ownership: Ownership,
 }
@@ -76,13 +77,24 @@ pub(super) fn load(project: &Path, store: &Database) -> Result<Listed, String> {
         })
         .map(|e| {
             let path = e.path.to_string_lossy().into_owned();
+            let folder = project_name(&path).to_string();
+            // Only the dialog's and switcher's display names are the user's; a
+            // session-made worktree's is a slug of the prompt (as is a name that
+            // only repeats the folder). Its branch, renamed once the session's
+            // checkout is named, reads better.
             let name = e
                 .meta
                 .as_ref()
+                .filter(|m| {
+                    matches!(
+                        m.created_by,
+                        worktree::CreatedBy::Dialog | worktree::CreatedBy::Switcher
+                    )
+                })
                 .map(|m| m.display_name.trim().to_owned())
-                .filter(|n| !n.is_empty())
+                .filter(|n| !n.is_empty() && *n != folder)
                 .or_else(|| e.branch.clone())
-                .unwrap_or_else(|| project_name(&path).to_string());
+                .unwrap_or(folder);
             RailWorktree {
                 path,
                 branch: e.branch,
