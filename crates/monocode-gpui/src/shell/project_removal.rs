@@ -119,6 +119,7 @@ impl Shell {
         self.workspace.project_appearance.remove(path);
         self.workspace.project_browser_urls.remove(path);
         self.set_project_terminal_setup(path, None, cx);
+        self.save_project_runs(path, Default::default(), cx);
         self.workspace.project_focus.remove(path);
         self.workspace.collapsed.remove(path);
         self.browser_file_watches.remove(path);

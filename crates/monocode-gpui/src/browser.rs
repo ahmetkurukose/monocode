@@ -490,6 +490,14 @@ impl BrowserView {
         window.focus(&self.address.focus_handle(cx), cx);
     }
 
+    /// Whether the page, drawn in the last frame, stands under something
+    /// floating: the Shell's (`shell_covered`) or its own menu.
+    pub(crate) fn under_overlay(&self, shell_covered: bool) -> bool {
+        // Once its picture stands in for it, the page is no longer placed.
+        let drawn = self.placed.get() || self.stand_in.is_some();
+        drawn && !self.asleep && (shell_covered || self.menu.is_some())
+    }
+
     /// Whether the native page is in front of the user right now: real
     /// mouse and key events can only be sent to one that is.
     pub(crate) fn on_screen(&self) -> bool {

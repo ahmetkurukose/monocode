@@ -71,7 +71,11 @@ actions!(
         Submit,
         SubmitSecondary,
         Up,
-        Down
+        Down,
+        GoToDefinition,
+        FindUsages,
+        ShowHover,
+        ShowSignature
     ]
 );
 pub struct Submitted;
@@ -132,6 +136,11 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("escape", DismissCompletion, Some("CodeEditor")),
         KeyBinding::new("tab", Indent, Some("CodeEditor")),
         KeyBinding::new("shift-tab", Outdent, Some("CodeEditor")),
+        KeyBinding::new("f12", GoToDefinition, Some("CodeEditor")),
+        KeyBinding::new("shift-f12", FindUsages, Some("CodeEditor")),
+        KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
+        // Not Cmd+Shift+Space: the quick composer takes that system-wide.
+        KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
     ]);
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-a"), SelectAll, Some("Composer")),
@@ -1065,12 +1074,16 @@ impl Input {
     }
     fn mouse_down(&mut self, e: &MouseDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         if cfg!(target_os = "macos") && e.modifiers.control {
-            self.open_context_menu(e, w, cx);
+            self.code_right_down(e, w, cx);
             return;
         }
         #[cfg(target_os = "macos")]
         crate::traffic_lights::focus_content(w);
-        if self.code_fold_down(e, cx) || self.code_scrollbar_down(e, w, cx) {
+        if self.code_gutter_down(e, false, w, cx)
+            || self.code_fold_down(e, cx)
+            || self.code_scrollbar_down(e, w, cx)
+            || self.code_link_down(e, w, cx)
+        {
             return;
         }
         w.focus(&self.focus, cx);
@@ -1103,9 +1116,10 @@ impl Input {
         self.end_drag();
         self.code_scrollbar_up();
     }
-    fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_move(&mut self, e: &MouseMoveEvent, w: &mut Window, cx: &mut Context<Self>) {
         self.code_hover(e, cx);
         self.code_scrollbar_move(e, cx);
+        self.code_pointer(e, w, cx);
     }
     fn end_drag(&mut self) {
         self.selecting = false;
@@ -1270,7 +1284,7 @@ impl EntityInputHandler for Input {
         &mut self,
         r: Option<Range<usize>>,
         text: &str,
-        _: &mut Window,
+        w: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.read_only {
@@ -1350,6 +1364,7 @@ impl EntityInputHandler for Input {
         self.reversed = false;
         self.marked = None;
         self.command_removed(previous_command, cx);
+        self.code_typed(text, w, cx);
         cx.emit(Changed);
         cx.notify();
     }
@@ -1848,7 +1863,8 @@ impl Element for InputElement {
     }
 }
 impl Render for Input {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_code_overlays(window, cx);
         div()
             .id("native-composer")
             .relative()
@@ -1877,9 +1893,16 @@ impl Render for Input {
             .track_focus(&self.focus)
             .cursor(if self.code_rail_hovered() {
                 CursorStyle::Arrow
+            } else if self.code_link_hovered() {
+                CursorStyle::PointingHand
             } else {
                 CursorStyle::IBeam
             })
+            .on_action(cx.listener(Self::go_to_definition))
+            .on_action(cx.listener(Self::find_usages))
+            .on_action(cx.listener(Self::show_hover))
+            .on_action(cx.listener(Self::show_signature))
+            .on_modifiers_changed(cx.listener(Self::code_modifiers))
             .on_action(cx.listener(Self::start_completion))
             .on_action(cx.listener(Self::dismiss_completion))
             .on_action(cx.listener(Self::fold))
@@ -1925,10 +1948,15 @@ impl Render for Input {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::submit_secondary))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::open_context_menu))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::code_right_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.code_pointer_left(cx);
+                }
+            }))
             .child(if self.code.is_some() {
                 code::CodeElement { input: cx.entity() }.into_any_element()
             } else {
@@ -1937,6 +1965,7 @@ impl Render for Input {
             .children(self.code_tooltip())
             .children(self.completion_popup(cx))
             .children(self.hunk_actions(cx))
+            .children(self.code_popovers(cx))
             .children(self.editing_menu(cx))
     }
 }
@@ -2523,5 +2552,19 @@ mod native_input_tests {
                 assert_eq!(input.take(cx).as_deref(), Some("line one\nline two"));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn signature_help_keeps_off_the_quick_composers_system_wide_key(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            bind(cx);
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let keys: Vec<String> = keymap
+                .bindings_for_action(&ShowSignature)
+                .filter_map(|binding| Some(binding.keystrokes().first()?.unparse()))
+                .collect();
+            assert_eq!(keys, ["ctrl-shift-space"]);
+        });
     }
 }

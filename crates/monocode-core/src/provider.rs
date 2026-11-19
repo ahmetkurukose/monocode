@@ -1422,6 +1422,7 @@ fn run_operation(
             crate::visual_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::browser_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::db_bridge::configure_codex(&mut command, &request.settings.environment);
+            crate::code::bridge::configure_codex(&mut command, &request.settings.environment);
             crate::mono::bridge::configure_codex(
                 &mut command,
                 request.settings.mono.as_ref(),
@@ -1515,6 +1516,13 @@ fn run_operation(
             {
                 servers.insert(crate::db_bridge::SERVER_NAME.into(), server);
                 allowed.push(crate::db_bridge::CLAUDE_ALLOWED_TOOLS);
+            }
+            if let Some(server) = (!settings.text_only)
+                .then(|| crate::code::bridge::mcp_server(&settings.environment))
+                .flatten()
+            {
+                servers.insert(crate::code::bridge::SERVER_NAME.into(), server);
+                allowed.push(crate::code::bridge::claude_allowed_tools());
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);

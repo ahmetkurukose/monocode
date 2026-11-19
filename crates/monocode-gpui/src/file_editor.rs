@@ -17,6 +17,9 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod chrome;
 mod diff;
+#[cfg(test)]
+mod extension_tests;
+mod extensions;
 mod media;
 #[cfg(test)]
 #[path = "file_editor/tests.rs"]
@@ -42,7 +45,9 @@ actions!(
         Format,
         PreviousChange,
         NextChange,
-        RevertChange
+        RevertChange,
+        NavigateBack,
+        NavigateForward
     ]
 );
 pub(crate) fn bind(cx: &mut App) {
@@ -67,6 +72,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-g"), FindNext, Some("FileEditor")),
         KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, Some("FileEditor")),
         KeyBinding::new("escape", DismissSearch, Some("FileEditor")),
+        KeyBinding::new("ctrl--", NavigateBack, Some("FileEditor")),
+        KeyBinding::new("ctrl-shift--", NavigateForward, Some("FileEditor")),
     ]);
 }
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
@@ -183,6 +190,8 @@ pub(crate) struct FileEditor {
     markdown: Option<Entity<TranscriptView>>,
     markdown_source: SharedString,
     navigation: Option<(usize, usize)>,
+    /// This pane's part in the editor's extension points (`code_editor`).
+    extensions: extensions::Extensions,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -280,9 +289,12 @@ impl FileEditor {
             }
         })
         .detach();
+        let cwd = git.read(cx).project().to_owned();
+        let extensions = extensions::Extensions::new(&path, &cwd, &input, cx);
         Self {
             path,
-            cwd: git.read(cx).project().to_owned(),
+            cwd,
+            extensions,
             git,
             git_original: None,
             git_staged: false,
@@ -426,6 +438,7 @@ impl FileEditor {
                         this.input.update(cx, |input, cx| {
                             input.reload_file(text, !first && !force, cx);
                         });
+                        this.document_loaded(cx);
                         this.dirty = false;
                         if first && !this.show_diff && (this.is_markdown() || this.is_svg()) {
                             this.preview = cx
@@ -561,6 +574,7 @@ impl FileEditor {
         }
         self.schedule_analysis(cx);
         self.schedule_autosave(cx);
+        self.schedule_document_sync(cx);
         if self.dirty {
             self.input
                 .update(cx, |input, cx| input.schedule_completion(false, cx));
@@ -634,14 +648,24 @@ impl FileEditor {
             let work = cx.background_executor().spawn(async move {
                 match syntax {
                     Some(syntax) => {
-                        crate::editor_syntax::analyze(&syntax, &path, &source, base.as_deref())
+                        let analysis =
+                            crate::editor_syntax::analyze(&syntax, &path, &source, base.as_deref());
+                        // The tree is parsed by now, so naming the symbols
+                        // for the header's crumbs costs one more walk of it.
+                        let outline =
+                            crate::code_editor::symbols::outline_with(&syntax, &path, &source);
+                        (analysis, outline)
                     }
-                    None => crate::editor_analysis::analyze(&path, &source, base.as_deref()),
+                    None => (
+                        crate::editor_analysis::analyze(&path, &source, base.as_deref()),
+                        Vec::new(),
+                    ),
                 }
             });
-            let result = work.await;
+            let (result, outline) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if this.input.read(cx).content == text && this.git_original == original {
+                    this.extensions.outline = Arc::new(outline);
                     match result {
                         Ok(analysis) => this
                             .input
@@ -781,6 +805,7 @@ impl FileEditor {
                         this.edited(cx);
                         this.git.update(cx, |git, cx| git.changed(cx));
                         cx.emit(FileEvent::Saved);
+                        this.document_saved(cx);
                     }
                     Err(error) => {
                         this.error = Some(error);
@@ -1007,6 +1032,8 @@ impl gpui::Render for FileEditor {
                 .into_any_element()
         });
         let selection_menu = self.code_selection_menu(window, cx);
+        let header_parts = self.header_parts(cx);
+        let header_menu = self.header_menu(cx);
         self.input.update(cx, |i, _| {
             i.set_editor_diff(self.show_diff, !self.git_staged)
         });
@@ -1230,7 +1257,13 @@ impl gpui::Render for FileEditor {
             .on_action(cx.listener(|this, _: &FindNext, _, cx| this.step_match(false, cx)))
             .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.step_match(true, cx)))
             .on_action(cx.listener(|this, _: &DismissSearch, w, cx| this.dismiss_search(w, cx)))
-            .child(self.path_header(controls, cx))
+            .on_action(
+                cx.listener(|this, _: &NavigateBack, w, cx| this.navigate_history(true, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &NavigateForward, w, cx| this.navigate_history(false, w, cx)),
+            )
+            .child(self.path_header(controls, header_parts, cx))
             .when(self.show_diff && ready && !self.preview, |d| {
                 d.child(self.diff_toolbar(cx))
             })
@@ -1255,6 +1288,7 @@ impl gpui::Render for FileEditor {
             .when(ready && !self.preview, |d| d.child(self.status_footer(cx)))
             .child(self.selection_surface(cx))
             .children(selection_menu)
+            .children(header_menu)
     }
 }
 

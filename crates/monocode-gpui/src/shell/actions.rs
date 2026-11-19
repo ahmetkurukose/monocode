@@ -2,7 +2,10 @@
 //! one click. The button shows the last action run; its chevron lists the
 //! rest and opens the editor.
 use super::*;
-use crate::workspace::{ACTION_ICONS, ProjectAction};
+use crate::{
+    run_ui::footer,
+    workspace::{ACTION_ICONS, ProjectAction},
+};
 
 pub(super) struct ActionDialog {
     /// The action being edited, or `None` for a new one.
@@ -22,6 +25,7 @@ impl Shell {
             .map_or(&[], Vec::as_slice)
     }
     /// The action the footer button runs: the last one run, else the first.
+    #[cfg(test)]
     fn current_action(&self) -> Option<&ProjectAction> {
         let actions = self.project_actions();
         self.workspace
@@ -33,7 +37,7 @@ impl Shell {
 
     /// Runs `id` in its own dock terminal, reusing that terminal while it
     /// sits idle at a prompt and opening a fresh one otherwise.
-    pub(super) fn run_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn run_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.workspace.project.clone();
         if project.starts_with("remote://") {
             self.error = Some("Actions are not available on remote projects.".into());
@@ -108,18 +112,23 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn actions_menu(&self) -> Vec<MenuItem> {
+    pub(crate) fn actions_menu(&self, cx: &App) -> Vec<MenuItem> {
         let actions = self.project_actions();
-        let mut items: Vec<MenuItem> = actions
-            .iter()
-            .map(|a| {
-                MenuAction::new(SharedString::from(format!("run:{}", a.id)), a.name.clone())
-                    .icon(a.icon())
-                    .into()
-            })
-            .collect();
-        if !actions.is_empty() {
+        let mut items = footer::menu_items(&self.workspace.project, cx);
+        if !items.is_empty() && !actions.is_empty() {
             items.push(MenuItem::Separator);
+        }
+        items.extend(actions.iter().map(|a| {
+            MenuItem::from(
+                MenuAction::new(SharedString::from(format!("run:{}", a.id)), a.name.clone())
+                    .icon(a.icon()),
+            )
+        }));
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        items.push(footer::settings_item());
+        if !actions.is_empty() {
             items.push(
                 MenuAction::new("edit", "Edit action")
                     .icon("pencil-edit-02")
@@ -147,6 +156,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if footer::pick(action, &self.workspace.project, window, cx) {
+            return;
+        }
         if action == "add" {
             self.open_action_dialog(None, window, cx);
         } else if let Some(id) = action.strip_prefix("run:") {
@@ -156,19 +168,34 @@ impl Shell {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn action_dialog_open(&self) -> bool {
+        self.action_dialog.is_some()
+    }
+
+    fn toggle_actions_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_open(&MenuTarget::Actions) {
+            self.close_menu(cx);
+        } else {
+            let anchor = Anchor::Slot(self.actions_anchor.clone());
+            self.open_menu(MenuTarget::Actions, anchor, window, cx);
+        }
+    }
+
     /// The footer's split button: run the current action, or pick another.
     pub(super) fn actions_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.workspace.project.starts_with("remote://") {
             return None;
         }
         let classic = self.workspace.boxy_layout();
-        let current = self.current_action().cloned();
+        let running = footer::running_count(&self.workspace.project, cx);
         let menu_open = self.menu_open(&MenuTarget::Actions);
         // Each part rounds fully inside the frame's 2px inset.
         let outer = if classic { 6. } else { 10. };
         let segment = |id: &'static str| {
             div()
                 .id(id)
+                .debug_selector(|| id.to_owned())
                 .role(Role::Button)
                 .h_full()
                 .flex()
@@ -181,32 +208,32 @@ impl Shell {
                 .hover(|s| s.bg(content(0.08)).text_color(content(1.)))
         };
         let pad = px(if classic { 4. } else { 6. });
-        let main = match &current {
-            Some(action) => {
-                let id = action.id.clone();
-                segment("footer-action-run")
-                    .aria_label(SharedString::from(format!("Run {}", action.name)))
-                    .aria_description(SharedString::from(action.command.clone()))
-                    .px(pad)
-                    .gap(px(6.))
-                    .max_w(px(180.))
-                    .min_w_0()
-                    .child(icon(action.icon(), 12.).text_color(content(0.55)))
-                    .child(div().min_w_0().truncate().child(action.name.clone()))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.run_action(&id, window, cx)),
-                    )
-            }
-            None => segment("footer-action-add")
-                .aria_label("Add action")
-                .px(pad)
-                .gap(px(6.))
-                .child(icon("play", 12.).text_color(content(0.55)))
-                .child("Actions")
-                .on_click(
-                    cx.listener(|this, _, window, cx| this.open_action_dialog(None, window, cx)),
-                ),
-        };
+        // A press opens the menu: what can be started, what is running and
+        // how to stop it. Only a project with nothing to list goes straight
+        // to adding an action.
+        let main = segment("footer-action-run")
+            .aria_label("Actions")
+            .px(pad)
+            .gap(px(6.))
+            .child(icon("play", 12.).text_color(if running > 0 {
+                accent_color()
+            } else {
+                content(0.55)
+            }))
+            .child(if running > 0 {
+                SharedString::from(format!("{running} running"))
+            } else {
+                SharedString::from("Actions")
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                let listed = footer::has_items(&this.workspace.project, cx)
+                    || !this.project_actions().is_empty();
+                if listed {
+                    this.toggle_actions_menu(window, cx);
+                } else {
+                    this.open_action_dialog(None, window, cx);
+                }
+            }));
         let chevron = segment("footer-action-menu")
             .aria_label("Actions")
             .aria_expanded(menu_open)
@@ -215,14 +242,7 @@ impl Shell {
             .when(menu_open, |d| d.bg(content(0.08)).text_color(content(1.)))
             .child(self.actions_anchor.probe())
             .child(icon("chevron-down", 12.).text_color(content(0.55)))
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.menu_open(&MenuTarget::Actions) {
-                    this.close_menu(cx);
-                } else {
-                    let anchor = Anchor::Slot(this.actions_anchor.clone());
-                    this.open_menu(MenuTarget::Actions, anchor, window, cx);
-                }
-            }));
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_actions_menu(window, cx)));
         Some(
             div()
                 .id("footer-actions")

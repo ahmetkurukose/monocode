@@ -6,11 +6,19 @@ mod automation_runs;
 mod browser_agent;
 mod browser_panes;
 mod browser_selftest;
+#[cfg(feature = "selftest")]
+mod code_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
 mod database_footer;
+#[cfg(test)]
+#[path = "code_insight/shell_tests.rs"]
+mod code_insight_tests;
+mod code_shell;
+#[cfg(test)]
+mod code_shell_tests;
 mod database_send;
 mod file_panes;
 mod github_star;
@@ -41,10 +49,10 @@ mod rails;
 mod remote_projects;
 mod remote_sessions;
 mod search;
+mod session_close;
 mod session_filters;
 mod session_folders;
 mod session_groups;
-mod session_close;
 mod session_loading;
 mod session_preview;
 mod session_shortcuts;
@@ -417,6 +425,8 @@ pub(crate) enum MenuTarget {
     TerminalTab(usize),
     /// The footer chip's list of terminals running a process.
     RunningTerminals,
+    /// The list of a footer chip a code feature contributed, by the chip's id.
+    FooterChip(&'static str),
     /// The footer Actions button's list of saved commands.
     Actions,
     /// The footer Databases button's data sources.
@@ -923,6 +933,8 @@ pub(crate) struct Shell {
     sidebar_fitted_room: Option<(i32, bool)>,
     viewport_width: f32,
     viewport_height: f32,
+    /// Anchors and flags for what the code features draw (`shell/code_shell.rs`).
+    code: code_shell::CodeChrome,
     observations: Vec<Subscription>,
     /// Terminals whose shell ended, closed on the next frame.
     exited_terminals: Vec<gpui::EntityId>,
@@ -1319,6 +1331,7 @@ impl Shell {
             viewport_width: 1200.,
             viewport_height: 800.,
             exited_terminals: Vec::new(),
+            code: Default::default(),
             observations: vec![
                 git_observation,
                 git_changes,
@@ -2132,10 +2145,12 @@ impl Shell {
             self.workspace.right_panel_tabs.clone(),
             self.workspace.changes_view,
         );
+        let strip = self.workspace.right_panel_strip.clone();
         let terminal_tab = self.terminal_in_panel(cx);
         let panel = cx.new(|cx| {
             let mut panel = RightPanel::new(git, tab, order, window, cx);
             panel.set_terminal_tab(terminal_tab, cx);
+            panel.set_strip(strip, cx);
             panel
         });
         let explorer = panel.read(cx).explorer.clone();
@@ -2230,6 +2245,7 @@ impl Shell {
                         }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
+                    PanelEvent::Strip(strip) => this.workspace.right_panel_strip = strip.clone(),
                 }
                 this.persist(cx);
             }));
@@ -5832,6 +5848,7 @@ impl Shell {
     /// opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
         2 + usize::from(self.terminal_in_panel(cx))
+            + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
     fn toggle_room(&self, cx: &App) -> f32 {
@@ -5997,13 +6014,13 @@ impl Shell {
         };
         match target {
             // Answered by terminal_menu_items above.
-            MenuTarget::TerminalTab(_) | MenuTarget::RunningTerminals => {
-                ("".into(), Vec::new(), 160., MenuStyle::Explorer)
-            }
+            MenuTarget::TerminalTab(_)
+            | MenuTarget::RunningTerminals
+            | MenuTarget::FooterChip(_) => ("".into(), Vec::new(), 160., MenuStyle::Explorer),
             MenuTarget::Actions => (
                 "Actions".into(),
-                self.actions_menu(),
-                200.,
+                self.actions_menu(cx),
+                240.,
                 MenuStyle::Explorer,
             ),
             MenuTarget::Databases => (
@@ -6400,6 +6417,7 @@ impl Shell {
                         .icon("terminal")
                         .into(),
                 ];
+                items.extend(self.code_settings_menu_items(cx));
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
                     if self.workspace.project_rail_assignments.contains_key(path) {
@@ -6519,6 +6537,7 @@ impl Shell {
         match target {
             MenuTarget::TerminalTab(ix) => self.run_terminal_tab_menu(ix, action, window, cx),
             MenuTarget::RunningTerminals => self.run_running_terminals_menu(action, window, cx),
+            MenuTarget::FooterChip(id) => self.run_code_chip_menu(id, action, window, cx),
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
             MenuTarget::Databases => self.run_databases_menu(action, window, cx),
             MenuTarget::DatabaseImport => self.run_database_import_menu(action, window, cx),
@@ -6642,6 +6661,8 @@ impl Shell {
                     self.open_browser_start_dialog(path, window, cx);
                 } else if action == "terminal-setup" {
                     self.open_terminal_setup_dialog(path, window, cx);
+                } else if let Some(page) = action.strip_prefix("code-settings:") {
+                    self.open_code_settings_page(path, page, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9239,6 +9260,7 @@ impl Render for Shell {
         self.keep_visible_idle_agents(cx);
         self.sync_git_guard(cx);
         self.sync_ui_scale(window, cx);
+        crate::code_shell::frame(self, window, cx);
         if !self.pending_database_sends.is_empty() {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -9301,6 +9323,8 @@ impl Render for Shell {
             self.start_browser_agent(window, cx);
             self.start_database_footer(window, cx);
             self.start_browser_selftest(window, cx);
+            #[cfg(feature = "selftest")]
+            self.start_code_selftest(window, cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
@@ -9858,6 +9882,13 @@ impl Render for Shell {
                     this.close_action_dialog(window, cx);
                     return;
                 }
+                // The project's dialogs (run configurations, the terminal
+                // setup) close on Escape from whatever field has focus; the
+                // key reaches this action before their own handler.
+                if this.background_dialog.is_some() {
+                    this.close_project_dialog(window, cx);
+                    return;
+                }
                 if let Some(settings) = this.settings.clone() {
                     if !settings.update(cx, |s, cx| s.dismiss_transient(window, cx)) {
                         this.close_settings(window, cx);
@@ -10080,6 +10111,9 @@ impl Render for Shell {
                         |p| p.side(Side::Top).align(crate::popover::Align::End).max_height(560.),
                     )
                     .when(open.target == MenuTarget::RunningTerminals, |p| {
+                        p.side(Side::Top).align(crate::popover::Align::End)
+                    })
+                    .when(matches!(open.target, MenuTarget::FooterChip(_)), |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
             }))

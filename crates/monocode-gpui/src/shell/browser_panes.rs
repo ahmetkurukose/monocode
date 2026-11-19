@@ -480,6 +480,11 @@ impl Shell {
     /// tab is not in front, its pane was closed) is taken off screen.
     pub(super) fn browser_frame(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let covered = self.browser_covered(cx);
+        // Asked before the frame starts, while each page still knows whether
+        // the last one drew it.
+        let over_page =
+            (self.browser_views.values()).any(|view| view.read(cx).under_overlay(covered));
+        crate::popover::set_over_page(over_page);
         let frames: Vec<crate::browser::PageFrame> = (self.browser_views.values())
             .map(|view| {
                 view.update(cx, |view, cx| {

@@ -15,6 +15,10 @@ mod branch_popup;
 mod browser;
 mod change_tree;
 mod changes;
+mod code_agent;
+mod code_editor;
+mod code_insight;
+mod code_shell;
 mod commit_dialog;
 mod composer_completion;
 mod composer_motion;
@@ -22,6 +26,7 @@ mod composer_runner;
 mod context_meter;
 mod conversation;
 mod database;
+mod debug_ui;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod dialog_resize;
@@ -82,6 +87,7 @@ mod response_actions;
 mod reveal;
 mod review;
 mod right_panel;
+mod run_ui;
 mod runtime;
 mod search;
 mod send_morph;
@@ -132,8 +138,12 @@ fn quit(cx: &mut App) {
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
+    // The language servers and debug sessions are waited for too: the quit
+    // hooks of the framework are given too little time to do it.
+    let services = code_agent::shutdown(cx);
     cx.spawn(async move |cx| {
         shutdown.await;
+        services.await;
         cx.update(|cx| cx.quit());
     })
     .detach();
@@ -144,8 +154,10 @@ fn restart(cx: &mut App) {
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
+    let services = code_agent::shutdown(cx);
     cx.spawn(async move |cx| {
         shutdown.await;
+        services.await;
         cx.update(|cx| cx.restart());
     })
     .detach();
@@ -217,6 +229,13 @@ fn main() {
     }
     if cli_args.first().is_some_and(|a| a == "db-mcp") {
         if let Err(error) = monocode_core::db_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if cli_args.first().is_some_and(|a| a == "code-mcp") {
+        if let Err(error) = monocode_core::code::bridge::mcp_stdio() {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -469,6 +488,7 @@ fn main() {
             diff_view::bind(cx);
             fonts::init(cx);
             terminal::bind(cx);
+            code_shell::register(cx);
             let modifier = if cfg!(target_os = "macos") {
                 "cmd"
             } else {
@@ -546,6 +566,7 @@ fn main() {
                             cx,
                         )
                     });
+                    code_agent::install(&shell, cx);
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
                     #[cfg(target_os = "macos")]
                     {

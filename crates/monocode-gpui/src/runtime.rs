@@ -604,6 +604,25 @@ fn run_turn_using(
                 settings.environment.extend(environment);
             }
         }
+        // The code tools, for a session in a local folder: the capability
+        // holds the folder it runs in and its project, and opens only those.
+        if !settings.text_only
+            && !raw_native_command
+            && monocode_core::code::bridge::enabled()
+            && cwd != "~"
+            && monocode_core::remote::parse_remote_path(cwd).is_none()
+        {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let (folder, project) = (
+                std::path::Path::new(cwd),
+                std::path::Path::new(&summary.cwd),
+            );
+            if let Ok(environment) =
+                monocode_core::code::bridge::environment(summary.id, folder, project, &executable)
+            {
+                settings.environment.extend(environment);
+            }
+        }
         if let Some(visual_bridge) = &visual_bridge {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             settings

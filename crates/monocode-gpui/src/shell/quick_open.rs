@@ -5,6 +5,12 @@ pub(super) struct Open {
     restore: Option<FocusHandle>,
     _events: Subscription,
 }
+#[cfg(any(test, feature = "selftest"))]
+impl Open {
+    pub(super) fn picker(&self) -> &Entity<QuickOpen> {
+        &self.picker
+    }
+}
 impl Shell {
     pub(super) fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(open) = self.quick_open.take() {
@@ -99,6 +105,12 @@ impl Shell {
                         }
                     }
                 },
+                // A feature's row: run it once this update is over, so it
+                // can reach the shell.
+                Picked::Action(run) => {
+                    let run = run.clone();
+                    window.defer(cx, move |window, cx| run(window, cx));
+                }
                 Picked::Dismiss => (),
             }
         });

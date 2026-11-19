@@ -21,6 +21,8 @@ enum ProjectDialog {
     Theme(Entity<ThemeDialog>),
     BrowserStartUrl(Entity<BrowserStartDialog>),
     TerminalSetup(Entity<crate::terminal_setup::TerminalSetupDialog>),
+    /// A page a code feature added (`code_shell::settings`).
+    CodePage(Entity<crate::code_shell::settings::PageDialog>),
 }
 impl Shell {
     pub(super) fn appearance(&self, path: &str) -> ProjectAppearance {
@@ -224,7 +226,7 @@ impl Shell {
             _ => None,
         }
     }
-    pub(super) fn close_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_background_dialog(window, cx);
     }
     pub(super) fn show_terminal_setup_dialog(
@@ -238,6 +240,27 @@ impl Shell {
             _events: events,
         });
         cx.notify();
+    }
+    pub(super) fn show_code_page_dialog(
+        &mut self,
+        view: Entity<crate::code_shell::settings::PageDialog>,
+        events: Subscription,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_dialog = Some(OpenBackground {
+            view: ProjectDialog::CodePage(view),
+            _events: events,
+        });
+        cx.notify();
+    }
+    #[cfg(any(test, feature = "selftest"))]
+    pub(super) fn code_page_dialog(
+        &self,
+    ) -> Option<Entity<crate::code_shell::settings::PageDialog>> {
+        match &self.background_dialog.as_ref()?.view {
+            ProjectDialog::CodePage(view) => Some(view.clone()),
+            _ => None,
+        }
     }
     fn close_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.background_dialog = None;
@@ -270,6 +293,11 @@ impl Shell {
             ),
             ProjectDialog::TerminalSetup(view) => (
                 view.read(cx).measured_height().unwrap_or(560.),
+                Default::default(),
+                view.into(),
+            ),
+            ProjectDialog::CodePage(view) => (
+                view.read(cx).measured_height().unwrap_or(420.),
                 Default::default(),
                 view.into(),
             ),

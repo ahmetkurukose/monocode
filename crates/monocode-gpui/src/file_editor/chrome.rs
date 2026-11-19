@@ -1,4 +1,4 @@
-use super::FileEditor;
+use super::{FileEditor, extensions::HeaderParts};
 use crate::{
     file_icons::file_type_icon,
     right_panel::{stroke, tabular},
@@ -12,7 +12,12 @@ const CONTROL_HEIGHT: f32 = 20.;
 const CONTROL_INSET: f32 = (HEADER_HEIGHT - 1. - CONTROL_HEIGHT) / 2.;
 
 impl FileEditor {
-    pub(super) fn path_header(&self, controls: Option<AnyElement>, cx: &App) -> AnyElement {
+    pub(super) fn path_header(
+        &self,
+        controls: Option<AnyElement>,
+        parts: HeaderParts,
+        cx: &App,
+    ) -> AnyElement {
         let path = Path::new(&self.path);
         let name = path
             .file_name()
@@ -63,6 +68,7 @@ impl FileEditor {
             .border_color(stroke())
             .text_size(px(11.))
             .line_height(px(16.))
+            .children(parts.leading)
             .child(file_type_icon(&name, false, false, 16.))
             .child(
                 div()
@@ -88,8 +94,10 @@ impl FileEditor {
                             .truncate()
                             .text_color(content(0.85))
                             .child(name.into_owned()),
-                    ),
+                    )
+                    .children(parts.crumbs),
             )
+            .children(parts.trailing)
             .children(controls)
             .into_any_element()
     }

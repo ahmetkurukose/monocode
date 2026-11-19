@@ -591,6 +591,10 @@ impl Shell {
                 ),
             );
         }
+        // The tabs code features are showing follow the panel's own.
+        if let Some(panel) = &self.right_panel {
+            tabs.extend(panel.read(cx).extra_tabs());
+        }
         let count = tabs.len();
         row.pl_1p5()
             .pr(px(12. + self.window_controls))
@@ -812,11 +816,13 @@ impl Shell {
                 let databases = self.databases_button(cx);
                 let branch = self.git_branch_button(cx);
                 let pressure = self.pressure_chip(cx);
+                let chips = self.code_chips(cx);
                 let terminal = self.terminal_footer(cx);
-                let between = pressure.is_some() && terminal.is_some();
+                let between = (pressure.is_some() || !chips.is_empty()) && terminal.is_some();
                 d.children(databases)
                     .children(branch)
                     .children(pressure)
+                    .children(chips)
                     .when(between, |d| {
                         d.child(
                             super::terminal_dock::footer_separator()

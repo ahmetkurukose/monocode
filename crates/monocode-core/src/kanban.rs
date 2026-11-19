@@ -94,7 +94,10 @@ impl Task {
 
     /// Its first line of notes, for the card.
     pub fn notes_preview(&self) -> Option<&str> {
-        self.notes.lines().map(str::trim).find(|line| !line.is_empty())
+        self.notes
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
     }
 
     pub fn remaining_min(&self) -> u32 {
@@ -273,7 +276,11 @@ impl Board {
         };
         Some(self.add(
             title,
-            if typed > 0 { typed } else { parsed.estimate_min },
+            if typed > 0 {
+                typed
+            } else {
+                parsed.estimate_min
+            },
             parsed.column.unwrap_or(column),
             now,
         ))
@@ -463,7 +470,12 @@ pub fn parse_quick_add(input: &str) -> QuickAdd {
             minutes += hours.as_str().parse::<f64>().unwrap_or(0.) * 60.
                 + mins.as_str().parse::<f64>().unwrap_or(0.);
         } else if let Some(hours) = capture.get(3) {
-            minutes += hours.as_str().replace(',', ".").parse::<f64>().unwrap_or(0.) * 60.
+            minutes += hours
+                .as_str()
+                .replace(',', ".")
+                .parse::<f64>()
+                .unwrap_or(0.)
+                * 60.
                 + capture
                     .get(4)
                     .map_or(0., |m| m.as_str().parse().unwrap_or(0.));
@@ -516,13 +528,13 @@ pub fn parse_hhmm(input: &str) -> u32 {
 
 /// Typing into a time field keeps it to `##:##`.
 pub fn mask_hhmm(input: &str) -> String {
-    let digits: String = input
-        .chars()
-        .filter(char::is_ascii_digit)
-        .take(4)
-        .collect();
+    let digits: String = input.chars().filter(char::is_ascii_digit).take(4).collect();
     if digits.len() > 2 {
-        format!("{}:{}", &digits[..digits.len() - 2], &digits[digits.len() - 2..])
+        format!(
+            "{}:{}",
+            &digits[..digits.len() - 2],
+            &digits[digits.len() - 2..]
+        )
     } else {
         digits
     }
@@ -558,7 +570,10 @@ mod tests {
     use super::*;
 
     fn titles(board: &Board, column: Column) -> Vec<&str> {
-        board.column(column).map(|task| task.title.as_str()).collect()
+        board
+            .column(column)
+            .map(|task| task.title.as_str())
+            .collect()
     }
 
     #[test]
@@ -568,7 +583,10 @@ mod tests {
         assert_eq!(parsed.estimate_min, 90);
         assert_eq!(parsed.column, Some(Column::Today));
         assert_eq!(parse_quick_add("Call 45m").estimate_min, 45);
-        assert_eq!(parse_quick_add("Read 1.5h @hafta").column, Some(Column::ThisWeek));
+        assert_eq!(
+            parse_quick_add("Read 1.5h @hafta").column,
+            Some(Column::ThisWeek)
+        );
         assert_eq!(parse_quick_add("Read 1,5h").estimate_min, 90);
         assert_eq!(parse_quick_add("Gym 2sa 15dk").estimate_min, 135);
         assert_eq!(parse_quick_add("Sync 1:30").estimate_min, 90);
@@ -668,9 +686,14 @@ mod tests {
         let mut board = Board::default();
         let id = board.quick_add("Plan 30m", "", Column::Backlog, 1).unwrap();
         assert_eq!(board.task(&id).unwrap().estimate_min, 30);
-        let id = board.quick_add("Ship @today", "01:00", Column::Backlog, 1).unwrap();
+        let id = board
+            .quick_add("Ship @today", "01:00", Column::Backlog, 1)
+            .unwrap();
         let task = board.task(&id).unwrap();
-        assert_eq!((task.title.as_str(), task.column, task.estimate_min), ("Ship", Column::Today, 60));
+        assert_eq!(
+            (task.title.as_str(), task.column, task.estimate_min),
+            ("Ship", Column::Today, 60)
+        );
         assert!(board.quick_add("   ", "", Column::Backlog, 1).is_none());
     }
 }

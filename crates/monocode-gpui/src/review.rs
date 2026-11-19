@@ -787,7 +787,6 @@ impl ReviewPane {
         })
         .detach();
     }
-    #[cfg(test)]
     pub(crate) fn active_editor(&self) -> Option<Entity<FileEditor>> {
         self.sources
             .get(self.state.active)

@@ -129,6 +129,12 @@ impl Protocol {
         ) {
             list.push(databases);
         }
+        if let (Some(list), Some(code)) = (
+            servers.as_array_mut(),
+            crate::code::bridge::acp_server(&settings.environment),
+        ) {
+            list.push(code);
+        }
         servers
     }
     pub(super) fn acp_cancel(&mut self, stdin: &mut impl Write) -> Result<(), String> {

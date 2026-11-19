@@ -1,12 +1,23 @@
 //! The editor shares native selection/IME handling with Input and retains glyph
 //! runs for visible lines. Scroll position is independent of the caret.
 use super::*;
+use crate::code_editor::{CompletionItem, Decor, Severity, popup_place::Area};
 use crate::{
     editor_analysis::Analysis,
     editor_scrollbar::{Metrics, WIDTH},
 };
 use gpui::{AnyElement, Task};
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
+
+#[path = "../code_editor/editor.rs"]
+mod ext;
+#[cfg(test)]
+#[path = "../code_editor/editor_tests.rs"]
+mod ext_tests;
+#[path = "../code_editor/editor_gutter.rs"]
+mod gutter;
+#[path = "../code_editor/editor_popups.rs"]
+mod popups;
 
 const TOP_PADDING: f32 = 8.;
 const BOTTOM_PADDING: f32 = 32.;
@@ -16,7 +27,7 @@ struct MarkerHit {
     bounds: Bounds<Pixels>,
     pos: usize,
     diagnostic: bool,
-    message: String,
+    message: SharedString,
 }
 
 pub(crate) type Completer = std::sync::Arc<
@@ -30,7 +41,7 @@ pub(super) struct Code {
     diff: bool,
     deleted_rows: Vec<(f32, f32, String, usize, Vec<crate::editor_analysis::Token>)>,
     path: String,
-    completions: Vec<crate::editor_analysis::Completion>,
+    completions: Vec<CompletionItem>,
     completion_index: usize,
     completion_task: Option<Task<()>>,
     completion_source: Option<(SharedString, usize)>,
@@ -56,6 +67,11 @@ pub(super) struct Code {
     markers: Vec<MarkerHit>,
     hovered_marker: Option<usize>,
     affinity: Cell<Option<(usize, bool)>>,
+    /// What outside code draws on this editor. `None` until something is set,
+    /// so an editor nobody extends pays nothing for it.
+    decor: Option<Rc<Decor>>,
+    /// Providers and the state of their popovers, likewise absent by default.
+    ext: Option<Box<ext::Ext>>,
 }
 impl Code {
     fn new() -> Self {
@@ -90,6 +106,8 @@ impl Code {
             markers: Vec::new(),
             hovered_marker: None,
             affinity: Cell::new(None),
+            decor: None,
+            ext: None,
         }
     }
     fn row(&self, offset: usize) -> usize {
@@ -140,11 +158,26 @@ impl Code {
     }
     fn gutter(&self) -> f32 {
         let digits = self.offsets.len().to_string().len() as f32;
-        if self.diff {
-            4. + 12. + digits * 7.5 + 5. + 16. + 1. + 6.
-        } else {
-            4. + (digits * 7.5 + 12.).max(36.) + 12. + 1. + 6.
-        }
+        let slots = self.decor.as_ref().map_or(0., |decor| decor.width());
+        slots
+            + if self.diff {
+                4. + 12. + digits * 7.5 + 5. + 16. + 1. + 6.
+            } else {
+                4. + (digits * 7.5 + 12.).max(36.) + 12. + 1. + 6.
+            }
+    }
+    /// Where the editor's own diagnostics and the outside ones are.
+    fn diagnostic_ranges(&self) -> impl Iterator<Item = (Range<usize>, Severity)> + '_ {
+        self.analysis
+            .diagnostics
+            .iter()
+            .map(|d| (d.range(), Severity::parse(&d.severity)))
+            .chain(
+                self.decor
+                    .iter()
+                    .flat_map(|decor| &decor.diagnostics)
+                    .map(|d| (d.range.clone(), d.severity)),
+            )
     }
     fn top(&self, row: usize, line_height: f32) -> f32 {
         self.tops
@@ -187,7 +220,7 @@ impl Input {
             code.layout_width = None;
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "selftest"))]
     pub(crate) fn completion_labels(&self) -> Vec<String> {
         self.code
             .as_ref()
@@ -263,11 +296,11 @@ impl Input {
             return;
         }
         let at = self.cursor();
+        let typed = self.content[..at].chars().next_back();
+        let asked = self.completion_request(typed, explicit);
         if !explicit
-            && !self.content[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            && asked.is_none()
+            && !typed.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
         {
             return;
         }
@@ -281,6 +314,7 @@ impl Input {
         let path = code.path.clone();
         let completer = code.completer.clone();
         code.completion_source = Some((source.clone(), at));
+        code.carry_completions(asked.is_some(), &source, at);
         code.completion_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(if explicit {
@@ -289,16 +323,29 @@ impl Input {
                     100
                 }))
                 .await;
-            let text = source.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    match completer {
-                        Some(complete) => Ok(complete(&text, at, explicit)),
-                        None => crate::editor_analysis::complete(&path, &text, at, explicit),
-                    }
-                })
-                .await;
+            // An installed provider answers first; the built-in completers
+            // still serve when it has nothing (no server for this file).
+            let mut items = match asked {
+                Some(asked) => asked.run(&source, at, cx).await,
+                None => Vec::new(),
+            };
+            if items.is_empty() {
+                let text = source.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match completer {
+                            Some(complete) => Ok(complete(&text, at, explicit)),
+                            None => crate::editor_analysis::complete(&path, &text, at, explicit),
+                        }
+                    })
+                    .await;
+                items = result
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(CompletionItem::from)
+                    .collect();
+            }
             let _ = this.update(cx, |this, cx| {
                 if this.content == source
                     && this.cursor() == at
@@ -306,8 +353,9 @@ impl Input {
                     && let Some(code) = &mut this.code
                     && code.completion_source.as_ref() == Some(&(source, at))
                 {
-                    code.completions = result.unwrap_or_default();
+                    code.completions = items;
                     code.completion_index = 0;
+                    this.completion_selected(cx);
                     cx.notify();
                 }
             });
@@ -340,7 +388,7 @@ impl Input {
         let Some(option) = code.completions.get(code.completion_index).cloned() else {
             return false;
         };
-        self.replace_bytes(option.from..option.to, &option.insert, option.cursor, cx);
+        self.apply_completion(option, cx);
         true
     }
     pub(super) fn completion_step(&mut self, backwards: bool, cx: &mut Context<Self>) -> bool {
@@ -358,6 +406,7 @@ impl Input {
                 1
             })
             % code.completions.len();
+        self.completion_selected(cx);
         cx.notify();
         true
     }
@@ -367,6 +416,9 @@ impl Input {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.dismiss_popovers(cx) {
+            return;
+        }
         let Some(code) = &mut self.code else {
             cx.propagate();
             return;
@@ -429,7 +481,8 @@ impl Input {
         }
         let p = self.code_position(self.cursor());
         let gutter = code.gutter();
-        let height = (code.completions.len().min(10) as f32 * 22.).min(240.);
+        // Rows, the list's own padding and its border.
+        let height = code.completions.len().min(10) as f32 * 22. + 10.;
         let viewport = self.bounds.map_or(400., |b| b.size.height.as_f32());
         let y = (p.y - self.scroll_y).as_f32();
         let top = if y + self.line_height + height > viewport {
@@ -448,72 +501,91 @@ impl Input {
             .min((viewport_width - 8.).max(1.));
         let left = (gutter + (p.x - self.scroll_x).as_f32())
             .clamp(4., (viewport_width - width - 4.).max(4.));
-        Some(
-            div()
-                .id("editor-completions")
-                .role(Role::List)
-                .aria_label("Autocomplete")
+        let container = (viewport_width, viewport);
+        let documentation = self.completion_documentation(
+            container,
+            Area::new(left, top, width, height),
+            Area::new(0., y, viewport_width, self.line_height),
+        );
+        let list = div()
+            .id("editor-completions")
+            .debug_selector(|| "editor-completions".into())
+            .role(Role::List)
+            .aria_label("Autocomplete")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(crate::theme::content(0.12))
+            .bg(crate::theme::shell_fill().opacity(1.))
+            .shadow_md()
+            .overflow_hidden()
+            .py_1()
+            .children(
+                code.completions
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(10)
+                    .map(|(n, option)| {
+                        div()
+                            .id(("completion", n))
+                            .role(Role::ListItem)
+                            .aria_label(option.label.clone())
+                            .px_2()
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(crate::theme::content(1.))
+                            .when(n == code.completion_index, |d| {
+                                d.bg(crate::theme::accent_color().opacity(0.25))
+                            })
+                            .child(div().text_color(crate::theme::content(0.5)).child(
+                                match option.kind.as_str() {
+                                    "function" | "method" => "ƒ",
+                                    "keyword" => "k",
+                                    "variable" | "field" | "property" => "v",
+                                    "class" | "struct" | "interface" | "enum" => "C",
+                                    "module" => "M",
+                                    "constant" => "π",
+                                    "table" => "T",
+                                    "column" => "c",
+                                    "schema" => "S",
+                                    _ => "·",
+                                },
+                            ))
+                            .child(option.label.clone())
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_color(crate::theme::content(0.5))
+                                    .child(option.detail.clone()),
+                            )
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(code) = &mut this.code {
+                                    code.completion_index = n;
+                                }
+                                this.accept_completion(cx);
+                            }))
+                    }),
+            );
+        Some(match documentation {
+            // Both are placed against the editor, so their parent covers it.
+            Some(documentation) => div()
                 .absolute()
-                .left(px(left))
-                .top(px(top))
-                .w(px(width))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(crate::theme::content(0.12))
-                .bg(crate::theme::shell_fill().opacity(1.))
-                .shadow_md()
-                .overflow_hidden()
-                .py_1()
-                .children(
-                    code.completions
-                        .iter()
-                        .enumerate()
-                        .skip(first)
-                        .take(10)
-                        .map(|(n, option)| {
-                            div()
-                                .id(("completion", n))
-                                .role(Role::ListItem)
-                                .aria_label(option.label.clone())
-                                .px_2()
-                                .h(px(22.))
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_size(px(12.))
-                                .text_color(crate::theme::content(1.))
-                                .when(n == code.completion_index, |d| {
-                                    d.bg(crate::theme::accent_color().opacity(0.25))
-                                })
-                                .child(div().text_color(crate::theme::content(0.5)).child(
-                                    match option.kind.as_str() {
-                                        "function" => "ƒ",
-                                        "keyword" => "k",
-                                        "variable" => "v",
-                                        "table" => "T",
-                                        "column" => "c",
-                                        "schema" => "S",
-                                        _ => "·",
-                                    },
-                                ))
-                                .child(option.label.clone())
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .text_color(crate::theme::content(0.5))
-                                        .child(option.detail.clone()),
-                                )
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(code) = &mut this.code {
-                                        code.completion_index = n;
-                                    }
-                                    this.accept_completion(cx);
-                                }))
-                        }),
-                )
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(list)
+                .child(documentation)
                 .into_any_element(),
-        )
+            None => list.into_any_element(),
+        })
     }
     fn toggle_fold_row(&mut self, row: usize, cx: &mut Context<Self>) {
         let Some(code) = &mut self.code else {
@@ -732,14 +804,18 @@ impl Input {
     }
     pub(super) fn code_changed(&mut self) {
         if let Some(code) = &mut self.code {
+            code.keep_completions();
             code.completions.clear();
             code.completion_task = None;
             code.completion_source = None;
             code.deleted_rows.clear();
             code.hovered_change = None;
-            code.offsets = std::iter::once(0)
-                .chain(self.content.match_indices('\n').map(|(at, _)| at + 1))
-                .collect();
+            let old_offsets = std::mem::replace(
+                &mut code.offsets,
+                std::iter::once(0)
+                    .chain(self.content.match_indices('\n').map(|(at, _)| at + 1))
+                    .collect(),
+            );
             code.visible.clear();
             code.reveal = true;
             code.max_width = px(0.);
@@ -752,6 +828,7 @@ impl Input {
             let previous = std::mem::replace(&mut code.text, self.content.clone());
             if let Some(edit) = crate::editor_analysis::Edit::between(&previous, &self.content) {
                 code.analysis = Arc::new(code.analysis.remapped(edit));
+                code.remap_decor(edit, &old_offsets, &self.content);
             }
             code.markers.clear();
             code.affinity.set(None);
@@ -1250,15 +1327,28 @@ fn paint_rail(
             );
         }
         // Exactly one diagnostic per logical line, strongest severity wins.
+        // Outside diagnostics share the rows; `Ok` indexes the editor's own
+        // list and `Err` the outside one, so only a row's winner is copied.
         let mut diagnostics = std::collections::BTreeMap::new();
-        for diagnostic in &code.analysis.diagnostics {
-            let row = code.row(diagnostic.from);
-            let current = diagnostics.entry(row).or_insert(diagnostic);
-            if diagnostic.priority() > current.priority() {
-                *current = diagnostic;
+        let outside = code.decor.as_ref().map_or(&[][..], |d| &d.diagnostics[..]);
+        let own = code
+            .analysis
+            .diagnostics
+            .iter()
+            .enumerate()
+            .map(|(n, d)| (d.from, Severity::parse(&d.severity), Ok(n)));
+        let outside_marks = outside
+            .iter()
+            .enumerate()
+            .map(|(n, d)| (d.range.start, d.severity, Err(n)));
+        for (from, severity, which) in own.chain(outside_marks) {
+            let row = code.row(from);
+            let current = diagnostics.entry(row).or_insert((from, severity, which));
+            if severity > current.1 {
+                *current = (from, severity, which);
             }
         }
-        for (row, diagnostic) in diagnostics {
+        for (row, (from, severity, which)) in diagnostics {
             let bounds = Bounds::new(
                 rail.origin
                     + point(
@@ -1267,23 +1357,15 @@ fn paint_rail(
                     ),
                 size(px(WIDTH - 5.), px(3.)),
             );
-            let color = match diagnostic.severity.as_str() {
-                "error" => 0xf87171,
-                "warning" => 0xfbbf24,
-                "info" => 0x60a5fa,
-                _ => 0x969696,
-            };
-            let ink = if diagnostic.severity == "hint" {
-                crate::theme::content(0.48)
-            } else {
-                rgb(color).into()
-            };
-            w.paint_quad(fill(bounds, ink).corner_radii(px(1.)));
+            w.paint_quad(fill(bounds, severity.color()).corner_radii(px(1.)));
             markers.push(MarkerHit {
                 bounds,
-                pos: diagnostic.from,
+                pos: from,
                 diagnostic: true,
-                message: diagnostic.message.clone(),
+                message: match which {
+                    Ok(n) => code.analysis.diagnostics[n].message.clone().into(),
+                    Err(n) => outside[n].label().clone(),
+                },
             });
         }
         let cursor_y = code.row(i.cursor()) as f32 / code.offsets.len().max(1) as f32 * height;
@@ -1342,7 +1424,7 @@ fn paint_rail(
                 bounds,
                 pos: change.from,
                 diagnostic: false,
-                message: String::new(),
+                message: SharedString::default(),
             });
         }
     });
@@ -1545,13 +1627,10 @@ fn shape(i: &Input, row: usize, width: Option<Pixels>, w: &mut Window) -> Wrappe
             runs = decorated;
         }
     }
-    for diagnostic in code
-        .analysis
-        .diagnostics
-        .iter()
+    for (range, severity) in code
+        .diagnostic_ranges()
         .filter(|_| code.fold_at(row).is_none())
     {
-        let range = diagnostic.range();
         if range.end <= start || range.start >= end {
             continue;
         }
@@ -1573,7 +1652,7 @@ fn shape(i: &Input, row: usize, width: Option<Pixels>, w: &mut Window) -> Wrappe
                 decorated.push(TextRun {
                     len: b - a,
                     underline: Some(UnderlineStyle {
-                        color: Some(rgb(0xf87171).into()),
+                        color: Some(severity.color()),
                         thickness: px(1.),
                         wavy: true,
                     }),
@@ -1843,6 +1922,7 @@ impl Element for CodeElement {
         snapshot.analysis = code.analysis.clone();
         snapshot.search_matches = code.search_matches.clone();
         snapshot.diff = code.diff;
+        snapshot.decor = code.decor.clone();
         let code = &snapshot;
         w.handle_input(
             &i.focus,
@@ -1850,6 +1930,21 @@ impl Element for CodeElement {
             cx,
         );
         w.with_content_mask(Some(ContentMask { bounds }), |w| {
+            if let Some(decor) = &code.decor {
+                let left = state.text_bounds.left() - px(code.gutter());
+                for ((row, line), top) in state.lines.iter().zip(&tops) {
+                    gutter::paint_row(
+                        decor,
+                        *row,
+                        Bounds::new(
+                            point(left, bounds.top() + px(*top) - state.scroll.y),
+                            size(bounds.right() - px(WIDTH) - left, line.size(lh).height),
+                        ),
+                        lh,
+                        w,
+                    );
+                }
+            }
             if code.diff {
                 for (top, line, number) in &state.deleted {
                     let y = bounds.top() + px(*top) - state.scroll.y;
@@ -2061,6 +2156,45 @@ impl Element for CodeElement {
                         }
                     }
                     let _ = line.paint(point(x, y), lh, TextAlign::Left, None, w, cx);
+                    if let Some(decor) = &code.decor {
+                        if let Some(link) = &decor.link {
+                            let a = code.display_offset(*row, link.start).min(line.len());
+                            let b = code.display_offset(*row, link.end).min(line.len());
+                            let from = line_position(line, a, lh, false);
+                            let to = line.position_for_index(b, lh).unwrap_or_default();
+                            if a < b && link.start >= start && from.y == to.y {
+                                w.paint_quad(fill(
+                                    Bounds::new(
+                                        point(x + from.x, y + from.y + lh - px(3.)),
+                                        size(to.x - from.x, px(1.)),
+                                    ),
+                                    crate::theme::accent_color(),
+                                ));
+                            }
+                        }
+                        if code.fold_at(*row).is_none() {
+                            let mut end =
+                                line.position_for_index(line.len(), lh).unwrap_or_default();
+                            for note in decor.notes_on(*row) {
+                                let text = plain_line(
+                                    &note.text,
+                                    None,
+                                    11.,
+                                    w,
+                                    gutter::note_color(note.tone),
+                                );
+                                let _ = text.paint(
+                                    point(x + end.x + px(14.), y + end.y),
+                                    lh,
+                                    TextAlign::Left,
+                                    None,
+                                    w,
+                                    cx,
+                                );
+                                end.x += text.width() + px(14.);
+                            }
+                        }
+                    }
                     for hint in code
                         .analysis
                         .hints

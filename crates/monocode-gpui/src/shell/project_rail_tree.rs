@@ -586,10 +586,19 @@ impl Shell {
             .text_size(px(11.))
             .text_color(content(0.4))
             .group_hover("rail-session-hover", |s| s.invisible())
-            .child(monocode_core::time::relative(
-                updated,
-                monocode_core::time::now_ms(),
-            ));
+            // What a code feature says the agent is at ("paused at views.py:43")
+            // takes the place of the row's age.
+            .child(match crate::code_shell::rail::status(id, cx) {
+                Some(status) => div()
+                    .debug_selector(move || format!("rail-session-status-{id}"))
+                    .max_w(px(132.))
+                    .truncate()
+                    .text_color(content(0.6))
+                    .child(status)
+                    .into_any_element(),
+                None => monocode_core::time::relative(updated, monocode_core::time::now_ms())
+                    .into_any_element(),
+            });
         let label = format!("{} {title}", if archived { "Unarchive" } else { "Archive" });
         let archive = div()
             .id(("rail-session-archive", id as u64 as usize))

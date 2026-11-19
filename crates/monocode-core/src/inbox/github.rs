@@ -216,8 +216,20 @@ pub(super) fn git_github_work_items_for(
         args.push(query);
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let json = gh_checked(root, &refs)?;
+    let json = match gh_checked(root, &refs) {
+        Ok(json) => json,
+        // A repository with issues switched off has no issues to list. As
+        // an error it took the inbox's place whenever the repository also
+        // had no pull request to show.
+        Err(error) if kind == "issue" && issues_disabled(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     parse_github_work_items(&json, kind, &repo)
+}
+
+/// gh's refusal to list issues: "the 'owner/name' repository has disabled issues".
+fn issues_disabled(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("has disabled issues")
 }
 
 pub(super) fn git_github_work_item_for(
@@ -1369,5 +1381,19 @@ fn git_diff_full_context(root: &Path, base: &str, head: &str) -> Result<(String,
         Ok((String::new(), true))
     } else {
         Ok((output, false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::issues_disabled;
+
+    #[test]
+    fn a_repository_without_issues_is_told_from_other_failures() {
+        assert!(issues_disabled(
+            "the 'socradar-io/nova' repository has disabled issues"
+        ));
+        assert!(!issues_disabled("HTTP 401: Bad credentials"));
+        assert!(!issues_disabled("Could not resolve to a Repository"));
     }
 }

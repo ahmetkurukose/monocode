@@ -100,6 +100,8 @@ pub(crate) struct Preferences {
     /// What agents may do in the browser pane: "any" site, "local"
     /// addresses only, or "off".
     pub browser_agents: String,
+    /// Agents get the code tools: language servers, runs and the debugger.
+    pub code_agents: bool,
     /// Where web links in replies and terminals open: "monocode" (a
     /// browser pane) or "system" (the user's own browser).
     pub browser_links: String,
@@ -210,6 +212,7 @@ impl Default for Preferences {
             claude_hooks: true,
             claude_chrome: false,
             browser_agents: "any".into(),
+            code_agents: true,
             browser_links: "monocode".into(),
             browser_sleep_minutes: 15,
             browser_max_live: 4,
