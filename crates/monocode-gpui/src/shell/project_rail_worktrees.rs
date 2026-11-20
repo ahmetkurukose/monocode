@@ -347,7 +347,7 @@ impl Shell {
             }
         };
         if !blank_here {
-            self.new_chat(cx);
+            self.new_chat_in_selected_checkout(cx);
         }
     }
 

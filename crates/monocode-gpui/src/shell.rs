@@ -5150,28 +5150,37 @@ impl Shell {
         })
         .detach();
     }
+    /// A new chat starts in the project's main checkout, whatever worktree the
+    /// view shows; the view follows it there.
     pub(super) fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.create_session(self.default_choice(), false, cx);
+    }
+    /// A new chat in the selected checkout, for "New session here".
+    pub(super) fn new_chat_in_selected_checkout(&mut self, cx: &mut Context<Self>) {
+        self.create_session_target(self.default_choice(), false, None, true, cx);
     }
     fn create(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.create_session(self.explicit_choice(kind), false, cx);
     }
+    /// A blank chat (`only_if_empty`) belongs to the checkout the view shows;
+    /// any other new chat starts in the main checkout.
     fn create_session(
         &mut self,
         choice: new_chat_choice::NewChatChoice,
         only_if_empty: bool,
         cx: &mut Context<Self>,
     ) {
-        self.create_session_target(choice, only_if_empty, None, cx);
+        self.create_session_target(choice, only_if_empty, None, only_if_empty, cx);
     }
     fn create_in_folder(&mut self, folder: String, cx: &mut Context<Self>) {
-        self.create_session_target(self.default_choice(), false, Some(folder), cx);
+        self.create_session_target(self.default_choice(), false, Some(folder), false, cx);
     }
     fn create_session_target(
         &mut self,
         choice: new_chat_choice::NewChatChoice,
         only_if_empty: bool,
         folder: Option<String>,
+        in_selected_checkout: bool,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
@@ -5179,6 +5188,11 @@ impl Shell {
         // Only an explicit new chat gets here while asleep: placing a blank
         // one stays off for sleeping projects.
         self.wake_project(&cwd, cx);
+        if !in_selected_checkout {
+            // Not a worktree by default: the chat starts on the main
+            // checkout's branch, and the view returns there to show it.
+            self.worktree_focus.remove(&cwd);
+        }
         let focus = self.worktree_focus.get(&cwd).cloned();
         // The project folder as a selected checkout is not a separate worktree.
         let copy = focus.clone().filter(|f| {

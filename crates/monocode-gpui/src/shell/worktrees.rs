@@ -378,6 +378,46 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_new_chat_starts_on_the_main_checkout_while_a_worktree_is_shown(cx: &mut TestAppContext) {
+        let (window, _, main_session) = window(cx);
+        let project = "/work/monocode";
+        let feature = WorktreeFocus {
+            path: "/work/monocode-worktrees/feature".into(),
+            branch: Some("feature".into()),
+        };
+        window
+            .update(cx, |shell, w, cx| {
+                shell.sessions[&main_session]
+                    .update(cx, |session, _| session.summary.has_messages = true);
+                shell.open(main_session, w, cx);
+                shell.worktree_focus.insert(project.into(), feature.clone());
+                assert_eq!(shell.working_copy(), feature.path);
+                shell.create(Kind::Claude, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                let id = shell.workspace.active.unwrap();
+                assert_ne!(id, main_session);
+                let session = shell.sessions[&id].read(cx);
+                assert_eq!(session.summary.cwd, project);
+                assert_eq!(session.settings.worktree_cwd, None);
+                assert_eq!(
+                    locked(&shell.store)
+                        .unwrap()
+                        .agent_settings(id)
+                        .unwrap()
+                        .and_then(|settings| settings.worktree_cwd),
+                    None
+                );
+                assert_eq!(shell.working_copy(), project, "the view follows the chat");
+                assert_eq!(shell.terminal_cwd(cx), project);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn copies_keep_running_sessions_and_route_new_tabs_and_splits(cx: &mut TestAppContext) {
         let (window, feature_session, main_session) = window(cx);
         window
@@ -484,7 +524,8 @@ mod tests {
                         .as_deref(),
                     Some(other.path.as_str())
                 );
-                shell.create(Kind::Claude, cx);
+                // "New session here" keeps the selected checkout.
+                shell.new_chat_in_selected_checkout(cx);
             })
             .unwrap();
         cx.run_until_parked();
