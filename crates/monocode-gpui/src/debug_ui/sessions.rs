@@ -36,7 +36,34 @@ pub(super) struct Debugger {
 struct Shared(Entity<Debugger>);
 impl Global for Shared {}
 
+/// Ends the debug sessions whose program runs in `project`, which is
+/// going to sleep: a paused debuggee holds its memory for as long as it is
+/// left there.
+fn end_sessions_of(project: &str, cx: &App) {
+    let key = monocode_core::files::path_key(project);
+    for session in services().dap().sessions() {
+        let live = !matches!(
+            session.state(),
+            monocode_core::code::dap::SessionState::Terminated { .. }
+        );
+        if live && monocode_core::files::path_key(&checkout_of(&session, cx).project) == key {
+            if session.state() == monocode_core::code::dap::SessionState::Starting {
+                session.disconnect();
+            } else {
+                session.terminate();
+            }
+        }
+    }
+}
+
 pub(super) fn init(cx: &mut App) {
+    let events = context::events(cx);
+    cx.subscribe(&events, |_, event: &CodeEvent, cx| {
+        if let CodeEvent::ProjectSlept(project) = event {
+            end_sessions_of(project, cx);
+        }
+    })
+    .detach();
     let debugger = cx.new(Debugger::new);
     cx.set_global(Shared(debugger));
 }

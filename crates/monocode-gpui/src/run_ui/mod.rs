@@ -51,6 +51,22 @@ fn test_header(cx: &App) -> Rc<header::RunHeader> {
 }
 
 pub(crate) fn init(cx: &mut App) {
+    // A project going to sleep takes its runs with it, the ones an agent
+    // started without a tab included.
+    let events = crate::code_shell::context::events(cx);
+    cx.subscribe(&events, |_, event, cx| {
+        if let crate::code_shell::context::CodeEvent::ProjectSlept(project) = event {
+            let key = monocode_core::files::path_key(project);
+            for info in monocode_core::code::services::services().runs().list() {
+                let here =
+                    monocode_core::files::path_key(&chip::checkout_of(&info, cx).project) == key;
+                if info.state.is_running() && here {
+                    start::stop(info.id);
+                }
+            }
+        }
+    })
+    .detach();
     targets::init(cx);
     start::init(cx);
     header::init(cx);

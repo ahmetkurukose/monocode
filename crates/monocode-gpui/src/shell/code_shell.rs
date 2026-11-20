@@ -103,6 +103,9 @@ impl Shell {
         if let Some((pane, editor)) = self.code_focused_editor(cx) {
             (pane, editor.entity_id(), &editor.read(cx).path).hash(&mut hasher);
         }
+        for project in &self.workspace.projects {
+            self.project_asleep(project).hash(&mut hasher);
+        }
         hasher.finish()
     }
 
@@ -153,11 +156,16 @@ impl Shell {
                 editor: editor.downgrade(),
             }
         });
+        let asleep = (projects.iter())
+            .filter(|project| self.project_asleep(project))
+            .cloned()
+            .collect();
         Snapshot {
             focus,
             projects,
             checkouts,
             focused,
+            asleep,
         }
     }
 

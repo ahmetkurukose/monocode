@@ -436,6 +436,42 @@ fn the_chip_follows_the_servers_and_the_projects_settings_decide_what_runs(
 }
 
 #[gpui::test]
+fn a_sleeping_project_gives_up_its_servers_and_gets_them_back_on_waking(cx: &mut TestAppContext) {
+    let rig = Rig::with(|launch| Ok(server_for(launch)), cx);
+    let path = rig.write("app.py", "import os\n");
+    let project = rig.root.to_string_lossy().into_owned();
+    let (window, mut visual) = start(&rig.root, cx);
+    let cx = &mut visual;
+    open_file(window, cx, &path);
+    let servers = |cx: &mut VisualTestContext, text: &str| {
+        chip(cx).is_some_and(|chip| chip.text.as_ref() == text)
+    };
+    wait(cx, "two ready servers", |cx| servers(cx, "2 servers"));
+
+    // Asleep: the editor stays open, the servers and their memory do not.
+    let asleep = project.clone();
+    window
+        .update(cx, |shell, _, cx| shell.sleep_projects(vec![asleep], 0, cx))
+        .unwrap();
+    wait(cx, "the servers to be stopped", |cx| {
+        cx.update(|_, cx| context::asleep(&project, cx)) && chip(cx).is_none()
+    });
+    assert!(rig.manager.statuses().iter().all(|status| {
+        !matches!(
+            status.state,
+            ServerState::Ready | ServerState::Starting | ServerState::Indexing { .. }
+        )
+    }));
+
+    // Awake: the file that was open is served again.
+    let awake = project.clone();
+    window
+        .update(cx, |shell, _, cx| shell.wake_project(&awake, cx))
+        .unwrap();
+    wait(cx, "the servers to be back", |cx| servers(cx, "2 servers"));
+}
+
+#[gpui::test]
 fn a_leading_at_sign_still_finds_files_and_text_where_there_are_no_symbols(
     cx: &mut TestAppContext,
 ) {
