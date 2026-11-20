@@ -193,14 +193,8 @@ pub(crate) fn pick(id: &str, window: &mut Window, cx: &mut App) {
             );
         }
         "open" => {
-            if let Some(url) = &info.url
-                && !context::open_url(url, window, cx)
-            {
-                start::notice(
-                    "Open a session in this project to show the page beside it.",
-                    window,
-                    cx,
-                );
+            if let Some(url) = &info.url {
+                cx.open_url(url);
             }
         }
         "forget" => {

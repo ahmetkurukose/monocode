@@ -620,21 +620,10 @@ fn run_turn_using(
         } else {
             None
         };
-        // The browser pane's tools, unless agents are kept out of it. The
-        // capability is the session's; like the visual one it is transport
-        // only and never saved with the conversation.
-        if !settings.text_only && !raw_native_command && monocode_core::browser_bridge::enabled() {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            if let Ok(environment) =
-                monocode_core::browser_bridge::environment(summary.id, &executable)
-            {
-                settings.environment.extend(environment);
-            }
-        }
         // The user's Database-view data sources, scoped to the session's
         // project. Sources belong to projects, and a session's worktree is
         // usually not inside its project, so the project's path is the one
-        // given, not the worktree's. Transport only, like the browser's.
+        // given, not the worktree's. Transport only, like the visual one.
         if !settings.text_only && !raw_native_command {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             if let Ok(environment) =

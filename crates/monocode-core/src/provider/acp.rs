@@ -117,12 +117,6 @@ impl Protocol {
         ) {
             list.push(app);
         }
-        if let (Some(list), Some(browser)) = (
-            servers.as_array_mut(),
-            crate::browser_bridge::acp_server(&settings.environment),
-        ) {
-            list.push(browser);
-        }
         if let (Some(list), Some(databases)) = (
             servers.as_array_mut(),
             crate::db_bridge::acp_server(&settings.environment),

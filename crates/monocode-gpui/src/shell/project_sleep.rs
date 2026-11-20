@@ -1,9 +1,8 @@
 //! Sleeping a project gives back what an idle project still holds: its
 //! shells and the jobs in them, the warm agent processes its chats left
-//! behind, its web pages and the chats' loaded transcripts. What is needed to
-//! pick it up again stays: the chats themselves (composer text, queued
-//! messages, model and permission choices), their tabs, the terminal
-//! folders and page addresses. Selecting the project, or one of its chats,
+//! behind and the chats' loaded transcripts. What is needed to pick it up
+//! again stays: the chats themselves (composer text, queued messages, model
+//! and permission choices), their tabs and the terminal folders. Selecting the project, or one of its chats,
 //! shows its sleep screen; only Wake wakes it, along with what starts work
 //! there: a new chat, a terminal, or a turn. Each chat shown then reloads its
 //! history, and its next turn resumes the provider session cold.
@@ -22,15 +21,12 @@ pub(super) struct SleepTally {
     pub(super) agents: usize,
     /// Shells closed, with whatever ran in them.
     pub(super) terminals: usize,
-    /// Web pages put to sleep.
-    pub(super) pages: usize,
 }
 impl SleepTally {
     fn add(&mut self, other: Self) {
         self.chats += other.chats;
         self.agents += other.agents;
         self.terminals += other.terminals;
-        self.pages += other.pages;
     }
     /// "2 agents stopped · 1 terminal closed", or `None` when nothing was held.
     pub(super) fn summary(&self) -> Option<String> {
@@ -42,7 +38,6 @@ impl SleepTally {
         let parts: Vec<String> = [
             part(self.agents, "agent stopped", "agents stopped"),
             part(self.terminals, "terminal closed", "terminals closed"),
-            part(self.pages, "page asleep", "pages asleep"),
             part(self.chats, "chat unloaded", "chats unloaded"),
         ]
         .into_iter()
@@ -53,11 +48,10 @@ impl SleepTally {
 }
 
 /// The in-memory side of the sleeping projects, which the workspace does not
-/// save: what each Sleep freed, and the pages to reopen on waking.
+/// save: what each Sleep freed.
 #[derive(Default)]
 pub(super) struct ProjectSleep {
     tallies: HashMap<String, SleepTally>,
-    pages: HashMap<String, Vec<i64>>,
 }
 
 impl Shell {
@@ -280,28 +274,6 @@ impl Shell {
                 tally.terminals += 1;
             }
         }
-        // A sleeping page keeps its address and gives up its web view.
-        let key = monocode_core::files::path_key(path);
-        let mut pages: Vec<i64> = self
-            .browser_views
-            .iter()
-            .filter(|(pane, view)| {
-                !view.read(cx).asleep()
-                    && self
-                        .browser_pane_project(**pane)
-                        .is_some_and(|project| monocode_core::files::path_key(&project) == key)
-            })
-            .map(|(&pane, _)| pane)
-            .collect();
-        pages.sort_unstable();
-        for pane in &pages {
-            if let Some(view) = self.browser_views.get(pane) {
-                view.update(cx, |view, cx| view.sleep(cx));
-            }
-        }
-        tally.pages = pages.len();
-        self.project_sleep.pages.insert(path.to_owned(), pages);
-        self.sync_browser_file_watchers(cx);
         // Idle agents resume their provider session cold on the next turn.
         tally.agents = monocode_core::provider::retire_idle_sessions(&sessions);
         // A chat with unsent text, attachments or queued messages keeps its
@@ -318,19 +290,12 @@ impl Shell {
         tally
     }
 
-    /// Wake `path` if it sleeps. Shells and pages come back as they are
-    /// shown; the chats on screen reload their history.
+    /// Wake `path` if it sleeps. Shells come back as they are shown; the chats on screen reload their history.
     pub(super) fn wake_project(&mut self, path: &str, cx: &mut Context<Self>) -> bool {
         if self.workspace.slept_projects.remove(path).is_none() {
             return false;
         }
         self.project_sleep.tallies.remove(path);
-        for pane in self.project_sleep.pages.remove(path).unwrap_or_default() {
-            if let Some(view) = self.browser_views.get(&pane) {
-                view.update(cx, |view, cx| view.wake(cx));
-            }
-        }
-        self.sync_browser_file_watchers(cx);
         self.update_chat_visibility(cx);
         self.persist(cx);
         self.invalidate_chrome(cx);
@@ -341,7 +306,6 @@ impl Shell {
     pub(super) fn forget_project_sleep(&mut self, path: &str) {
         self.workspace.slept_projects.remove(path);
         self.project_sleep.tallies.remove(path);
-        self.project_sleep.pages.remove(path);
     }
     /// Wake the current project from its sleep screen and put the user back
     /// in its active chat.
@@ -810,13 +774,13 @@ mod tests {
     const ANOTHER: &str = "/work/another-project";
     const MONOCODE: &str = "/work/monocode";
 
-    /// Opens chat `a` in its project with the dock's one shell and a page,
-    /// back on the chat, and returns the page.
+    /// Opens chat `a` in its project with the dock's one shell, back on the
+    /// chat.
     fn busy_project(
         window: WindowHandle<Shell>,
         a: i64,
         cx: &mut TestAppContext,
-    ) -> (VisualTestContext, i64) {
+    ) -> VisualTestContext {
         cx.update(|cx| {
             bind_keys(cx);
             crate::terminal::bind(cx);
@@ -832,16 +796,7 @@ mod tests {
         visual.run_until_parked();
         visual.simulate_keystrokes("cmd-j");
         visual.run_until_parked();
-        let page = window
-            .update(&mut visual, |shell, w, cx| {
-                shell.new_browser_pane(Some("localhost:3000".into()), w, cx);
-                let page = shell.workspace.active.unwrap();
-                shell.open(a, w, cx);
-                page
-            })
-            .unwrap();
-        visual.run_until_parked();
-        (visual, page)
+        visual
     }
     fn sleep_menu(window: WindowHandle<Shell>, visual: &mut VisualTestContext, action: &str) {
         window
@@ -867,15 +822,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sleeping_frees_shells_pages_and_history_and_waking_restores_them(cx: &mut TestAppContext) {
+    fn sleeping_frees_shells_and_history_and_waking_restores_them(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, page) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         window
             .update(&mut visual, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, ANOTHER);
                 assert!(shell.sessions[&a].read(cx).history_loaded());
                 assert_eq!(shell.terminals[ANOTHER].len(), 1);
-                assert!(!shell.browser_views[&page].read(cx).asleep());
             })
             .unwrap();
         // An idle shell sleeps without a question.
@@ -888,12 +842,6 @@ mod tests {
                 // The shell is gone; the dock remembers where it was.
                 assert!(!shell.terminals.contains_key(ANOTHER));
                 assert_eq!(shell.workspace.docks[ANOTHER].terminals.len(), 1);
-                // The page keeps its address without a web view.
-                assert!(shell.browser_views[&page].read(cx).asleep());
-                assert_eq!(
-                    shell.workspace.browser_panes[&page].url,
-                    "http://localhost:3000"
-                );
                 // The chat, its tab and its settings stay; its transcript goes.
                 let chat = shell.sessions[&a].read(cx);
                 assert!(!chat.history_loaded());
@@ -905,13 +853,11 @@ mod tests {
                         chats: 1,
                         agents: 0,
                         terminals: 1,
-                        pages: 1,
                     }
                 );
                 let message = notice(shell, cx).unwrap();
                 assert!(message.starts_with("another-project:"), "{message}");
                 assert!(message.contains("1 terminal closed"), "{message}");
-                assert!(message.contains("1 page asleep"), "{message}");
             })
             .unwrap();
         // It stays asleep across a restart.
@@ -940,10 +886,9 @@ mod tests {
             .update(&mut visual, |shell, _, cx| {
                 assert!(!shell.project_asleep(ANOTHER));
                 assert!(!shell.workspace.saved_json().contains("slept_projects"));
-                // A fresh shell where the old one was, the page back, and the
-                // chat's history reloaded from the store.
+                // A fresh shell where the old one was, and the chat's
+                // history reloaded from the store.
                 assert_eq!(shell.terminals[ANOTHER].len(), 1);
-                assert!(!shell.browser_views[&page].read(cx).asleep());
                 let chat = shell.sessions[&a].read(cx);
                 assert!(chat.history_loaded());
                 assert!(!chat.needs_history_restore());
@@ -955,7 +900,7 @@ mod tests {
     #[gpui::test]
     fn a_chat_on_the_sleep_screen_wakes_the_project_and_opens(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         sleep_menu(window, &mut visual, "project-sleep");
         let chat = visual.debug_bounds("project-sleep-chat-0").unwrap();
         visual.simulate_click(chat.center(), Default::default());
@@ -973,7 +918,7 @@ mod tests {
     #[gpui::test]
     fn sleeping_asks_before_stopping_a_running_job(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         let terminal = window
             .update(&mut visual, |shell, _, cx| {
                 let terminal = shell.terminals[ANOTHER][0].clone();
@@ -1002,7 +947,7 @@ mod tests {
     #[gpui::test]
     fn a_working_chat_keeps_its_project_awake_and_a_new_turn_wakes_it(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         window
             .update(&mut visual, |shell, w, cx| {
                 shell.sessions[&a].update(cx, |chat, _| chat.busy = true);
@@ -1039,7 +984,7 @@ mod tests {
     #[gpui::test]
     fn a_group_sleeps_and_wakes_together_and_each_wakes_on_its_own(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         let group = window
             .update(&mut visual, |shell, w, cx| {
                 shell.workspace.classic_layout = true;
@@ -1096,7 +1041,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (window, a, b) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         window
             .update(&mut visual, |shell, w, cx| {
                 shell.workspace.classic_layout = true;
@@ -1164,7 +1109,7 @@ mod tests {
     #[gpui::test]
     fn other_projects_sleep_from_the_current_one_and_leave_it_awake(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
-        let (mut visual, _) = busy_project(window, a, cx);
+        let mut visual = busy_project(window, a, cx);
         window
             .update(&mut visual, |shell, w, cx| {
                 shell.select_project(MONOCODE.into(), w, cx);
@@ -1277,7 +1222,6 @@ mod tests {
             chats: 3,
             agents: 1,
             terminals: 2,
-            pages: 0,
         };
         assert_eq!(
             tally.summary().as_deref(),

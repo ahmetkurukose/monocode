@@ -1374,7 +1374,7 @@ fn open_tabs_come_back_after_a_restart_and_wait_for_their_project(cx: &mut TestA
             view.save_state();
         })
         .unwrap();
-    drop(elsewhere);
+    let _ = elsewhere;
     // Back in the first project they all reopen, the same one in front.
     let again = open_view(cx, f.state_dir.clone());
     again

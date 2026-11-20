@@ -1511,19 +1511,6 @@ pub(crate) fn checkouts_overlap(project: &str, cwd: &str) -> bool {
 impl Changes {
     /// The windows this panel opens. The shell draws them, so they appear
     /// from the menu bar even where the panel itself is not on screen.
-    /// Whether a dialog or picker of this panel is open over the window.
-    pub(crate) fn has_overlay(&self, cx: &App) -> bool {
-        self.form
-            .read(cx)
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.surface == Surface::Panel)
-            || self.commit_dialog.is_some()
-            || self.update_dialog.is_some()
-            || self.stash_dialog.is_some()
-            || self.branch_picker.is_some()
-    }
-
     pub(crate) fn overlays(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
         if let Some(confirm) = CommitForm::pending_overlay(&self.form, Surface::Panel, window, cx) {

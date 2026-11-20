@@ -223,6 +223,26 @@ pub(super) fn tree_rows(diff: &Diff, collapsed: &HashSet<String>) -> Vec<TreeRow
     rows
 }
 
+/// A file shown whole: every line of it, with the changes marked, rather than
+/// only the hunks and three lines around them.
+pub(super) fn full_file_model(path: &str, original: &str, current: &str) -> DiffFile {
+    let unified = monocode_core::diff::build_unified_file(original, current, usize::MAX);
+    DiffFile {
+        id: file_id(path),
+        path: path.to_owned(),
+        label: path.to_owned(),
+        binary: false,
+        too_large: false,
+        empty_message: None,
+        additions: unified.additions,
+        deletions: unified.deletions,
+        blocks: Arc::new(unified.blocks),
+        can_stage: false,
+        can_discard: false,
+        can_stage_hunk: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,25 +304,5 @@ mod tests {
         assert_eq!((rows[0].additions, rows[0].deletions), (3, 1));
         let folded = tree_rows(&diff, &HashSet::from(["src/app/model".to_string()]));
         assert_eq!(folded.len(), 2);
-    }
-}
-
-/// A file shown whole: every line of it, with the changes marked, rather than
-/// only the hunks and three lines around them.
-pub(super) fn full_file_model(path: &str, original: &str, current: &str) -> DiffFile {
-    let unified = monocode_core::diff::build_unified_file(original, current, usize::MAX);
-    DiffFile {
-        id: file_id(path),
-        path: path.to_owned(),
-        label: path.to_owned(),
-        binary: false,
-        too_large: false,
-        empty_message: None,
-        additions: unified.additions,
-        deletions: unified.deletions,
-        blocks: Arc::new(unified.blocks),
-        can_stage: false,
-        can_discard: false,
-        can_stage_hunk: false,
     }
 }

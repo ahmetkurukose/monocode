@@ -1,7 +1,7 @@
 //! Where a feature is: which project and checkout a file, a pane or the
 //! focused surface belongs to, the focused file editor, the project's
 //! terminal setup and toolchain, and the two ways out of a feature's own
-//! views (open a file at a line, open a URL in the browser pane). Also the
+//! views (open a file at a line). Also the
 //! app-wide events a feature follows: projects and checkouts coming and
 //! going, the focused file changing, the app quitting.
 //!
@@ -201,8 +201,8 @@ pub(crate) fn checkout_for_path(path: &str, cx: &App) -> Option<Checkout> {
         .cloned()
 }
 
-/// The checkout a pane works in: a chat's, or the one a file, terminal or
-/// browser pane borrows from its session. Reads the shell, so not from
+/// The checkout a pane works in: a chat's, or the one a file or terminal
+/// pane borrows from its session. Reads the shell, so not from
 /// inside a closure the shell calls while it draws.
 pub(crate) fn checkout_for_pane(pane: i64, cx: &App) -> Option<Checkout> {
     let shell = cx.try_global::<super::Host>()?.shell.upgrade()?;
@@ -253,15 +253,6 @@ pub(crate) fn open_file(
         shell.code_open_file(folder, path.to_owned(), at, window, cx)
     })
     .is_some()
-}
-
-/// Opens `url` as a page in the project's browser pane. False when there is
-/// no session in the project to open it beside.
-pub(crate) fn open_url(url: &str, window: &mut Window, cx: &mut App) -> bool {
-    super::with_shell(window, cx, |shell, window, cx| {
-        shell.code_open_url(url.to_owned(), window, cx)
-    })
-    .unwrap_or(false)
 }
 
 /// Shows the user a sentence: why something a feature was asked for did not

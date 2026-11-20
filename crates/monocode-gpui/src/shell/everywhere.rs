@@ -608,6 +608,7 @@ impl Shell {
     }
 
     /// Types into the open Search Everywhere.
+    #[cfg(test)]
     pub(super) fn set_everywhere_query(&mut self, text: String, cx: &mut Context<Self>) {
         if let Some(open) = &self.everywhere {
             let input = open.view.read(cx).input.clone();

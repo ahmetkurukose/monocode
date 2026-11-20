@@ -529,6 +529,7 @@ impl Everywhere {
         (self.tab, text.trim().to_owned())
     }
 
+    #[cfg(test)]
     pub(crate) fn tab(&self) -> Tab {
         self.tab
     }

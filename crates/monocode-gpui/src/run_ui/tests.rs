@@ -765,9 +765,8 @@ fn the_configurations_page_edits_the_projects_list_in_the_workspace(cx: &mut Tes
     assert!(page.read_with(&fx.visual, |page, _| page.runs().is_empty()));
 
     // A new configuration is not saved until it has a command.
-    let edit =
-        |fx: &mut Fixture,
-         f: Box<dyn FnOnce(&mut RunsPage, &mut Window, &mut gpui::Context<RunsPage>)>| {
+    type Edit = Box<dyn FnOnce(&mut RunsPage, &mut Window, &mut gpui::Context<RunsPage>)>;
+    let edit = |fx: &mut Fixture, f: Edit| {
             let page = page.clone();
             fx.feature(move |window, cx| page.update(cx, |page, cx| f(page, window, cx)));
             fx.visual.run_until_parked();
@@ -804,7 +803,7 @@ fn the_configurations_page_edits_the_projects_list_in_the_workspace(cx: &mut Tes
     );
     assert_eq!((echo.cwd.as_str(), echo.env.as_str()), ("sub", "MODE=dev"));
     fx.visual.update(|_, cx| {
-        assert_eq!(settings::runs(&project, cx).configs, [echo.clone()]);
+        assert_eq!(settings::runs(&project, cx).configs, std::slice::from_ref(&echo));
     });
 
     // With a file focused the preview is the command line it comes to.

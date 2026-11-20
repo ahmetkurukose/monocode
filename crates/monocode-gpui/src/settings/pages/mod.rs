@@ -1,7 +1,6 @@
 //! One file per Settings page, each a port of its SettingsView.tsx function.
 mod appearance;
 mod archive;
-pub(crate) mod browser;
 mod chat;
 mod connections;
 mod general;
@@ -37,7 +36,6 @@ impl SettingsView {
             }
             Section::Appearance => self.appearance_page(window, cx),
             Section::Terminal => self.terminal_page(cx),
-            Section::Browser => self.browser_page(cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Chat => self.chat_page(cx),
             Section::Providers => self.providers_page(cx),

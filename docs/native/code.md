@@ -51,7 +51,7 @@ crates/monocode-gpui/src/
   debug_ui/      breakpoints in the gutter, the debug dock tab
 ```
 
-Core conventions: plain threads and channels as in `browser_bridge.rs`; events reach the
+Core conventions: plain threads and channels as in `db_bridge.rs`; events reach the
 UI over `async_channel`; child processes go through `process::configure_child` and are
 killed when their owner is dropped. Every part has unit tests against a scripted fake
 peer. Tests that need real tools read `MONOCODE_TEST_PYTHON` (a venv interpreter with
@@ -522,7 +522,7 @@ the page unsaved, and deleting a project drops its entry.
 are running, hidden otherwise. Its list has those and the last eight that ended: label
 (and worktree), state or exit code, time taken, and "you" or the agent session's title;
 each row shows its tab, stops it, runs it again (as the user, in a tab) or opens the local
-address it announced in the browser pane, which never happens by itself. A run with no tab
+address it announced in the system browser, which never happens by itself. A run with no tab
 (an agent's `run_start`) opens a read-only dock tab that follows the registry's output.
 
 **Quick open** (`commands.rs`). `Run: <name>` for every offered configuration and task,
@@ -697,12 +697,12 @@ the project whose linked worktree the path is in. A project that is a folder ins
 larger repository is its own checkout. It also applies the setting below and registers
 `shutdown` for quit.
 
-**The server.** `code::bridge`, built like `browser_bridge.rs`: a listener on `127.0.0.1`,
+**The server.** `code::bridge`, built like `db_bridge.rs`: a listener on `127.0.0.1`,
 a random token per agent session, and the stdio subcommand `code-mcp` of the Monocode
 binary, which each provider is handed when a session starts (Claude `--mcp-config`, Codex
 `mcp_servers.monocode_code.*`, ACP `mcpServers`) and which forwards every `tools/call` as
-one JSON line `{session, token, tool, arguments}`. Server name `monocode_code`. Unlike the
-browser, a call needs no interface thread: it is answered on its connection's thread and
+one JSON line `{session, token, tool, arguments}`. Server name `monocode_code`. A call
+needs no interface thread: it is answered on its connection's thread and
 may wait there for a program (at most 300 s; the stdio side waits a minute longer).
 
 **Capability.** `bridge::environment(session, cwd, project, executable)` is called by
@@ -754,8 +754,7 @@ as it is). A tool that panics answers with an error and frees its connection slo
 guard); a request must be complete within 10 s whatever the pace it arrives at. The accept
 loop logs and backs off on an error and carries on; the cached hub listens again, on the
 same address if it can, with the sessions already issued, if its thread ever ends.
-`bridge::revoke(session)` ends a session's token (nothing in the app calls it yet; neither
-does the browser bridge's), and at most 512 sessions are remembered. A session needs an
+`bridge::revoke(session)` ends a session's token (nothing in the app calls it yet), and at most 512 sessions are remembered. A session needs an
 absolute folder and project to be given a capability, and a checkout that the app does not
 vouch for and that lies above both is replaced by the session's own folder.
 "Unseen output" of a debug session is counted per agent session in all the bytes the
@@ -803,7 +802,7 @@ agent's headless run, its output tab, stop, rerun and removal; the quick open co
 agent's run in a tab. With `MONOCODE_TEST_PYTHON`, one test runs real pytest from a marker
 (a passing and a failing test, exit codes 0 and 1, pytest's output). Nothing was looked at
 in the running app: the page's and the output tab's layout, the right-click menu on a
-marker and opening a detected address in the browser pane are untested beyond compiling.
+marker and opening a detected address in the browser are untested beyond compiling.
 
 ### The self-test in a real window
 
