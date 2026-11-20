@@ -38,6 +38,15 @@ pub enum BrowserEvent {
     },
     /// The browser is gone; the view can be dropped.
     Closed,
+    /// A find-in-page result ([`BrowserView::find`]). `active_ordinal` counts
+    /// from 1; several updates may arrive for one search, the last one final.
+    FindResult {
+        count: i32,
+        active_ordinal: i32,
+        final_update: bool,
+    },
+    /// The page took the keyboard (a click in it, or [`BrowserView::set_focus`]).
+    Focused,
 }
 
 /// A rectangle in the parent view's coordinates, in points, origin top-left.
@@ -190,11 +199,49 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_find_handler! {
+    struct PageFindHandler {
+        state: PageState,
+    }
+
+    impl FindHandler {
+        fn on_find_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            _identifier: ::std::os::raw::c_int,
+            count: ::std::os::raw::c_int,
+            _selection_rect: Option<&cef::Rect>,
+            active_match_ordinal: ::std::os::raw::c_int,
+            final_update: ::std::os::raw::c_int,
+        ) {
+            self.state.send(BrowserEvent::FindResult {
+                count,
+                active_ordinal: active_match_ordinal,
+                final_update: final_update != 0,
+            });
+        }
+    }
+}
+
+wrap_focus_handler! {
+    struct PageFocusHandler {
+        state: PageState,
+    }
+
+    impl FocusHandler {
+        fn on_got_focus(&self, _browser: Option<&mut Browser>) {
+            self.state.send(BrowserEvent::Focused);
+        }
+    }
+}
+
 wrap_client! {
     struct PageClient {
         display: cef::DisplayHandler,
         load: cef::LoadHandler,
         life_span: cef::LifeSpanHandler,
+        find: cef::FindHandler,
+        focus: cef::FocusHandler,
     }
 
     impl Client {
@@ -208,6 +255,14 @@ wrap_client! {
 
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
             Some(self.life_span.clone())
+        }
+
+        fn find_handler(&self) -> Option<cef::FindHandler> {
+            Some(self.find.clone())
+        }
+
+        fn focus_handler(&self) -> Option<cef::FocusHandler> {
+            Some(self.focus.clone())
         }
     }
 }
@@ -240,7 +295,9 @@ impl BrowserView {
         let mut client = PageClient::new(
             PageDisplayHandler::new(state.clone()),
             PageLoadHandler::new(state.clone()),
-            PageLifeSpanHandler::new(state),
+            PageLifeSpanHandler::new(state.clone()),
+            PageFindHandler::new(state.clone()),
+            PageFocusHandler::new(state),
         );
 
         let bounds = cef::Rect {
@@ -324,6 +381,33 @@ impl BrowserView {
         self.browser.stop_load();
     }
 
+    /// Reloads without the cache (⇧⌘R).
+    pub fn reload_ignore_cache(&self) {
+        self.browser.reload_ignore_cache();
+    }
+
+    /// Finds `text` in the page; results arrive as
+    /// [`BrowserEvent::FindResult`]. `find_next` continues the current
+    /// search (next or previous match) instead of starting a new one.
+    pub fn find(&self, text: &str, forward: bool, match_case: bool, find_next: bool) {
+        if let Some(host) = self.browser.host() {
+            host.find(
+                Some(&text.into()),
+                forward as _,
+                match_case as _,
+                find_next as _,
+            );
+        }
+    }
+
+    /// Ends the search; `clear_selection` also drops the active match's
+    /// selection.
+    pub fn stop_finding(&self, clear_selection: bool) {
+        if let Some(host) = self.browser.host() {
+            host.stop_finding(clear_selection as _);
+        }
+    }
+
     /// Gives the page keyboard focus, or takes it away.
     pub fn set_focus(&self, focused: bool) {
         if let Some(host) = self.browser.host() {
@@ -336,6 +420,12 @@ impl BrowserView {
         if let Some(host) = self.browser.host() {
             host.set_zoom_level(level);
         }
+    }
+
+    /// The page's zoom level now. Chromium keeps one level per host, so it
+    /// changes when the page navigates to another host.
+    pub fn zoom_level(&self) -> f64 {
+        self.browser.host().map_or(0., |host| host.zoom_level())
     }
 
     pub fn show_dev_tools(&self) {
