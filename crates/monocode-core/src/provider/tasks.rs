@@ -17,6 +17,15 @@ pub(super) struct Activities {
     /// What the UI was last told the yielded turn is waiting on.
     pub(super) published: Vec<BackgroundTask>,
 }
+/// The Agent call whose subagent ran tool call `id` as one of its steps.
+fn owning_agent(tools: &HashMap<String, ToolCall>, id: &str) -> Option<String> {
+    tools.values().find_map(|tool| match &tool.panel {
+        Some(Panel::Agent(run)) if tool.id != id && run.steps.iter().any(|s| s.id == id) => {
+            Some(tool.id.clone())
+        }
+        _ => None,
+    })
+}
 fn text(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.trim().is_empty())
 }
@@ -576,7 +585,11 @@ impl Protocol {
         let tasks = &mut self.activities.claude_tasks;
         match subtype {
             "task_started" if !tasks.iter().any(|task| task.id == id) => {
-                let source = text(&value["tool_use_id"]).and_then(|id| self.tools.get(id));
+                let tool_use_id = text(&value["tool_use_id"]).map(str::to_owned);
+                let parent = tool_use_id
+                    .as_deref()
+                    .and_then(|id| owning_agent(&self.tools, id));
+                let source = tool_use_id.as_deref().and_then(|id| self.tools.get(id));
                 let command = source
                     .filter(|tool| tool.name == "Bash")
                     .and_then(|tool| serde_json::from_str::<Value>(&tool.input).ok())
@@ -593,6 +606,8 @@ impl Protocol {
                     agent: is_agent_task(value["task_type"].as_str()),
                     command,
                     started_at: crate::time::now_ms(),
+                    tool_use_id,
+                    parent,
                 });
             }
             "task_updated" => {
@@ -631,6 +646,10 @@ impl Protocol {
                 continue;
             };
             if !tasks.iter().any(|task| task.id == id) {
+                let tool_use_id = text(&row["tool_use_id"]).map(str::to_owned);
+                let parent = tool_use_id
+                    .as_deref()
+                    .and_then(|id| owning_agent(&self.tools, id));
                 tasks.push(BackgroundTask {
                     id: id.into(),
                     description: text(&row["description"])
@@ -639,6 +658,8 @@ impl Protocol {
                     agent: is_agent_task(row["task_type"].as_str()),
                     command: None,
                     started_at: crate::time::now_ms(),
+                    tool_use_id,
+                    parent,
                 });
             }
         }
@@ -1011,5 +1032,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tick(&mut p), Some(Vec::new()));
+    }
+    #[test]
+    fn a_subagents_background_command_names_the_subagent_that_started_it() {
+        let mut p = protocol(Kind::Claude);
+        p.frame(json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Wait","prompt":"Sleep"}}]}}), &mut Vec::new()).unwrap();
+        p.frame(json!({"type":"system","subtype":"task_started","task_id":"agent-task","tool_use_id":"agent-call","description":"Wait","task_type":"local_agent"}), &mut Vec::new()).unwrap();
+        p.frame(json!({"type":"assistant","parent_tool_use_id":"agent-call","message":{"id":"m","content":[{"type":"tool_use","id":"sleep-call","name":"Bash","input":{"command":"sleep 300","run_in_background":true}}]}}), &mut Vec::new()).unwrap();
+        p.frame(json!({"type":"system","subtype":"task_started","task_id":"sleep","tool_use_id":"sleep-call","description":"Sleep","task_type":"local_bash"}), &mut Vec::new()).unwrap();
+        let tasks = &p.activities.claude_tasks;
+        assert_eq!(tasks[0].tool_use_id.as_deref(), Some("agent-call"));
+        assert_eq!(tasks[0].parent, None, "the main agent started the subagent");
+        assert_eq!(tasks[1].tool_use_id.as_deref(), Some("sleep-call"));
+        assert_eq!(tasks[1].parent.as_deref(), Some("agent-call"));
     }
 }

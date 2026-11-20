@@ -132,6 +132,11 @@ pub struct BackgroundTask {
     pub command: Option<String>,
     /// Unix milliseconds.
     pub started_at: u64,
+    /// The tool call that started it: for a subagent, its Agent call.
+    pub tool_use_id: Option<String>,
+    /// The Agent call of the subagent that started it; `None` when the main
+    /// agent did.
+    pub parent: Option<String>,
 }
 
 fn codex_error(error: &Value, fallback: &str) -> String {

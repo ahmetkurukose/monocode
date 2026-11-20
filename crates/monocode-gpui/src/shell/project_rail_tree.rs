@@ -684,7 +684,7 @@ impl Shell {
                     .child(status)
                     .child(archive),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.open(id, window, cx))),
+            .on_click(cx.listener(move |this, _, window, cx| this.open_main_agent(id, window, cx))),
         )
         .into_any_element()
     }
