@@ -306,6 +306,23 @@ pub(crate) struct BrowserPane {
     pub owner: i64,
     pub url: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "DevToolsDock::is_default")]
+    pub devtools: DevToolsDock,
+}
+
+/// A page's DevTools docked under it (context.md K18): whether it was open,
+/// and its height in points (0 until the divider is first moved).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DevToolsDock {
+    pub open: bool,
+    pub height: u32,
+}
+
+impl DevToolsDock {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -2175,6 +2192,7 @@ mod tests {
                 owner: 1,
                 url: "http://localhost:5173".into(),
                 title: "Vite".into(),
+                ..BrowserPane::default()
             }
         );
         assert_eq!(restored.focused.get(&1), Some(&-4));

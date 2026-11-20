@@ -338,12 +338,28 @@ impl BrowserView {
         }
     }
 
-    pub fn show_dev_tools(&self) {
-        if let Some(host) = self.browser.host() {
-            let window_info = cef::WindowInfo::default();
-            let settings = cef::BrowserSettings::default();
-            host.show_dev_tools(Some(&window_info), None, Some(&settings), None);
-        }
+    /// Opens the page's DevTools docked inside `parent` (macOS: an
+    /// `NSView*`) at `frame`, as a second child view rather than a window.
+    /// Fails if DevTools is open already.
+    pub fn show_dev_tools(
+        &self,
+        parent: *mut c_void,
+        frame: Frame,
+    ) -> Result<
+        (
+            crate::DevToolsView,
+            async_channel::Receiver<crate::DevToolsEvent>,
+        ),
+        CreateError,
+    > {
+        crate::DevToolsView::open(&self.browser, parent, frame)
+    }
+
+    /// Asks for a PNG of what the page shows now, at the screen's scale.
+    /// `done` runs on the main thread; it is dropped without running if the
+    /// page closes first.
+    pub fn capture(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
+        crate::capture::capture(&self.browser, Box::new(done));
     }
 
     /// Closes the page. [`BrowserEvent::Closed`] follows.
@@ -351,6 +367,7 @@ impl BrowserView {
         if self.closed.replace(true) {
             return;
         }
+        crate::capture::forget(self.browser.identifier());
         if let Some(host) = self.browser.host() {
             host.close_browser(1);
         }

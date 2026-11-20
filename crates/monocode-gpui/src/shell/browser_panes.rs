@@ -23,7 +23,15 @@ impl Shell {
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
         let page = cx.new(|cx| BrowserPage::new(state.url, state.title, profiles, cx));
+        page.update(cx, |page, _| page.devtools_dock = state.devtools);
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
+            let dock = page.read(cx).devtools_dock;
+            if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
+                && state.devtools != dock
+            {
+                state.devtools = dock;
+                this.persist(cx);
+            }
             let (url, title) = {
                 let page = page.read(cx);
                 (page.url.clone(), page.title.clone())
@@ -74,6 +82,7 @@ impl Shell {
                 owner,
                 url: url.unwrap_or_default(),
                 title: String::new(),
+                ..BrowserPane::default()
             },
         );
         self.workspace.open(pane);
@@ -139,6 +148,20 @@ impl Shell {
         true
     }
 
+    /// ⌥⌘I: the focused browser pane's docked DevTools opens or closes.
+    pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self
+            .workspace
+            .active
+            .filter(|id| self.workspace.browser_panes.contains_key(id))
+        else {
+            return;
+        };
+        if let Some(page) = self.browser_page(pane, cx) {
+            page.update(cx, |page, cx| page.toggle_dev_tools(cx));
+        }
+    }
+
     /// A browser pane: its split header over the page.
     pub(super) fn browser_pane_surface(
         &mut self,
@@ -171,6 +194,42 @@ mod tests {
     };
 
     #[test]
+    fn a_page_remembers_its_docked_devtools() {
+        use crate::workspace::DevToolsDock;
+        let docked = BrowserPane {
+            owner: 1,
+            url: "http://localhost:5173/".into(),
+            devtools: DevToolsDock {
+                open: true,
+                height: 320,
+            },
+            ..BrowserPane::default()
+        };
+        let saved = serde_json::to_string(&docked).unwrap();
+        assert_eq!(serde_json::from_str::<BrowserPane>(&saved).unwrap(), docked);
+        // Closed and never resized: nothing saved, and older saves read so.
+        let plain = BrowserPane {
+            devtools: DevToolsDock::default(),
+            ..docked
+        };
+        let saved = serde_json::to_string(&plain).unwrap();
+        assert!(!saved.contains("devtools"), "{saved}");
+        let older = r#"{"owner":1,"url":"http://localhost:5173/","title":""}"#;
+        assert_eq!(serde_json::from_str::<BrowserPane>(older).unwrap(), plain);
+        // Closed after a resize keeps the height for next time.
+        let resized = r#"{"owner":1,"devtools":{"height":250}}"#;
+        assert_eq!(
+            serde_json::from_str::<BrowserPane>(resized)
+                .unwrap()
+                .devtools,
+            DevToolsDock {
+                open: false,
+                height: 250
+            }
+        );
+    }
+
+    #[test]
     fn restore_keeps_browser_pages_of_known_sessions_in_open_tabs() {
         let mut state = Workspace {
             tabs: vec![1, -2],
@@ -184,6 +243,7 @@ mod tests {
             owner,
             url: "http://localhost:5173/".into(),
             title: "Vite".into(),
+            ..BrowserPane::default()
         };
         state.browser_panes.insert(-1, page(1));
         // Its own tab, but its owner is gone.
