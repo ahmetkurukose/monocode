@@ -135,7 +135,12 @@ impl DatabaseView {
             .console_store
             .list(source)
             .into_iter()
-            .chain(self.consoles.iter().filter(|c| c.source == source).map(|c| c.id))
+            .chain(
+                self.consoles
+                    .iter()
+                    .filter(|c| c.source == source)
+                    .map(|c| c.id),
+            )
             .max()
             .unwrap_or(0)
             + 1;
@@ -171,7 +176,9 @@ impl DatabaseView {
         }
         self.append_to_console(ix, &text, cx);
         let content = self.consoles[ix].editor.read(cx).content.clone();
-        let _ = self.console_store.save(source, self.consoles[ix].id, &content);
+        let _ = self
+            .console_store
+            .save(source, self.consoles[ix].id, &content);
         let console = &mut self.consoles[ix];
         match (result, error) {
             (_, Some(error)) => {
@@ -190,8 +197,7 @@ impl DatabaseView {
         // The user's own console stays in front; a source with no console
         // shown yet shows this one.
         if !self.active.contains_key(source) {
-            self.active
-                .insert(source.to_owned(), self.consoles[ix].id);
+            self.active.insert(source.to_owned(), self.consoles[ix].id);
         }
         cx.notify();
     }

@@ -78,7 +78,7 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(window.into(), &shortcut());
         cx.run_until_parked();
-        let next = window
+        window
             .update(cx, |shell, _, cx| {
                 assert!(shell.sessions[&first].read(cx).summary.archived);
                 assert!(!shell.workspace.open_sessions().contains(&first));
@@ -91,11 +91,15 @@ mod tests {
                         .is_empty()
                 );
                 assert!(!shell.sessions[&other].read(cx).summary.archived);
-                shell
-                    .workspace
-                    .active
-                    .expect("archiving selects another pane")
+                // The project's only tab is gone: nothing is in front.
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
             })
+            .unwrap();
+        // Another chat in front takes the held key's repeats unarchived.
+        let next = other;
+        window
+            .update(cx, |shell, window, cx| shell.open(next, window, cx))
             .unwrap();
         // The test keyboard sends key-down events only, reproducing auto-repeat.
         cx.simulate_keystrokes(window.into(), &shortcut());

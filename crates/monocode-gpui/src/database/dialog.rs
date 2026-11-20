@@ -218,7 +218,11 @@ impl SourceDialog {
             let kubectl = tunnel.kind == TunnelKind::Kubectl;
             let remote = Self::text(&self.tunnel_remote_port, cx);
             tunnel.remote_port = if kubectl && !remote.is_empty() {
-                Some(remote.parse().map_err(|_| "The remote port must be a number")?)
+                Some(
+                    remote
+                        .parse()
+                        .map_err(|_| "The remote port must be a number")?,
+                )
             } else {
                 None
             };
@@ -332,8 +336,8 @@ impl SourceDialog {
     /// No tunnel, or the program that opens the source's port.
     fn tunnel_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.source.tunnel.as_ref().map(|t| t.kind);
-        let choices = std::iter::once((None, "None"))
-            .chain(TunnelKind::ALL.into_iter().map(|kind| {
+        let choices =
+            std::iter::once((None, "None")).chain(TunnelKind::ALL.into_iter().map(|kind| {
                 let label = match kind {
                     TunnelKind::AlloyDb => "AlloyDB",
                     TunnelKind::CloudSql => "Cloud SQL",
@@ -386,36 +390,46 @@ impl SourceDialog {
     /// A labelled row of choices, one of them on.
     fn chips(
         label: &'static str,
-        choices: impl Iterator<Item = (SharedString, &'static str, bool, Box<dyn Fn(&mut DataSource)>)>,
+        choices: impl Iterator<
+            Item = (
+                SharedString,
+                &'static str,
+                bool,
+                Box<dyn Fn(&mut DataSource)>,
+            ),
+        >,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let row = div().flex().flex_wrap().gap(px(6.)).children(choices.map(
-            |(id, text, on, choose)| {
-                div()
-                    .id(id)
-                    .role(Role::RadioButton)
-                    .aria_label(text)
-                    .aria_selected(on)
-                    .h(px(24.))
-                    .px(px(10.))
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(content(if on { 0.5 } else { 0.12 }))
-                    .when(on, |d| d.bg(content(0.1)))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .text_color(content(if on { 1. } else { 0.7 }))
-                    .hover(|s| s.bg(content(0.08)))
-                    .child(text)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        choose(&mut this.source);
-                        this.test = Test::Idle;
-                        cx.notify();
-                    }))
-            },
-        ));
+        let row =
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .children(choices.map(|(id, text, on, choose)| {
+                    div()
+                        .id(id)
+                        .role(Role::RadioButton)
+                        .aria_label(text)
+                        .aria_selected(on)
+                        .h(px(24.))
+                        .px(px(10.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(if on { 0.5 } else { 0.12 }))
+                        .when(on, |d| d.bg(content(0.1)))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(content(if on { 1. } else { 0.7 }))
+                        .hover(|s| s.bg(content(0.08)))
+                        .child(text)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            choose(&mut this.source);
+                            this.test = Test::Idle;
+                            cx.notify();
+                        }))
+                }));
         div()
             .flex()
             .flex_col()
@@ -439,18 +453,22 @@ impl SourceDialog {
             TunnelKind::Kubectl => "Forward (svc/name, pod/name, deploy/name)",
             TunnelKind::Custom => "Command (run with sh -c; listens on the port above)",
         };
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(Self::labeled(target, &self.tunnel_target, None));
+        let mut column = div().flex().flex_col().gap(px(10.)).child(Self::labeled(
+            target,
+            &self.tunnel_target,
+            None,
+        ));
         match tunnel.kind {
             TunnelKind::Kubectl => {
                 column = column.child(
                     div()
                         .flex()
                         .gap(px(10.))
-                        .child(Self::labeled("Remote port", &self.tunnel_remote_port, Some(110.)))
+                        .child(Self::labeled(
+                            "Remote port",
+                            &self.tunnel_remote_port,
+                            Some(110.),
+                        ))
                         .child(Self::labeled("Namespace", &self.tunnel_namespace, None))
                         .child(Self::labeled("Context", &self.tunnel_context, None)),
                 );

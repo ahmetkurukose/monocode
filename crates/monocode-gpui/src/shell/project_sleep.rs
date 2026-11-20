@@ -1211,7 +1211,7 @@ mod tests {
             )
             .unwrap();
         chat.has_messages = true;
-        // No tab is open, so launching would place a blank chat.
+        // No tab is open: the project is asleep, then empty once woken.
         let mut state = crate::workspace::Workspace::default();
         state.add_project(MONOCODE);
         state.add_project(ANOTHER);
@@ -1241,15 +1241,16 @@ mod tests {
             })
             .unwrap();
         visual.run_until_parked();
-        // Waking places a chat to work in.
+        // Waking a project with nothing open shows the empty workspace.
         let wake = visual.debug_bounds("project-wake").unwrap();
         visual.simulate_click(wake.center(), Default::default());
         visual.run_until_parked();
         assert!(visual.debug_bounds("project-sleep-screen").is_none());
+        assert!(visual.debug_bounds("empty-workspace").is_some());
         window
             .update(&mut visual, |shell, _, _| {
                 assert!(!shell.project_asleep(MONOCODE));
-                assert!(shell.workspace.active.is_some());
+                assert!(shell.workspace.active.is_none());
             })
             .unwrap();
     }

@@ -20,6 +20,7 @@ mod code_shell;
 mod code_shell_tests;
 mod database_footer;
 mod database_send;
+mod empty_workspace;
 mod file_panes;
 mod github_star;
 mod idle_agents;
@@ -2567,6 +2568,7 @@ impl Shell {
             self.open_file_pane(pane, window, cx);
         }
         let Some(id) = self.workspace.active else {
+            self.open_review_from_empty_workspace(tab, pin, window, cx);
             return;
         };
         let review = match self.review_for(id, cx) {
@@ -2835,6 +2837,9 @@ impl Shell {
             return view;
         }
         if let Some(screen) = self.project_sleep_screen(cx) {
+            return screen;
+        }
+        if let Some(screen) = self.empty_workspace_screen(cx) {
             return screen;
         }
         let Some(id) = self.workspace.active else {
@@ -5088,9 +5093,12 @@ impl Shell {
     fn ensure_project_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A sleeping project shows its sleep screen instead of a blank chat;
         // placing one must not wake it. Waking places one if still needed.
+        // An empty project shows the empty workspace instead; only an app with
+        // no chat anywhere, a first launch, starts on a blank one.
         if self.workspace.active.is_some()
             || self.mono_active(cx)
             || self.project_asleep(&self.workspace.project)
+            || !self.order.is_empty()
         {
             return;
         }
@@ -8330,35 +8338,10 @@ impl Shell {
                 .into_any_element(),
         )
     }
-    fn tab_can_close(&self, id: i64, cx: &App) -> bool {
-        let Some(tab) = self.workspace.tab_of(id) else {
-            return false;
-        };
-        let layout = self.workspace.layout(tab);
-        // Beside the pins, the strip's last tab counts as the only one.
-        let tabs = if self.tab_pinned(&TitleTab::Session(tab)) {
-            self.visible_tabs(cx)
-        } else {
-            self.strip_tabs(cx)
-        };
-        tabs.len() > 1
-            || layout.is_split()
-            || layout.leaf_ids().iter().any(|id| {
-                self.session_summaries.contains_key(id) && {
-                    let s = self.session_metadata(*id, cx);
-                    s.summary.has_messages
-                        || s.busy
-                        || s.has_saved_draft()
-                        || self
-                            .sessions
-                            .get(id)
-                            .is_some_and(|v| !v.read(cx).input.read(cx).content.is_empty())
-                } || self
-                    .workspace
-                    .reviews
-                    .get(id)
-                    .is_some_and(|r| !r.tabs.is_empty())
-            })
+    /// Any open tab can be closed. A lone blank chat used to stay, since
+    /// closing it only brought another; now the empty workspace shows instead.
+    fn tab_can_close(&self, id: i64, _: &App) -> bool {
+        self.workspace.tab_of(id).is_some()
     }
     fn start_tab_drag(&mut self, id: TitleTab, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.skip_tab_click = false;
@@ -10573,11 +10556,11 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, "/work/another-project");
-                assert_eq!(shell.visible_tabs(cx).len(), 1);
-                assert_eq!(shell.workspace.tabs.len(), 2);
-                let active = shell.workspace.active.unwrap();
-                assert!(![a, b].contains(&active));
-                assert!(!shell.sessions[&active].read(cx).summary.has_messages);
+                // Closing everything leaves everything closed: the empty
+                // workspace, not a blank chat.
+                assert_eq!(shell.visible_tabs(cx).len(), 0);
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
                 assert!(shell.sessions.contains_key(&a) && shell.sessions.contains_key(&b));
                 assert!(shell.history.back.iter().all(|id| *id == b));
                 assert!(shell.history.forward.is_empty());
@@ -10673,9 +10656,11 @@ mod tests {
                         .values()
                         .filter(|s| s.read(cx).summary.cwd == "/work/empty")
                         .count(),
-                    1
+                    0,
+                    "selecting a project with nothing open creates no chat"
                 );
-                assert!(shell.workspace.active.is_some());
+                assert!(shell.workspace.active.is_none());
+                assert!(shell.empty_workspace_showing(cx));
             })
             .unwrap();
     }
@@ -10702,10 +10687,9 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, "/work/another-project");
-                assert_eq!(shell.visible_tabs(cx).len(), 1);
-                assert_eq!(shell.workspace.tabs.len(), 2);
-                let active = shell.workspace.active.unwrap();
-                assert!(!shell.sessions[&active].read(cx).summary.has_messages);
+                assert_eq!(shell.visible_tabs(cx).len(), 0);
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
             })
             .unwrap();
     }
@@ -10755,10 +10739,11 @@ mod tests {
         window
             .update(cx, |shell, w, cx| {
                 assert_eq!(shell.workspace.project, "/work/monocode");
-                let blank = shell.workspace.active.unwrap();
-                assert_ne!(blank, b);
-                assert_eq!(shell.workspace.tabs, [a, blank]);
-                assert!(!shell.sessions[&blank].read(cx).summary.has_messages);
+                // b was the project's only tab: it shows the empty workspace,
+                // and the other project's tab is untouched.
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
+                assert_eq!(shell.workspace.tabs, [a]);
                 assert!(shell.sessions[&b].read(cx).busy);
                 shell.open(b, w, cx);
                 assert_eq!(
@@ -10769,7 +10754,7 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
-    fn tab_lifecycle_opening_a_conversation_replaces_the_blank_tab(cx: &mut TestAppContext) {
+    fn tab_lifecycle_opening_a_conversation_leaves_the_empty_workspace(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);
         window
             .update(cx, |shell, w, cx| {
@@ -10780,8 +10765,8 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
-                let blank = shell.workspace.active.unwrap();
-                assert_eq!(shell.workspace.tabs, [a, blank]);
+                assert_eq!(shell.workspace.active, None);
+                assert_eq!(shell.workspace.tabs, [a]);
                 shell.open(b, w, cx);
                 assert_eq!(shell.workspace.tabs, [a, b]);
                 assert_eq!(shell.workspace.active, Some(b));
@@ -10853,7 +10838,7 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
-    fn tab_lifecycle_closing_a_file_only_tab_restores_the_project_chat(cx: &mut TestAppContext) {
+    fn tab_lifecycle_closing_a_file_only_tab_leaves_the_empty_workspace(cx: &mut TestAppContext) {
         let (window, a, b) = window(cx);
         window
             .update(cx, |shell, w, cx| {
@@ -10880,50 +10865,58 @@ mod tests {
                 assert_eq!(shell.workspace.project, "/work/monocode");
                 assert!(shell.workspace.tabs.contains(&a));
                 assert!(!shell.reviews.contains_key(&b));
-                let active = shell.workspace.active.unwrap();
-                assert_eq!(
-                    shell.sessions[&active].read(cx).summary.cwd,
-                    "/work/monocode"
-                );
+                // b's chat was never open in a tab of its own: closing the
+                // file leaves the empty workspace, not a blank chat.
+                assert!(shell.workspace.active.is_none());
+                assert!(shell.empty_workspace_showing(cx));
             })
             .unwrap();
     }
     #[gpui::test]
-    fn projects_without_tabs_land_on_one_reusable_blank_session(cx: &mut TestAppContext) {
+    fn projects_without_tabs_show_the_empty_workspace_and_create_no_chat(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
-        let blank = |shell: &Shell, cx: &App| {
-            let id = shell
-                .workspace
-                .active
-                .expect("a project always has an active session");
-            let summary = &shell.sessions[&id].read(cx).summary;
-            assert_eq!(summary.cwd, "/work/empty");
-            assert!(!summary.has_messages);
-            id
-        };
-        window
+        let before = window
             .update(cx, |shell, w, cx| {
                 shell.workspace.add_project("/work/empty");
+                let before = shell.sessions.len();
                 shell.select_project("/work/empty".into(), w, cx);
+                before
             })
             .unwrap();
         cx.run_until_parked();
-        let (first, count) = window
-            .update(cx, |shell, w, cx| {
-                let id = blank(shell, cx);
-                // Close its tab, leave, and come back: the same blank returns.
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
+                assert_eq!(shell.sessions.len(), before);
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("empty-workspace").is_some());
+        // New session starts a chat as before; closing its tab and coming
+        // back leaves the project empty again, with that chat kept.
+        window
+            .update(visual, |shell, _, cx| shell.new_chat(cx))
+            .unwrap();
+        visual.run_until_parked();
+        let first = window
+            .update(visual, |shell, w, cx| {
+                let id = shell.workspace.active.expect("New session opens a chat");
+                assert_eq!(shell.sessions[&id].read(cx).summary.cwd, "/work/empty");
                 shell.close(id, w, cx);
                 shell.open(b, w, cx);
                 shell.select_project("/work/empty".into(), w, cx);
-                (id, shell.sessions.len())
+                id
             })
             .unwrap();
-        cx.run_until_parked();
+        visual.run_until_parked();
         window
-            .update(cx, |shell, _, cx| {
-                assert_eq!(blank(shell, cx), first);
-                assert_eq!(shell.sessions.len(), count);
-                assert!(shell.workspace.tabs.contains(&first));
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
+                assert_eq!(shell.sessions.len(), before + 1);
+                assert!(shell.sessions.contains_key(&first));
+                assert!(!shell.workspace.tabs.contains(&first));
             })
             .unwrap();
     }
@@ -12750,6 +12743,16 @@ mod tests {
         keys(format!("{m}-shift-right"), cx);
         let after = project(cx);
         assert_ne!(after, before);
+        // The next project has nothing open: the empty workspace, with no
+        // composer for the shortcut to reach.
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(shell.empty_workspace_showing(cx))
+            })
+            .unwrap();
+        keys(format!("{m}-shift-left"), cx);
+        let after = project(cx);
+        assert_eq!(after, before);
         // ...but with a draft it selects text, as in any field.
         window
             .update(cx, |shell, w, cx| {
