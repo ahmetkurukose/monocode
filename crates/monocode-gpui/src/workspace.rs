@@ -182,8 +182,9 @@ pub(crate) struct Workspace {
     pub project_rail_pinned: HashSet<String>,
     /// Projects opened in the rail's tree view.
     pub project_rail_expanded: HashSet<String>,
-    /// Worktrees opened under their project in the rail's tree view.
-    pub project_rail_worktrees_expanded: HashSet<String>,
+    /// Worktrees closed under their project in the rail's tree view; any other is open,
+    /// so a new worktree shows its chats straight away.
+    pub project_rail_worktrees_collapsed: HashSet<String>,
     /// Projects put to sleep, with when (ms). A sleeping project keeps its
     /// chats, tabs and terminal list but runs no shells, warm agents or pages
     /// until it is opened again.
@@ -503,7 +504,7 @@ impl Default for Workspace {
             project_rail_width: 220.,
             project_rail_pinned: HashSet::new(),
             project_rail_expanded: HashSet::new(),
-            project_rail_worktrees_expanded: HashSet::new(),
+            project_rail_worktrees_collapsed: HashSet::new(),
             slept_projects: HashMap::new(),
             project_rail_groups: Vec::new(),
             project_rail_assignments: HashMap::new(),

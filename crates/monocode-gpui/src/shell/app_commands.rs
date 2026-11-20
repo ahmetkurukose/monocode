@@ -637,6 +637,21 @@ impl Shell {
                     }
                 }
             },
+            "worktrees.merge" | "worktrees.delete" => {
+                let caller = call.session;
+                self.app_worktree_action(
+                    super::worktree_app::WorktreeCall {
+                        action,
+                        project,
+                        input,
+                        caller: Some(caller),
+                    },
+                    Box::new(move |this, result, cx| this.finish_app_call(call, result, cx)),
+                    window,
+                    cx,
+                );
+                return;
+            }
             "worktrees.list" | "worktrees.create" => {
                 self.app_background(
                     call,

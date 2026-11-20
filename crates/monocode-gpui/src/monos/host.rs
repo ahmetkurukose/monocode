@@ -729,6 +729,30 @@ impl Monos {
                     }
                 }
             }
+            // The same shell paths as the user's own Merge and Delete, so the rail and
+            // the chats follow; answered after this update, never inside it.
+            "worktrees.merge" | "worktrees.delete" => {
+                let monos = cx.entity().downgrade();
+                let reply: crate::shell::AppReply = Box::new(move |_, result, cx| {
+                    cx.defer(move |cx| {
+                        let _ = monos.update(cx, |monos, cx| monos.finish_call(call, result, cx));
+                    });
+                });
+                let _ = self.owner.update(cx, |shell, cx| {
+                    shell.app_worktree_action(
+                        crate::shell::WorktreeCall {
+                            action,
+                            project,
+                            input,
+                            caller: None,
+                        },
+                        reply,
+                        window,
+                        cx,
+                    )
+                });
+                return;
+            }
             "soul.read" | "soul.update" | "memory.read" | "memory.search" | "memory.add"
             | "memory.replace" | "memory.remove" | "habits.list" | "habits.add"
             | "habits.update" | "habits.run" | "habits.remove" | "notes.list" | "notes.read"

@@ -1107,14 +1107,17 @@ impl Store {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    /// Keep conversation history while detaching a removed working copy.
+    /// Keep conversation history while detaching a removed working copy. With `to` (the
+    /// checkout of the branch the worktree came from) its sessions carry on there;
+    /// without, they move to the main checkout marked `worktree_removed`.
     pub fn detach_worktree(
         &self,
         path: &str,
         main: &str,
+        to: Option<&str>,
     ) -> Result<Vec<(Session, crate::agent::Settings)>, String> {
         if self.shared.is_some() {
-            return self.shared_detach_worktree(path, main);
+            return self.shared_detach_worktree(path, main, to);
         }
 
         let sessions = self.sessions()?;
@@ -1125,15 +1128,7 @@ impl Store {
             if !crate::files::is_equal_or_inside(execution, path) {
                 continue;
             }
-            settings.worktree_cwd = Some(execution.to_owned());
-            settings.worktree_removed = true;
-            settings.revision += 1;
-            settings.new_worktree = false;
-            settings.worktree_base = None;
-            if crate::files::is_equal_or_inside(&session.cwd, path) {
-                session.cwd = main.into();
-            }
-            session.provider_id = None;
+            detach_session(&mut session, &mut settings, path, main, to);
             changed.push((session, settings));
         }
         let tx = self
@@ -1201,8 +1196,78 @@ impl Store {
     }
 }
 
+/// One session of a removed worktree at `path`: to `to` when given (the main checkout
+/// means no worktree), else to `main` marked removed. The provider's own session is
+/// tied to the old folder, so it starts afresh; the transcript stays.
+pub(crate) fn detach_session(
+    session: &mut Session,
+    settings: &mut crate::agent::Settings,
+    path: &str,
+    main: &str,
+    to: Option<&str>,
+) {
+    let execution = settings
+        .worktree_cwd
+        .clone()
+        .unwrap_or_else(|| session.cwd.clone());
+    match to {
+        Some(to) => {
+            settings.worktree_cwd =
+                (crate::files::path_key(to) != crate::files::path_key(main)).then(|| to.to_owned());
+            settings.worktree_removed = false;
+        }
+        None => {
+            settings.worktree_cwd = Some(execution);
+            settings.worktree_removed = true;
+        }
+    }
+    settings.revision += 1;
+    settings.new_worktree = false;
+    settings.worktree_base = None;
+    if crate::files::is_equal_or_inside(&session.cwd, path) {
+        session.cwd = main.into();
+    }
+    session.provider_id = None;
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_worktree_sessions_carry_on_in_the_checkout_of_their_base() {
+        let store = super::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let worktree = |cwd: &str| crate::agent::Settings {
+            worktree_cwd: Some(cwd.into()),
+            ..Default::default()
+        };
+        let to_main = store.create("codex", "/project").unwrap();
+        store
+            .save_agent_settings(to_main.id, &worktree("/wt/feature"))
+            .unwrap();
+        let detached = store
+            .detach_worktree("/wt/feature", "/project", Some("/project"))
+            .unwrap();
+        assert_eq!(detached.len(), 1);
+        let (session, settings) = &detached[0];
+        assert_eq!(session.cwd, "/project");
+        assert_eq!(
+            settings.worktree_cwd, None,
+            "the main checkout is no worktree"
+        );
+        assert!(!settings.worktree_removed);
+        let stored = store.agent_settings(to_main.id).unwrap().unwrap();
+        assert!(!stored.worktree_removed && stored.worktree_cwd.is_none());
+        // A base checked out in another worktree: the session moves there.
+        let to_other = store.create("codex", "/project").unwrap();
+        store
+            .save_agent_settings(to_other.id, &worktree("/wt/child"))
+            .unwrap();
+        let detached = store
+            .detach_worktree("/wt/child", "/project", Some("/wt/parent"))
+            .unwrap();
+        assert_eq!(detached[0].1.worktree_cwd.as_deref(), Some("/wt/parent"));
+        assert!(!detached[0].1.worktree_removed);
+    }
+
     #[test]
     fn removed_worktree_keeps_history_and_requires_reattachment() {
         let mut store = super::Store::open(std::path::Path::new(":memory:")).unwrap();
@@ -1228,7 +1293,7 @@ mod tests {
             )
             .unwrap();
         let detached = store
-            .detach_worktree("/project-worktrees/feature", "/project")
+            .detach_worktree("/project-worktrees/feature", "/project", None)
             .unwrap();
         assert_eq!(detached.len(), 1);
         assert_eq!(detached[0].0.cwd, "/project");

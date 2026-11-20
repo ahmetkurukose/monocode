@@ -186,6 +186,11 @@ impl Shell {
         cache.loading.clear();
         cache.stale.extend(cache.lists.keys().cloned());
         self.projects_frame.update(cx, |_, cx| cx.notify());
+        // The Worktrees tab lists the same, with each one's state.
+        if let Some(panel) = &self.right_panel {
+            let pane = panel.read(cx).worktrees.clone();
+            pane.update(cx, |pane, cx| pane.reload(cx));
+        }
     }
 
     /// A worktree was made or removed outside the dialogs (an app or Mono API call):
@@ -260,11 +265,7 @@ impl Shell {
                 sessions: sessions.len(),
                 last: false,
             });
-            if self
-                .workspace
-                .project_rail_worktrees_expanded
-                .contains(&tree.path)
-            {
+            if self.rail_worktree_open(&tree.path) {
                 let hidden = sessions.len().saturating_sub(MAX_WORKTREE_SESSIONS);
                 rows.extend(sessions.into_iter().take(MAX_WORKTREE_SESSIONS).map(|id| {
                     ProjectRailRow::WorktreeSession {
@@ -293,10 +294,18 @@ impl Shell {
         rows
     }
 
+    /// The worktree's row is open (the default) in the rail's tree.
+    pub(super) fn rail_worktree_open(&self, path: &str) -> bool {
+        !self
+            .workspace
+            .project_rail_worktrees_collapsed
+            .contains(path)
+    }
+
     pub(super) fn toggle_rail_worktree_expanded(&mut self, path: &str, cx: &mut Context<Self>) {
-        let open = &mut self.workspace.project_rail_worktrees_expanded;
-        if !open.remove(path) {
-            open.insert(path.into());
+        let closed = &mut self.workspace.project_rail_worktrees_collapsed;
+        if !closed.remove(path) {
+            closed.insert(path.into());
         }
         self.persist(cx);
         self.projects_frame.update(cx, |_, cx| cx.notify());
@@ -425,10 +434,7 @@ impl Shell {
             return div().into_any_element();
         };
         let n = ordinal(&path);
-        let expanded = self
-            .workspace
-            .project_rail_worktrees_expanded
-            .contains(&path);
+        let expanded = self.rail_worktree_open(&path);
         let focused = self.workspace.project == project
             && !self.app_view_open()
             && self
@@ -528,11 +534,7 @@ impl Shell {
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let path = click_path.clone();
-                        if !this
-                            .workspace
-                            .project_rail_worktrees_expanded
-                            .contains(&path)
-                        {
+                        if !this.rail_worktree_open(&path) {
                             this.toggle_rail_worktree_expanded(&path, cx);
                         }
                         this.select_rail_worktree(click_project.clone(), path, window, cx);
@@ -816,8 +818,13 @@ mod tests {
         f.window
             .update(visual, |shell, _, cx| {
                 shell.workspace.project_rail_expanded.insert(f.main.clone());
-                shell.workspace.project_rail_worktrees_expanded =
-                    worktrees.iter().map(|p| p.to_string()).collect();
+                // Only `worktrees` open; every other row closed.
+                shell.workspace.project_rail_worktrees_collapsed =
+                    [&f.managed, &f.legacy, &f.external]
+                        .into_iter()
+                        .filter(|p| !worktrees.contains(&p.as_str()))
+                        .cloned()
+                        .collect();
                 shell.invalidate_chrome(cx);
                 cx.notify();
             })
@@ -885,6 +892,50 @@ mod tests {
         assert_eq!(loads(&f, visual), 2);
         assert!(at(visual, format!("rail-worktree-{}", f.external)).is_some());
         assert!(at(visual, format!("rail-worktree-{}", f.managed)).is_some());
+    }
+
+    #[gpui::test]
+    fn a_worktree_row_starts_open_until_the_user_closes_it(cx: &mut TestAppContext) {
+        let (f, mut visual) = fixture(cx);
+        let visual = &mut visual;
+        // Only the project is opened; no worktree was ever toggled.
+        f.window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project_rail_expanded.insert(f.main.clone());
+                shell.invalidate_chrome(cx);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let nested = |visual: &mut VisualTestContext| {
+            f.window
+                .update(visual, |shell, _, _| {
+                    shell.project_rail_list.rows.iter().any(|r| {
+                        matches!(r, ProjectRailRow::WorktreeSession { id, .. } if *id == f.in_worktree)
+                    })
+                })
+                .unwrap()
+        };
+        assert!(nested(visual), "its chats show straight away");
+        f.window
+            .update(visual, |shell, _, cx| {
+                shell.toggle_rail_worktree_expanded(&f.managed, cx);
+                shell.invalidate_chrome(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(!nested(visual), "closed by the user");
+        f.window
+            .update(visual, |shell, _, _| {
+                assert!(
+                    shell
+                        .workspace
+                        .project_rail_worktrees_collapsed
+                        .contains(&f.managed),
+                    "and remembered"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

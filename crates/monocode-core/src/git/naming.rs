@@ -86,6 +86,33 @@ pub fn generate(
     parse(&output)
 }
 
+/// [`generate`] that gives up after `timeout` (the provider is told to stop), for a
+/// name the caller waits on before making the worktree.
+pub fn generate_within(
+    text: TextModel,
+    cwd: &Path,
+    message: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (cwd, message, flag) = (cwd.to_path_buf(), message.to_owned(), cancel.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send(generate(text, &cwd, &message, flag));
+    });
+    let named = rx.recv_timeout(timeout).ok().flatten();
+    if named.is_none() {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    named
+}
+
+/// The worktree folder (and branch) slug for a generated `mc/<fragment>` name.
+pub fn generated_slug(generated: &str) -> Option<String> {
+    let fragment = generated.strip_prefix("mc/").unwrap_or(generated);
+    worktree::naming::slug(fragment).ok()
+}
+
 fn request(
     text: TextModel,
     cwd: &Path,

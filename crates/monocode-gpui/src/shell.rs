@@ -72,8 +72,11 @@ mod title_tabs;
 mod window_chrome;
 mod worktree_create;
 pub(crate) use worktree_create::SetupChoice;
+mod worktree_app;
 mod worktree_delete;
 mod worktree_dialog;
+pub(crate) use worktree_app::{AppReply, WorktreeCall};
+mod worktree_merge;
 mod worktrees;
 
 use crate::{
@@ -1632,6 +1635,17 @@ impl Shell {
             }));
         self.observations.push(cx.subscribe(
             &view,
+            |this, view, event: &crate::conversation::MergeWorktree, cx| {
+                // Merged on the next frame, which has the window the removal needs.
+                let project = view.read(cx).summary.cwd.clone();
+                this.worktree_ui
+                    .pending_merges
+                    .push((project, event.path.clone(), event.delete));
+                cx.notify();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
             move |this, _, event: &crate::conversation::OpenSessionChanges, cx| {
                 let tab = event.0.clone();
                 // The card's pane takes focus, so its review opens beside it.
@@ -2280,6 +2294,55 @@ impl Shell {
                             cx,
                         )
                     });
+                }
+            },
+        ));
+        let worktrees = panel.read(cx).worktrees.clone();
+        let store = self.store.clone();
+        worktrees.update(cx, |pane, _| pane.set_store(store));
+        self.observations.push(cx.subscribe_in(
+            &worktrees,
+            window,
+            |this, _, event: &crate::worktrees_pane::WorktreesPaneEvent, window, cx| {
+                use crate::worktrees_pane::WorktreesPaneEvent as E;
+                // The rail's project, not the checkout the panel happens to show.
+                let rail_project = this.workspace.project.clone();
+                match event {
+                    E::Open { path, .. } => {
+                        if monocode_core::files::path_key(path)
+                            == monocode_core::files::path_key(&rail_project)
+                        {
+                            this.select_worktree(None, window, cx);
+                        } else {
+                            this.select_rail_worktree(rail_project, path.clone(), window, cx);
+                        }
+                    }
+                    E::Merge {
+                        project,
+                        path,
+                        delete,
+                    } => this.merge_worktree(
+                        worktree_merge::MergeRequest {
+                            project: project.clone(),
+                            path: path.clone(),
+                            delete: *delete,
+                            force: false,
+                            done: None,
+                            caller: None,
+                        },
+                        window,
+                        cx,
+                    ),
+                    E::Delete { project, path } => {
+                        this.open_delete_worktree_dialog(project.clone(), path.clone(), window, cx)
+                    }
+                    E::Create => this.open_create_worktree_dialog(
+                        rail_project,
+                        String::new(),
+                        worktree_create::WorktreeOrigin::Rail,
+                        window,
+                        cx,
+                    ),
                 }
             },
         ));
@@ -5890,7 +5953,9 @@ impl Shell {
             .debug_selector(|| "titlebar-file-search".into())
             .flex_shrink_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| this.open_everywhere(None, None, window, cx)))
+            .on_click(
+                cx.listener(|this, _, window, cx| this.open_everywhere(None, None, window, cx)),
+            )
     }
     fn diff_stat_room(&self, cx: &App) -> f32 {
         if self.mono_active(cx) || !self.git.read(cx).available() {
@@ -5923,10 +5988,10 @@ impl Shell {
                 crate::right_panel::tabs_width(self.right_tab_count(cx)),
             )
     }
-    /// Explorer and History, and Terminal when it lives in the panel. Changes
-    /// opens from the diff stat instead.
+    /// Explorer, History and Worktrees, and Terminal when it lives in the panel.
+    /// Changes opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        2 + usize::from(self.terminal_in_panel(cx))
+        3 + usize::from(self.terminal_in_panel(cx))
             + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
@@ -9441,6 +9506,21 @@ impl Render for Shell {
         {
             self.focus_pane(id, window, cx);
             self.open_review(tab, window, cx);
+        }
+        self.run_worktree_deletes_after_turns(window, cx);
+        for (project, path, delete) in std::mem::take(&mut self.worktree_ui.pending_merges) {
+            self.merge_worktree(
+                worktree_merge::MergeRequest {
+                    project,
+                    path,
+                    delete,
+                    force: false,
+                    done: None,
+                    caller: None,
+                },
+                window,
+                cx,
+            );
         }
         // Native fullscreen transitions resize the window, which redraws it.
         self.fullscreen = window.is_fullscreen();

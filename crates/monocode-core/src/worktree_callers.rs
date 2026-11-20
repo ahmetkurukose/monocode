@@ -50,6 +50,21 @@ pub fn for_session(
     created_by: CreatedBy,
     store: &Mutex<Store>,
 ) -> Result<SessionWorktree, String> {
+    for_session_named(cwd, base_ref, prompt, None, session, created_by, store)
+}
+
+/// [`for_session`] with a name already chosen (e.g. generated from the prompt before
+/// the worktree is made, so the folder and the branch share it); `None` or an
+/// unusable name falls back to the prompt's first words.
+pub fn for_session_named(
+    cwd: &Path,
+    base_ref: Option<&str>,
+    prompt: &str,
+    name: Option<&str>,
+    session: i64,
+    created_by: CreatedBy,
+    store: &Mutex<Store>,
+) -> Result<SessionWorktree, String> {
     if crate::files::remote::is_remote(cwd) {
         return git::create_worktree(cwd, base_ref.unwrap_or("HEAD"), session).map(|path| {
             SessionWorktree {
@@ -61,7 +76,12 @@ pub fn for_session(
     let request = CreateRequest {
         base: base_for(created_by, base_ref),
         created_by,
-        ..CreateRequest::new(cwd, &worktree::naming::from_prompt(prompt))
+        ..CreateRequest::new(
+            cwd,
+            &name
+                .and_then(|n| worktree::naming::slug(n).ok())
+                .unwrap_or_else(|| worktree::naming::from_prompt(prompt)),
+        )
     };
     worktree::create::create(&request, store, &|_| {}).map(|created| SessionWorktree {
         path: created.path,
@@ -215,6 +235,38 @@ mod tests {
             .unwrap()
             .trim()
             .to_owned()
+    }
+
+    #[test]
+    fn a_session_worktree_named_beforehand_shares_the_name_with_its_branch() {
+        let (temp, main) = repo();
+        let root = temp.path().canonicalize().unwrap().join("workspaces");
+        let store = store(&root);
+        let made = for_session_named(
+            &main,
+            None,
+            "bu projedeki tab yönetme biçiminden hoşlanmıyorum",
+            Some("worktree-experience-audit"),
+            1,
+            CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        assert!(made.path.ends_with("worktree-experience-audit"));
+        let branch = git::git(&made.path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "worktree-experience-audit");
+        // An unusable name falls back to the prompt.
+        let made = for_session_named(
+            &main,
+            None,
+            "fix the build",
+            Some("..."),
+            2,
+            CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        assert!(made.path.ends_with("fix-the-build"));
     }
 
     #[test]

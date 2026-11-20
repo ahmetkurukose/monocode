@@ -119,6 +119,7 @@ mod window_state;
 mod workspace;
 mod worktree_dialog;
 mod worktree_switcher;
+mod worktrees_pane;
 
 use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};

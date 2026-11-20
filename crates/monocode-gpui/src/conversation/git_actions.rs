@@ -23,6 +23,10 @@ pub(super) fn restored_session_edits(
     Ok(paths)
 }
 
+/// The pill menu's Merge to <base>, and Merge & delete worktree.
+const MERGE_ID: &str = "git-action:merge";
+const MERGE_DELETE_ID: &str = "git-action:merge-delete";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GitAction {
     Stage,
@@ -173,39 +177,82 @@ impl Conversation {
         if !self.history_loaded() || self.busy || self.is_remote() || self.settings.mono.is_some() {
             return;
         }
-        if self.session_edits.is_empty() || self.settings.worktree_removed {
-            if self.session_git.uncommitted() || self.session_unpushed {
+        // A session in a worktree (not the project's own checkout) may merge it back.
+        let in_worktree = !self.settings.worktree_removed
+            && self.settings.worktree_cwd.as_deref().is_some_and(|w| {
+                monocode_core::files::path_key(w)
+                    != monocode_core::files::path_key(&self.summary.cwd)
+            });
+        let edits = !self.session_edits.is_empty() && !self.settings.worktree_removed;
+        if !edits && !in_worktree {
+            if self.session_git.uncommitted()
+                || self.session_unpushed
+                || self.worktree_merge.is_some()
+            {
                 self.session_git = Default::default();
                 self.session_unpushed = false;
+                self.worktree_merge = None;
                 cx.notify();
             }
             return;
         }
         let cwd = self.execution_cwd().to_owned();
         let work_cwd = cwd.clone();
-        let paths = self.session_edits.clone();
+        let paths = edits.then(|| self.session_edits.clone());
         let commit =
             crate::transcript::git_turns::latest_commit(self.transcript.read(cx).source_rows());
         let work = cx.background_executor().spawn(async move {
             let cwd = Path::new(&work_cwd);
-            let changes = monocode_core::git::session_changes(cwd, &paths);
-            let unpushed = commit.is_some_and(|commit| monocode_core::git::unpushed(cwd, &commit));
-            (changes, unpushed)
+            let (changes, unpushed) = match paths {
+                Some(paths) => (
+                    monocode_core::git::session_changes(cwd, &paths),
+                    commit.is_some_and(|commit| monocode_core::git::unpushed(cwd, &commit)),
+                ),
+                None => Default::default(),
+            };
+            let merge = in_worktree
+                .then(|| monocode_core::worktree::merge::status(cwd).ok())
+                .flatten();
+            (changes, unpushed, merge)
         });
         cx.spawn(async move |this, cx| {
-            let (changes, unpushed) = work.await;
+            let (changes, unpushed, merge) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if this.session_edits_generation == generation
                     && this.execution_cwd() == cwd
-                    && (this.session_git, this.session_unpushed) != (changes, unpushed)
+                    && (
+                        &this.session_git,
+                        this.session_unpushed,
+                        &this.worktree_merge,
+                    ) != (&changes, unpushed, &merge)
                 {
                     this.session_git = changes;
                     this.session_unpushed = unpushed;
+                    this.worktree_merge = merge;
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+    /// The base this session's worktree can be merged into now: it has commits the
+    /// base lacks, and nothing uncommitted (only commits are merged).
+    fn merge_offer(&self) -> Option<&str> {
+        let status = self.worktree_merge.as_ref()?;
+        (status.can_merge() && !self.session_git.uncommitted())
+            .then_some(status.base.as_deref())
+            .flatten()
+    }
+    fn merge_worktree(&mut self, delete: bool, cx: &mut Context<Self>) {
+        if self.merge_offer().is_none() || !self.git_actions_ready() {
+            return;
+        }
+        let Some(path) = self.settings.worktree_cwd.clone() else {
+            return;
+        };
+        cx.emit(MergeWorktree { path, delete });
+        self.menu = None;
+        cx.notify();
     }
     /// The next steps for the session's work, the pill's default first:
     /// unstaged work offers every action, staged work skips Stage, and a
@@ -236,7 +283,8 @@ impl Conversation {
     /// turns without edits leave the pill available until the work is pushed
     /// or the files are clean.
     fn git_actions_shown(&self) -> bool {
-        (self.session_git.uncommitted() || self.session_unpushed) && self.git_actions_ready()
+        (self.session_git.uncommitted() || self.session_unpushed || self.merge_offer().is_some())
+            && self.git_actions_ready()
     }
     /// Everything the pill needs except work to act on: `/stage` and
     /// `/commit` may still ask, and the agent says when it changed nothing.
@@ -253,7 +301,7 @@ impl Conversation {
     pub(super) fn git_action_menu_items(&self, cx: &gpui::App) -> Vec<MenuItem> {
         let offers = self.git_offers(cx);
         let current = offers.first().copied();
-        offers
+        let mut items: Vec<MenuItem> = offers
             .into_iter()
             .map(|action| {
                 MenuAction::new(
@@ -265,10 +313,38 @@ impl Conversation {
                 .checked(Some(action) == current)
                 .into()
             })
-            .collect()
+            .collect();
+        if let Some(base) = self.merge_offer() {
+            let commits = self.worktree_merge.as_ref().map_or(0, |s| s.ahead);
+            let commits = format!(
+                "{commits} {}",
+                if commits == 1 { "commit" } else { "commits" }
+            );
+            items.push(
+                MenuAction::new(SharedString::from(MERGE_ID), format!("Merge to {base}"))
+                    .icon("git-merge")
+                    .description(format!("Bring this worktree's {commits} into {base}"))
+                    .checked(current.is_none())
+                    .into(),
+            );
+            items.push(
+                MenuAction::new(
+                    SharedString::from(MERGE_DELETE_ID),
+                    format!("Merge to {base} & delete worktree"),
+                )
+                .icon("trash")
+                .description(format!("Merge, then delete it; this chat moves to {base}"))
+                .into(),
+            );
+        }
+        items
     }
     /// A menu pick: `true` when `id` was one of the pill's actions.
     pub(super) fn git_action_choice(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if id == MERGE_ID || id == MERGE_DELETE_ID {
+            self.merge_worktree(id == MERGE_DELETE_ID, cx);
+            return true;
+        }
         let Some(action) = id.strip_prefix("git-action:").and_then(GitAction::from_id) else {
             return false;
         };
@@ -340,8 +416,13 @@ impl Conversation {
             return None;
         }
         let offers = self.git_offers(cx);
-        let current = *offers.first()?;
-        let has_menu = offers.len() > 1;
+        let merge = self.merge_offer().map(str::to_owned);
+        // Git work first; once committed (and pushed), merging is what is left.
+        let current = offers.first().copied();
+        if current.is_none() && merge.is_none() {
+            return None;
+        }
+        let has_menu = offers.len() + if merge.is_some() { 2 } else { 0 } > 1;
         let menu_open = self.menu_is(ComposerMenu::GitActions);
         let segment = |id: &'static str| {
             div()
@@ -356,14 +437,28 @@ impl Conversation {
                 .hover(|s| s.bg(content(0.06)).text_color(content(1.)))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };
+        let (label, aria, icon_path): (SharedString, SharedString, &'static str) = match current {
+            Some(action) => (
+                action.label().into(),
+                action.message().into(),
+                action.icon(),
+            ),
+            None => {
+                let label: SharedString = format!("Merge to {}", merge.unwrap_or_default()).into();
+                (label.clone(), label, "git-merge")
+            }
+        };
         let main = segment("git-action-run")
-            .aria_label(SharedString::from(current.message()))
+            .aria_label(aria)
             .pl(px(10.))
             .pr(px(if has_menu { 8. } else { 10. }))
             .gap(px(6.))
-            .child(icon(current.icon(), 14.).text_color(content(0.55)))
-            .child(div().text_size(px(12.)).child(current.label()))
-            .on_click(cx.listener(move |this, _, _, cx| this.run_git_action(current, cx)));
+            .child(icon(icon_path, 14.).text_color(content(0.55)))
+            .child(div().text_size(px(12.)).child(label))
+            .on_click(cx.listener(move |this, _, _, cx| match current {
+                Some(action) => this.run_git_action(action, cx),
+                None => this.merge_worktree(false, cx),
+            }));
         let chevron = segment("git-action-menu")
             .aria_label("Git actions")
             .aria_expanded(menu_open)
@@ -472,6 +567,119 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[gpui::test]
+    fn a_worktree_chat_offers_merging_into_its_base_once_its_work_is_committed(
+        cx: &mut TestAppContext,
+    ) {
+        let repo = Repo::new();
+        let workspaces = std::env::temp_dir().join(format!(
+            "monocode-pill-merge-{}",
+            monocode_core::mono::new_id()
+        ));
+        let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+        monocode_core::worktree::meta::save_prefs(
+            &store.lock().unwrap(),
+            &monocode_core::worktree::Prefs {
+                root: Some(workspaces.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tree = monocode_core::worktree_callers::named(
+            &repo.0,
+            "pill-feature",
+            None,
+            false,
+            monocode_core::worktree::CreatedBy::Dialog,
+            &store,
+        )
+        .unwrap();
+        let wt = Repo(std::path::PathBuf::from(&tree.path));
+        std::fs::write(wt.0.join("feature.rs"), "feature\n").unwrap();
+        wt.git(&["add", "feature.rs"]);
+        wt.git(&["commit", "-m", "Feature"]);
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&repo.0)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let summary = {
+            let db = store.lock().unwrap();
+            let mut summary = db.create("codex", &repo.cwd()).unwrap();
+            summary.provider = "fixture".into();
+            summary.has_messages = true;
+            db.save_agent_settings(
+                summary.id,
+                &monocode_core::agent::Settings {
+                    worktree_cwd: Some(tree.path.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            summary
+        };
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let window = cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut view = Conversation::new(summary, store.clone(), cx);
+                    view.load(cx);
+                    view
+                })
+            })
+            .unwrap()
+        });
+        let seen = asked.clone();
+        let _events = window
+            .update(cx, |_, _, cx| {
+                cx.subscribe(&cx.entity(), move |_, _, e: &MergeWorktree, _| {
+                    seen.borrow_mut().push((e.path.clone(), e.delete))
+                })
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let refresh = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |view, _, cx| view.refresh_git_actions(cx))
+                .unwrap();
+            visual.run_until_parked();
+        };
+        refresh(visual);
+        assert!(
+            visual.debug_bounds("git-actions").is_some(),
+            "the pill shows"
+        );
+        window
+            .update(visual, |view, _, cx| {
+                assert_eq!(view.merge_offer(), Some(base.as_str()));
+                assert_eq!(
+                    view.git_action_menu_items(cx).len(),
+                    2,
+                    "Merge, Merge & delete"
+                );
+                assert!(view.git_action_choice(MERGE_DELETE_ID, cx));
+            })
+            .unwrap();
+        assert_eq!(*asked.borrow(), [(tree.path.clone(), true)]);
+        // Uncommitted work is not merged: no offer until it is committed.
+        std::fs::write(wt.0.join("feature.rs"), "changed\n").unwrap();
+        refresh(visual);
+        window
+            .update(visual, |view, _, _| assert_eq!(view.merge_offer(), None))
+            .unwrap();
+        assert!(visual.debug_bounds("git-actions").is_none());
+        drop(wt);
+        let _ = std::fs::remove_dir_all(&workspaces);
     }
 
     #[gpui::test]
