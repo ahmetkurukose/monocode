@@ -1,9 +1,7 @@
 use super::*;
 use crate::{
     project_background::ProjectBackground,
-    project_settings::{
-        AppearanceControls, BackgroundDialog, Event, project_icon,
-    },
+    project_settings::{AppearanceControls, BackgroundDialog, Event, project_icon},
     project_theme::ThemeDialog,
 };
 use monocode_core::project_appearance::ProjectAppearance;

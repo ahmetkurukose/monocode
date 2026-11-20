@@ -116,16 +116,15 @@ pub(crate) fn schedule_work(delay_ms: i64) {
 fn fire_in(delay: Duration) {
     let timer = TIMER.load(Ordering::Acquire);
     if !timer.is_null() {
-        unsafe { CFRunLoopTimerSetNextFireDate(timer, CFAbsoluteTimeGetCurrent() + delay.as_secs_f64()) };
+        unsafe {
+            CFRunLoopTimerSetNextFireDate(timer, CFAbsoluteTimeGetCurrent() + delay.as_secs_f64())
+        };
     }
 }
 
 /// Main thread: bring the timer forward to the requested deadline.
 extern "C" fn on_signal(_info: *const c_void) {
-    let deadline = REQUESTED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    let deadline = REQUESTED.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(deadline) = deadline {
         fire_in(deadline.saturating_duration_since(Instant::now()));
     }

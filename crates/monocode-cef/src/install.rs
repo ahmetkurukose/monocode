@@ -121,7 +121,10 @@ impl InstalledRuntime {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Progress {
     /// Bytes so far out of the archive's size.
-    Downloading { done: u64, total: u64 },
+    Downloading {
+        done: u64,
+        total: u64,
+    },
     Verifying,
     Extracting,
 }
@@ -326,7 +329,10 @@ fn download(
 fn verify(archive: &Archive, part: &Path) -> Result<()> {
     let len = fs::metadata(part)?.len();
     if len != archive.size {
-        return Err(Error::Corrupt(format!("{len} bytes, expected {}", archive.size)));
+        return Err(Error::Corrupt(format!(
+            "{len} bytes, expected {}",
+            archive.size
+        )));
     }
     let digest = sha1_file(part)?;
     if digest != archive.sha1 {
@@ -460,7 +466,11 @@ mod tests {
     #[test]
     fn pinned_archive_matches_the_version() {
         if let Some(archive) = pinned() {
-            assert!(archive.file.starts_with(&format!("cef_binary_{CEF_VERSION}_")));
+            assert!(
+                archive
+                    .file
+                    .starts_with(&format!("cef_binary_{CEF_VERSION}_"))
+            );
             assert!(archive.file.ends_with("_minimal.tar.bz2"));
             assert_eq!(archive.sha1.len(), 40);
         }
@@ -482,8 +492,9 @@ mod tests {
     #[test]
     fn keeps_only_runtime_files() {
         let top = "cef_binary_x_minimal";
-        let keep_framework =
-            destination(Path::new(&format!("{top}/Release/Chromium Embedded Framework.framework/Resources/icudtl.dat")));
+        let keep_framework = destination(Path::new(&format!(
+            "{top}/Release/Chromium Embedded Framework.framework/Resources/icudtl.dat"
+        )));
         let header = destination(Path::new(&format!("{top}/include/cef_app.h")));
         let wrapper = destination(Path::new(&format!("{top}/libcef_dll/wrapper.cc")));
         assert_eq!(header, None);
@@ -491,9 +502,14 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(
                 keep_framework,
-                Some(PathBuf::from("Chromium Embedded Framework.framework/Resources/icudtl.dat"))
+                Some(PathBuf::from(
+                    "Chromium Embedded Framework.framework/Resources/icudtl.dat"
+                ))
             );
-            assert_eq!(destination(Path::new(&format!("{top}/Release/cef_sandbox.a"))), None);
+            assert_eq!(
+                destination(Path::new(&format!("{top}/Release/cef_sandbox.a"))),
+                None
+            );
         } else {
             assert_eq!(
                 destination(Path::new(&format!("{top}/Resources/locales/en-US.pak"))),

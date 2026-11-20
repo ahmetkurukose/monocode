@@ -138,8 +138,13 @@ jobs:
       - name: Install Rosetta to run the Intel build while packaging
         if: matrix.target == 'x86_64-apple-darwin'
         run: /usr/sbin/softwareupdate --install-rosetta --agree-to-license || arch -x86_64 /usr/bin/true
+      # cef-dll-sys builds Chromium's C++ wrapper with CMake and Ninja.
+      - name: Install Ninja for the Chromium wrapper
+        if: runner.os == 'macOS'
+        run: command -v ninja || brew install ninja
+      # On macOS the bundle carries Chromium's helper processes beside the app.
       - name: Build optimized native app
-        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui --target ${{ matrix.target }} --release
+        run: cargo build --locked --manifest-path crates/monocode-gpui/Cargo.toml -p monocode-gpui ${{ runner.os == 'macOS' && '-p monocode-cef --bin monocode-gpui --bin monocode-cef-helper' || '' }} --target ${{ matrix.target }} --release
       - name: Use TCP for Mac notarization
         if: runner.os == 'macOS'
         run: |

@@ -161,6 +161,9 @@ test("macOS bundles automatically and preserves the selected data mode for Finde
     await t.test(`${mode}: ${JSON.stringify(args)}`, async (t) => {
       const f = await fixture(t, {}, { platform: "darwin", args });
       await f.until((events) => f.starts(events) === 1);
+      const build = f.calls.find((call) => call.args[0] === "build");
+      // The bundle needs Chromium's helper next to the app.
+      assert.deepEqual(build.args, ["build", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "-p", "monocode-gpui", "--bin", "monocode-gpui", "-p", "monocode-cef", "--bin", "monocode-cef-helper", "--profile", "native-dev"]);
       const packaged = f.calls.find((call) => call.command === "bash");
       assert.deepEqual(packaged.args, ["scripts/bundle-native-macos.sh", "native-dev", join(f.root, "custom-target"), "0.15.0", mode]);
       const app = f.calls.find((call) => !["cargo", "bash"].includes(call.command));

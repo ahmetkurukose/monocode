@@ -1435,10 +1435,9 @@ mod tests {
         let icons = at(visual, format!("rail-app-icons-{ix}")).unwrap();
         let shown = window
             .update(visual, |shell, _, _| {
-                (PROJECT_APPS.iter())
-                    .filter(|(app, _, _)| shell.workspace.preferences.project_app_shown(app))
+                (PROJECT_APPS.iter().rev())
+                    .find(|(app, _, _)| shell.workspace.preferences.project_app_shown(app))
                     .map(|(app, _, _)| *app)
-                    .last()
             })
             .unwrap()
             .expect("an app icon is shown");

@@ -1,8 +1,9 @@
 [package]
+workspace = "../monocode-gpui"
 name = "monocode-cef"
-version = "0.16.0"
+version.workspace = true
 edition = "2024"
-license = "MIT"
+license.workspace = true
 publish = false
 description = "Monocode's Chromium engine: CEF runtime install, initialization, message pump and native browser views. Independent of GPUI."
 
@@ -35,5 +36,3 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 [dev-dependencies]
 tempfile = "3"
 
-# Built on its own until it joins the native workspace.
-[workspace]

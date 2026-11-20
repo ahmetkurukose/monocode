@@ -60,7 +60,9 @@ impl std::fmt::Display for StartError {
             StartError::NotMainThread => write!(f, "Chromium must start on the main thread"),
             StartError::Unsupported => write!(f, "Chromium is not supported on this platform yet"),
             StartError::LibraryLoad(p) => write!(f, "could not load Chromium from {}", p.display()),
-            StartError::NsApp(e) => write!(f, "could not prepare the application for Chromium: {e}"),
+            StartError::NsApp(e) => {
+                write!(f, "could not prepare the application for Chromium: {e}")
+            }
             StartError::Initialize => write!(f, "Chromium failed to initialize"),
         }
     }
@@ -204,7 +206,13 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
         mock_keychain: config.mock_keychain,
     });
     let args = cef::args::Args::new();
-    if cef::initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()) != 1 {
+    if cef::initialize(
+        Some(args.as_main_args()),
+        Some(&settings),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    ) != 1
+    {
         return Err(StartError::Initialize);
     }
     crate::mac::pump::install();

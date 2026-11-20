@@ -983,8 +983,7 @@ impl Workspace {
     }
     /// A file or terminal pane standing in for its owner session.
     pub fn is_detached_pane(&self, id: i64) -> bool {
-        self.review_owners.contains_key(&id)
-            || self.terminal_panes.contains_key(&id)
+        self.review_owners.contains_key(&id) || self.terminal_panes.contains_key(&id)
     }
     /// File, Mono and terminal panes share the negative IDs below every
     /// session.

@@ -72,6 +72,9 @@ monocode-core = { path = "../monocode-core", features = ["test-support"] }
 
 # The vendored renderer's backdrop-blur marker for frosted popovers.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The browser's Chromium engine (docs/native/browser/context.md). macOS first;
+# Windows and Linux follow in phase 6.
+monocode-cef = { path = "../monocode-cef" }
 gpui_apple = { package = "gpui-pre-apple", version = "=0.3.9" }
 # Only named so that the self-test can turn on the window's render-to-image.
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.9", optional = true, features = ["test-support"] }
@@ -94,7 +97,7 @@ parking_lot = "0.12"
 # Experimental native builds resolve separately from the production Tauri app.
 [workspace]
 resolver = "2"
-members = [".", "../monocode-core"]
+members = [".", "../monocode-core", "../monocode-cef"]
 
 [workspace.package]
 version = "0.16.0"
