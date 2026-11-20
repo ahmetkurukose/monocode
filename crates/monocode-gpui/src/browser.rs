@@ -11,19 +11,21 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
 };
 
 use gpui::{
-    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, Pixels,
-    Subscription, Window, WindowId, canvas, div, prelude::*, px,
+    AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
+    KeyDownEvent, Pixels, Subscription, Window, WindowId, canvas, div, prelude::*, px,
 };
 
 use crate::{
     input::{self, Input},
-    theme::{content, icon, icon_button_enabled},
+    modal,
+    popover::{Align, Anchor, AnchorSlot, popover},
+    theme::{content, icon, icon_button, icon_button_enabled},
 };
 
 /// Whether Chromium runs, shared by every window.
@@ -213,6 +215,31 @@ pub(crate) fn page_title(url: &str, title: &str) -> String {
 /// A page's address or title changed; the pane saves them.
 pub(crate) struct PageChanged;
 
+/// The profile a page browses with; Chromium's own type, or its stand-in
+/// where Chromium is not available yet.
+pub(crate) type Profile = monocode_cef::Profile;
+
+/// What a page asks of the pane around it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PageRequest {
+    /// A new page beside this one (a popup, `target=_blank`, a middle
+    /// click). `popup` is a created popup the new page adopts
+    /// ([`BrowserPage::adopt_popup`]); without it the page loads `url`.
+    Open {
+        url: String,
+        foreground: bool,
+        popup: Option<u64>,
+    },
+    /// The page closed itself (`window.close()`).
+    Close,
+}
+
+/// Something the page waits on the user for, shown as a modal over it.
+enum PagePrompt {
+    Auth(monocode_cef::AuthRequest),
+    Dialog(monocode_cef::JsDialog),
+}
+
 /// One browser page in a pane: its toolbar, and the Chromium view below.
 pub(crate) struct BrowserPage {
     pub url: String,
@@ -228,9 +255,22 @@ pub(crate) struct BrowserPage {
     host: Rc<Host>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    // Downloads and the dialogs the page asks for.
+    downloads: Vec<monocode_cef::Download>,
+    downloads_open: bool,
+    downloads_anchor: AnchorSlot,
+    /// The first one shows; the rest wait their turn.
+    prompts: VecDeque<PagePrompt>,
+    /// The shown prompt's fields: user name and password, or a prompt's text.
+    prompt_fields: Vec<Entity<Input>>,
+    prompt_focus: FocusHandle,
+    /// The shown prompt takes the keyboard on the next frame.
+    focus_prompt: bool,
+    _prompt_subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
+impl EventEmitter<PageRequest> for BrowserPage {}
 
 impl Focusable for BrowserPage {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -275,6 +315,14 @@ impl BrowserPage {
             host: Rc::new(Host::default()),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
+            downloads: Vec::new(),
+            downloads_open: false,
+            downloads_anchor: AnchorSlot::default(),
+            prompts: VecDeque::new(),
+            prompt_fields: Vec::new(),
+            prompt_focus: cx.focus_handle(),
+            focus_prompt: false,
+            _prompt_subscriptions: Vec::new(),
         }
     }
 
@@ -334,11 +382,8 @@ impl BrowserPage {
             BrowserEvent::LoadFailed { url, text, .. } => {
                 self.failure = Some(format!("{url} could not be loaded: {text}"));
             }
-            // New windows open in this page until pages have tabs (phase 1).
-            BrowserEvent::PopupRequested { url, .. } => {
-                self.host.with_view(|view| view.load_url(&url));
-            }
             BrowserEvent::Closed => {}
+            other => self.on_page_event(other, cx),
         }
         cx.notify();
     }
@@ -396,6 +441,7 @@ impl BrowserPage {
                     .bg(content(0.05))
                     .child(self.address.clone()),
             )
+            .children(self.downloads_button(cx))
     }
 
     /// Instead of the page while Chromium is not running yet.
@@ -476,10 +522,11 @@ impl BrowserPage {
 }
 
 impl Render for BrowserPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.engine.read(cx).state == EngineState::Idle {
             self.start_engine(cx);
         }
+        self.focus_prompt_now(window, cx);
         let body = match self.status(cx) {
             Some(status) => status,
             None => self.surface(cx),
@@ -512,6 +559,572 @@ impl Render for BrowserPage {
                 )
             })
             .child(div().flex_1().min_h_0().min_w_0().child(body))
+            .relative()
+            .children(self.downloads_popover(cx))
+            .children(self.prompt_overlay(cx))
+    }
+}
+
+// ---- Popups, downloads, dialogs and profiles ----
+
+/// A size for people: `512 B`, `3.4 MB`.
+pub(crate) fn human_bytes(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    let units = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000. {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes / 1000.;
+    let mut unit = 0;
+    while value >= 1000. && unit + 1 < units.len() {
+        value /= 1000.;
+        unit += 1;
+    }
+    if value < 10. {
+        format!("{value:.1} {}", units[unit])
+    } else {
+        format!("{value:.0} {}", units[unit])
+    }
+}
+
+/// A download's line under its name.
+pub(crate) fn download_status(download: &monocode_cef::Download) -> String {
+    use monocode_cef::DownloadState;
+    match download.state {
+        DownloadState::InProgress => match download.total {
+            Some(total) => format!(
+                "{} of {}",
+                human_bytes(download.received),
+                human_bytes(total)
+            ),
+            None => human_bytes(download.received),
+        },
+        DownloadState::Complete => match download.total {
+            Some(total) => human_bytes(total),
+            None => human_bytes(download.received),
+        },
+        DownloadState::Canceled => "Canceled".into(),
+        DownloadState::Failed => "Failed".into(),
+    }
+}
+
+/// A host for a dialog's title: `example.com says`.
+fn origin_host(origin: &str) -> String {
+    let rest = origin.split("://").nth(1).unwrap_or(origin);
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+impl BrowserPage {
+    /// The events beyond the toolbar's: new pages, downloads and dialogs.
+    fn on_page_event(&mut self, event: monocode_cef::BrowserEvent, cx: &mut Context<Self>) {
+        use monocode_cef::BrowserEvent;
+        match event {
+            BrowserEvent::PopupRequested {
+                url, foreground, ..
+            } => cx.emit(PageRequest::Open {
+                url,
+                foreground,
+                popup: None,
+            }),
+            BrowserEvent::PopupOpened {
+                id,
+                url,
+                foreground,
+            } => cx.emit(PageRequest::Open {
+                url,
+                foreground,
+                popup: Some(id),
+            }),
+            BrowserEvent::CloseRequested => cx.emit(PageRequest::Close),
+            BrowserEvent::Download(download) => {
+                // The toolbar's indicator shows it; opening the list on its
+                // own would hide the page, which no overlay may cover.
+                match self.downloads.iter_mut().find(|d| d.id == download.id) {
+                    Some(known) => *known = download,
+                    None => self.downloads.push(download),
+                }
+            }
+            BrowserEvent::Auth(request) => self.push_prompt(PagePrompt::Auth(request), cx),
+            BrowserEvent::Dialog(dialog) => self.push_prompt(PagePrompt::Dialog(dialog), cx),
+            BrowserEvent::DialogsReset => {
+                let shown = matches!(self.prompts.front(), Some(PagePrompt::Dialog(_)));
+                self.prompts.retain(|p| matches!(p, PagePrompt::Auth(_)));
+                if shown {
+                    self.show_prompt(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The profile the page browses with. A page that exists already opens
+    /// again in the new profile, at the same address.
+    pub(crate) fn set_profile(&mut self, profile: monocode_cef::Profile, cx: &mut Context<Self>) {
+        if self.host.options.borrow().profile == profile {
+            return;
+        }
+        if self.host.view.borrow().is_some() {
+            self.host = Rc::new(Host::default());
+            cx.notify();
+        }
+        self.host.options.borrow_mut().profile = profile;
+    }
+
+    /// Takes over a popup this page's opener created (crate::popup in
+    /// monocode-cef), so that it keeps `window.opener`. False when it is gone;
+    /// the page then loads its address afresh.
+    pub(crate) fn adopt_popup(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2::{MainThreadMarker, MainThreadOnly, msg_send, rc::Retained};
+            use objc2_app_kit::NSView;
+            use objc2_foundation::NSRect;
+
+            if self.host.view.borrow().is_some() {
+                return false;
+            }
+            let Some(mtm) = MainThreadMarker::new() else {
+                return false;
+            };
+            let Some((view, events)) = monocode_cef::take_popup(id) else {
+                return false;
+            };
+            let clip: Retained<mac::BrowserClip> = unsafe {
+                let clip = mac::BrowserClip::alloc(mtm).set_ivars(());
+                msg_send![super(clip), initWithFrame: NSRect::ZERO]
+            };
+            let clip: Retained<NSView> = Retained::into_super(clip);
+            clip.setWantsLayer(true);
+            clip.setClipsToBounds(true);
+            view.reparent(Retained::as_ptr(&clip) as *mut std::ffi::c_void);
+            // Hidden until its tab paints it.
+            view.set_visible(false);
+            *self.host.view.borrow_mut() = Some(Hosted { clip, view });
+            let page = cx.weak_entity();
+            cx.spawn(async move |_, cx| {
+                while let Ok(event) = events.recv().await {
+                    if page
+                        .update(cx, |page, cx| page.on_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (id, cx);
+            false
+        }
+    }
+
+    fn downloads_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_cef::DownloadState;
+        if self.downloads.is_empty() {
+            return None;
+        }
+        // Overall progress of what is still coming, when sizes are known.
+        let active: Vec<_> = self
+            .downloads
+            .iter()
+            .filter(|d| d.state == DownloadState::InProgress)
+            .collect();
+        let progress = (!active.is_empty()).then(|| {
+            let fractions: Vec<f64> = active.iter().filter_map(|d| d.fraction()).collect();
+            if fractions.is_empty() {
+                0.
+            } else {
+                fractions.iter().sum::<f64>() / fractions.len() as f64
+            }
+        });
+        Some(
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(self.downloads_anchor.probe())
+                .child(
+                    icon_button("browser-downloads", "Downloads", "arrow-down-circle").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.downloads_open = !this.downloads_open;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .when_some(progress, |d, progress| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .bottom(px(1.))
+                            .left(px(5.))
+                            .right(px(5.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(content(0.12))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .w(gpui::relative(progress.clamp(0.08, 1.) as f32))
+                                    .bg(crate::theme::accent_color()),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn downloads_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.downloads_open || self.downloads.is_empty() {
+            return None;
+        }
+        let weak = cx.weak_entity();
+        let rows: Vec<AnyElement> = self
+            .downloads
+            .iter()
+            .rev()
+            .map(|download| self.download_row(download, cx))
+            .collect();
+        Some(
+            popover(
+                "browser-downloads-popover",
+                Anchor::Slot(self.downloads_anchor.clone()),
+            )
+            .align(Align::End)
+            .width(320.)
+            .max_height(360.)
+            .padding(6.)
+            .on_dismiss(move |_, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.downloads_open = false;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .id("browser-downloads-list")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn download_row(
+        &self,
+        download: &monocode_cef::Download,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use monocode_cef::DownloadState;
+        let id = download.id;
+        let running = download.state == DownloadState::InProgress;
+        let path = download.path.clone();
+        div()
+            .id(("browser-download", id as usize))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .hover(|s| s.bg(content(0.05)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(content(
+                                if download.state == DownloadState::Complete || running {
+                                    0.9
+                                } else {
+                                    0.5
+                                },
+                            ))
+                            .child(download.name()),
+                    )
+                    .when(running, |d| {
+                        d.child(
+                            div()
+                                .h(px(3.))
+                                .w_full()
+                                .rounded_full()
+                                .bg(content(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_full()
+                                        .w(gpui::relative(
+                                            download.fraction().unwrap_or(0.).clamp(0.03, 1.)
+                                                as f32,
+                                        ))
+                                        .bg(crate::theme::accent_color()),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.45))
+                            .child(download_status(download)),
+                    ),
+            )
+            .when(download.state != DownloadState::Canceled, |d| {
+                d.child(
+                    icon_button("browser-download-reveal", "Show in Finder", "folder-open")
+                        .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                )
+            })
+            .when(running, |d| {
+                d.child(
+                    icon_button("browser-download-cancel", "Cancel download", "x")
+                        .on_click(cx.listener(move |_, _, _, _| monocode_cef::cancel_download(id))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn push_prompt(&mut self, prompt: PagePrompt, cx: &mut Context<Self>) {
+        self.prompts.push_back(prompt);
+        if self.prompts.len() == 1 {
+            self.show_prompt(cx);
+        }
+    }
+
+    /// Makes the fields of the prompt in front, and gives it the keyboard.
+    fn show_prompt(&mut self, cx: &mut Context<Self>) {
+        let field = |label: &str, cx: &mut Context<Self>| {
+            let label = label.to_owned();
+            cx.new(|cx| {
+                let mut input = Input::field(label.clone(), label, content(0.35), cx);
+                input.set_font_size(13.);
+                input
+            })
+        };
+        let fields = match self.prompts.front() {
+            Some(PagePrompt::Auth(_)) => {
+                let user = field("User name", cx);
+                let password = field("Password", cx);
+                password.update(cx, |input, _| input.set_secret(true));
+                vec![user, password]
+            }
+            Some(PagePrompt::Dialog(dialog)) => match &dialog.kind {
+                monocode_cef::DialogKind::Prompt(text) => {
+                    let input = field("Answer", cx);
+                    let text = text.clone();
+                    input.update(cx, |input, cx| input.set_text(text, cx));
+                    vec![input]
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        self._prompt_subscriptions = fields
+            .iter()
+            .map(|field| {
+                cx.subscribe(field, |this, _, _: &input::Submitted, cx| {
+                    this.answer_prompt(true, cx)
+                })
+            })
+            .collect();
+        self.prompt_fields = fields;
+        self.focus_prompt = !self.prompts.is_empty();
+        if self.prompts.is_empty() {
+            // The page takes the keyboard back on the next click into it.
+            self.host.with_view(|view| view.set_focus(true));
+        }
+        cx.notify();
+    }
+
+    fn focus_prompt_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_prompt) {
+            return;
+        }
+        self.host.with_view(|view| view.set_focus(false));
+        match self.prompt_fields.first() {
+            Some(field) => window.focus(&field.focus_handle(cx), cx),
+            None => window.focus(&self.prompt_focus, cx),
+        }
+    }
+
+    /// Answers the prompt in front: OK / Sign In, or Cancel.
+    fn answer_prompt(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompts.pop_front() else {
+            return;
+        };
+        let text = |ix: usize, cx: &Context<Self>| {
+            self.prompt_fields
+                .get(ix)
+                .map(|f| f.read(cx).content.to_string())
+                .unwrap_or_default()
+        };
+        match &prompt {
+            PagePrompt::Auth(request) if accept => {
+                request.sign_in(text(0, cx).trim(), &text(1, cx));
+            }
+            PagePrompt::Auth(request) => request.cancel(),
+            PagePrompt::Dialog(dialog) if accept => {
+                let answer =
+                    matches!(dialog.kind, monocode_cef::DialogKind::Prompt(_)).then(|| text(0, cx));
+                dialog.accept(answer.as_deref());
+            }
+            PagePrompt::Dialog(dialog) => dialog.decline(),
+        }
+        self.show_prompt(cx);
+    }
+
+    fn prompt_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_cef::DialogKind;
+        let prompt = self.prompts.front()?;
+        let (title, detail, accept, cancel) = match prompt {
+            PagePrompt::Auth(request) => {
+                let c = &request.challenge;
+                let place = if c.port == 0 || c.port == 80 || c.port == 443 {
+                    c.host.clone()
+                } else {
+                    format!("{}:{}", c.host, c.port)
+                };
+                let what = if c.proxy { "The proxy" } else { "The site" };
+                let mut detail = format!("{what} {place} asks for a user name and password.");
+                if !c.realm.is_empty() {
+                    detail.push_str(&format!(" It says: “{}”", c.realm));
+                }
+                (
+                    format!("Sign in to {}", c.host),
+                    detail,
+                    "Sign In",
+                    Some("Cancel"),
+                )
+            }
+            PagePrompt::Dialog(dialog) => {
+                let says = match origin_host(&dialog.origin) {
+                    host if host.is_empty() => "This page says".to_owned(),
+                    host => format!("{host} says"),
+                };
+                match &dialog.kind {
+                    DialogKind::Alert => (says, dialog.message.clone(), "OK", None),
+                    DialogKind::Confirm | DialogKind::Prompt(_) => {
+                        (says, dialog.message.clone(), "OK", Some("Cancel"))
+                    }
+                    DialogKind::BeforeUnload { reload } => (
+                        if *reload {
+                            "Reload this page?"
+                        } else {
+                            "Leave this page?"
+                        }
+                        .to_owned(),
+                        "Changes you made may not be saved.".to_owned(),
+                        if *reload { "Reload" } else { "Leave" },
+                        Some("Stay"),
+                    ),
+                }
+            }
+        };
+        let labels: &[&str] = match prompt {
+            PagePrompt::Auth(_) => &["User name", "Password"],
+            PagePrompt::Dialog(_) => &[""],
+        };
+        let fields = self.prompt_fields.iter().zip(labels).map(|(field, label)| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .when(!label.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.5))
+                            .child(*label),
+                    )
+                })
+                .child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(0.12))
+                        .bg(content(0.04))
+                        .px_2()
+                        .py(px(6.))
+                        .child(field.clone()),
+                )
+        });
+        let card = modal::card().w(px(380.)).child(
+            modal::card_body()
+                .child(modal::title(title))
+                .when(!detail.is_empty(), |d| {
+                    d.child(
+                        modal::body(detail)
+                            .mt(px(6.))
+                            .max_h(px(240.))
+                            .overflow_hidden(),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(14.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .children(fields),
+                )
+                .child(
+                    modal::actions()
+                        .when_some(cancel, |d, cancel| {
+                            d.child(
+                                modal::ghost_button("browser-prompt-cancel", cancel)
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.answer_prompt(false, cx)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            modal::primary_button("browser-prompt-accept", accept)
+                                .cursor_pointer()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_prompt(true, cx)),
+                                ),
+                        ),
+                ),
+        );
+        let has_fields = !self.prompt_fields.is_empty();
+        let dismissible = cancel.is_some();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .track_focus(&self.prompt_focus)
+                .key_context("BrowserPrompt")
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    match event.keystroke.key.as_str() {
+                        "escape" => this.answer_prompt(!dismissible, cx),
+                        // Fields submit on Return themselves.
+                        "enter" if !has_fields => this.answer_prompt(true, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(modal::overlay("browser-prompt", card, {
+                    let weak = cx.weak_entity();
+                    move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| this.answer_prompt(!dismissible, cx));
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 }
 
@@ -538,6 +1151,8 @@ struct Host {
     painted: Cell<Option<(WindowId, u64, Bounds<Pixels>)>>,
     shown: Cell<bool>,
     registered: Cell<bool>,
+    /// The profile the page is created in ([`BrowserPage::set_profile`]).
+    options: RefCell<monocode_cef::CreateOptions>,
 }
 
 struct Hosted {
@@ -650,7 +1265,7 @@ impl Host {
             clip.setClipsToBounds(true);
             parent.addSubview_positioned_relativeTo(&clip, NSWindowOrderingMode::Above, None);
             let raw = Retained::as_ptr(&clip) as *mut std::ffi::c_void;
-            match monocode_cef::BrowserView::create(raw, frame, url) {
+            match monocode_cef::BrowserView::create_with(raw, frame, url, &self.options.borrow()) {
                 Ok((view, events)) => {
                     let page = page.clone();
                     cx.spawn(async move |cx| {
@@ -824,8 +1439,92 @@ mod monocode_cef {
         PopupRequested {
             url: String,
             user_gesture: bool,
+            foreground: bool,
         },
+        PopupOpened {
+            id: u64,
+            url: String,
+            foreground: bool,
+        },
+        CloseRequested,
+        Download(Download),
+        Auth(AuthRequest),
+        Dialog(JsDialog),
+        DialogsReset,
         Closed,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub enum Profile {
+        #[default]
+        Default,
+        Isolated(String),
+    }
+    impl Profile {
+        pub fn for_project(path: &str) -> Self {
+            Profile::Isolated(path.to_owned())
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct CreateOptions {
+        pub profile: Profile,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DownloadState {
+        InProgress,
+        Complete,
+        Canceled,
+        Failed,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Download {
+        pub id: u32,
+        pub path: std::path::PathBuf,
+        pub received: i64,
+        pub total: Option<i64>,
+        pub state: DownloadState,
+    }
+    impl Download {
+        pub fn name(&self) -> String {
+            String::new()
+        }
+        pub fn fraction(&self) -> Option<f64> {
+            None
+        }
+    }
+    pub fn cancel_download(_: u32) {}
+
+    pub struct AuthChallenge {
+        pub host: String,
+        pub port: u16,
+        pub realm: String,
+        pub proxy: bool,
+    }
+    pub struct AuthRequest {
+        pub challenge: AuthChallenge,
+    }
+    impl AuthRequest {
+        pub fn sign_in(&self, _: &str, _: &str) {}
+        pub fn cancel(&self) {}
+    }
+
+    pub enum DialogKind {
+        Alert,
+        Confirm,
+        Prompt(String),
+        BeforeUnload { reload: bool },
+    }
+    pub struct JsDialog {
+        pub kind: DialogKind,
+        pub origin: String,
+        pub message: String,
+    }
+    impl JsDialog {
+        pub fn accept(&self, _: Option<&str>) {}
+        pub fn decline(&self) {}
     }
 
     /// Never created: [`runtime::start`] always fails here.
@@ -875,6 +1574,74 @@ mod tests {
             Some(dir.path().join("X Helper.app/Contents/MacOS/X Helper"))
         );
         assert_eq!(find_helper(&dir.path().join("missing")), None);
+    }
+
+    #[gpui::test]
+    fn popups_ask_for_pages_and_downloads_are_listed_once(cx: &mut gpui::TestAppContext) {
+        use monocode_cef::{BrowserEvent, Download, DownloadState};
+        let page = cx.new(|cx| BrowserPage::new(String::new(), String::new(), "/tmp".into(), cx));
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let asked = asked.clone();
+            cx.subscribe(&page, move |_, request: &PageRequest, _| {
+                asked.borrow_mut().push(request.clone())
+            })
+            .detach();
+        });
+        let download = |received, state| Download {
+            id: 3,
+            path: "/d/a.zip".into(),
+            received,
+            total: Some(10),
+            state,
+        };
+        page.update(cx, |page, cx| {
+            page.on_event(
+                BrowserEvent::PopupRequested {
+                    url: "https://a.test/".into(),
+                    user_gesture: false,
+                    foreground: false,
+                },
+                cx,
+            );
+            page.on_event(BrowserEvent::CloseRequested, cx);
+            page.on_event(
+                BrowserEvent::Download(download(0, DownloadState::InProgress)),
+                cx,
+            );
+            page.on_event(
+                BrowserEvent::Download(download(10, DownloadState::Complete)),
+                cx,
+            );
+            assert_eq!(page.downloads, [download(10, DownloadState::Complete)]);
+            assert_eq!(download_status(&page.downloads[0]), "10 B");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *asked.borrow(),
+            [
+                PageRequest::Open {
+                    url: "https://a.test/".into(),
+                    foreground: false,
+                    popup: None,
+                },
+                PageRequest::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn download_sizes_read_like_a_browsers() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1_500), "1.5 KB");
+        assert_eq!(human_bytes(34_000_000), "34 MB");
+        assert_eq!(human_bytes(2_100_000_000), "2.1 GB");
+        assert_eq!(
+            origin_host("https://example.com:8080/a?b"),
+            "example.com:8080"
+        );
+        assert_eq!(origin_host(""), "");
     }
 
     #[test]

@@ -1,0 +1,282 @@
+//! Downloads: straight into `~/Downloads` under a name that clashes with
+//! nothing there, without a dialog (docs/native/browser/context.md §3.3).
+//! Progress comes back as [`BrowserEvent::Download`]. Every callback here
+//! runs on CEF's UI thread, the main thread.
+
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+use cef::*;
+
+use crate::view::{BrowserEvent, PageState};
+
+/// A download as its page last saw it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Download {
+    /// Unique among this run's downloads.
+    pub id: u32,
+    /// Where the file goes; its name is the one shown.
+    pub path: PathBuf,
+    pub received: i64,
+    /// `None` while the server has not said.
+    pub total: Option<i64>,
+    pub state: DownloadState,
+}
+
+impl Download {
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// 0.0 to 1.0, when the size is known.
+    pub fn fraction(&self) -> Option<f64> {
+        let total = self.total.filter(|t| *t > 0)?;
+        Some((self.received as f64 / total as f64).clamp(0., 1.))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    InProgress,
+    Complete,
+    Canceled,
+    /// Interrupted: the network, the disk or the server gave up.
+    Failed,
+}
+
+/// Stops a download in progress. A [`DownloadState::Canceled`] update follows.
+pub fn cancel_download(id: u32) {
+    if let Some(callback) = ACTIVE
+        .with(|a| a.borrow().get(&id).map(|d| d.callback.clone()))
+        .flatten()
+    {
+        callback.cancel();
+    }
+}
+
+struct Active {
+    path: PathBuf,
+    /// The latest one CEF handed over; it cancels the download.
+    callback: Option<DownloadItemCallback>,
+}
+
+thread_local! {
+    /// Downloads between their start and their end, by id. Their paths are
+    /// taken even while nothing exists there yet.
+    static ACTIVE: RefCell<HashMap<u32, Active>> = RefCell::new(HashMap::new());
+}
+
+/// `~/Downloads`, made if it is missing.
+fn downloads_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = home.join("Downloads");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// A file name a server suggested, safe to use in a folder: no folders of
+/// its own, no hidden or empty names.
+pub(crate) fn safe_name(suggested: &str) -> String {
+    let name: String = suggested
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
+        .collect();
+    let name = name.trim().trim_start_matches('.').trim();
+    if name.is_empty() {
+        "download".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// `name`, or `name (1).ext`, `name (2).ext`, … : the first that `taken`
+/// says is free. A double extension such as `.tar.gz` stays together.
+pub(crate) fn unique_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_owned();
+    }
+    let lower = name.to_ascii_lowercase();
+    let split = ["tar.gz", "tar.bz2", "tar.xz", "tar.zst"]
+        .iter()
+        .find_map(|ext| {
+            lower
+                .strip_suffix(ext)
+                .filter(|stem| stem.ends_with('.') && stem.len() > 1)
+                .map(|stem| stem.len() - 1)
+        })
+        .or_else(|| name.rfind('.').filter(|ix| *ix > 0));
+    let (stem, ext) = match split {
+        Some(ix) => name.split_at(ix),
+        None => (name, ""),
+    };
+    (1..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|candidate| !taken(candidate))
+        .expect("some name is free")
+}
+
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let reserved = |path: &Path| ACTIVE.with(|a| a.borrow().values().any(|d| d.path == path));
+    dir.join(unique_name(name, |candidate| {
+        let path = dir.join(candidate);
+        path.exists() || reserved(&path)
+    }))
+}
+
+fn snapshot(item: &DownloadItem, path: PathBuf) -> Download {
+    let state = if item.is_complete() != 0 {
+        DownloadState::Complete
+    } else if item.is_canceled() != 0 {
+        DownloadState::Canceled
+    } else if item.is_interrupted() != 0 {
+        DownloadState::Failed
+    } else {
+        DownloadState::InProgress
+    };
+    let total = item.total_bytes();
+    Download {
+        id: item.id(),
+        path,
+        received: item.received_bytes().max(0),
+        total: (total > 0).then_some(total),
+        state,
+    }
+}
+
+wrap_download_handler! {
+    pub(crate) struct PageDownloadHandler {
+        state: PageState,
+    }
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> ::std::os::raw::c_int {
+            // The default the bindings return (0) would refuse every one.
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return 0;
+            };
+            let suggested = suggested_name.map(|s| s.to_string()).unwrap_or_default();
+            let path = unique_path(&downloads_dir(), &safe_name(&suggested));
+            let id = item.id();
+            ACTIVE.with(|a| {
+                a.borrow_mut().insert(id, Active { path: path.clone(), callback: None })
+            });
+            callback.cont(Some(&path.to_string_lossy().as_ref().into()), 0);
+            self.state.send(BrowserEvent::Download(Download {
+                id,
+                path,
+                received: 0,
+                total: None,
+                state: DownloadState::InProgress,
+            }));
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else { return };
+            let id = item.id();
+            // Before its path is chosen a download is not reported.
+            let Some(path) = ACTIVE.with(|a| {
+                let mut active = a.borrow_mut();
+                let entry = active.get_mut(&id)?;
+                if let Some(callback) = callback {
+                    entry.callback = Some(callback.clone());
+                }
+                Some(entry.path.clone())
+            }) else {
+                return;
+            };
+            let download = snapshot(item, path);
+            if download.state != DownloadState::InProgress {
+                ACTIVE.with(|a| a.borrow_mut().remove(&id));
+            }
+            self.state.send(BrowserEvent::Download(download));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_download_takes_the_first_free_name() {
+        let taken = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
+        assert_eq!(unique_name("a.pdf", taken(&[])), "a.pdf");
+        assert_eq!(unique_name("a.pdf", taken(&["a.pdf"])), "a (1).pdf");
+        assert_eq!(
+            unique_name("a.pdf", taken(&["a.pdf", "a (1).pdf"])),
+            "a (2).pdf"
+        );
+        assert_eq!(unique_name("README", taken(&["README"])), "README (1)");
+        assert_eq!(
+            unique_name("src.tar.gz", taken(&["src.tar.gz"])),
+            "src (1).tar.gz"
+        );
+        assert_eq!(
+            unique_name("v1.2.zip", taken(&["v1.2.zip"])),
+            "v1.2 (1).zip"
+        );
+    }
+
+    #[test]
+    fn a_suggested_name_stays_inside_the_folder() {
+        assert_eq!(safe_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_name("a\\b.txt"), "b.txt");
+        assert_eq!(safe_name(".bashrc"), "bashrc");
+        assert_eq!(safe_name("  "), "download");
+        assert_eq!(safe_name(""), "download");
+        assert_eq!(safe_name("a:b\n.txt"), "a_b_.txt");
+    }
+
+    #[test]
+    fn reserved_and_existing_paths_are_skipped() {
+        let dir =
+            std::env::temp_dir().join(format!("monocode-cef-download-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "").unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (1).txt"));
+        ACTIVE.with(|a| {
+            a.borrow_mut().insert(
+                7,
+                Active {
+                    path: dir.join("f (1).txt"),
+                    callback: None,
+                },
+            )
+        });
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

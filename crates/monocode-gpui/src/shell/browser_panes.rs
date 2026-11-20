@@ -3,7 +3,7 @@
 //! opened from the title strip's New tab menu.
 use super::*;
 use crate::{
-    browser::{BrowserPage, PageChanged},
+    browser::{BrowserPage, PageChanged, PageRequest},
     workspace::BrowserPane,
 };
 
@@ -22,7 +22,24 @@ impl Shell {
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
-        let page = cx.new(|cx| BrowserPage::new(state.url, state.title, profiles, cx));
+        let profile = self.browser_profile(state.owner);
+        let page = cx.new(|cx| {
+            let mut page = BrowserPage::new(state.url, state.title, profiles, cx);
+            page.set_profile(profile, cx);
+            page
+        });
+        // Asked from inside a page's event: handled once that is over, with
+        // the window at hand.
+        cx.subscribe(&page, move |_, _, request: &PageRequest, cx| {
+            let request = request.clone();
+            cx.spawn(async move |this, cx| {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.browser_page_request(pane, request, window, cx)
+                });
+            })
+            .detach();
+        })
+        .detach();
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
             let (url, title) = {
                 let page = page.read(cx);
@@ -160,6 +177,119 @@ impl Shell {
             })
             .child(div().flex_1().min_h_0().min_w_0().children(page))
             .into_any_element()
+    }
+}
+
+// ---- Pages opened by pages, and profiles ----
+
+impl Shell {
+    /// The profile `owner`'s project browses with (K15): the shared default
+    /// one, or the project's own.
+    fn browser_profile(&self, owner: i64) -> crate::browser::Profile {
+        let Some(cwd) = self.session_summaries.get(&owner).map(|s| s.cwd.as_str()) else {
+            return crate::browser::Profile::Default;
+        };
+        let key = monocode_core::files::path_key(cwd);
+        if self.workspace.browser_isolated_projects.contains(&key) {
+            crate::browser::Profile::for_project(&key)
+        } else {
+            crate::browser::Profile::Default
+        }
+    }
+
+    fn browser_page_request(
+        &mut self,
+        pane: i64,
+        request: PageRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace.browser_panes.contains_key(&pane) {
+            return;
+        }
+        match request {
+            PageRequest::Open {
+                url,
+                foreground,
+                popup,
+            } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
+            PageRequest::Close => self.close_pane(pane, window, cx),
+        }
+    }
+
+    /// A page `opener` opened: its own title tab right after the opener's,
+    /// for the same owner. It takes focus only when `foreground`.
+    fn open_browser_page_beside(
+        &mut self,
+        opener: i64,
+        url: String,
+        foreground: bool,
+        popup: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.workspace.browser_panes.get(&opener).map(|b| b.owner) else {
+            return;
+        };
+        let pane = self.workspace.next_pane_id();
+        self.workspace.browser_panes.insert(
+            pane,
+            BrowserPane {
+                owner,
+                url,
+                title: String::new(),
+            },
+        );
+        let active = self.workspace.active;
+        self.workspace.open(pane);
+        if let Some(after) = self.workspace.tab_of(opener) {
+            self.workspace.place_tab_after(pane, after);
+        }
+        if let Some(id) = popup
+            && let Some(page) = self.browser_page(pane, cx)
+        {
+            page.update(cx, |page, cx| page.adopt_popup(id, cx));
+        }
+        if foreground {
+            self.pane_motion = None;
+            self.fit_sidebar(cx);
+            self.open_browser_pane(pane, window, cx);
+        } else {
+            self.workspace.active = active;
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
+    /// The project menu's "Isolated browser profile" switch.
+    pub(super) fn browser_profile_menu(&self, path: &str) -> MenuAction {
+        let on = (self.workspace.browser_isolated_projects)
+            .contains(&monocode_core::files::path_key(path));
+        MenuAction::new("browser-isolated", "Isolated browser profile")
+            .description("Own cookies and storage for this project's pages. Open pages reload.")
+            .icon("globe")
+            .toggle(on)
+    }
+
+    /// Turns the project's own browser profile on or off; its open pages
+    /// open again in the profile they now use.
+    pub(super) fn toggle_browser_isolation(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = monocode_core::files::path_key(path);
+        let isolated = &mut self.workspace.browser_isolated_projects;
+        if !isolated.remove(&key) {
+            isolated.insert(key);
+        }
+        let pages: Vec<_> = (self.browser_pages.iter())
+            .filter_map(|(pane, (page, _))| {
+                let owner = self.workspace.browser_panes.get(pane)?.owner;
+                Some((page.clone(), self.browser_profile(owner)))
+            })
+            .collect();
+        for (page, profile) in pages {
+            page.update(cx, |page, cx| page.set_profile(profile, cx));
+        }
+        self.persist(cx);
+        cx.notify();
     }
 }
 
