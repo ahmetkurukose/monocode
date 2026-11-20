@@ -13,12 +13,19 @@ pub mod view;
 mod capture;
 mod devtools;
 
+mod dialogs;
+mod download;
 #[cfg(target_os = "macos")]
 mod mac;
+mod popup;
+mod profile;
 
 pub use devtools::{DevToolsEvent, DevToolsView};
 pub use runtime::{RuntimeConfig, StartError};
-pub use view::{BrowserEvent, BrowserView, CreateError, Frame};
+pub use view::{
+    AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CreateError, CreateOptions, DialogKind,
+    Download, DownloadState, Frame, JsDialog, Profile, cancel_download, profile_id, take_popup,
+};
 
 /// `OnScheduleMessagePumpWork`, from any CEF thread.
 fn pump_schedule(delay_ms: i64) {

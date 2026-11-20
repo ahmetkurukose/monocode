@@ -7,9 +7,23 @@
 //! says where the view sits ([`BrowserView::set_frame`]) and whether it shows
 //! ([`BrowserView::set_visible`]); page state comes back as [`BrowserEvent`]s.
 
-use std::{cell::RefCell, ffi::c_void, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use cef::*;
+
+pub use crate::{
+    dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
+    download::{Download, DownloadState, cancel_download},
+    popup::take_popup,
+    profile::{Profile, profile_id},
+};
 
 /// What a page reports. Delivered on the main thread, in order.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,12 +44,31 @@ pub enum BrowserEvent {
         code: i32,
         text: String,
     },
-    /// The page asked for a new window (`window.open`, `target=_blank`). No
-    /// window was created; the host decides what to do with the URL.
+    /// The page asked for a new window (`window.open`, `target=_blank`, a
+    /// middle click). No window was created; the host opens the URL as a new
+    /// page, and shows it at once when `foreground` (crate::popup).
     PopupRequested {
         url: String,
         user_gesture: bool,
+        foreground: bool,
     },
+    /// The page opened a popup that keeps `window.opener`; it is ready for a
+    /// new page to adopt with [`take_popup`].
+    PopupOpened {
+        id: u64,
+        url: String,
+        foreground: bool,
+    },
+    /// The page closes itself (`window.close()`); the host closes its tab.
+    CloseRequested,
+    /// A download started or moved on.
+    Download(Download),
+    /// The page needs a user name and password.
+    Auth(AuthRequest),
+    /// `alert`, `confirm`, `prompt` or `beforeunload`.
+    Dialog(JsDialog),
+    /// The page's pending dialogs are void (it navigated).
+    DialogsReset,
     /// The browser is gone; the view can be dropped.
     Closed,
     /// A find-in-page result ([`BrowserView::find`]). `active_ordinal` counts
@@ -47,6 +80,12 @@ pub enum BrowserEvent {
     },
     /// The page took the keyboard (a click in it, or [`BrowserView::set_focus`]).
     Focused,
+}
+
+/// How a page is created.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CreateOptions {
+    pub profile: Profile,
 }
 
 /// A rectangle in the parent view's coordinates, in points, origin top-left.
@@ -79,13 +118,34 @@ impl std::fmt::Display for CreateError {
 
 impl std::error::Error for CreateError {}
 
+/// What a page's handlers share. Thread safe: some callbacks run on CEF's
+/// IO thread.
 #[derive(Clone)]
-struct PageState {
+pub(crate) struct PageState {
     events: async_channel::Sender<BrowserEvent>,
+    /// The host closes the page; only a close of its own is reported.
+    closing: Arc<AtomicBool>,
+    /// The page's gestureless popups (crate::popup).
+    pub(crate) popups: Arc<Mutex<crate::popup::PopupLimiter>>,
+    /// Set on a popup CEF creates for the host to adopt.
+    popup: Option<crate::popup::PopupKey>,
 }
 
 impl PageState {
-    fn send(&self, event: BrowserEvent) {
+    pub(crate) fn new(
+        popup: Option<crate::popup::PopupKey>,
+    ) -> (Self, async_channel::Receiver<BrowserEvent>) {
+        let (tx, rx) = async_channel::unbounded();
+        let state = PageState {
+            events: tx,
+            closing: Arc::default(),
+            popups: Arc::default(),
+            popup,
+        };
+        (state, rx)
+    }
+
+    pub(crate) fn send(&self, event: BrowserEvent) {
         // Unbounded: never blocks a CEF callback.
         let _ = self.events.try_send(event);
     }
@@ -169,27 +229,59 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        // ---- Popups and closing (crate::popup) ----
+
         fn on_before_popup(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut cef::Frame>,
-            _popup_id: ::std::os::raw::c_int,
+            popup_id: ::std::os::raw::c_int,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
-            _target_disposition: WindowOpenDisposition,
+            target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
-            _popup_features: Option<&cef::PopupFeatures>,
-            _window_info: Option<&mut cef::WindowInfo>,
-            _client: Option<&mut Option<cef::Client>>,
+            popup_features: Option<&cef::PopupFeatures>,
+            window_info: Option<&mut cef::WindowInfo>,
+            client: Option<&mut Option<cef::Client>>,
             _settings: Option<&mut cef::BrowserSettings>,
             _extra_info: Option<&mut Option<cef::DictionaryValue>>,
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            // Never let Alloy open a native window of its own.
-            self.state.send(BrowserEvent::PopupRequested {
-                url: string(target_url),
-                user_gesture: user_gesture != 0,
-            });
+            // Never lets Alloy open a native window of its own.
+            crate::popup::before_popup(
+                &self.state,
+                browser,
+                popup_id,
+                target_url,
+                target_disposition,
+                user_gesture != 0,
+                popup_features,
+                window_info,
+                client,
+            )
+        }
+
+        fn on_before_popup_aborted(
+            &self,
+            browser: Option<&mut Browser>,
+            popup_id: ::std::os::raw::c_int,
+        ) {
+            let opener = browser.map(|b| b.identifier()).unwrap_or_default();
+            crate::popup::aborted((opener, popup_id));
+        }
+
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            if let (Some(key), Some(browser)) = (self.state.popup, browser) {
+                crate::popup::created(key, browser.clone(), &self.state);
+            }
+        }
+
+        fn do_close(&self, _browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
+            // Returning 0 would have CEF close the host's whole window; the
+            // host tears the page down instead, when it closes the tab.
+            if !self.state.closing.load(Ordering::SeqCst) {
+                self.state.send(BrowserEvent::CloseRequested);
+            }
             1
         }
 
@@ -235,36 +327,74 @@ wrap_focus_handler! {
     }
 }
 
-wrap_client! {
-    struct PageClient {
-        display: cef::DisplayHandler,
-        load: cef::LoadHandler,
-        life_span: cef::LifeSpanHandler,
-        find: cef::FindHandler,
-        focus: cef::FocusHandler,
+// One handler per concern: CEF's client takes them all at once, so its
+// generated constructor has a parameter for each.
+mod client {
+    #![allow(clippy::too_many_arguments)]
+    use super::*;
+
+    wrap_client! {
+        pub(super) struct PageClient {
+            display: cef::DisplayHandler,
+            load: cef::LoadHandler,
+            life_span: cef::LifeSpanHandler,
+            find: cef::FindHandler,
+            focus: cef::FocusHandler,
+            // Downloads, authentication and JavaScript dialogs.
+            download: cef::DownloadHandler,
+            request: cef::RequestHandler,
+            dialogs: cef::JsdialogHandler,
+        }
+
+        impl Client {
+            fn display_handler(&self) -> Option<cef::DisplayHandler> {
+                Some(self.display.clone())
+            }
+
+            fn load_handler(&self) -> Option<cef::LoadHandler> {
+                Some(self.load.clone())
+            }
+
+            fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
+                Some(self.life_span.clone())
+            }
+
+            fn find_handler(&self) -> Option<cef::FindHandler> {
+                Some(self.find.clone())
+            }
+
+            fn focus_handler(&self) -> Option<cef::FocusHandler> {
+                Some(self.focus.clone())
+            }
+
+            fn download_handler(&self) -> Option<cef::DownloadHandler> {
+                Some(self.download.clone())
+            }
+
+            fn request_handler(&self) -> Option<cef::RequestHandler> {
+                Some(self.request.clone())
+            }
+
+            fn jsdialog_handler(&self) -> Option<cef::JsdialogHandler> {
+                Some(self.dialogs.clone())
+            }
+        }
     }
+}
+use client::PageClient;
 
-    impl Client {
-        fn display_handler(&self) -> Option<cef::DisplayHandler> {
-            Some(self.display.clone())
-        }
-
-        fn load_handler(&self) -> Option<cef::LoadHandler> {
-            Some(self.load.clone())
-        }
-
-        fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
-            Some(self.life_span.clone())
-        }
-
-        fn find_handler(&self) -> Option<cef::FindHandler> {
-            Some(self.find.clone())
-        }
-
-        fn focus_handler(&self) -> Option<cef::FocusHandler> {
-            Some(self.focus.clone())
-        }
-    }
+/// A page's client, for a new page or a popup CEF creates.
+pub(crate) fn page_client(state: PageState) -> cef::Client {
+    PageClient::new(
+        PageDisplayHandler::new(state.clone()),
+        PageLoadHandler::new(state.clone()),
+        PageLifeSpanHandler::new(state.clone()),
+        PageFindHandler::new(state.clone()),
+        PageFocusHandler::new(state.clone()),
+        crate::download::PageDownloadHandler::new(state.clone()),
+        crate::dialogs::PageRequestHandler::new(state.clone()),
+        crate::dialogs::PageDialogHandler::new(state),
+    )
 }
 
 /// A page and its native view.
@@ -273,7 +403,11 @@ pub struct BrowserView {
     /// CEF's own view, a child of the parent given to [`BrowserView::create`].
     native: *mut c_void,
     frame: RefCell<Frame>,
-    closed: Rc<std::cell::Cell<bool>>,
+    closing: Arc<AtomicBool>,
+    /// A popup's first parent, made in `OnBeforePopup`, until
+    /// [`BrowserView::reparent`] moves the view out of it.
+    #[cfg(target_os = "macos")]
+    holder: RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSView>>>,
 }
 
 impl BrowserView {
@@ -284,21 +418,25 @@ impl BrowserView {
         frame: Frame,
         url: &str,
     ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), CreateError> {
+        Self::create_with(parent, frame, url, &CreateOptions::default())
+    }
+
+    /// [`BrowserView::create`], in the given profile.
+    pub fn create_with(
+        parent: *mut c_void,
+        frame: Frame,
+        url: &str,
+        options: &CreateOptions,
+    ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), CreateError> {
         if !crate::runtime::is_started() {
             return Err(CreateError::NotStarted);
         }
         if !cfg!(target_os = "macos") {
             return Err(CreateError::Unsupported);
         }
-        let (tx, rx) = async_channel::unbounded();
-        let state = PageState { events: tx };
-        let mut client = PageClient::new(
-            PageDisplayHandler::new(state.clone()),
-            PageLoadHandler::new(state.clone()),
-            PageLifeSpanHandler::new(state.clone()),
-            PageFindHandler::new(state.clone()),
-            PageFocusHandler::new(state),
-        );
+        let (state, rx) = PageState::new(None);
+        let mut client = page_client(state.clone());
+        let mut context = crate::profile::request_context(&options.profile);
 
         let bounds = cef::Rect {
             x: 0,
@@ -319,23 +457,52 @@ impl BrowserView {
             Some(&url.into()),
             Some(&settings),
             None,
-            None,
+            context.as_mut(),
         )
         .ok_or(CreateError::Failed)?;
+        let view = Self::from_browser(browser, &state);
+        view.set_frame(frame);
+        Ok((view, rx))
+    }
+
+    /// The view of a browser CEF created, with its page's state.
+    pub(crate) fn from_browser(browser: Browser, state: &PageState) -> Self {
         // A pointer on macOS and Windows, an X11 window id on Linux.
         #[allow(clippy::unnecessary_cast)]
         let native = browser
             .host()
             .map(|host| host.window_handle() as *mut c_void)
             .unwrap_or(std::ptr::null_mut());
-        let view = Self {
+        Self {
             browser,
             native,
             frame: RefCell::new(Frame::default()),
-            closed: Rc::default(),
-        };
-        view.set_frame(frame);
-        Ok((view, rx))
+            closing: state.closing.clone(),
+            #[cfg(target_os = "macos")]
+            holder: RefCell::default(),
+        }
+    }
+
+    /// Keeps `parent`, the view's first superview, alive until
+    /// [`BrowserView::reparent`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn hold(&self, parent: objc2::rc::Retained<objc2_app_kit::NSView>) {
+        *self.holder.borrow_mut() = Some(parent);
+    }
+
+    /// Moves the page into another parent view (macOS: an `NSView*`), as a
+    /// new tab adopts a popup ([`take_popup`]). [`BrowserView::set_frame`]
+    /// places it there.
+    pub fn reparent(&self, parent: *mut c_void) {
+        if self.native.is_null() || parent.is_null() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::view::reparent(self.native, parent);
+            self.holder.borrow_mut().take();
+        }
+        *self.frame.borrow_mut() = Frame::default();
     }
 
     /// Moves and sizes the page inside its parent.
@@ -454,7 +621,7 @@ impl BrowserView {
 
     /// Closes the page. [`BrowserEvent::Closed`] follows.
     pub fn close(&self) {
-        if self.closed.replace(true) {
+        if self.closing.swap(true, Ordering::SeqCst) {
             return;
         }
         crate::capture::forget(self.browser.identifier());

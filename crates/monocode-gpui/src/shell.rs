@@ -6637,6 +6637,7 @@ impl Shell {
                     self.external_editor_menu(path).into(),
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
+                    self.browser_profile_menu(path).into(),
                     MenuItem::Separator,
                 ]);
                 items.extend(self.project_sleep_menu(path, cx));
@@ -6828,6 +6829,8 @@ impl Shell {
                     self.open_in_external_editor(editor, &path, cx);
                 } else if action.starts_with("mute:") {
                     self.run_project_notification_menu(&path, action, window, cx);
+                } else if action == "browser-isolated" {
+                    self.toggle_browser_isolation(&path, cx);
                 }
             }
         }
