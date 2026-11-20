@@ -1456,9 +1456,11 @@ pub(super) fn respond(
     let preference = match &decision {
         Decision::Allow => ["allow_once", "allow_always"],
         Decision::Session => ["allow_always", "allow_once"],
-        Decision::Deny | Decision::KeepOpen | Decision::Answer(_) | Decision::Steer(_) => {
-            ["reject_once", "reject_always"]
-        }
+        Decision::Deny
+        | Decision::KeepOpen
+        | Decision::Answer(_)
+        | Decision::Steer(_)
+        | Decision::StopTask => ["reject_once", "reject_always"],
     };
     let options: Vec<_> = request["options"]
         .as_array()

@@ -24,7 +24,7 @@ const PROJECT_APPS: [(&str, AppView, &str); 4] = [
 ];
 
 /// A plain tooltip for the rail's app icons.
-struct RailTip(SharedString);
+pub(super) struct RailTip(pub(super) SharedString);
 impl Render for RailTip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -67,7 +67,8 @@ impl Shell {
     /// (each with the sessions working there), creations in progress, then
     /// its terminals. A session listed under a worktree is not listed again.
     pub(super) fn project_rail_tree_children(&self, path: &str, cx: &App) -> Vec<ProjectRailRow> {
-        self.project_rail_children_with(path, true, cx)
+        let rows = self.project_rail_children_with(path, true, cx);
+        self.with_subagent_rows(rows, cx)
     }
 
     fn project_rail_children_with(
@@ -454,7 +455,8 @@ impl Shell {
             | ProjectRailRow::More { project, .. }
             | ProjectRailRow::Worktree { project, .. }
             | ProjectRailRow::WorktreeSession { project, .. }
-            | ProjectRailRow::PendingWorktree { project, .. } => project.clone(),
+            | ProjectRailRow::PendingWorktree { project, .. }
+            | ProjectRailRow::Subagent { project, .. } => project.clone(),
             _ => String::new(),
         };
         let element = match row {
@@ -470,6 +472,13 @@ impl Shell {
                 sessions,
                 last,
             } => self.project_rail_worktree_row(project, path, sessions, last, cx),
+            ProjectRailRow::Subagent {
+                project,
+                session,
+                id,
+                nested,
+                last,
+            } => self.project_rail_subagent_row(project, session, id, nested, last, cx),
             ProjectRailRow::PendingWorktree { project, id, last } => {
                 self.project_rail_pending_worktree_row(project, id, last, cx)
             }
@@ -549,7 +558,14 @@ impl Shell {
             )
         };
         let done = self.unseen_finished.contains(&id);
+        let subagents = self.subagent_disclosure(id, cx);
+        // An open subagent view highlights its own row instead, when listed.
+        let showing_subagent = subagents.is_some()
+            && self.expanded_subagents.contains(&id)
+            && (self.sessions.get(&id))
+                .is_some_and(|view| view.read(cx).open_subagent_id(cx).is_some());
         let selected = !self.app_view_open()
+            && !showing_subagent
             && self
                 .workspace
                 .active
@@ -655,6 +671,9 @@ impl Shell {
                     .truncate()
                     .child(SharedString::from(title)),
             )
+            .when_some(subagents, |d, (count, chevron)| {
+                d.child(count).child(chevron)
+            })
             .child(
                 div()
                     .relative()

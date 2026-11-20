@@ -762,7 +762,7 @@ pub(crate) fn run_with_client(
                         next["type"] = json!("answer");
                         next["reply"] = reply(question, answers);
                     }
-                    Decision::KeepOpen => continue,
+                    Decision::KeepOpen | Decision::StopTask => continue,
                     Decision::Steer(_) => {
                         return Err("Steering is not supported by this remote host".into());
                     }

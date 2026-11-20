@@ -54,6 +54,15 @@ pub(super) enum ProjectRailRow {
         id: u64,
         last: bool,
     },
+    /// A running subagent under the session that spawned it, while that
+    /// session's child list is open. `nested` follows a worktree session.
+    Subagent {
+        project: String,
+        session: i64,
+        id: String,
+        nested: bool,
+        last: bool,
+    },
     Gap,
     Empty,
 }
@@ -662,6 +671,7 @@ impl Shell {
                         | ProjectRailRow::Worktree { .. }
                         | ProjectRailRow::WorktreeSession { .. }
                         | ProjectRailRow::PendingWorktree { .. }
+                        | ProjectRailRow::Subagent { .. }
                 )
             )
         };
@@ -693,7 +703,8 @@ impl Shell {
             | ProjectRailRow::More { .. }
             | ProjectRailRow::Worktree { .. }
             | ProjectRailRow::WorktreeSession { .. }
-            | ProjectRailRow::PendingWorktree { .. }) => self.project_rail_child_row(row, cx),
+            | ProjectRailRow::PendingWorktree { .. }
+            | ProjectRailRow::Subagent { .. }) => self.project_rail_child_row(row, cx),
             ProjectRailRow::Gap => div().h(px(8.)).into_any(),
             ProjectRailRow::Empty => div()
                 .px_4()
@@ -1627,9 +1638,7 @@ impl Shell {
                                 // The options button always takes the row's
                                 // last 24px: the label gives them up unless the
                                 // app icons or the moon come after it.
-                                .when(!reordering && !has_app_icons && !asleep, |d| {
-                                    d.pr(px(24.))
-                                })
+                                .when(!reordering && !has_app_icons && !asleep, |d| d.pr(px(24.)))
                                 .child(label),
                         )
                         .when(asleep && !has_app_icons, |d| {

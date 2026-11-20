@@ -428,6 +428,8 @@ pub(super) fn run(
                 while let Ok(control) = controls.try_recv() {
                     if let Decision::Steer(message) = control.decision {
                         queue.push_back(message);
+                    } else if matches!(control.decision, Decision::StopTask) {
+                        // OpenCode has no per-task stop; the rail never offers one.
                     } else {
                         let events = state.respond(&client, control)?;
                         if !events.is_empty() {

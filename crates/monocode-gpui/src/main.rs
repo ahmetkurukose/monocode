@@ -97,6 +97,7 @@ mod settings;
 mod shell;
 mod sound;
 mod stash_dialog;
+mod subagent_dot;
 mod syntax;
 mod tab_label;
 mod tab_motion;

@@ -18,6 +18,7 @@ pub(crate) mod phases;
 mod provider_switch;
 mod remote_plans;
 pub(crate) mod selection;
+pub(crate) mod subagents;
 pub(crate) mod tasks;
 mod tools;
 mod user_links;
@@ -664,6 +665,8 @@ struct CodeDrag {
 }
 
 pub(crate) struct TranscriptView {
+    subagent_cache: subagents::Cache,
+    subagent_focus: subagents::Focus,
     selection: selection::Selection,
     selection_focus: Option<gpui::FocusHandle>,
     links: links::State,
@@ -2474,6 +2477,8 @@ impl TranscriptView {
     }
     pub(crate) fn new() -> Self {
         Self {
+            subagent_cache: Default::default(),
+            subagent_focus: Default::default(),
             selection: Default::default(),
             selection_focus: None,
             links: Default::default(),
@@ -2918,6 +2923,7 @@ impl TranscriptView {
             "transcript patches must be contiguous"
         );
         let known = self.source.len();
+        self.invalidate_subagents(start);
         for (ix, row) in rows.into_iter().enumerate() {
             let ix = start + ix;
             let bytes = row.text.capacity().saturating_add(row.role.capacity());
@@ -5975,6 +5981,9 @@ impl Render for TranscriptView {
         self.markdown_cache
             .begin_frame(&self.file_link_base, &self.search_match);
         self.begin_measurements(window, cx);
+        if let Some(focus) = self.render_subagent_focus(window, cx) {
+            return focus;
+        }
         if !self.scroll_bound {
             self.scroll_bound = true;
             self.list
@@ -6158,6 +6167,7 @@ impl Render for TranscriptView {
                         ),
                 )
             })
+            .into_any_element()
     }
 }
 

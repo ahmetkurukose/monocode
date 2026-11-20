@@ -156,6 +156,18 @@ impl Protocol {
         }
     }
 
+    /// Stop one subagent or background task and leave the turn running. Only
+    /// Claude names its tasks to a stop; elsewhere the UI offers none.
+    pub(super) fn stop_task(&mut self, task: &str, stdin: &mut impl Write) -> Result<(), String> {
+        if self.request.kind == Kind::Claude {
+            write_json(
+                stdin,
+                json!({"type":"control_request","request_id":format!("native-stop-task-{task}"),"request":{"subtype":"stop_task","task_id":task}}),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn codex_access(&self) -> (Value, &'static str, Value, &'static str) {
         let (policy, sandbox, mut sandbox_policy, reviewer) = self.request.settings.access.codex();
         if (self.request.settings.operator

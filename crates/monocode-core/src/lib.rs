@@ -37,6 +37,7 @@ pub mod session_filters;
 pub mod session_groups;
 pub mod session_title;
 pub mod store;
+pub mod subagents;
 pub mod terminal_setup;
 pub mod time;
 pub mod tool;

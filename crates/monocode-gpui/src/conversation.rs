@@ -17,6 +17,8 @@ mod notifications;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
+mod subagent_view;
+pub(crate) use subagent_view::SubagentsChanged;
 #[cfg(test)]
 mod submission_tests;
 mod title;
@@ -152,6 +154,7 @@ pub(crate) struct Conversation {
     folder_selected: bool,
     follow_ups: follow_up::FollowUps,
     background: background_tasks::BackgroundTasks,
+    subagent_ui: subagent_view::SubagentUi,
     changes: changes_shelf::ChangesShelf,
     attachments: Vec<std::path::PathBuf>,
     pending_attachments: Vec<std::path::PathBuf>,
@@ -616,6 +619,7 @@ impl Conversation {
             folder_selected: false,
             follow_ups: Default::default(),
             background: Default::default(),
+            subagent_ui: Default::default(),
             changes: Default::default(),
             attachments: Vec::new(),
             pending_attachments: Vec::new(),
@@ -1284,6 +1288,7 @@ impl Conversation {
                                 v.stop_streaming(cx);
                             }
                         });
+                        this.publish_subagents(cx);
                         if let Some(id) = update.provider_turn_id {
                             this.transcript
                                 .update(cx, |view, _| view.record_provider_turn(id));
@@ -1514,6 +1519,7 @@ impl Conversation {
                             this.questions.clear();
                             this.controls = None;
                             this.transcript.update(cx, |v, cx| v.streaming(false, cx));
+                            this.publish_subagents(cx);
                             let model_id = turn_model_id.clone();
                             this.transcript.update(cx, |view, _| {
                                 if let Some(turn) = view.active_turn()
@@ -1652,6 +1658,7 @@ impl Conversation {
             ResponseRequest::QuoteSelection { text } => self.mono_quote(text, window, cx),
             ResponseRequest::EditLastTurn { turn } => self.begin_edit_last_turn(*turn, window, cx),
             ResponseRequest::Draft { send } => self.draft_action(*send, cx),
+            ResponseRequest::OpenSubagent { id } => self.open_subagent(Some(id.clone()), cx),
             ResponseRequest::SaveNote {
                 turn,
                 text,
@@ -2830,6 +2837,7 @@ impl Conversation {
         self.status = "Ready".into();
         self.transcript
             .update(cx, |view, cx| view.stop_streaming(cx));
+        self.publish_subagents(cx);
         self.review
             .update(cx, |review, cx| review.set_busy(false, cx));
         cx.emit(SessionChanged);
@@ -3883,6 +3891,15 @@ impl Render for Conversation {
         if !self.summary.has_messages {
             return self.empty(window, cx);
         }
+        // A subagent's view swaps the composer for its status bar.
+        let (subagent_bar, subagent_status) = match self.focused_subagent(cx) {
+            Some((focus, all)) => (
+                Some(self.subagent_bar(&focus, &all, cx)),
+                Some(self.subagent_status_bar(&focus, cx)),
+            ),
+            None => (None, None),
+        };
+        let in_subagent = subagent_status.is_some();
         self.attachment_drop_target("session-chat", cx)
             .relative()
             .capture_action(
@@ -3912,9 +3929,13 @@ impl Render for Conversation {
                         .fold(panel, |panel, region| panel.ignore(region.clone())),
                 )
             })
+            .children(subagent_bar)
             .child({
-                let git = self.git_action_pill(cx);
-                let changes = self.changes_pill(cx);
+                let (git, changes) = if in_subagent {
+                    (None, None)
+                } else {
+                    (self.git_action_pill(cx), self.changes_pill(cx))
+                };
                 let beside = git.is_some() || changes.is_some();
                 let pill = beside.then(|| {
                     div()
@@ -3970,16 +3991,19 @@ impl Render for Conversation {
                             .flex_col()
                             .px(px(10.))
                             .pb(px(6.))
-                            .child({
-                                let composer = self
-                                    .composer_motion
-                                    .clone()
-                                    .wrap(self.composer(window, cx))
-                                    .into_any_element();
-                                let focus = self.input.focus_handle(cx);
-                                let card = self.questions.front().map(|(card, _)| card);
-                                self.question_overlay
-                                    .wrap(composer, card, &focus, window, cx)
+                            .children(subagent_status)
+                            .when(!in_subagent, |d| {
+                                d.child({
+                                    let composer = self
+                                        .composer_motion
+                                        .clone()
+                                        .wrap(self.composer(window, cx))
+                                        .into_any_element();
+                                    let focus = self.input.focus_handle(cx);
+                                    let card = self.questions.front().map(|(card, _)| card);
+                                    self.question_overlay
+                                        .wrap(composer, card, &focus, window, cx)
+                                })
                             }),
                     ),
             )

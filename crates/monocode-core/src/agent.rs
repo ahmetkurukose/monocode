@@ -234,6 +234,9 @@ pub enum Decision {
     Deny,
     Answer(Vec<Vec<String>>),
     KeepOpen,
+    /// Stop one subagent or background task, named by `Control::id`, and
+    /// leave the turn running.
+    StopTask,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuestionOption {
