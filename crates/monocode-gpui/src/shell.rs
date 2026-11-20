@@ -756,6 +756,9 @@ pub(crate) struct Shell {
     groups: HashMap<String, monocode_core::session_groups::Groups>,
     reminders: Vec<monocode_core::store::Reminder>,
     renaming: Option<session_groups::Renaming>,
+    /// Where the open session menu came from, so its Rename edits the
+    /// title in that row rather than in the sidebar.
+    menu_rename_host: session_groups::RenameHost,
     link_dialog: Option<session_groups::LinkDialog>,
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
@@ -1210,6 +1213,7 @@ impl Shell {
             groups: sidebar_metadata.groups,
             reminders: sidebar_metadata.reminders,
             renaming: None,
+            menu_rename_host: session_groups::RenameHost::Sidebar,
             link_dialog: None,
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
@@ -5962,6 +5966,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_preview(cx);
+        self.menu_rename_host = session_groups::RenameHost::Sidebar;
         // Close the previous menu first, so the new one remembers the focus
         // that was there before either opened.
         self.menu = None;
@@ -6135,6 +6140,16 @@ impl Shell {
                         if pinned { "Unpin Tab" } else { "Pin Tab" },
                     )
                     .into(),
+                ];
+                // A tab holding a chat can rename it.
+                if tab
+                    .session()
+                    .and_then(|id| self.tab_rename_session(id))
+                    .is_some()
+                {
+                    items.push(MenuAction::new("rename", "Rename").shortcut("F2").into());
+                }
+                items.extend([
                     MenuItem::Separator,
                     MenuAction::new("close", "Close Tab")
                         .shortcut(format!("{MOD}W"))
@@ -6158,7 +6173,7 @@ impl Shell {
                         })
                         .disabled(count < 2 && !closable)
                         .into(),
-                ];
+                ]);
                 // A tab holding a file can send it to a data source's console.
                 if let Some(id) = tab.session() {
                     let sources = self
@@ -6578,6 +6593,18 @@ impl Shell {
             match action {
                 "archive" => return self.toggle_archive(id, cx),
                 "delete" => return self.confirm_delete_session(id, window, cx),
+                "rename" => {
+                    if let Some(session) = self.tab_rename_session(id) {
+                        let host = self.tab_rename_host(id);
+                        self.start_rename_in(
+                            session_groups::RenameTarget::Session(session),
+                            host,
+                            window,
+                            cx,
+                        );
+                    }
+                    return;
+                }
                 _ => {}
             }
             if let Some(source) = action.strip_prefix("send-db:") {
@@ -8913,12 +8940,25 @@ impl Shell {
                                 )
                             })
                             .child(self.pane_tile_stack(&copy, leaving, shuffle))
-                            .child(self.pane_headline(
-                                &copy,
-                                (leaving, dir, progress),
-                                active,
-                                hovered,
-                            )),
+                            .child(
+                                self.tab_rename_session(id)
+                                    .and_then(|session| {
+                                        self.rename_field(
+                                            session,
+                                            session_groups::RenameHost::Tab,
+                                            TITLE_TAB_TEXT_SIZE,
+                                            cx,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        self.pane_headline(
+                                            &copy,
+                                            (leaving, dir, progress),
+                                            active,
+                                            hovered,
+                                        )
+                                    }),
+                            ),
                     )
                     .when(close, |d| {
                         d.child(
@@ -9016,12 +9056,27 @@ impl Shell {
                             this.request_close(id, window, cx);
                         }),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if std::mem::take(&mut this.skip_tab_click) {
-                            return;
-                        }
-                        this.open_title_tab(&TitleTab::Session(id), window, cx);
-                    }));
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            if std::mem::take(&mut this.skip_tab_click) {
+                                return;
+                            }
+                            // The first click selected the tab; a double click
+                            // names its chat in place.
+                            if event.click_count() == 2
+                                && let Some(session) = this.tab_rename_session(id)
+                            {
+                                this.start_rename_in(
+                                    session_groups::RenameTarget::Session(session),
+                                    session_groups::RenameHost::Tab,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.open_title_tab(&TitleTab::Session(id), window, cx);
+                            }
+                        }),
+                    );
                 let element = if dragging {
                     gpui::deferred(tab).with_priority(1).into_any()
                 } else {
