@@ -2,6 +2,7 @@
 //!
 //! - [`runtime`]: loads and initializes CEF inside the app.
 //! - [`view`]: a page shown as a native child view of the host window.
+//! - [`DevToolsView`]: a page's DevTools, docked as a second child view.
 //!
 //! Nothing here depends on the UI toolkit; the app hands in native view
 //! pointers and receives page events.
@@ -9,9 +10,13 @@
 pub mod runtime;
 pub mod view;
 
+mod capture;
+mod devtools;
+
 #[cfg(target_os = "macos")]
 mod mac;
 
+pub use devtools::{DevToolsEvent, DevToolsView};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{BrowserEvent, BrowserView, CreateError, Frame};
 

@@ -7,24 +7,59 @@
 //! A page's view sits above GPUI's own view, so GPUI cannot draw over it.
 //! Each frame every shown page records that it painted; the [`sweep`] element,
 //! painted last, hides the pages that did not (their tab is not in front) and
-//! the ones a menu, a modal or a notification covers ([`cover`]).
+//! moves away the ones a menu, a modal or a notification covers ([`cover`]),
+//! drawing their last frame in their place instead (K16). A page's docked
+//! DevTools (K18) is a second view, placed and swept the same way.
 
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     path::{Path, PathBuf},
     rc::{Rc, Weak},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
-    KeyBinding, Pixels, Subscription, Window, WindowId, actions, canvas, div, prelude::*, px,
+    AnyWindowHandle, App, Bounds, Context, Corners, CursorStyle, DispatchPhase, Entity,
+    EventEmitter, FocusHandle, Focusable, Global, Image, ImageFormat, KeyBinding, MouseButton,
+    MouseMoveEvent, MouseUpEvent, Pixels, RenderImage, Subscription, Window, WindowId, actions,
+    canvas, div, prelude::*, px,
 };
 
 use crate::{
     input::{self, Input},
     theme::{content, icon, icon_button_enabled},
+    workspace::DevToolsDock,
 };
+
+actions!(
+    workspace,
+    [
+        /// ⌥⌘I: the focused page's docked DevTools.
+        ToggleBrowserDevTools
+    ]
+);
+
+/// DevTools and the page above it each keep at least this many points.
+const DEVTOOLS_MIN: f32 = 120.;
+const PAGE_MIN: f32 = 80.;
+
+/// DevTools' height in a body `available` points tall: the saved height
+/// (0: 40% of the body), kept clear of both minimums. Unmeasured (0), the
+/// body takes the wanted height as it is.
+pub(crate) fn devtools_height(saved: u32, available: f32) -> f32 {
+    let wanted = if saved == 0 {
+        (available * 0.4).max(DEVTOOLS_MIN)
+    } else {
+        saved as f32
+    };
+    if available <= 0. {
+        return wanted;
+    }
+    let max = (available - PAGE_MIN).max(0.);
+    wanted.clamp(DEVTOOLS_MIN.min(max), max)
+}
 
 /// Whether Chromium runs, shared by every window.
 #[derive(Clone, Debug, PartialEq)]
@@ -342,7 +377,15 @@ pub(crate) struct BrowserPage {
     window: Option<AnyWindowHandle>,
     engine: Entity<Engine>,
     profiles: PathBuf,
-    host: Rc<Host>,
+    host: Rc<Host<monocode_cef::BrowserView>>,
+    /// Saved with the pane; the shell sets it when it makes the page.
+    pub devtools_dock: DevToolsDock,
+    /// The docked DevTools' view, made when first painted while open.
+    devtools: Rc<Host<monocode_cef::DevToolsView>>,
+    /// The divider being dragged: where the drag started, and the height then.
+    devtools_drag: Option<(f32, f32)>,
+    /// The body under the toolbar, as last laid out.
+    body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -378,6 +421,11 @@ impl BrowserPage {
                     this.load(url, cx);
                 }
             }),
+            // Snapshots sit in GPU atlases until given back.
+            cx.on_release(|page, cx| {
+                page.host.release(cx);
+                page.devtools.release(cx);
+            }),
         ];
         Self {
             url,
@@ -395,6 +443,10 @@ impl BrowserPage {
             engine,
             profiles,
             host: Rc::new(Host::default()),
+            devtools_dock: DevToolsDock::default(),
+            devtools: Rc::new(Host::default()),
+            devtools_drag: None,
+            body_bounds: Rc::default(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -453,6 +505,7 @@ impl BrowserPage {
                     self.failure = None;
                 } else {
                     self.sync_zoom(cx);
+                    self.snapshot_when_settled(cx);
                 }
             }
             BrowserEvent::Progress(progress) => self.progress = progress,
@@ -771,6 +824,63 @@ impl BrowserPage {
                         .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
                 )
             })
+            .child(
+                icon_button_enabled("browser-devtools", "DevTools", "code", ready)
+                    .when(self.devtools_dock.open, |b| b.bg(content(0.1)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
+            )
+    }
+
+    /// Opens or closes the docked DevTools.
+    pub(crate) fn toggle_dev_tools(&mut self, cx: &mut Context<Self>) {
+        self.devtools_dock.open = !self.devtools_dock.open;
+        if !self.devtools_dock.open {
+            self.drop_dev_tools(cx);
+        }
+        cx.emit(PageChanged);
+        cx.notify();
+    }
+
+    /// Closes DevTools' view; a new host makes the next one.
+    fn drop_dev_tools(&mut self, cx: &mut App) {
+        self.devtools_drag = None;
+        let old = std::mem::replace(&mut self.devtools, Rc::new(Host::default()));
+        old.release(cx);
+        old.close();
+    }
+
+    /// DevTools closed on its own (its UI, or a crash).
+    fn dev_tools_closed(
+        &mut self,
+        host: &Weak<Host<monocode_cef::DevToolsView>>,
+        cx: &mut Context<Self>,
+    ) {
+        if std::ptr::eq(host.as_ptr(), Rc::as_ptr(&self.devtools)) {
+            self.devtools_dock.open = false;
+            self.drop_dev_tools(cx);
+            cx.emit(PageChanged);
+        }
+        // An earlier DevTools finishing its close lets a new one open.
+        cx.notify();
+    }
+
+    /// A snapshot once a load has had a moment to paint, so an overlay has
+    /// a recent frame to show at once.
+    fn snapshot_when_settled(&self, cx: &mut Context<Self>) {
+        let host = Rc::downgrade(&self.host);
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            cx.update(|cx| {
+                if let Some(host) = host.upgrade()
+                    && host.shown.get() == Placement::Shown
+                {
+                    host.refresh_snapshot(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Instead of the page while Chromium is not running yet.
@@ -843,10 +953,212 @@ impl BrowserPage {
         let page = cx.weak_entity();
         canvas(
             |_, _, _| {},
-            move |bounds, _, window, cx| host.paint(bounds, &url, &page, window, cx),
+            move |bounds, _, window, cx| {
+                host.paint(bounds, window, cx, |parent, frame, cx| {
+                    match monocode_cef::BrowserView::create(parent, frame, &url) {
+                        Ok((view, events)) => {
+                            let page = page.clone();
+                            cx.spawn(async move |cx| {
+                                while let Ok(event) = events.recv().await {
+                                    if page
+                                        .update(cx, |page, cx| page.on_event(event, cx))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
+                            Some(view)
+                        }
+                        Err(e) => {
+                            let error = e.to_string();
+                            let page = page.clone();
+                            cx.defer(move |cx| {
+                                let _ = page.update(cx, |page, cx| {
+                                    page.failure = Some(error);
+                                    cx.notify();
+                                });
+                            });
+                            None
+                        }
+                    }
+                })
+            },
         )
         .size_full()
         .into_any_element()
+    }
+
+    /// Where DevTools draws, under the page: made once the page is.
+    fn devtools_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let host = self.devtools.clone();
+        let page_host = self.host.clone();
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let weak = Rc::downgrade(&host);
+                host.paint(bounds, window, cx, |parent, frame, cx| {
+                    let opened = page_host
+                        .view
+                        .borrow()
+                        .as_ref()
+                        .map(|hosted| hosted.view.show_dev_tools(parent, frame));
+                    match opened? {
+                        Ok((view, events)) => {
+                            let page = page.clone();
+                            cx.spawn(async move |cx| {
+                                if events.recv().await.is_ok() {
+                                    let _ = page
+                                        .update(cx, |page, cx| page.dev_tools_closed(&weak, cx));
+                                }
+                            })
+                            .detach();
+                            Some(view)
+                        }
+                        // An earlier DevTools is still closing; its close
+                        // repaints, and this tries again.
+                        Err(e) => {
+                            log::debug!("browser: DevTools did not open: {e}");
+                            None
+                        }
+                    }
+                })
+            },
+        )
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The page, with DevTools under a draggable divider when it is open.
+    fn body(&mut self, page: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let open = self.devtools_dock.open && self.engine.read(cx).state == EngineState::Ready;
+        if !open {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(page)
+                .into_any_element();
+        }
+        let available = self
+            .body_bounds
+            .get()
+            .map_or(0., |b| f32::from(b.size.height));
+        let height = devtools_height(self.devtools_dock.height, available);
+        let slot = self.body_bounds.clone();
+        // The next render clamps to a new size, so a resize asks for it.
+        let probe = canvas(
+            move |bounds, window, _| {
+                if slot
+                    .replace(Some(bounds))
+                    .is_none_or(|old| old.size != bounds.size)
+                {
+                    window.on_next_frame(|window, _| window.refresh());
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let divider = div()
+            .id("browser-devtools-divider")
+            .role(gpui::Role::Splitter)
+            .aria_label("Resize DevTools")
+            // Real space, not an overlap: Chromium's views would take the
+            // pointer over any part of it they cover.
+            .h(px(5.))
+            .flex_shrink_0()
+            .cursor(CursorStyle::ResizeUpDown)
+            .flex()
+            .items_center()
+            .child(div().h(px(1.)).w_full().bg(content(0.12)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.devtools_drag = Some((f32::from(event.position.y), height));
+                    cx.stop_propagation();
+                }),
+            );
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(probe)
+            .child(div().flex_1().min_h_0().min_w_0().child(page))
+            .child(divider)
+            .child(
+                div()
+                    .h(px(height))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(self.devtools_surface(cx)),
+            )
+            .when(self.devtools_drag.is_some(), |d| {
+                d.child(self.drag_listener(cx))
+            })
+            .into_any_element()
+    }
+
+    /// While the divider drags: window-wide, since the pointer passes over
+    /// Chromium's views, whose drags AppKit still sends to GPUI's view.
+    fn drag_listener(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let moved = page.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = moved.update(cx, |page, cx| page.drag_divider(event, cx));
+                });
+                let released = page.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = released.update(cx, |page, cx| page.end_divider_drag(cx));
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    fn drag_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((start, height)) = self.devtools_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_divider_drag(cx);
+            return;
+        }
+        let available = self
+            .body_bounds
+            .get()
+            .map_or(0., |b| f32::from(b.size.height));
+        let wanted = (height + start - f32::from(event.position.y)).max(1.);
+        let height = devtools_height(wanted.round() as u32, available).round() as u32;
+        if height != self.devtools_dock.height {
+            self.devtools_dock.height = height;
+            cx.notify();
+        }
+    }
+
+    fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+        if self.devtools_drag.take().is_some() {
+            // Saved once, when the drag ends.
+            cx.emit(PageChanged);
+            cx.notify();
+        }
     }
 }
 
@@ -905,15 +1217,15 @@ impl Render for BrowserPage {
                     ),
                 )
             })
-            .child(div().flex_1().min_h_0().min_w_0().child(body))
+            .child(self.body(body, cx))
     }
 }
 
 // ---- The native view and its visibility ----
 
 thread_local! {
-    /// Every page's host, for [`sweep`].
-    static HOSTS: RefCell<Vec<Weak<Host>>> = const { RefCell::new(Vec::new()) };
+    /// Every page's and DevTools' host, for [`sweep`].
+    static HOSTS: RefCell<Vec<Weak<dyn Swept>>> = const { RefCell::new(Vec::new()) };
     /// Per window: the frame being painted, and what overlays covered in it.
     static FRAMES: RefCell<HashMap<WindowId, Frame>> = RefCell::new(HashMap::new());
 }
@@ -924,25 +1236,163 @@ struct Frame {
     covers: Vec<Bounds<Pixels>>,
 }
 
-/// A page's Chromium view inside a clipping view of the window.
-#[derive(Default)]
-struct Host {
-    view: RefCell<Option<Hosted>>,
+/// A Chromium view a [`Host`] places: a page or its DevTools.
+trait NativeView: 'static {
+    fn set_frame(&self, frame: monocode_cef::Frame);
+    fn set_visible(&self, visible: bool);
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>);
+    fn close(&self);
+}
+
+impl NativeView for monocode_cef::BrowserView {
+    fn set_frame(&self, frame: monocode_cef::Frame) {
+        self.set_frame(frame);
+    }
+    fn set_visible(&self, visible: bool) {
+        self.set_visible(visible);
+    }
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        self.capture(done);
+    }
+    fn close(&self) {
+        self.close();
+    }
+}
+
+impl NativeView for monocode_cef::DevToolsView {
+    fn set_frame(&self, frame: monocode_cef::Frame) {
+        self.set_frame(frame);
+    }
+    fn set_visible(&self, visible: bool) {
+        self.set_visible(visible);
+    }
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        self.capture(done);
+    }
+    fn close(&self) {
+        self.close();
+    }
+}
+
+/// How a host's view shows, as the last sweep decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Placement {
+    /// Not painted (its tab is not in front): hidden from Chromium too, which
+    /// throttles it.
+    #[default]
+    Hidden,
+    /// Under an overlay: moved out of the window but still live for
+    /// Chromium, so it can be captured; its snapshot is drawn in its place.
+    Covered,
+    Shown,
+}
+
+/// What a host painted in this frame at `bounds` becomes, under `covers`.
+fn shown(painted: bool, bounds: Bounds<Pixels>, covers: &[Bounds<Pixels>]) -> Placement {
+    if !painted || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+        Placement::Hidden
+    } else if covers.iter().any(|cover| cover.intersects(&bounds)) {
+        Placement::Covered
+    } else {
+        Placement::Shown
+    }
+}
+
+/// A capture asked for longer ago than this is given up: a page Chromium
+/// does not draw may never answer.
+const CAPTURE_PATIENCE: Duration = Duration::from_secs(3);
+
+/// A Chromium view inside a clipping view of the window, and the last frame
+/// captured from it.
+struct Host<V> {
+    view: RefCell<Option<Hosted<V>>>,
     /// The window and frame it was last painted in, and where.
     painted: Cell<Option<(WindowId, u64, Bounds<Pixels>)>>,
-    shown: Cell<bool>,
+    shown: Cell<Placement>,
     registered: Cell<bool>,
+    /// One recent frame, at the screen's scale. Given back to the GPU atlas
+    /// when replaced, when the view hides, and with the page.
+    snapshot: RefCell<Option<Arc<RenderImage>>>,
+    /// When the capture on its way was asked for.
+    capturing: Cell<Option<Instant>>,
+    /// The page is gone: captures still on their way are dropped.
+    released: Cell<bool>,
 }
 
-struct Hosted {
+impl<V> Default for Host<V> {
+    fn default() -> Self {
+        Self {
+            view: RefCell::default(),
+            painted: Cell::default(),
+            shown: Cell::default(),
+            registered: Cell::default(),
+            snapshot: RefCell::default(),
+            capturing: Cell::default(),
+            released: Cell::default(),
+        }
+    }
+}
+
+struct Hosted<V> {
     #[cfg(target_os = "macos")]
     clip: objc2::rc::Retained<objc2_app_kit::NSView>,
-    view: monocode_cef::BrowserView,
+    view: V,
 }
 
-impl Host {
-    /// Runs `f` on the page, if it exists yet.
-    fn with_view(&self, f: impl FnOnce(&monocode_cef::BrowserView)) -> bool {
+/// Covered views wait this far outside the window (points).
+#[cfg(target_os = "macos")]
+const AWAY: f64 = -100_000.;
+
+/// Painted last in a window, it settles each host painted there.
+trait Swept {
+    fn sweep(
+        self: Rc<Self>,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+        window: &mut Window,
+        cx: &mut App,
+    );
+}
+
+impl<V: NativeView> Swept for Host<V> {
+    fn sweep(
+        self: Rc<Self>,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((painted_in, painted, bounds)) = self.painted.get() else {
+            return;
+        };
+        if painted_in != window_id {
+            return;
+        }
+        let next = shown(painted == epoch, bounds, covers);
+        let prev = self.shown.replace(next);
+        self.apply(prev, next);
+        match next {
+            Placement::Hidden if prev != Placement::Hidden => {
+                self.set_snapshot(None, Some(window), cx)
+            }
+            Placement::Covered if prev != Placement::Covered => {
+                // Live while covered, so this capture is of the frame just
+                // left; until it comes, the last one shows, if any.
+                self.refresh_snapshot(cx);
+                if self.snapshot.borrow().is_some() {
+                    window.on_next_frame(|window, _| window.refresh());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<V: NativeView> Host<V> {
+    /// Runs `f` on the view, if it exists yet.
+    fn with_view(&self, f: impl FnOnce(&V)) -> bool {
         match self.view.borrow().as_ref() {
             Some(hosted) => {
                 f(&hosted.view);
@@ -952,14 +1402,139 @@ impl Host {
         }
     }
 
-    fn set_shown(&self, shown: bool) {
-        if self.shown.replace(shown) == shown {
+    /// Carries the sweep's decision to the native views.
+    fn apply(&self, prev: Placement, next: Placement) {
+        let slot = self.view.borrow();
+        let Some(hosted) = slot.as_ref() else { return };
+        match next {
+            Placement::Hidden => {
+                if prev != Placement::Hidden {
+                    #[cfg(target_os = "macos")]
+                    hosted.clip.setHidden(true);
+                    hosted.view.set_visible(false);
+                }
+            }
+            Placement::Covered | Placement::Shown => {
+                if prev == Placement::Hidden {
+                    #[cfg(target_os = "macos")]
+                    hosted.clip.setHidden(false);
+                    hosted.view.set_visible(true);
+                }
+                // Paint put the clip in place this frame; a covered one moves
+                // out of the window instead of hiding, which would stop
+                // Chromium drawing and so capturing it.
+                #[cfg(target_os = "macos")]
+                if next == Placement::Covered {
+                    hosted
+                        .clip
+                        .setFrameOrigin(objc2_foundation::NSPoint::new(AWAY, AWAY));
+                }
+            }
+        }
+    }
+
+    /// Replaces the snapshot, giving the old one's texture back.
+    fn set_snapshot(
+        &self,
+        image: Option<Arc<RenderImage>>,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        if self.released.get() && image.is_some() {
             return;
         }
-        if let Some(hosted) = self.view.borrow().as_ref() {
+        if let Some(old) = self.snapshot.replace(image) {
+            cx.drop_image(old, window);
+        }
+    }
+
+    /// The page is gone: its snapshot goes, and no other comes.
+    fn release(&self, cx: &mut App) {
+        self.set_snapshot(None, None, cx);
+        self.released.set(true);
+    }
+
+    /// Asks Chromium for the view's current frame, unless a capture is on
+    /// its way. PNG decoding runs off the main thread.
+    fn refresh_snapshot(self: &Rc<Self>, cx: &mut App) {
+        if self.released.get()
+            || self
+                .capturing
+                .get()
+                .is_some_and(|asked| asked.elapsed() < CAPTURE_PATIENCE)
+        {
+            return;
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        let asked = self.with_view(|view| {
+            view.capture(Box::new(move |result| {
+                let _ = tx.try_send(result);
+            }))
+        });
+        if !asked {
+            return;
+        }
+        self.capturing.set(Some(Instant::now()));
+        let host = Rc::downgrade(self);
+        let renderer = cx.svg_renderer();
+        cx.spawn(async move |cx| {
+            // Closed without a result when the view closes first.
+            let png = match rx.recv().await {
+                Ok(Ok(png)) => Some(png),
+                Ok(Err(e)) => {
+                    log::debug!("browser: no snapshot: {e}");
+                    None
+                }
+                Err(_) => None,
+            };
+            let image = match png {
+                Some(png) => cx
+                    .background_spawn(async move {
+                        Image::from_bytes(ImageFormat::Png, png).to_image_data(renderer)
+                    })
+                    .await
+                    .map_err(|e| log::debug!("browser: snapshot did not decode: {e}"))
+                    .ok(),
+                None => None,
+            };
+            cx.update(|cx| {
+                let Some(host) = host.upgrade() else { return };
+                host.capturing.set(None);
+                // A hidden view keeps no snapshot: it would only hold memory.
+                let Some(image) = image.filter(|_| host.shown.get() != Placement::Hidden) else {
+                    return;
+                };
+                host.set_snapshot(Some(image), None, cx);
+                if host.shown.get() == Placement::Covered
+                    && let Some((window_id, ..)) = host.painted.get()
+                    && let Some(window) = cx
+                        .windows()
+                        .into_iter()
+                        .find(|w| w.window_id() == window_id)
+                {
+                    let _ = window.update(cx, |_, window, _| window.refresh());
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Closes the view now, rather than when the last frame lets go of it.
+    fn close(&self) {
+        if let Some(hosted) = self.view.borrow_mut().take() {
+            hosted.view.close();
             #[cfg(target_os = "macos")]
-            hosted.clip.setHidden(!shown);
-            hosted.view.set_visible(shown);
+            hosted.clip.removeFromSuperview();
+        }
+    }
+
+    /// Under an overlay, the snapshot stands in for the view.
+    fn paint_snapshot(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        if self.shown.get() != Placement::Covered {
+            return;
+        }
+        if let Some(image) = self.snapshot.borrow().clone() {
+            let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
         }
     }
 
@@ -967,21 +1542,21 @@ impl Host {
     fn paint(
         self: &Rc<Self>,
         _: Bounds<Pixels>,
-        _: &str,
-        _: &gpui::WeakEntity<BrowserPage>,
         _: &mut Window,
         _: &mut App,
+        _: impl FnOnce(*mut std::ffi::c_void, monocode_cef::Frame, &mut App) -> Option<V>,
     ) {
     }
 
+    /// Places the view at `bounds` this frame, making it with `create` (in
+    /// a parent view and at a frame) the first time.
     #[cfg(target_os = "macos")]
     fn paint(
         self: &Rc<Self>,
         bounds: Bounds<Pixels>,
-        url: &str,
-        page: &gpui::WeakEntity<BrowserPage>,
         window: &mut Window,
         cx: &mut App,
+        create: impl FnOnce(*mut std::ffi::c_void, monocode_cef::Frame, &mut App) -> Option<V>,
     ) {
         use objc2::{MainThreadMarker, MainThreadOnly, msg_send, rc::Retained};
         use objc2_app_kit::{NSView, NSWindowOrderingMode};
@@ -989,8 +1564,10 @@ impl Host {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         if !self.registered.replace(true) {
-            HOSTS.with(|hosts| hosts.borrow_mut().push(Rc::downgrade(self)));
+            let swept: Weak<dyn Swept> = Rc::downgrade(self) as Weak<dyn Swept>;
+            HOSTS.with(|hosts| hosts.borrow_mut().push(swept));
         }
+        self.paint_snapshot(bounds, window);
         let id = Window::window_handle(window).window_id();
         let epoch = FRAMES.with(|f| f.borrow().get(&id).map_or(0, |f| f.epoch));
         let Ok(handle) = HasWindowHandle::window_handle(window) else {
@@ -1005,9 +1582,9 @@ impl Host {
         // GPUI keeps its AppKit content view alive throughout paint.
         let parent = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
         let clipped = bounds.intersect(&window.content_mask().bounds);
+        // An empty place hides it in the sweep.
         self.painted.set(Some((id, epoch, clipped)));
         if clipped.size.width <= px(0.) || clipped.size.height <= px(0.) {
-            self.set_shown(false);
             return;
         }
         // AppKit frames are in window points; GPUI's are divided by the
@@ -1044,33 +1621,14 @@ impl Host {
             clip.setClipsToBounds(true);
             parent.addSubview_positioned_relativeTo(&clip, NSWindowOrderingMode::Above, None);
             let raw = Retained::as_ptr(&clip) as *mut std::ffi::c_void;
-            match monocode_cef::BrowserView::create(raw, frame, url) {
-                Ok((view, events)) => {
-                    let page = page.clone();
-                    cx.spawn(async move |cx| {
-                        while let Ok(event) = events.recv().await {
-                            if page
-                                .update(cx, |page, cx| page.on_event(event, cx))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    })
-                    .detach();
+            match create(raw, frame, cx) {
+                Some(view) => {
                     *slot = Some(Hosted { clip, view });
-                    self.shown.set(true);
+                    // Chromium makes its view shown.
+                    self.shown.set(Placement::Shown);
                 }
-                Err(e) => {
+                None => {
                     clip.removeFromSuperview();
-                    let error = e.to_string();
-                    let page = page.clone();
-                    cx.defer(move |cx| {
-                        let _ = page.update(cx, |page, cx| {
-                            page.failure = Some(error);
-                            cx.notify();
-                        });
-                    });
                     return;
                 }
             }
@@ -1085,17 +1643,17 @@ impl Host {
                 None,
             );
         }
+        // Shown or not is the sweep's to say, after the overlays painted.
         hosted.clip.setFrame(rect);
         hosted.view.set_frame(frame);
-        drop(slot);
-        self.set_shown(true);
     }
 }
 
-impl Drop for Host {
+impl<V> Drop for Host<V> {
     fn drop(&mut self) {
+        // The snapshot's texture went back with the page (`release`).
         if let Some(hosted) = self.view.get_mut().take() {
-            hosted.view.close();
+            drop(hosted.view);
             #[cfg(target_os = "macos")]
             hosted.clip.removeFromSuperview();
         }
@@ -1103,7 +1661,8 @@ impl Drop for Host {
 }
 
 /// Marks `bounds` (window coordinates) as drawn over by an overlay this
-/// frame: a page under it hides, since GPUI cannot draw above the page.
+/// frame: a page under it gives way to its snapshot, since GPUI cannot draw
+/// above the page.
 pub(crate) fn cover(bounds: Bounds<Pixels>, window: &Window) {
     let id = window.window_handle().window_id();
     FRAMES.with(|f| f.borrow_mut().entry(id).or_default().covers.push(bounds));
@@ -1116,13 +1675,14 @@ pub(crate) fn cover_element() -> impl IntoElement {
         .inset_0()
 }
 
-/// Painted after everything else in a window: hides the pages that were not
-/// painted in this frame or that an overlay covers, and starts the next frame.
+/// Painted after everything else in a window: hides the views that were not
+/// painted in this frame, moves away the ones an overlay covers, and starts
+/// the next frame.
 pub(crate) fn sweep() -> impl IntoElement {
     gpui::deferred(
         canvas(
             |_, _, _| {},
-            |_, _, window, _| {
+            |_, _, window, cx| {
                 let id = window.window_handle().window_id();
                 let (epoch, covers) = FRAMES.with(|f| {
                     let mut frames = f.borrow_mut();
@@ -1132,23 +1692,14 @@ pub(crate) fn sweep() -> impl IntoElement {
                     frame.epoch += 1;
                     (epoch, covers)
                 });
-                HOSTS.with(|hosts| {
-                    hosts.borrow_mut().retain(|host| {
-                        let Some(host) = host.upgrade() else {
-                            return false;
-                        };
-                        match host.painted.get() {
-                            Some((window, painted, bounds)) if window == id => {
-                                let covered = covers.iter().any(|c| c.intersects(&bounds));
-                                if painted != epoch || covered {
-                                    host.set_shown(false);
-                                }
-                            }
-                            _ => {}
-                        }
-                        true
-                    });
+                let live: Vec<Rc<dyn Swept>> = HOSTS.with(|hosts| {
+                    let mut hosts = hosts.borrow_mut();
+                    hosts.retain(|host| host.strong_count() > 0);
+                    hosts.iter().filter_map(Weak::upgrade).collect()
                 });
+                for host in live {
+                    host.sweep(id, epoch, &covers, window, cx);
+                }
             },
         )
         .size_0(),
@@ -1245,9 +1796,35 @@ mod monocode_cef {
         Focused,
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Frame {
+        pub x: f64,
+        pub y: f64,
+        pub width: f64,
+        pub height: f64,
+    }
+
+    const UNAVAILABLE: &str = "the browser is not available on this platform yet";
+
     /// Never created: [`runtime::start`] always fails here.
     pub struct BrowserView;
     impl BrowserView {
+        pub fn create(
+            _: *mut std::ffi::c_void,
+            _: Frame,
+            _: &str,
+        ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), &'static str> {
+            Err(UNAVAILABLE)
+        }
+        pub fn show_dev_tools(
+            &self,
+            _: *mut std::ffi::c_void,
+            _: Frame,
+        ) -> Result<(DevToolsView, async_channel::Receiver<DevToolsEvent>), &'static str> {
+            Err(UNAVAILABLE)
+        }
+        pub fn capture(&self, _: impl FnOnce(Result<Vec<u8>, String>) + 'static) {}
+        pub fn set_frame(&self, _: Frame) {}
         pub fn set_visible(&self, _: bool) {}
         pub fn load_url(&self, _: &str) {}
         pub fn go_back(&self) {}
@@ -1262,6 +1839,19 @@ mod monocode_cef {
         pub fn zoom_level(&self) -> f64 {
             0.
         }
+        pub fn close(&self) {}
+    }
+
+    pub enum DevToolsEvent {
+        #[allow(dead_code)]
+        Closed,
+    }
+
+    pub struct DevToolsView;
+    impl DevToolsView {
+        pub fn set_frame(&self, _: Frame) {}
+        pub fn set_visible(&self, _: bool) {}
+        pub fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
         pub fn close(&self) {}
     }
 }
@@ -1334,6 +1924,105 @@ mod tests {
             find_status("rust", Some((12, 0))).as_deref(),
             Some("1 of 12")
         );
+    }
+
+    #[test]
+    fn devtools_keeps_its_height_clear_of_both_minimums() {
+        // Unsaved: 40% of the body, never under the minimum.
+        assert_eq!(devtools_height(0, 1000.), 400.);
+        assert_eq!(devtools_height(0, 250.), DEVTOOLS_MIN);
+        // Saved: as it was, while it fits.
+        assert_eq!(devtools_height(300, 1000.), 300.);
+        assert_eq!(devtools_height(10, 1000.), DEVTOOLS_MIN);
+        assert_eq!(devtools_height(990, 1000.), 1000. - PAGE_MIN);
+        // A body too short for both: the page keeps its minimum.
+        assert_eq!(devtools_height(300, 150.), 150. - PAGE_MIN);
+        assert_eq!(devtools_height(300, 50.), 0.);
+        // Not measured yet: the wanted height.
+        assert_eq!(devtools_height(300, 0.), 300.);
+        assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
+    }
+
+    #[test]
+    fn a_view_hides_unpainted_and_gives_way_under_an_overlay() {
+        let at = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: gpui::point(px(x), px(y)),
+            size: gpui::size(px(w), px(h)),
+        };
+        let page = at(0., 40., 800., 600.);
+        let menu = at(700., 30., 200., 100.);
+        let elsewhere = at(900., 0., 50., 50.);
+        assert_eq!(shown(true, page, &[]), Placement::Shown);
+        assert_eq!(shown(true, page, &[elsewhere]), Placement::Shown);
+        assert_eq!(shown(true, page, &[elsewhere, menu]), Placement::Covered);
+        assert_eq!(shown(false, page, &[]), Placement::Hidden);
+        assert_eq!(shown(false, page, &[menu]), Placement::Hidden);
+        assert_eq!(shown(true, at(0., 0., 0., 100.), &[]), Placement::Hidden);
+    }
+
+    struct NoView;
+    impl NativeView for NoView {
+        fn set_frame(&self, _: monocode_cef::Frame) {}
+        fn set_visible(&self, _: bool) {}
+        fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
+        fn close(&self) {}
+    }
+
+    #[gpui::test]
+    fn a_snapshot_gives_its_texture_back_when_replaced_or_released(cx: &mut gpui::TestAppContext) {
+        let image = || {
+            let frame = image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([9; 4])));
+            Arc::new(RenderImage::new(vec![frame]))
+        };
+        let (first, second) = (image(), image());
+        let host = Rc::new(Host::<NoView>::default());
+        host.shown.set(Placement::Covered);
+        let window = cx.add_empty_window();
+        let draw = |window: &mut gpui::VisualTestContext| {
+            let host = host.clone();
+            window.draw(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(20.), px(20.)),
+                |_, _| {
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| host.paint_snapshot(bounds, window),
+                    )
+                    .size_full()
+                    .into_any_element()
+                },
+            );
+        };
+        // Outside any window's update, as captures land and pages go.
+        let app = |window: &mut gpui::VisualTestContext, f: &dyn Fn(&mut App)| {
+            let app: &gpui::TestAppContext = window;
+            app.update(f);
+        };
+        let in_atlas = |window: &mut gpui::VisualTestContext, image: &Arc<RenderImage>| {
+            window.update(|window, _| window.has_image_atlas_entry(image))
+        };
+
+        app(window, &|cx| {
+            host.set_snapshot(Some(first.clone()), None, cx)
+        });
+        draw(window);
+        assert!(in_atlas(window, &first));
+        // Painting it again reuses the texture.
+        draw(window);
+        assert!(in_atlas(window, &first));
+
+        app(window, &|cx| {
+            host.set_snapshot(Some(second.clone()), None, cx)
+        });
+        assert!(!in_atlas(window, &first));
+        draw(window);
+        assert!(in_atlas(window, &second));
+
+        app(window, &|cx| host.release(cx));
+        assert!(!in_atlas(window, &second));
+        // A capture that lands after the page went is dropped.
+        app(window, &|cx| host.set_snapshot(Some(image()), None, cx));
+        assert!(host.snapshot.borrow().is_none());
     }
 
     #[test]

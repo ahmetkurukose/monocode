@@ -307,6 +307,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}--"), ZoomOut, context),
         KeyBinding::new(&format!("{modifier}-0"), ResetZoom, context),
         KeyBinding::new(&format!("{modifier}-shift-r"), Reload, context),
+        KeyBinding::new(
+            &format!("{modifier}-alt-i"),
+            crate::browser::ToggleBrowserDevTools,
+            context,
+        ),
         KeyBinding::new(&format!("{modifier}-alt-left"), FocusPaneLeft, context),
         KeyBinding::new(&format!("{modifier}-alt-right"), FocusPaneRight, context),
         KeyBinding::new(&format!("{modifier}-alt-up"), FocusPaneUp, context),
@@ -9878,6 +9883,9 @@ impl Render for Shell {
                 this.step_ui_scale(0, cx);
             }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| this.request_reload(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::browser::ToggleBrowserDevTools, _, cx| {
+                this.toggle_browser_dev_tools(cx)
+            }))
             .on_action(cx.listener(|this, _: &SidebarAppearance, window, cx| {
                 this.open_settings(crate::settings::Section::Appearance, window, cx)
             }))

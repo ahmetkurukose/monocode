@@ -309,6 +309,23 @@ pub(crate) struct BrowserPane {
     /// Page zoom in percent; `None` is 100%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<u16>,
+    #[serde(default, skip_serializing_if = "DevToolsDock::is_default")]
+    pub devtools: DevToolsDock,
+}
+
+/// A page's DevTools docked under it (context.md K18): whether it was open,
+/// and its height in points (0 until the divider is first moved).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DevToolsDock {
+    pub open: bool,
+    pub height: u32,
+}
+
+impl DevToolsDock {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
