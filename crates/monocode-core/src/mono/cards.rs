@@ -99,6 +99,7 @@ pub fn pull_request(cwd: &str, repo: Option<&str>, number: u64) -> Result<Value,
     }
     cmd.env("GH_PROMPT_DISABLED", "1");
     crate::scm::shell::apply_gui_env(&mut cmd);
+    crate::scm::shell::apply_gh_env(&mut cmd, std::path::Path::new(cwd));
     crate::process::configure_child(&mut cmd);
     let output = cmd.output().map_err(|e| e.to_string())?;
     if !output.status.success() {

@@ -515,6 +515,9 @@ impl ViewState {
 pub struct Snapshot {
     pub items: Vec<Item>,
     pub errors: BTreeMap<String, String>,
+    /// Per provider, why some projects are missing while others still
+    /// listed items (e.g. a repository the signed-in account cannot see).
+    pub warnings: BTreeMap<String, String>,
     pub connections: BTreeMap<String, Status>,
     pub linear_teams: Vec<OptionRow>,
     pub jira_projects: Vec<OptionRow>,
@@ -639,6 +642,20 @@ fn github_repositories(project: &Path) -> Result<Vec<String>, String> {
             (std::time::Instant::now(), repos.clone()),
         );
     Ok(repos)
+}
+
+/// The provider's answer for a folder that is not one of its checkouts.
+fn not_a_provider_checkout(error: &str) -> bool {
+    let error = error.to_lowercase();
+    [
+        "no git remotes",
+        "known github host",
+        "not a git repository",
+        "could not read git remotes",
+        "remote matches the configured",
+    ]
+    .iter()
+    .any(|benign| error.contains(benign))
 }
 
 fn repo_checkouts<'a>(
@@ -809,25 +826,40 @@ impl Service {
                 // Each project's repository, then each repository's issues and
                 // pull requests, are separate calls to the provider: run them
                 // side by side, or a dozen projects take a dozen times as long.
-                let resolved = parallel(projects, |project| {
-                    match provider {
-                        "github" => github_repositories(project),
-                        "gitlab" => gitlab::gitlab_repo(
-                            self.data_dir.clone(),
-                            project.to_string_lossy().into_owned(),
-                        )
-                        .map(|r| vec![r]),
-                        _ => azure_devops::azure_devops_repo(
-                            self.data_dir.clone(),
-                            project.to_string_lossy().into_owned(),
-                        )
-                        .map(|r| vec![r]),
-                    }
-                    .ok()
+                let resolved = parallel(projects, |project| match provider {
+                    "github" => github_repositories(project),
+                    "gitlab" => gitlab::gitlab_repo(
+                        self.data_dir.clone(),
+                        project.to_string_lossy().into_owned(),
+                    )
+                    .map(|r| vec![r]),
+                    _ => azure_devops::azure_devops_repo(
+                        self.data_dir.clone(),
+                        project.to_string_lossy().into_owned(),
+                    )
+                    .map(|r| vec![r]),
                 });
+                // A project without a remote on this provider is simply not
+                // in the inbox; any other failure (no access, signed in as
+                // another account) must be said, not shown as an empty list.
+                let unresolved = projects
+                    .iter()
+                    .zip(&resolved)
+                    .filter_map(|(project, resolved)| {
+                        let error = resolved.as_ref().err()?;
+                        (!not_a_provider_checkout(error)).then(|| {
+                            let name = project
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| project.to_string_lossy().into_owned());
+                            format!("{name}: {error}")
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let checkouts = repo_checkouts(projects, &self.cwd, |project| {
                     let at = projects.iter().position(|p| p.as_path() == project)?;
-                    resolved[at].clone()
+                    resolved[at].clone().ok()
                 });
                 let jobs: Vec<(&PathBuf, &str, &str)> = checkouts
                     .iter()
@@ -885,9 +917,14 @@ impl Service {
                     }));
                 }
                 if items.is_empty() {
+                    if !unresolved.is_empty() {
+                        return Err(unresolved);
+                    }
                     if let Some(error) = first_error {
                         return Err(error);
                     }
+                } else if !unresolved.is_empty() {
+                    snapshot.warnings.insert(provider.into(), unresolved);
                 }
                 Ok(items)
             })();
@@ -1133,6 +1170,7 @@ fn run_command_raw(program: &str, root: &Path, args: &[&str]) -> Result<String, 
         .env("GH_PAGER", "cat")
         .env("GIT_PAGER", "cat");
     crate::scm::shell::apply_gui_env(&mut command);
+    crate::scm::shell::apply_gh_env(&mut command, root);
     crate::process::configure_child(&mut command);
     let output = command.output().map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1150,6 +1188,20 @@ fn run_command_raw(program: &str, root: &Path, args: &[&str]) -> Result<String, 
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    #[test]
+    fn only_missing_remotes_are_quietly_left_out() {
+        assert!(not_a_provider_checkout("no git remotes found"));
+        assert!(not_a_provider_checkout(
+            "none of the git remotes configured for this repository point to a known GitHub host"
+        ));
+        assert!(not_a_provider_checkout(
+            "No GitLab remote matches the configured host"
+        ));
+        assert!(!not_a_provider_checkout(
+            "GraphQL: Could not resolve to a Repository with the name 'acme/app'. (repository)"
+        ));
+    }
 
     fn item(number: i64, provider: &str) -> Item {
         Item {

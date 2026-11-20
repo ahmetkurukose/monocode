@@ -1298,6 +1298,7 @@ fn gh_run(root: &Path, args: &[&str]) -> Result<String, String> {
         .env("GH_PAGER", "cat")
         .env("GIT_PAGER", "cat");
     shell::apply_gui_env(&mut cmd);
+    shell::apply_gh_env(&mut cmd, root);
     crate::process::configure_child(&mut cmd);
     let output = cmd.output().map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
@@ -1371,6 +1372,14 @@ fn git_cmd_for_args(args: &[&str]) -> Command {
 
 fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
     let mut cmd = git_cmd_for_args(args);
+    if matches!(
+        args.first().copied(),
+        Some("push" | "pull" | "fetch" | "clone")
+    ) {
+        // The credential helper may be `gh`, which picks its account from
+        // the environment the project's shell would set.
+        shell::apply_gh_env(&mut cmd, root);
+    }
     let output = cmd
         .arg("--no-pager")
         .arg("-C")

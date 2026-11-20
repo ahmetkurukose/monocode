@@ -294,6 +294,19 @@ fn load_login_shell_env() -> HashMap<String, String> {
 /// version managers initialize from there.
 #[cfg(not(windows))]
 fn load_unix_login_shell_env() -> HashMap<String, String> {
+    let mut map = login_shell_vars(None, &|key| key == "PATH").unwrap_or_default();
+    map.retain(|_, value| !value.is_empty());
+    map
+}
+
+/// The variables `keep` picks from the user's interactive login shell,
+/// started in `dir` when given, so `cd` hooks and direnv-style setups see
+/// that directory. None when the shell could not run or timed out.
+#[cfg(not(windows))]
+fn login_shell_vars(
+    dir: Option<&Path>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Option<HashMap<String, String>> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "/bin/zsh".into()
@@ -306,10 +319,18 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(dir) = dir {
+        // PWD too: shells trust an inherited PWD naming the same directory,
+        // so a hook matching on the symlinked path still matches.
+        cmd.current_dir(dir).env("PWD", dir);
+        // What Monocode itself inherited must not stand in for what the
+        // shell would choose in this directory.
+        for key in GH_ACCOUNT_VARS {
+            cmd.env_remove(key);
+        }
+    }
     crate::process::isolate(&mut cmd);
-    let Ok(child) = cmd.spawn() else {
-        return HashMap::new();
-    };
+    let child = cmd.spawn().ok()?;
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -322,7 +343,7 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            return HashMap::new();
+            return None;
         }
     };
     let mut map = HashMap::new();
@@ -330,11 +351,67 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key == "PATH" && !value.is_empty() {
+        if keep(key) {
             map.insert(key.to_string(), value.to_string());
         }
     }
-    map
+    Some(map)
+}
+
+/// Variables that pick the GitHub account `gh` uses, and through its
+/// credential helper the account git pushes with.
+const GH_ACCOUNT_VARS: [&str; 5] = [
+    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "GH_ENTERPRISE_TOKEN",
+];
+
+/// Gives `cmd` the GitHub account variables a terminal opened in `dir` would
+/// have. A GUI launch never runs the shell's `cd` hooks, so without this a
+/// project whose shell switches `GH_CONFIG_DIR` is queried with the default
+/// account. The answer is kept a while per directory; when the shell cannot
+/// be read, `cmd` keeps the inherited environment.
+pub(crate) fn apply_gh_env(cmd: &mut Command, dir: &Path) {
+    #[cfg(not(windows))]
+    if let Some(vars) = gh_env_for(dir) {
+        for key in GH_ACCOUNT_VARS {
+            match vars.get(key) {
+                Some(value) => cmd.env(key, value),
+                None => cmd.env_remove(key),
+            };
+        }
+    }
+    #[cfg(windows)]
+    let _ = (cmd, dir);
+}
+
+#[cfg(not(windows))]
+fn gh_env_for(dir: &Path) -> Option<HashMap<String, String>> {
+    const KEEP: Duration = Duration::from_secs(600);
+    type Known = HashMap<PathBuf, (std::time::Instant, HashMap<String, String>)>;
+    static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
+    let dir = expand_home(dir);
+    if !dir.is_dir() {
+        return None;
+    }
+    {
+        let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, vars)) = known.as_ref().and_then(|known| known.get(&dir)) {
+            if at.elapsed() < KEEP {
+                return Some(vars.clone());
+            }
+        }
+    }
+    // Not under the lock: projects resolve side by side.
+    let vars = login_shell_vars(Some(&dir), &|key| GH_ACCOUNT_VARS.contains(&key))?;
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(dir, (std::time::Instant::now(), vars.clone()));
+    Some(vars)
 }
 
 #[cfg(test)]
