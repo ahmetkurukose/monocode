@@ -17,14 +17,11 @@ name = "monocode-cef-helper"
 path = "src/bin/monocode-cef-helper.rs"
 
 [dependencies]
-# Pinned exactly: the wrapper is compiled against this CEF API version and the
-# runtime downloaded by `install` must be the same build (see install::PINNED).
+# Pinned exactly: the wrapper is compiled against this CEF API version, and the
+# app bundle ships the framework from the same SDK build cef-dll-sys fetched
+# (scripts/bundle-native-macos.sh).
 cef = { version = "=156.7.0", default-features = false, features = ["sandbox"] }
 log = "0.4"
-ureq = "2.12"
-sha1_smol = "1"
-bzip2 = "0.6"
-tar = "0.4"
 libc = "0.2"
 async-channel = "2"
 
@@ -33,6 +30,4 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSApplication"] }
 
-[dev-dependencies]
-tempfile = "3"
 

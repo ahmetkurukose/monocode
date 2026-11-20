@@ -39,10 +39,10 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K4 | Eklentiler | Gömülü sekmelerde ilk fazlarda eklenti/Chrome şifre yöneticisi/izin balonu **olmayacağı kabul**. Hedef: seçilmiş **20–30 eklenti** çalışsın (tüm Chrome API yüzeyi değil). |
 | K5 | Öncelik | Önce dev browser, sonra tam browser. |
 | K6 | Agent katmanı | Agent araçları **Orca'nın komut setine göre sıfırdan** tasarlanır, süreç içi **CDP** üzerine kurulur (enjekte JS değil). Ayrıca dış araçlar için sekme başına **Chrome uyumlu CDP uç noktası** (dev-browser `--connect`, agent-browser, Playwright, chrome-devtools-mcp). agent-browser uygulamaya paketlenmez. |
-| K7 | CEF dağıtımı | CEF **uygulama paketine konmaz**, **ayrıca indirilir**. |
-| K8 | İndirme zamanı | **İlk browser açılışında**. |
-| K9 | İndirme kaynağı | **Spotify CEF build'leri** (`cef-builds.spotifycdn.com`), minimal dağıtım. İlk sürüm Spotify'dan doğrudan; ileride paketi kendimiz imzalayıp kendi CDN'imizden sunarız. |
-| K10 | Sürüm bağlılığı | Uygulama **tek, tam bir CEF sürümüne kilitli** (API hash). CEF yükseltmesi = yeni indirme. Kabul. |
+| K7 | CEF dağıtımı | **Revize (Faz 0, 2026-11-20):** CEF framework'ü **uygulama paketinin içinde** gelir (`Contents/Frameworks`). İlk karar "ayrıca indirilir" idi; Chromium'un macOS sandbox'ı helper süreçlerine yalnızca çalışan uygulamanın bundle'ından okuma izni verdiği için indirilen framework sandbox açıkken yüklenemedi (`main_bundle_path` ile ayrı runtime bundle'ı da denendi, işe yaramadı). Sandbox'ı kapatmak yerine gömme seçildi. |
+| K8 | İndirme zamanı | **Geçersiz** (K7): indirme yok. CEF ilk sayfa gösterildiğinde başlatılır (lazy). |
+| K9 | Framework kaynağı | **Revize:** framework, `cef-dll-sys`'in build sırasında indirdiği CEF SDK'dan (Spotify minimal dağıtımı) alınır; bundle betiği kopyalar ve bizim kimliğimizle imzalar. |
+| K10 | Sürüm bağlılığı | Uygulama **tek, tam bir CEF sürümüne kilitli** (API hash; `cef = "=156.7.0"`). CEF yükseltmesi = crate yükseltmesi + yeni uygulama sürümü. |
 | K11 | WebKit | **Tamamen kaldırılır**, yedek olarak tutulmaz. |
 | K12 | Platform | **macOS, Windows, Linux** desteklenecek. Uygulama sırası: **önce macOS**, diğerleri sonra. Mimari baştan üç platforma uygun kurulur. |
 | K13 | Doğrulama testi | MDM/EDR (Iru, SentinelOne) için ayrı ön test **yapılmayacak**; geliştirme sırasında görülür. |
@@ -161,24 +161,29 @@ Monocode.app (GPUI, Rust)               ← CEF browser process burada (UI threa
      ├─ Monocode Helper (Renderer).app  (allow-jit)
      ├─ Monocode Helper (Plugin).app
      └─ Monocode Helper (Alerts).app
-   Helper'lar = tek küçük Rust binary (`monocode-cef-helper`): framework'ü indirme
-   klasöründen yükler, sandbox'ı başlatır, `cef::execute_process`. Bizim imzamızla gelir.
+   Helper'lar = tek küçük Rust binary (`monocode-cef-helper`, ~560 KB): sandbox'ı başlatır,
+   framework'ü yükler, `cef::execute_process`. Helper adları uygulamanın görünen adını
+   taşır (`<App> Helper (Renderer).app`); Chromium varyantları ana helper adından türetir.
 
-~/Library/Application Support/Monocode/
- ├─ cef/<cef-version>/Chromium Embedded Framework.framework   ← indirilen (~250–300 MB)
- └─ Browser/                                                   ← root_cache_path
+     └─ Chromium Embedded Framework.framework   (~250–300 MB, bizim imzamızla)
+
+<veri dizini>/Browser/        ← root_cache_path (veri moduna göre: dev / prod ayrı)
      ├─ Profiles/default/
      ├─ Profiles/<project-id>/       (proje bazlı izolasyon)
      └─ (agent oturumları: boş cache_path = bellekte, kapanınca silinir)
 ```
-- `CefSettings`: `root_cache_path` yukarıdaki; `framework_dir_path` ve `main_bundle_path`
-  indirme klasörünü ve uygulamayı gösterir; `browser_subprocess_path` helper; sandbox açık;
+- `CefSettings`: `root_cache_path` yukarıdaki; `framework_dir_path` bundle içindeki
+  framework'ü gösterir; `browser_subprocess_path` helper; sandbox açık;
   `remote_debugging_port = 0` (CDP süreç içi); `windowless_rendering_enabled` sadece OSR
   kullanılıyorsa.
 - `cef` crate macOS'ta framework'ü build sırasında linklemez; çalışma anında yolla yükler
-  (`cef_load_library`). Bu, ayrı indirmeyi mümkün kılar. Build sırasında CEF SDK (header +
-  `libcef_dll_wrapper`) gerekir; cmake + ninja kurulu.
-- CEF **lazy** başlatılır: ilk browser pane açıldığında, GPUI NSApp'i oluşturduktan sonra.
+  (`cef_load_library`). Build sırasında CEF SDK (header + `libcef_dll_wrapper` + framework)
+  gerekir; cmake + ninja kurulu. SDK `CEF_PATH`'te tutulur: varsayılan
+  `crates/monocode-gpui/target/cef-sdk` (`.cargo/config.toml`), native betikleri tüm
+  checkout'ların paylaştığı `~/Library/Caches/Monocode/cef-sdk`'yı kullanır.
+- CEF **lazy** başlatılır: ilk browser pane gösterildiğinde, o karenin ardından (pane önce
+  "Starting Chromium…" gösterir). Ölçüm: sıcak başlatma < 1 s; yeni kopyalanmış bundle'ın ilk
+  açılışında ~2,5 s.
 
 ### 4.4 NSApp ve mesaj döngüsü (macOS)
 - NSApp'i GPUI oluşturur (`GPUIApplication`). CEF, NSApp'in `CefAppProtocol`'e uymasını
@@ -234,39 +239,34 @@ Monocode.app (GPUI, Rust)               ← CEF browser process burada (UI threa
 - `cef` crate'in `accelerated_osr` özelliği üç platformda doku import'unu içerir (wgpu tabanlı;
   GPUI'ye uyarlanacak).
 
-## 5. CEF indirme ve güncelleme
+## 5. CEF dağıtımı ve güncelleme
 
-- **Ne zaman**: kullanıcı ilk kez browser açtığında. Pane'de ilerleme ekranı
-  ("Chromium hazırlanıyor… %42", boyut, hız); kaldığı yerden devam (HTTP range); hata/
-  çevrimdışı durumda tekrar dene; bitince sayfa kendiliğinden açılır.
-- **Nereden**: `cef-builds.spotifycdn.com` — uygulamanın kilitli olduğu tam sürümün
-  platform/mimari için **minimal** dağıtımı (`.tar.bz2`). Spotify'ın yayınladığı SHA ile
-  doğrulanır; doğrulanmayan arşiv açılmaz.
-- **Nereye**: `~/Library/Application Support/Monocode/cef/<version>/` (Windows/Linux'ta
-  platform eşdeğeri). Geçici klasöre açılır, doğrulanır, atomik `rename` ile yerine konur.
-- **Karantina**: uygulamanın kendi HTTP istemcisi `com.apple.quarantine` koymaz; önlem
-  olarak açılan dosyalarda yine temizlenir. Downloads klasörü kullanılmaz (TCC).
-- **Sürüm**: uygulama kilitli olduğu sürümü bilir; klasör yoksa indirir. Uygulama yeni CEF
-  sürümüne geçince yeni sürüm indirilir, geçiş tamamlanınca eskisi silinir.
-- Arşivden sadece gereken parçalar tutulur (framework; Windows/Linux'ta `libcef` +
-  kaynaklar + locales); örnek uygulamalar ve debug sembolleri atılır.
+- Framework uygulama paketinin içinde gelir (K7). Kaynak: `cef-dll-sys`'in build için
+  indirdiği SDK; `scripts/bundle-native-macos.sh` sürümü `Cargo.lock`'tan, mimariyi
+  binary'den okuyup `Contents/Frameworks`'e kopyalar. Framework yalnızca kaynağı veya imza
+  kimliği değiştiğinde yeniden kopyalanır ve imzalanır (dev döngüsünde ~2,5 s → ~7 s ilk).
+- Sürüm: uygulama tek CEF sürümüne kilitli (K10); yükseltme `cef`/`cef-dll-sys` crate
+  sürümüyle birlikte yapılır.
+- Boyut: uygulama paketi ~250–300 MB büyür (DMG'de sıkışık ~100–130 MB).
+- İlk tasarımdaki indirme yöneticisi (`monocode-cef::install`) K7 revizyonuyla kaldırıldı;
+  kodu git geçmişinde (`bfa3c1ac`).
 
 ### 5.1 İmzalama ve güvenlik
-- **Lokal build** (`scripts/bundle-native-macos.sh` ad-hoc veya
-  `MONOCODE_NATIVE_LOCAL_SIGNING`): hardened runtime yok → library validation yok →
-  imzasız framework sorunsuz yüklenir.
-- **Dağıtım build'i** (Developer ID, `--options runtime`): Spotify framework'ü bizim Team
-  ID'mizle imzalı olmadığı için uygulama ve helper'larda
-  `com.apple.security.cs.disable-library-validation` gerekir (notarization kabul eder).
-  Helper'larda ayrıca JIT entitlement'ları (`allow-jit`, gerekirse
+- İmzalama içten dışa: framework'ün `Libraries/*.dylib`'leri → framework → beş helper →
+  uygulama. Framework de bizim kimliğimizle imzalandığı için
+  `disable-library-validation` **gerekmez**.
+- **Lokal build** (ad-hoc veya `MONOCODE_NATIVE_LOCAL_SIGNING`): hardened runtime yok.
+- **Dağıtım build'i** (Developer ID, `--options runtime`): uygulama
+  `crates/monocode-gpui/macos/Entitlements.plist`, helper'lar
+  `crates/monocode-cef/macos/Helper.entitlements` (`allow-jit`,
   `allow-unsigned-executable-memory`).
-- **İleride**: Spotify paketini kendimiz imzalayıp kendi CDN'imizden sunmak →
-  `disable-library-validation` kalkar, EDR'lerde daha az uyarı.
+- Chromium sandbox'ı **açık**: GPU, ağ (`network`), depolama (`service`) ve renderer süreçleri
+  sandbox'lı çalışır (Faz 0'da doğrulandı).
 - **Kurumsal ortam notu** (geliştiricinin makinesi): Kandji/Iru MDM, SentinelOne EDR,
   sıkı Gatekeeper (`AllowIdentifiedDevelopers=0`, `DisableOverride=1`), içerik filtresi yok.
-  Gatekeeper yalnızca karantinalı dosyalara uygulandığı için indirmeye engel beklenmiyor;
-  tek risk SentinelOne'ın davranış sezgisi. Ön test yapılmayacak (K13); sorun çıkarsa
-  kendi imzalı CDN'e erken geçilir.
+  Framework uygulamayla ve bizim imzamızla geldiği için Gatekeeper açısından ayrı bir
+  durum yok; tek risk SentinelOne'ın davranış sezgisi. Ön test yapılmayacak (K13).
+  Faz 0'da bu makinede sandbox'lı Chromium sorunsuz çalıştı.
 
 ## 6. Agent katmanı
 
@@ -356,10 +356,11 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 | Eklentiler | Gömülü (Alloy) sekmelerde Chrome eklenti API'si yok; hibrit modelin çalışıp çalışmadığı belirsiz. En büyük risk. |
 | Overlay | Child view üstüne GPUI çizemez; overlay çözümü UX kalitesini belirler. |
 | Gizli sekme throttling | macOS windowed Alloy'da NSView gizleme ile throttling doğrulanacak. |
-| Bellek | Browser + GPU + network + sayfa başına renderer; ölçülecek. |
-| EDR | SentinelOne'ın imzasız indirilen framework'e tepkisi bilinmiyor. |
+| Bellek | Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
+| EDR | Framework artık uygulamayla ve bizim imzamızla geliyor; indirme kaynaklı risk kalktı. |
+| Sandbox ↔ dağıtım | **Çözüldü (K7 revizyonu):** sandbox yalnızca uygulama bundle'ından okumaya izin veriyor; framework gömüldü. |
 | Sürüm takibi | CEF ~4 haftada bir sürüm; güvenlik yamaları için yükseltme ritmi gerekir. |
-| Boyut | İndirme ~100–130 MB sıkışık, diskte ~250–300 MB. |
+| Boyut | Uygulama paketi ~250–300 MB büyür (DMG'de ~100–130 MB). |
 | Chrome Web Store | CEF'te CWS kurulumunun Chrome-style'da bile çalıştığı doğrulanmadı. |
 
 ## 12. Faz planı
@@ -371,8 +372,8 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 - WebKit browser'ının kodu, ayarları, testleri, self-test'leri ve MCP araçları tamamen silinir.
 - `cef` crate entegrasyonu, `monocode-cef-helper` binary'si, `.app` helper bundle'ları, build
   betikleri ve imzalama (§4.3, §5.1).
-- CEF indirme yöneticisi: Spotify kaynağı, SHA doğrulama, kaldığı yerden devam, ilerleme ekranı,
-  sürüm kilidi, karantina temizliği, eski sürüm temizliği (§5).
+- ~~CEF indirme yöneticisi~~ (yazıldı, sonra K7 revizyonuyla kaldırıldı; yerine framework'ün
+  bundle'a gömülmesi, §5).
 - NSApp `CefAppProtocol` uyarlaması, CFRunLoop mesaj pompası, lazy CEF başlatma (§4.4).
 - Pane içinde tek Chromium sekmesi (child NSView) + performans ölçümü (scroll fps, input
   gecikmesi, bellek).
@@ -411,7 +412,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 
 ### Faz 6 — Windows ve Linux
 - Windows: HWND child view + D3D11 OSR. Linux: X11 child view, Wayland'de OSR (§9).
-- `multi_threaded_message_loop`, platforma göre indirme ve helper'lar, GPUI DirectX/Vulkan
+- `multi_threaded_message_loop`, platforma göre CEF paketleme ve helper'lar, GPUI DirectX/Vulkan
   renderer yamaları.
 
 ### Faz 7 — Opsiyonel
@@ -437,7 +438,7 @@ Her faz bittiğinde:
 ### Faz durumu
 | Faz | Durum | Bitiş dokümanı |
 |---|---|---|
-| 0 | Başlamadı | — |
+| 0 | Bitti, kullanıcı onayı bekliyor | `phase-0-done.md` |
 | 1 | Başlamadı | — |
 | 2 | Başlamadı | — |
 | 3 | Başlamadı | — |

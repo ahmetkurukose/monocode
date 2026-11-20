@@ -24,6 +24,12 @@ test("Finder launches use development data for dev bundles and installed data fo
     await writeFile(join(bin, name), script);
     await chmod(join(bin, name), 0o755);
   }
+  // Stands in for the framework cef-dll-sys fetches with the CEF SDK.
+  const framework = join(directory, "sdk/Chromium Embedded Framework.framework");
+  await mkdir(join(framework, "Libraries"), { recursive: true });
+  await writeFile(join(framework, "Chromium Embedded Framework"), "framework");
+  await writeFile(join(framework, "Libraries/libcef_sandbox.dylib"), "sandbox");
+  const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}`, MONOCODE_CEF_FRAMEWORK: framework };
   for (const [profile, override, mode] of [
     ["native-dev", undefined, "dev-data"],
     ["release", undefined, "monocode-data"],
@@ -43,7 +49,7 @@ test("Finder launches use development data for dev bundles and installed data fo
       if (override) args.push(override);
       const packaged = spawnSync("bash", args, {
         cwd: root,
-        env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+        env,
         encoding: "utf8",
       });
       assert.ifError(packaged.error);
@@ -60,6 +66,12 @@ test("Finder launches use development data for dev bundles and installed data fo
       assert.ifError(launched.error);
       assert.equal(launched.status, 0, launched.stderr);
       assert.deepEqual(launched.stdout.trim().split("\n"), ["--cwd", "a project with spaces"]);
+      // Chromium's sandbox lets its helpers read only inside the app.
+      assert.equal(
+        await readFile(join(bundle, "Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework"), "utf8"),
+        "framework",
+      );
+      await access(join(bundle, "Frameworks/Chromium Embedded Framework.framework/Libraries/libcef_sandbox.dylib"));
       // Chromium derives the other helpers' names from the main one's.
       for (const variant of ["", " (GPU)", " (Renderer)", " (Plugin)", " (Alerts)"]) {
         const name = `Monocode Native Helper${variant}`;
@@ -75,7 +87,7 @@ test("Finder launches use development data for dev bundles and installed data fo
     const output = join(target, "release");
     const packaged = spawnSync("bash", ["scripts/bundle-native-macos.sh", "release", target, "0.16.0"], {
       cwd: root,
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}`, MONOCODE_NATIVE_APP_NAME: "SOCode" },
+      env: { ...env, MONOCODE_NATIVE_APP_NAME: "SOCode" },
       encoding: "utf8",
     });
     assert.ifError(packaged.error);

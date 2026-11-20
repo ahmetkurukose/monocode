@@ -12,6 +12,7 @@ mod arcade;
 mod assets;
 mod automations;
 mod branch_popup;
+mod browser;
 mod change_tree;
 mod changes;
 mod code_agent;

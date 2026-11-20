@@ -679,6 +679,8 @@ impl Element for Placed {
         cx: &mut App,
     ) {
         self.frame.paint(window, cx);
+        // A browser page under the card hides: GPUI cannot draw over it.
+        crate::browser::cover(*surface, window);
         let Some(dismiss) = self.on_dismiss.clone() else {
             return;
         };

@@ -1,8 +1,8 @@
 //! Chromium's child processes (renderer, GPU, network, utility).
 //!
-//! The runtime is downloaded outside the app bundle, so the framework path
-//! comes from the `--monocode-cef-framework=` switch the browser process adds
-//! to every child's command line (`monocode_cef::runtime::FRAMEWORK_SWITCH`).
+//! The framework path comes from the `--monocode-cef-framework=` switch the
+//! browser process adds to every child's command line
+//! (`monocode_cef::runtime::FRAMEWORK_SWITCH`).
 
 #[cfg(target_os = "macos")]
 fn main() {

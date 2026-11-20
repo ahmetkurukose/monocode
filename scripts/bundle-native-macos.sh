@@ -97,13 +97,57 @@ native_sign() {
   fi
 }
 
-# Chromium's child processes (docs/native/browser/context.md §4.3): one small
-# executable in five helper bundles. Chromium finds the GPU, Renderer, Plugin
-# and Alerts helpers by adding their suffix to the main helper's name, so all
-# five carry the app's visible name. The framework itself is not bundled; it
-# is downloaded on first use.
+# Signs code that carries no entitlements: libraries and frameworks.
+native_sign_code() {
+  if [ "$native_identity" = - ]; then
+    codesign --force --sign - "$1"
+  elif [ -n "${MONOCODE_NATIVE_LOCAL_SIGNING:-}" ]; then
+    codesign --force --sign "$native_identity" "$1"
+  else
+    codesign --force --sign "$native_identity" --timestamp "$1"
+  fi
+}
+
 native_frameworks="$native_bundle/Contents/Frameworks"
 mkdir -p "$native_frameworks"
+
+# The Chromium framework (docs/native/browser/context.md §4.3). It must be in
+# the bundle: Chromium's macOS sandbox lets the helpers read only inside the
+# app. It comes from the CEF SDK cef-dll-sys fetched for this build, so it is
+# the exact build the app was compiled against.
+native_cef="${MONOCODE_CEF_FRAMEWORK:-}"
+if [ -z "$native_cef" ]; then
+  native_cef_version="$(sed -n '/^name = "cef-dll-sys"$/{n;s/^version = ".*+\(.*\)"$/\1/p;}' crates/monocode-gpui/Cargo.lock)"
+  case "$(lipo -archs "$native_binary" 2>/dev/null || uname -m)" in
+    arm64) native_cef_arch=aarch64 ;;
+    x86_64) native_cef_arch=x86_64 ;;
+    *) echo "Unknown architecture of $native_binary" >&2; exit 1 ;;
+  esac
+  native_cef="${CEF_PATH:-crates/monocode-gpui/target/cef-sdk}/$native_cef_version/cef_macos_$native_cef_arch/Chromium Embedded Framework.framework"
+fi
+if [ ! -f "$native_cef/Chromium Embedded Framework" ]; then
+  echo "Missing the Chromium framework: $native_cef" >&2
+  echo 'Build the app with cargo first; cef-dll-sys fetches it (see .cargo/config.toml).' >&2
+  exit 1
+fi
+# ~250 MB: copied and signed again only when it or the signing identity changed.
+native_cef_dest="$native_frameworks/Chromium Embedded Framework.framework"
+native_cef_stamp="$native_target/.cef-framework-$native_name.stamp"
+native_cef_state="$native_identity|$(stat -f '%z %m' "$native_cef/Chromium Embedded Framework")"
+if [ ! -d "$native_cef_dest" ] || [ "$(cat "$native_cef_stamp" 2>/dev/null)" != "$native_cef_state" ]; then
+  rm -rf "$native_cef_dest"
+  ditto "$native_cef" "$native_cef_dest"
+  # Inside out: its libraries, then the framework.
+  for native_cef_library in "$native_cef_dest/Libraries/"*.dylib; do
+    native_sign_code "$native_cef_library"
+  done
+  native_sign_code "$native_cef_dest"
+  printf '%s' "$native_cef_state" > "$native_cef_stamp"
+fi
+
+# Chromium's child processes: one small executable in five helper bundles.
+# Chromium finds the GPU, Renderer, Plugin and Alerts helpers by adding their
+# suffix to the main helper's name, so all five carry the app's visible name.
 find "$native_frameworks" -maxdepth 1 -name '* Helper*.app' -exec rm -rf {} +
 for native_variant in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
   native_helper_name="$native_name Helper$native_variant"

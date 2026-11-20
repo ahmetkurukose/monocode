@@ -1,8 +1,9 @@
 //! Loading and initializing CEF in the app (the browser process).
 //!
-//! CEF starts lazily, the first time a browser opens, once the runtime is
-//! installed (see [`crate::install`]). Everything here runs on the main
-//! thread, which on macOS is CEF's UI thread.
+//! CEF starts lazily, the first time a browser opens. Its framework ships in
+//! the app bundle (`Contents/Frameworks`): Chromium's macOS sandbox lets the
+//! child processes read only inside the running app's bundle. Everything here
+//! runs on the main thread, which on macOS is CEF's UI thread.
 
 use std::{
     cell::{Cell, RefCell},
@@ -11,17 +12,15 @@ use std::{
 
 use cef::*;
 
-use crate::install::InstalledRuntime;
-
 /// The command-line switch through which child processes learn where the
-/// runtime lives (it is not inside the app bundle).
+/// framework is, so that they need not derive it from their own path.
 pub const FRAMEWORK_SWITCH: &str = "monocode-cef-framework";
 
 /// How to start CEF.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    /// The installed runtime to load.
-    pub runtime: InstalledRuntime,
+    /// `Chromium Embedded Framework.framework`, in the app bundle.
+    pub framework_dir: PathBuf,
     /// The helper executable for child processes. On macOS the main helper,
     /// `…/Monocode Helper.app/Contents/MacOS/Monocode Helper`; the GPU,
     /// Renderer, Plugin and Alerts variants sit beside it.
@@ -39,6 +38,11 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// The library `cef_load_library` is given.
+    pub fn library_path(&self) -> PathBuf {
+        self.framework_dir.join("Chromium Embedded Framework")
+    }
+
     /// The default profile's folder, inside `cache_root`.
     pub fn default_profile(&self) -> PathBuf {
         self.cache_root.join("Profiles").join("default")
@@ -168,7 +172,7 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
     if objc2::MainThreadMarker::new().is_none() {
         return Err(StartError::NotMainThread);
     }
-    let library = config.runtime.library_path();
+    let library = config.library_path();
     if !load_library(&library) {
         return Err(StartError::LibraryLoad(library));
     }
@@ -177,14 +181,14 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
 
     crate::mac::nsapp::adopt_cef_app_protocol().map_err(StartError::NsApp)?;
 
-    let framework_dir = config.runtime.framework_dir();
+    let framework_dir = &config.framework_dir;
     let profile = config.default_profile();
     let _ = std::fs::create_dir_all(&profile);
     let path = |p: &std::path::Path| CefString::from(p.to_string_lossy().as_ref());
     let settings = cef::Settings {
         no_sandbox: 0,
         browser_subprocess_path: path(&config.helper),
-        framework_dir_path: path(&framework_dir),
+        framework_dir_path: path(framework_dir),
         // The host owns the run loop; CEF is driven by crate::mac::pump.
         multi_threaded_message_loop: 0,
         external_message_pump: 1,

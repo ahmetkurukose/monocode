@@ -160,6 +160,10 @@ pub(crate) struct Workspace {
     /// by their negative pane IDs. Like file panes, each borrows its owner
     /// session's project and worktree scope.
     pub terminal_panes: HashMap<i64, TerminalPane>,
+    /// Browser pages (Chromium), by their negative pane IDs. Like terminal
+    /// panes, each borrows its owner session's project scope.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub browser_panes: HashMap<i64, BrowserPane>,
     /// Split trees of tabs with more than one pane, by tab key.
     pub layouts: HashMap<i64, PaneNode>,
     /// The pane each split tab returns to when it is activated.
@@ -292,6 +296,15 @@ impl DockSide {
 pub(crate) struct TerminalPane {
     pub owner: i64,
     pub cwd: String,
+}
+/// A browser page in the pane tree (docs/native/browser/context.md §4.5).
+/// Only its address and title are saved; the page loads again when shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct BrowserPane {
+    pub owner: i64,
+    pub url: String,
+    pub title: String,
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -459,6 +472,7 @@ impl Default for Workspace {
             reviews: Default::default(),
             review_owners: Default::default(),
             terminal_panes: Default::default(),
+            browser_panes: Default::default(),
             mono_panes: Default::default(),
             layouts: Default::default(),
             focused: Default::default(),
@@ -631,6 +645,19 @@ impl Workspace {
                 && sessions.iter().any(|(known, _)| *known == pane.owner)
         });
         known.extend(state.terminal_panes.keys().copied());
+        let (owners, monos, terminals) = (
+            &state.review_owners,
+            &state.mono_panes,
+            &state.terminal_panes,
+        );
+        state.browser_panes.retain(|id, pane| {
+            *id < 0
+                && !owners.contains_key(id)
+                && !monos.contains_key(id)
+                && !terminals.contains_key(id)
+                && sessions.iter().any(|(known, _)| *known == pane.owner)
+        });
+        known.extend(state.browser_panes.keys().copied());
         let mut seen = HashSet::new();
         let mut layouts = std::mem::take(&mut state.layouts);
         let mut focused = std::mem::take(&mut state.focused);
@@ -665,6 +692,7 @@ impl Workspace {
         }
         state.settle_mono_panes();
         state.prune_terminal_panes();
+        state.prune_browser_panes();
         state.normalize_title_order();
         if state
             .desktop_project_preferences
@@ -979,19 +1007,23 @@ impl Workspace {
             .get(&id)
             .copied()
             .or_else(|| self.terminal_panes.get(&id).map(|t| t.owner))
+            .or_else(|| self.browser_panes.get(&id).map(|b| b.owner))
             .unwrap_or(id)
     }
-    /// A file or terminal pane standing in for its owner session.
+    /// A file, terminal or browser pane standing in for its owner session.
     pub fn is_detached_pane(&self, id: i64) -> bool {
-        self.review_owners.contains_key(&id) || self.terminal_panes.contains_key(&id)
+        self.review_owners.contains_key(&id)
+            || self.terminal_panes.contains_key(&id)
+            || self.browser_panes.contains_key(&id)
     }
-    /// File, Mono and terminal panes share the negative IDs below every
-    /// session.
+    /// File, Mono, terminal and browser panes share the negative IDs below
+    /// every session.
     pub fn next_pane_id(&self) -> i64 {
         self.review_owners
             .keys()
             .chain(self.mono_panes.keys())
             .chain(self.terminal_panes.keys())
+            .chain(self.browser_panes.keys())
             .copied()
             .min()
             .unwrap_or(0)
@@ -1311,6 +1343,18 @@ impl Workspace {
             .collect();
         for id in &gone {
             self.terminal_panes.remove(id);
+        }
+        gone
+    }
+    /// Browser panes no tab holds any more, forgotten. Their pages close
+    /// with them, so the caller drops their views.
+    pub fn prune_browser_panes(&mut self) -> Vec<i64> {
+        let open: HashSet<_> = self.open_sessions().into_iter().collect();
+        let gone: Vec<_> = (self.browser_panes.keys().copied())
+            .filter(|id| !open.contains(id))
+            .collect();
+        for id in &gone {
+            self.browser_panes.remove(id);
         }
         gone
     }
@@ -2077,10 +2121,11 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_browser_pane_is_dropped_and_nothing_else_is_lost() {
+    fn a_page_saved_by_the_webkit_browser_reopens_in_chromium() {
         // Workspaces saved while Monocode had its WebKit browser keep pages in
-        // `browser_panes` and start pages in `project_browser_urls`. They load
-        // without them; the tab, its other panes and its focus survive.
+        // `browser_panes`, with settings Chromium pages do not have, and start
+        // pages in `project_browser_urls`. The page keeps its place, address
+        // and title; the rest is dropped.
         let mut state = Workspace::default();
         state.add_project("/p");
         state.terminal_panes.insert(
@@ -2121,12 +2166,26 @@ mod tests {
         saved["project_browser_urls"] = serde_json::json!({ "/p": "localhost:5173" });
         let restored = Workspace::restore(Some(&saved.to_string()), &[(1, "/p".into())], "/p");
         assert_eq!(restored.tabs, vec![1]);
-        assert_eq!(restored.layout(1).leaf_ids(), vec![1, -5]);
+        assert_eq!(restored.layout(1).leaf_ids(), vec![1, -4, -5]);
         assert!(restored.terminal_panes.contains_key(&-5));
-        assert_ne!(restored.focused.get(&1), Some(&-4));
-        assert_ne!(restored.active, Some(-4));
+        assert_eq!(
+            restored.browser_panes[&-4],
+            BrowserPane {
+                owner: 1,
+                url: "http://localhost:5173".into(),
+                title: "Vite".into(),
+            }
+        );
+        assert_eq!(restored.focused.get(&1), Some(&-4));
         assert!(restored.projects.contains(&"/p".to_string()));
         let again = serde_json::to_string(&restored).unwrap();
-        assert!(!again.contains("browser"), "{again}");
+        for gone in [
+            "project_browser_urls",
+            "keep_awake",
+            "zoom_percent",
+            "user_agent",
+        ] {
+            assert!(!again.contains(gone), "{gone}: {again}");
+        }
     }
 }
