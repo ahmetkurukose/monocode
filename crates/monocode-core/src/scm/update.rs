@@ -138,8 +138,12 @@ pub fn update_project(cwd: &Path, method: UpdateMethod) -> Result<UpdateReport, 
     if !git_is_work_tree(&root) {
         return Err("Not a git repository".into());
     }
+    // A lookup that timed out is not "no upstream".
+    if !git_has_upstream(&root)? {
+        return Err("The current branch has no upstream to update from".into());
+    }
     let upstream = git_stdout(&root, &["rev-parse", "--abbrev-ref", "@{upstream}"])
-        .ok_or("The current branch has no upstream to update from")?;
+        .ok_or("Git did not answer in time. Try again.")?;
     git_checked(&root, &["fetch"]).map_err(with_signing_hint)?;
     bring_in(&root, upstream, "@{upstream}", method)
 }

@@ -217,6 +217,13 @@ fn plist_data_mode(plist: &str) -> Option<bool> {
     }
 }
 fn main() {
+    // A MonoCode started from another one's agent or terminal inherits that
+    // app's marker. Anything this app starts without `process::isolate`
+    // (terminals, runs, a CLI typed by hand) would otherwise carry it and
+    // look like the other app's orphan to the launch reaper once that app
+    // quits. `isolate` sets this app's own id on the processes it owns.
+    // SAFETY: first statement of `main`; no other thread exists yet.
+    unsafe { std::env::remove_var("MONOCODE_HARNESS_PARENT") };
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }

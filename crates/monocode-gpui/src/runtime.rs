@@ -1031,7 +1031,8 @@ fn run_turn_using(
         result
     })();
     // A provider killed or cancelled by the quit was interrupted, not failed.
-    // A turn that completed while the app was quitting is simply done.
+    // A turn that completed while the app was quitting is not an error, though
+    // its steers count as unsettled: the quit froze the queue anyway.
     let quitting = monocode_core::process::shutting_down() && result.is_err();
     let cancelled = quitting
         || cancel.load(Ordering::Relaxed)

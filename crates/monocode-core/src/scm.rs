@@ -443,7 +443,7 @@ pub fn selected_context(cwd: &Path, paths: &[String]) -> Result<StagedContext, S
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     };
-    if git_stdout(&root, &["rev-parse", "--verify", "HEAD"]).is_some() {
+    if git_answers(&root, &["rev-parse", "--verify", "HEAD"])? {
         run(&["read-tree", "HEAD"])?;
     } else {
         run(&["read-tree", "--empty"])?;
@@ -1463,7 +1463,7 @@ fn sync_for(root: &Path) -> Sync {
     } else {
         ahead
     };
-    let head_pushed = git_stdout(
+    let head_pushed = git_stdout_within(
         root,
         &[
             "for-each-ref",
@@ -1472,6 +1472,7 @@ fn sync_for(root: &Path) -> Sync {
             "HEAD",
             "refs/remotes",
         ],
+        HISTORY_WALK_TIMEOUT,
     )
     .is_some();
     Sync {
@@ -1533,7 +1534,11 @@ fn git_ref_exists(root: &Path, spec: &str) -> bool {
 
 fn git_ahead_behind(root: &Path, base: &str) -> (i64, i64) {
     let spec = format!("{base}...HEAD");
-    let Some(text) = git_stdout(root, &["rev-list", "--left-right", "--count", &spec]) else {
+    let Some(text) = git_stdout_within(
+        root,
+        &["rev-list", "--left-right", "--count", &spec],
+        HISTORY_WALK_TIMEOUT,
+    ) else {
         return (0, 0);
     };
     let mut parts = text.split_whitespace();
@@ -1569,10 +1574,17 @@ pub fn git_dirs(root: &Path) -> Vec<std::path::PathBuf> {
 
 /// How long a read-only metadata query may take before its worker moves on.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+/// Walks of history or of every remote ref (ahead/behind counts, `--contains`)
+/// can take seconds on a large repository without a commit-graph. They still
+/// end, just later; a stalled Git does not.
+const HISTORY_WALK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    let (status, stdout) =
-        metadata_stdout(git_cmd().arg("-C").arg(root).args(args), METADATA_TIMEOUT)?;
+    git_stdout_within(root, args, METADATA_TIMEOUT)
+}
+
+fn git_stdout_within(root: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let (status, stdout) = metadata_stdout(git_cmd().arg("-C").arg(root).args(args), timeout)?;
     if !status.success() {
         return None;
     }
@@ -1589,11 +1601,14 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
 /// could not run is an error here, never "no upstream": guessing would rewrite
 /// the branch's tracking and skip its pull.
 fn git_has_upstream(root: &Path) -> Result<bool, String> {
+    git_answers(root, &["rev-parse", "--abbrev-ref", "@{upstream}"])
+}
+
+/// Whether a query printed something, with a timeout reported as an error
+/// rather than as "no". For decisions that would go wrong on a guess.
+fn git_answers(root: &Path, args: &[&str]) -> Result<bool, String> {
     upstream_from_lookup(metadata_stdout(
-        git_cmd()
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        git_cmd().arg("-C").arg(root).args(args),
         METADATA_TIMEOUT,
     ))
 }
