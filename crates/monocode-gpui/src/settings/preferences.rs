@@ -72,6 +72,10 @@ pub(crate) struct Preferences {
     pub project_apps_rev: u32,
     pub ui_scale: u32,
     pub show_excluded_files: bool,
+    /// Which default `show_excluded_files` was last migrated to, so the switch
+    /// to showing ignored files by default reaches saved preferences once.
+    #[serde(default)]
+    pub show_excluded_files_rev: u32,
     // Chat
     pub transcript_layout: String,
     pub anchor_prompts: bool,
@@ -192,7 +196,8 @@ impl Default for Preferences {
             ],
             project_apps_rev: PROJECT_APPS_REV,
             ui_scale: 100,
-            show_excluded_files: false,
+            show_excluded_files: true,
+            show_excluded_files_rev: SHOW_EXCLUDED_FILES_REV,
             transcript_layout: "chat".into(),
             anchor_prompts: true,
             paced_reveal: true,
@@ -241,6 +246,8 @@ impl Default for Preferences {
 
 /// 1: the API app.
 const PROJECT_APPS_REV: u32 = 1;
+/// 1: the explorer shows ignored files by default.
+const SHOW_EXCLUDED_FILES_REV: u32 = 1;
 
 impl Preferences {
     /// Offers apps added since these preferences were saved. Runs once per
@@ -250,6 +257,10 @@ impl Preferences {
             self.set_project_app_shown("api", true);
         }
         self.project_apps_rev = PROJECT_APPS_REV;
+        if self.show_excluded_files_rev < 1 {
+            self.show_excluded_files = true;
+        }
+        self.show_excluded_files_rev = SHOW_EXCLUDED_FILES_REV;
     }
 
     /// Unknown values fall back to the plain list.
@@ -431,5 +442,20 @@ mod decoration_tests {
         let mut fresh = Preferences::default();
         fresh.migrate();
         assert!(fresh.project_app_shown("api"));
+    }
+
+    #[test]
+    fn ignored_files_are_shown_by_default_once() {
+        assert!(Preferences::default().show_excluded_files);
+        let mut saved: Preferences =
+            serde_json::from_str(r#"{"show_excluded_files":false}"#).unwrap();
+        saved.migrate();
+        assert!(saved.show_excluded_files);
+        // Hiding them afterwards with the eye sticks across the next load.
+        saved.show_excluded_files = false;
+        let mut again: Preferences =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        again.migrate();
+        assert!(!again.show_excluded_files);
     }
 }

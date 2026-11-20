@@ -18,7 +18,7 @@ impl DesktopPreferences {
             ("close_to_tray", "closeToTray", true),
             ("inset_glass", "insetGlass", true),
             ("body_glass", "bodyGlass", true),
-            ("show_excluded_files", "showExcludedFiles", false),
+            ("show_excluded_files", "showExcludedFiles", true),
             ("anchor_prompts", "transcriptAnchor", true),
             ("paced_reveal", "pacedReveal", true),
             ("autocorrect", "composerAutocorrect", false),

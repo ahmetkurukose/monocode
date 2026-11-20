@@ -737,7 +737,7 @@ mod tests {
         let (window, _, _) = window(cx);
         window
             .update(cx, |shell, w, cx| {
-                assert!(!shell.workspace.preferences.show_excluded_files);
+                assert!(shell.workspace.preferences.show_excluded_files);
                 shell.ensure_right_panel(w, cx);
                 let explorer = shell
                     .right_panel
@@ -752,8 +752,8 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                assert!(shell.workspace.preferences.show_excluded_files);
-                assert!(crate::settings::show_excluded_files(cx), "search follows");
+                assert!(!shell.workspace.preferences.show_excluded_files);
+                assert!(!crate::settings::show_excluded_files(cx), "search follows");
                 let explorer = shell
                     .right_panel
                     .as_ref()
@@ -767,8 +767,8 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                assert!(!shell.workspace.preferences.show_excluded_files);
-                assert!(!crate::settings::show_excluded_files(cx));
+                assert!(shell.workspace.preferences.show_excluded_files);
+                assert!(crate::settings::show_excluded_files(cx));
             })
             .unwrap();
     }

@@ -303,7 +303,7 @@ impl Explorer {
             git,
             cwd: String::new(),
             enabled: false,
-            show_excluded: false,
+            show_excluded: true,
             expanded: HashSet::new(),
             selected: None,
             saved: HashMap::new(),
