@@ -590,6 +590,18 @@ impl Workspace {
         self.classic_layout || self.new_layout_boxy
     }
 
+    /// The saved state a fresh install starts from: the Classic layout and
+    /// the fresh-install preferences. It names no project, so the startup
+    /// project is still found as usual.
+    pub fn fresh_install_json() -> String {
+        serde_json::json!({
+            "classic_layout": true,
+            "new_layout_boxy": false,
+            "preferences": crate::settings::Preferences::fresh_install(),
+        })
+        .to_string()
+    }
+
     pub fn restore(saved: Option<&str>, sessions: &[(i64, String)], cwd: &str) -> Self {
         let mut state = saved
             .and_then(|s| serde_json::from_str::<Self>(s).ok())
@@ -1949,6 +1961,13 @@ mod tests {
         assert_eq!(fresh.active, Some(2));
         assert_eq!(fresh.project, "/a");
         assert!(fresh.new_layout_boxy);
+        let installed = Workspace::restore(Some(&Workspace::fresh_install_json()), &sessions, "/a");
+        assert_eq!(installed.project, "/a");
+        assert!(installed.classic_layout && !installed.new_layout_boxy);
+        assert_eq!(
+            installed.preferences,
+            crate::settings::Preferences::fresh_install()
+        );
         let rounded = Workspace::restore(Some(r#"{"new_layout_boxy":false}"#), &sessions, "/a");
         assert!(!rounded.new_layout_boxy);
     }

@@ -380,10 +380,13 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
-    let saved = db.ui_state().unwrap_or_else(|e| {
-        eprintln!("Cannot read workspace settings: {e}");
-        None
-    });
+    let saved = match db.ui_state() {
+        Ok(saved) => Some(saved.unwrap_or_else(workspace::Workspace::fresh_install_json)),
+        Err(e) => {
+            eprintln!("Cannot read workspace settings: {e}");
+            None
+        }
+    };
     let existing_project = if use_monocode {
         saved
             .as_deref()

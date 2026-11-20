@@ -250,6 +250,29 @@ const PROJECT_APPS_REV: u32 = 1;
 const SHOW_EXCLUDED_FILES_REV: u32 = 1;
 
 impl Preferences {
+    /// What a fresh install starts with, and what Restore defaults returns
+    /// to. `Default` keeps the baseline that tests and older saves rely on.
+    pub(crate) fn fresh_install() -> Self {
+        Self {
+            notifications: true,
+            close_session_tab: "archive".into(),
+            terminal_placement: "title".into(),
+            terminal_font_size: 12,
+            terminal_scrollback: 100_000,
+            terminal_copy_on_select: true,
+            workspace_theme: "harbor".into(),
+            theme_hue: 217,
+            theme_saturation: 37,
+            theme_dark_lightness: 7,
+            project_rail_view: "tree".into(),
+            ui_scale: 90,
+            show_excluded_files: true,
+            monos: false,
+            mono_menu_bar_icon: false,
+            ..Self::default()
+        }
+    }
+
     /// Offers apps added since these preferences were saved. Runs once per
     /// revision, so switching one off afterwards sticks.
     pub(crate) fn migrate(&mut self) {
@@ -330,7 +353,7 @@ impl Preferences {
 
     /// SettingsView's Restore defaults: the Appearance page only.
     pub(crate) fn restore_appearance(&mut self) {
-        let d = Self::default();
+        let d = Self::fresh_install();
         self.theme = d.theme;
         self.wayland_window_decorations = d.wayland_window_decorations;
         self.accent_color = d.accent_color;
