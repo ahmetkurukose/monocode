@@ -132,7 +132,9 @@ impl Conversation {
                 });
                 let next =
                     selected.map_or_else(|| body.to_owned(), |name| format!("/{name} {body}"));
-                input.set_text(next, cx);
+                // Keep the draft's history; undo past the prefix turns the
+                // mode back off through `CommandRemoved`.
+                input.replace_all(next, cx);
             }
         });
         self.save_settings(cx);

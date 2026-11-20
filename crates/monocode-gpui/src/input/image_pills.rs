@@ -63,6 +63,11 @@ impl Input {
         if self.code.is_some() {
             return;
         }
+        // Earlier steps hold the old numbering, which would bring back
+        // markers for an image that is gone or now has another number. That
+        // holds even when no marker is in the text now: an undone attach or
+        // a deleted pill is still in the history.
+        self.history.clear();
         let edits = image_markers::removal_edits(&self.content, removed, count);
         if edits.is_empty() {
             return;
@@ -71,9 +76,6 @@ impl Input {
         let text = image_markers::apply(&self.content, &edits, &mut offsets);
         // A composition spanning a rewritten marker cannot be carried over.
         self.marked = None;
-        // Earlier steps hold the old numbering, which would bring back
-        // markers for an image that is gone or now has another number.
-        self.history.clear();
         self.content = text.into();
         self.lines.clear();
         self.selection = self.clip_range(offsets[0]..offsets[1]);

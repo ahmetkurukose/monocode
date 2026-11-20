@@ -343,9 +343,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn moving_a_selection_ends_a_typing_run_but_deleting_runs_stay_whole(
-        cx: &mut TestAppContext,
-    ) {
+    fn moving_a_selection_ends_a_typing_run_but_deleting_runs_stay_whole(cx: &mut TestAppContext) {
         let window = field(cx);
         let m = modifier();
         // Shift+Left then Shift+Right lands back where typing stopped.
@@ -363,9 +361,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn image_markers_undo_as_one_step_and_a_removal_forgets_old_numbering(
-        cx: &mut TestAppContext,
-    ) {
+    fn image_markers_undo_as_one_step_and_a_removal_forgets_old_numbering(cx: &mut TestAppContext) {
         let window = field(cx);
         let m = modifier();
         cx.simulate_keystrokes(window.into(), "h i");
