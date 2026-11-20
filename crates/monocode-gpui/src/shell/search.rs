@@ -185,8 +185,9 @@ impl Shell {
         let panel = self.workspace.preferences.search_panel;
         self.close_menu(cx);
         if panel {
-            if self.quick_open.is_some() {
-                self.close_quick_open(window, cx);
+            if self.palette.is_some() || self.everywhere.is_some() {
+                self.close_palette(window, cx);
+                self.close_everywhere(window, cx);
             }
         } else {
             self.close_preview(cx);
@@ -331,7 +332,7 @@ impl Shell {
             self.toggle_archive(id, cx);
         }
     }
-    fn open_search_session(
+    pub(super) fn open_search_session(
         &mut self,
         id: i64,
         jump: Option<(usize, String)>,
@@ -477,7 +478,7 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
-    fn app_search_restores_draft_and_opens_cross_project_result(cx: &mut TestAppContext) {
+    fn search_everywhere_keeps_the_draft_and_opens_a_cross_project_conversation(cx: &mut TestAppContext) {
         cx.update(|cx| {
             input::bind(cx);
             super::super::bind_keys(cx);
@@ -499,7 +500,7 @@ mod tests {
         cx.refresh().unwrap();
         window
             .update(cx, |shell, w, cx| {
-                let view = &shell.app_search.as_ref().unwrap().view;
+                let view = &shell.everywhere.as_ref().unwrap().view;
                 assert!(view.focus_handle(cx).is_focused(w));
             })
             .unwrap();
@@ -507,7 +508,7 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
-                assert!(shell.app_search.is_none());
+                assert!(shell.everywhere.is_none());
                 let input = &shell.sessions[&b].read(cx).input;
                 assert_eq!(input.read(cx).content, "preserve this draft");
                 assert!(input.focus_handle(cx).is_focused(w));
@@ -516,12 +517,13 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         cx.simulate_input(window.into(), "Needle");
+        cx.executor().advance_clock(std::time::Duration::from_millis(400));
         cx.run_until_parked();
         cx.simulate_keystrokes(window.into(), "enter");
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                assert!(shell.app_search.is_none());
+                assert!(shell.everywhere.is_none());
                 assert_eq!(shell.workspace.active, Some(a));
                 assert_eq!(shell.workspace.project, "/work/another-project");
                 assert_eq!(

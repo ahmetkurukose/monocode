@@ -1,5 +1,6 @@
 //! SearchView.tsx/appSearch.ts: fuzzy titles and paths, literal message/content
 //! matches, stable identities, and the same per-scope ordering and limits.
+pub mod fast;
 pub mod project;
 use crate::{files::ProjectFile, store::Session, transcript::Row};
 use std::{

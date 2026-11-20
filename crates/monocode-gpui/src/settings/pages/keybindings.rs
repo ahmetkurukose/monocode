@@ -19,20 +19,20 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "App: Search Everywhere",
+        keys: "⇧⇧",
+        when: "Always",
+        fixed: true,
+    },
+    Binding {
         command: "App: Search",
         keys: "⌘K",
         when: "Always",
         fixed: false,
     },
     Binding {
-        command: "App: Go to File",
-        keys: "⌘P",
-        when: "Always",
-        fixed: false,
-    },
-    Binding {
         command: "App: Command Palette",
-        keys: "⌘⇧P",
+        keys: "⌘P",
         when: "Always",
         fixed: false,
     },

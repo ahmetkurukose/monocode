@@ -487,44 +487,41 @@ fn a_leading_at_sign_still_finds_files_and_text_where_there_are_no_symbols(
             shell.workspace.project = rig.root.to_string_lossy().into_owned()
         })
         .unwrap();
-    let ask = |cx: &mut VisualTestContext, typed: &str, content: bool| -> Vec<String> {
+    use crate::everywhere::Tab;
+    let ask = |cx: &mut VisualTestContext, typed: &str, tab: Tab| -> Vec<String> {
         let typed = typed.to_owned();
         window
             .update(cx, |shell, window, cx| {
-                shell.open_quick_open(false, window, cx);
-                if content {
-                    let picker = shell.quick_open.as_ref().unwrap().picker().clone();
-                    picker.update(cx, |picker, cx| picker.show_content(cx));
-                }
-                shell.set_quick_open_query(typed, cx);
+                shell.open_everywhere(Some(tab), Some(typed), window, cx);
             })
             .unwrap();
         let mut rows = Vec::new();
-        wait(cx, "quick open's rows", |cx| {
+        wait(cx, "search everywhere's rows", |cx| {
             rows = window
                 .update(cx, |shell, _, cx| {
-                    let open = shell.quick_open.as_ref().unwrap();
-                    open.picker().read(cx).row_labels()
+                    let open = shell.everywhere.as_ref().unwrap();
+                    open.view.read(cx).row_labels()
                 })
                 .unwrap();
             !rows.is_empty()
         });
         window
-            .update(cx, |shell, window, cx| shell.close_quick_open(window, cx))
+            .update(cx, |shell, window, cx| shell.close_everywhere(window, cx))
             .unwrap();
         rows.into_iter().map(|(label, _)| label).collect()
     };
-    // No symbols in the file in front: `@` is a character of the name
-    // looked for.
+    // No symbols in the file in front: on All, `@` is a character of the
+    // name looked for.
     open_file(window, cx, &css);
-    assert_eq!(ask(cx, "@types", false), ["shapes.d.ts"]);
-    // A file with symbols in front: its symbols, and when none answers,
-    // the files again.
+    let found = ask(cx, "@types", Tab::All);
+    assert_eq!(found.first().map(String::as_str), Some("shapes.d.ts"), "{found:?}");
+    // A file with symbols in front: on All, `@` searches its symbols.
     open_file(window, cx, &store);
-    assert_eq!(ask(cx, "@sto", false), ["Store"]);
-    assert_eq!(ask(cx, "@types", false), ["shapes.d.ts"]);
+    assert_eq!(ask(cx, "@sto", Tab::All), ["Store"]);
+    // The Files tab takes what is typed as a name.
+    assert_eq!(ask(cx, "@types", Tab::Files), ["shapes.d.ts"]);
     // Inside the files the text is looked for as it was typed.
-    assert_eq!(ask(cx, "@media", true), ["@media print {"]);
+    assert_eq!(ask(cx, "@media", Tab::Content), ["@media print {"]);
 }
 
 #[gpui::test]

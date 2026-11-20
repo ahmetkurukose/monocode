@@ -887,9 +887,9 @@ impl Shell {
                                 .font_weight(FontWeight::NORMAL)
                                 .text_color(content(0.4))
                                 .child(if cfg!(target_os = "macos") {
-                                    "⌘K"
+                                    "⇧⇧"
                                 } else {
-                                    "Ctrl K"
+                                    "Shift Shift"
                                 }),
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.focus_search(w, cx))),
@@ -1142,10 +1142,10 @@ impl Shell {
             .child(
                 icon_button("rail-global-search", "Search", "search")
                     .size(px(32.))
-                    .when(self.app_search.is_some(), |d| d.bg(content(0.1)))
+                    .when(self.everywhere.is_some(), |d| d.bg(content(0.1)))
                     .on_click(cx.listener(|this, _, w, cx| {
-                        if this.app_search.is_some() {
-                            this.close_app_search(w, cx)
+                        if this.everywhere.is_some() {
+                            this.close_everywhere(w, cx)
                         } else {
                             this.focus_search(w, cx)
                         }

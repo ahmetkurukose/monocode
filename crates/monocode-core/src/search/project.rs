@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 const MAX_MATCHES: usize = 500;
 /// The most characters of a matching line kept as its preview.
-const PREVIEW_CHARS: usize = 240;
+pub(crate) const PREVIEW_CHARS: usize = 240;
 /// How many of those come before the match.
-const PREVIEW_LEAD: usize = 60;
+pub(crate) const PREVIEW_LEAD: usize = 60;
 
 /// `line` cut to a window around the match at `column` (1-based, in
 /// characters), with … where text was left out. A minified bundle is one
@@ -34,7 +34,7 @@ fn clip_preview(line: &str, column: u32) -> String {
 }
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_GIT_GREP_BYTES: usize = 4 * 1024 * 1024;
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchOptions {
     pub cwd: String,
@@ -159,7 +159,13 @@ fn git_grep_capped(
     max_bytes: usize,
     cancel: &AtomicBool,
 ) -> Option<SearchResult> {
-    let mut args = vec!["grep".to_string(), "-z".to_string(), "-n".to_string()];
+    let mut args = vec![
+        "grep".to_string(),
+        "--no-color".to_string(),
+        "-I".to_string(),
+        "-z".to_string(),
+        "-n".to_string(),
+    ];
     if !options.case_sensitive {
         args.push("-i".to_string());
     }

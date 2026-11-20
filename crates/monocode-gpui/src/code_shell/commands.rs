@@ -1,7 +1,7 @@
-//! What a feature adds to quick open: commands for the `>` palette, and
+//! What a feature adds to search: commands for the command palette, and
 //! modes of its own behind a prefix character (`@` for symbols) whose rows
-//! come from the feature, asynchronously. `quick_open.rs` reads these lists
-//! and knows nothing of who filled them.
+//! come from the feature, asynchronously. `command_palette.rs` and
+//! `everywhere.rs` read these lists and know nothing of who filled them.
 use gpui::{App, Global, SharedString, Task, Window};
 use std::rc::Rc;
 
@@ -111,4 +111,14 @@ pub(crate) fn mode_for(query: &str, cx: &App) -> Option<(Mode, String)> {
     let mode = (cx.try_global::<Registry>()?.modes.iter())
         .find(|mode| mode.prefix == prefix && (mode.applies)(cx))?;
     Some((mode.clone(), query[prefix.len_utf8()..].trim().to_owned()))
+}
+
+/// The mode behind `prefix`: the first that applies right now, else the
+/// first registered, so its hint can say why there is nothing to list.
+pub(crate) fn mode_with_prefix(prefix: char, cx: &App) -> Option<Mode> {
+    let modes = &cx.try_global::<Registry>()?.modes;
+    (modes.iter())
+        .find(|mode| mode.prefix == prefix && (mode.applies)(cx))
+        .or_else(|| modes.iter().find(|mode| mode.prefix == prefix))
+        .cloned()
 }

@@ -27,6 +27,7 @@ mod agent;
 mod debugging;
 mod insight;
 mod running;
+mod search;
 
 type Cx = AsyncWindowContext;
 
@@ -95,6 +96,10 @@ impl Driver {
         }
         if wanted("idle") {
             self.idle(cx).await;
+        }
+        // Not in the default run: `--only search`.
+        if only.split(',').any(|name| name == "search") {
+            self.search(cx).await;
         }
     }
 

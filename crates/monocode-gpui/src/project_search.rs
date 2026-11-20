@@ -114,6 +114,9 @@ impl Drop for ProjectSearch {
 }
 
 impl ProjectSearch {
+    pub(crate) fn set_query(&mut self, text: String, cx: &mut Context<Self>) {
+        self.query.update(cx, |input, cx| input.set_text(text, cx));
+    }
     pub(crate) fn new(cwd: String, active: bool, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| {
             let mut input = Input::field("Search", "Search", content(0.35), cx);

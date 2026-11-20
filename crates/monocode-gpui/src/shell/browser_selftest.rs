@@ -430,12 +430,12 @@ impl Shell {
         }
         page_state!("before_overlay");
         this.update_in(cx, |this, window, cx| {
-            this.open_quick_open(false, window, cx)
+            this.open_everywhere(None, None, window, cx)
         })
         .map_err(gone)?;
         wait(cx, 900).await;
         page_state!("under_overlay");
-        this.update_in(cx, |this, window, cx| this.close_quick_open(window, cx))
+        this.update_in(cx, |this, window, cx| this.close_everywhere(window, cx))
             .map_err(gone)?;
         wait(cx, 900).await;
         page_state!("after_overlay");

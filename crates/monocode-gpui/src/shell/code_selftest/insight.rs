@@ -397,16 +397,16 @@ impl Driver {
         let outline_drawn = self.bounds(cx, "code-outline").is_some();
         self.shot(cx, "outline-tab").await;
 
-        // Quick open's `@`, typed: a class of the other module.
+        // Search Everywhere's `@`, typed: a class of the other module.
         if let Some((_, at)) = self.glyph(cx, "def make_order") {
             self.click(cx, at).await;
         }
-        self.keys(cx, "cmd-p").await;
+        self.keys(cx, "cmd-k").await;
         self.pause(cx, 300).await;
         self.type_text(cx, "@Order").await;
         let rows = |shell: &Shell, cx: &App| -> Vec<(String, String)> {
-            (shell.quick_open.as_ref())
-                .map(|open| open.picker().read(cx).row_labels())
+            (shell.everywhere.as_ref())
+                .map(|open| open.view.read(cx).row_labels())
                 .unwrap_or_default()
         };
         let mut listed = Vec::new();
