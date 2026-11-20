@@ -193,8 +193,10 @@ pub(crate) fn pick(id: &str, window: &mut Window, cx: &mut App) {
             );
         }
         "open" => {
+            // A dev server's address is local, so it opens in Monocode
+            // unless ⇧ is held or the run announced some other host.
             if let Some(url) = &info.url {
-                cx.open_url(url);
+                crate::shell::browser_links::open_link(url, window.modifiers().shift, window, cx);
             }
         }
         "forget" => {

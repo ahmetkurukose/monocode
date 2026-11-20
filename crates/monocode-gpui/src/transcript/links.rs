@@ -128,7 +128,9 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) {
         match (action, target) {
-            ("open-web", Target::Web(url)) => cx.open_url(url),
+            ("open-web", Target::Web(url)) => {
+                crate::shell::browser_links::open_link(url, window.modifiers().shift, window, cx)
+            }
             ("copy-link", Target::Web(url)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
             }

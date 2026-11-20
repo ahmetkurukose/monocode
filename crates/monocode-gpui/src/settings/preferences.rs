@@ -103,6 +103,10 @@ pub(crate) struct Preferences {
     pub claude_chrome: bool,
     /// Agents get the code tools: language servers, runs and the debugger.
     pub code_agents: bool,
+    /// Every web link clicked in a reply or a terminal opens in a browser
+    /// pane. Off, only local addresses do and the rest go to the user's own
+    /// browser.
+    pub browser_all_links: bool,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -207,6 +211,7 @@ impl Default for Preferences {
             claude_hooks: true,
             claude_chrome: false,
             code_agents: true,
+            browser_all_links: false,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),

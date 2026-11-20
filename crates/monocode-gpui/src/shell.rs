@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+pub(crate) mod browser_links;
 mod browser_panes;
 mod automation_runs;
 mod classic_sidebar;
@@ -9428,6 +9429,16 @@ impl Render for Shell {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
                 this.update(cx, |this, cx| this.close_exited_terminals(window, cx));
+            });
+        }
+        // A link clicked in this window's views (a terminal, a reply) that
+        // opens in Monocode's browser.
+        if browser_links::pending(cx) {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                for url in browser_links::take_for(window.window_handle(), cx) {
+                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                }
             });
         }
         if self.mono_panes_unsettled(cx) {
