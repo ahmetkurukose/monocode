@@ -229,7 +229,15 @@ impl Shell {
             .terminal_owner()
             .or_else(|| self.project_session_for_terminal())
         else {
-            self.new_terminal(window, cx);
+            // The empty workspace has no chat to lend a scope: make one.
+            if self.empty_workspace_showing(cx) && !self.workspace.project.starts_with("remote://")
+            {
+                self.with_pane_owner("a terminal", cx, |this, window, cx| {
+                    this.new_title_terminal(window, cx)
+                });
+            } else {
+                self.new_terminal(window, cx);
+            }
             return;
         };
         let cwd = self.terminal_cwd(cx);

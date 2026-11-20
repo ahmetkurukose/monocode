@@ -1336,7 +1336,14 @@ fn agents_statements_land_in_an_agent_console_with_their_result(cx: &mut TestApp
             let id = view.selected.clone().unwrap();
             let users = view.consoles.len();
             view.show_agent_statement(&id, "select 1", "db_query", Some(sample()), None, cx);
-            view.show_agent_statement(&id, "select oops", "db_query", None, Some("syntax error".into()), cx);
+            view.show_agent_statement(
+                &id,
+                "select oops",
+                "db_query",
+                None,
+                Some("syntax error".into()),
+                cx,
+            );
             // One Agent console, beside the user's own, which stays in front.
             assert_eq!(view.consoles.len(), users + 1);
             let agent = view
@@ -1345,9 +1352,17 @@ fn agents_statements_land_in_an_agent_console_with_their_result(cx: &mut TestApp
                 .find(|c| c.name.as_deref() == Some("Agent"))
                 .expect("an Agent console");
             let text = agent.editor.read(cx).content.to_string();
-            assert!(text.contains("-- db_query") && text.contains("select 1;") && text.contains("select oops;"), "{text}");
+            assert!(
+                text.contains("-- db_query")
+                    && text.contains("select 1;")
+                    && text.contains("select oops;"),
+                "{text}"
+            );
             assert_eq!(agent.result.as_ref().map(|r| r.rows.len()), Some(2));
-            assert_eq!(agent.error.as_ref().map(|e| e.0.message.as_str()), Some("syntax error"));
+            assert_eq!(
+                agent.error.as_ref().map(|e| e.0.message.as_str()),
+                Some("syntax error")
+            );
             assert_ne!(view.active.get(&id), Some(&agent.id));
         })
         .unwrap();
@@ -1355,7 +1370,9 @@ fn agents_statements_land_in_an_agent_console_with_their_result(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn imported_sources_are_saved_with_their_passwords_and_agent_access_changes(cx: &mut TestAppContext) {
+fn imported_sources_are_saved_with_their_passwords_and_agent_access_changes(
+    cx: &mut TestAppContext,
+) {
     let dir = tempfile::tempdir().unwrap();
     let window = open(cx, dir.path());
     window
@@ -1375,7 +1392,10 @@ fn imported_sources_are_saved_with_their_passwords_and_agent_access_changes(cx: 
             let saved = DataSourceStore::new(dir.path()).load();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].mcp, monocode_core::db::McpAccess::Write);
-            assert_eq!(saved[0].tunnel.as_ref().unwrap().instance, "projects/p/locations/r/clusters/c/instances/i");
+            assert_eq!(
+                saved[0].tunnel.as_ref().unwrap().instance,
+                "projects/p/locations/r/clusters/c/instances/i"
+            );
         })
         .unwrap();
 }

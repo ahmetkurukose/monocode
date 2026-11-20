@@ -67,11 +67,11 @@ impl Conversation {
 
     /// A row's click: a subagent opens its own view, a command its details.
     fn open_background_task(&mut self, task: &BackgroundTask, cx: &mut Context<Self>) {
-        if task.agent {
-            if let Some(id) = subagent_of(task, &self.subagents(cx)) {
-                self.open_subagent(Some(id), cx);
-                return;
-            }
+        if task.agent
+            && let Some(id) = subagent_of(task, &self.subagents(cx))
+        {
+            self.open_subagent(Some(id), cx);
+            return;
         }
         if !self.background.expanded.remove(&task.id) {
             self.background.expanded.insert(task.id.clone());
@@ -400,7 +400,7 @@ fn subagent_of(task: &BackgroundTask, subagents: &[Subagent]) -> Option<String> 
         .iter()
         .find(|s| {
             task.tool_use_id.as_deref() == Some(s.row.id.as_str())
-                || s.row.task_ids.iter().any(|id| *id == task.id)
+                || s.row.task_ids.contains(&task.id)
         })
         .map(|s| s.row.id.clone())
 }

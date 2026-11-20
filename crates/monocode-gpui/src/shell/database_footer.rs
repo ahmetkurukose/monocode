@@ -186,9 +186,9 @@ impl Shell {
                         if !wanted.is_empty() {
                             let listeners = tunnel::listeners();
                             for (port, spec) in wanted {
-                                tunnels
-                                    .entry(port)
-                                    .or_insert_with(|| tunnel::state(&spec, port, &listeners, &tunnel_dir));
+                                tunnels.entry(port).or_insert_with(|| {
+                                    tunnel::state(&spec, port, &listeners, &tunnel_dir)
+                                });
                             }
                         }
                         (sources, tunnels)
@@ -326,9 +326,12 @@ impl Shell {
                 .find(|(_, s)| matches!(s, Status::Failed(_) | Status::PortBusy(_)))
                 .map(|(_, s)| s.clone())
         });
-        let agents_busy = sources
-            .iter()
-            .any(|s| self.db_footer.stats.get(&s.id).is_some_and(|s| s.running > 0));
+        let agents_busy = sources.iter().any(|s| {
+            self.db_footer
+                .stats
+                .get(&s.id)
+                .is_some_and(|s| s.running > 0)
+        });
         let open = self.menu_open(&MenuTarget::Databases);
         let classic = self.workspace.boxy_layout();
         let description: SharedString = statuses
@@ -408,8 +411,7 @@ impl Shell {
             items.push(if running {
                 MenuAction::new(format!("tunnel-stop:{id}"), "Stop tunnel").icon("square")
             } else {
-                MenuAction::new(format!("tunnel-start:{id}"), "Open tunnel")
-                    .icon("git-branch-dot")
+                MenuAction::new(format!("tunnel-start:{id}"), "Open tunnel").icon("git-branch-dot")
             });
             items.push(
                 MenuAction::new(format!("tunnel-log:{id}"), "Show tunnel log").icon("file-script"),
@@ -760,7 +762,10 @@ impl Shell {
 
     /// Ticks a found connection on or off; the menu stays open.
     pub(super) fn toggle_found(&mut self, id: &str) -> bool {
-        let Some(i) = id.strip_prefix("pick:").and_then(|i| i.parse::<usize>().ok()) else {
+        let Some(i) = id
+            .strip_prefix("pick:")
+            .and_then(|i| i.parse::<usize>().ok())
+        else {
             return false;
         };
         if !self.db_footer.chosen.remove(&i) {

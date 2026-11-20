@@ -598,7 +598,11 @@ mod tests {
         };
         window
             .update(cx, |shell, w, cx| {
-                shell.select_worktree(Some(feature.clone()), w, cx)
+                shell.select_worktree(Some(feature.clone()), w, cx);
+                // A copy with nothing open shows the empty workspace; its
+                // first chat is started from there.
+                assert!(shell.empty_workspace_showing(cx));
+                shell.new_chat(cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -657,7 +661,8 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, "/work/monocode");
                 assert_eq!(shell.working_copy(), "/work/feature");
-                assert_eq!(shell.visible_tabs(cx).len(), 1);
+                // Everything of this copy is closed and stays closed.
+                assert_eq!(shell.visible_tabs(cx).len(), 0);
                 assert!(shell.workspace.title_order.contains(&mono_main));
                 assert!(shell.workspace.tabs.contains(&other_project));
             })

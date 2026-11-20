@@ -46,9 +46,9 @@ pub(crate) enum Event {
     Close,
 }
 
+pub(crate) use external::LinkState;
 #[cfg(test)]
 pub(crate) use send::write_sources;
-pub(crate) use external::LinkState;
 pub(crate) use send::{MAX_SEND_BYTES, Origin, Target, send_targets};
 
 const LIMITS: [usize; 4] = [100, 500, 1000, 5000];

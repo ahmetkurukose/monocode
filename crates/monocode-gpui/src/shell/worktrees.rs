@@ -498,12 +498,22 @@ mod tests {
         window
             .update(cx, |shell, w, cx| {
                 assert_eq!(shell.workspace.active, Some(main_session));
-                assert_eq!(shell.sessions.len(), 3);
+                assert_eq!(shell.sessions.len(), 2);
                 shell.select_worktree(Some(other.clone()), w, cx);
+                // A copy with nothing open shows the empty workspace; New
+                // session there starts a chat in that copy.
+                assert_eq!(shell.workspace.active, None);
+                assert!(shell.empty_workspace_showing(cx));
+                shell.new_chat(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
                 let id = shell
                     .workspace
                     .active
-                    .expect("reuse the completed blank for this copy");
+                    .expect("New session opens a chat for this copy");
                 assert_eq!(shell.sessions.len(), 3);
                 assert_eq!(shell.sessions[&id].read(cx).summary.cwd, project);
                 assert_eq!(

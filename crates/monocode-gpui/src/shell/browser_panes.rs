@@ -362,9 +362,9 @@ impl Shell {
             .terminal_owner()
             .or_else(|| self.project_session_for_terminal())
         else {
-            self.error =
-                Some("Open a session in this project before opening a browser page".into());
-            cx.notify();
+            self.with_pane_owner("a browser page", cx, move |this, window, cx| {
+                this.new_browser_pane(url, window, cx)
+            });
             return;
         };
         let url = url

@@ -542,7 +542,28 @@ impl UsageFooter {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .children(windows.map(|w| self.window_card(w, now))),
+                    .children(windows.map(|w| self.window_card(w, None, now)))
+                    .children(
+                        state
+                            .snapshot
+                            .iter()
+                            .flat_map(|s| &s.scoped)
+                            .map(|limit| self.window_card(&limit.window, Some(&limit.label), now)),
+                    )
+                    .children(
+                        state
+                            .snapshot
+                            .as_ref()
+                            .filter(|s| !s.breakdown.is_empty())
+                            .map(|s| breakdown_card(&s.breakdown)),
+                    )
+                    .children(
+                        state
+                            .snapshot
+                            .as_ref()
+                            .and_then(|s| s.credits.as_ref())
+                            .map(credits_card),
+                    ),
             )
             .children(
                 state
@@ -645,7 +666,7 @@ impl UsageFooter {
         }
         cx.notify();
     }
-    fn window_card(&self, w: &usage::Window, now: i64) -> gpui::Div {
+    fn window_card(&self, w: &usage::Window, scope: Option<&str>, now: i64) -> gpui::Div {
         let used = w.used_percent.clamp(0., 100.);
         let shown = self.display_percent(used);
         let label = match w.minutes {
@@ -653,6 +674,19 @@ impl UsageFooter {
             10_080 => "Weekly limit",
             43_200 => "Monthly limit",
             _ => "5-hour limit",
+        };
+        let label = match scope {
+            Some(scope) => format!("{label} · {scope}"),
+            None => label.to_owned(),
+        };
+        // The countdown, then the wall-clock time it lands on.
+        let reset = match w
+            .resets_at
+            .filter(|at| *at > now)
+            .and_then(usage::local_time)
+        {
+            Some(time) => format!("{} · {time}", w.reset_label(now)),
+            None => w.reset_label(now),
         };
         div()
             .rounded_lg()
@@ -721,7 +755,7 @@ impl UsageFooter {
                             "remaining"
                         }
                     ))
-                    .child(div().truncate().child(w.reset_label(now))),
+                    .child(div().truncate().child(reset)),
             )
     }
     fn suggestion(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -811,6 +845,89 @@ impl UsageFooter {
     }
 }
 use crate::accounts::ui::bar_color as usage_color;
+fn card() -> gpui::Div {
+    div()
+        .rounded_lg()
+        .bg(content(0.045))
+        .border_1()
+        .border_color(content(0.06))
+        .px_3()
+        .py(px(10.))
+}
+/// Where this week's usage went: one row per product that used any.
+fn breakdown_card(shares: &[usage::Share]) -> gpui::Div {
+    card()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(content(0.65))
+                .child("This week by product"),
+        )
+        .children(shares.iter().map(|share| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(10.))
+                .line_height(px(16.))
+                .child(
+                    div()
+                        .w(px(84.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_color(content(0.55))
+                        .child(share.label.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(content(0.1))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(share.percent as f32 / 100.))
+                                .rounded_full()
+                                .bg(content(0.45)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(30.))
+                        .flex_shrink_0()
+                        .text_right()
+                        .child(format!("{:.0}%", share.percent)),
+                )
+        }))
+}
+fn credits_card(credits: &usage::Credits) -> gpui::Div {
+    card()
+        .flex()
+        .justify_between()
+        .items_baseline()
+        .gap_3()
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(content(0.65))
+                .child("Usage credits"),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight::MEDIUM)
+                .when(credits.out_of_credits, |d| d.text_color(rgb(0xfcd34d)))
+                .when(!credits.enabled && !credits.out_of_credits, |d| {
+                    d.text_color(content(0.4))
+                })
+                .child(credits.summary()),
+        )
+}
 impl Render for UsageFooter {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.cache[index(self.kind)];
@@ -992,6 +1109,26 @@ mod tests {
                         resets_at: None,
                     }],
                     updated_at: usage::now_ms(),
+                    // The open popover below draws every optional card.
+                    scoped: vec![usage::ScopedLimit {
+                        label: "Fable".into(),
+                        window: usage::Window {
+                            used_percent: 17.,
+                            minutes: 10_080,
+                            resets_at: Some(usage::now_ms() + 3_600_000),
+                        },
+                    }],
+                    breakdown: vec![usage::Share {
+                        label: "Claude Code".into(),
+                        percent: 99.,
+                    }],
+                    credits: Some(usage::Credits {
+                        enabled: false,
+                        used: 0.,
+                        limit: Some(200.),
+                        currency: "USD".into(),
+                        out_of_credits: true,
+                    }),
                     ..Default::default()
                 }));
                 w.focus(&footer.trigger, cx);

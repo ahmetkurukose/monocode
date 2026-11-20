@@ -561,7 +561,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cmd_w_leaves_a_pin_open_and_the_strip_keeps_a_blank_tab(cx: &mut TestAppContext) {
+    fn cmd_w_leaves_a_pin_open_and_closing_the_strips_last_tab_shows_the_empty_workspace(
+        cx: &mut TestAppContext,
+    ) {
         let (window, _, first) = window(cx);
         cx.update(bind_keys);
         let second = window.update(cx, add_session).unwrap();
@@ -579,7 +581,7 @@ mod tests {
             .update(visual, |shell, w, cx| {
                 assert_eq!(shell.workspace.pinned_tabs, [TitleTab::Session(first)]);
                 assert_eq!(shell.active_title_tab(cx), Some(TitleTab::Session(first)));
-                // Closing the strip's last tab leaves a blank one, not the pin.
+                // Closing the strip's last tab leaves the strip empty, not the pin.
                 shell.open(second, w, cx);
                 shell.close_title_tabs(&[TitleTab::Session(second)], None, w, cx);
             })
@@ -587,9 +589,12 @@ mod tests {
         visual.run_until_parked();
         window
             .update(visual, |shell, _, cx| {
-                let strip = shell.strip_tabs(cx);
-                assert_eq!(strip.len(), 1);
-                assert_eq!(shell.active_title_tab(cx), Some(strip[0].clone()));
+                // The pin stays, but nothing is in front: the empty
+                // workspace shows, not a blank chat in the strip.
+                assert!(shell.strip_tabs(cx).is_empty());
+                assert_eq!(shell.workspace.pinned_tabs, [TitleTab::Session(first)]);
+                assert_eq!(shell.active_title_tab(cx), None);
+                assert!(shell.empty_workspace_showing(cx));
             })
             .unwrap();
     }
