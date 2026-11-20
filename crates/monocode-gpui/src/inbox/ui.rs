@@ -647,6 +647,14 @@ impl Inbox {
                     .flex_col()
                     .gap(px(2.))
                     .when(rows.is_empty(), |d| d.child(message(empty)))
+                    .when_some(
+                        self.snapshot
+                            .warnings
+                            .get(&self.state.source)
+                            .filter(|_| !rows.is_empty())
+                            .cloned(),
+                        |d, warning| d.child(error(warning)),
+                    )
                     .children(rows),
             )
             .child(
