@@ -1,5 +1,5 @@
 //! Finds the address a dev server says it is listening on, so the UI can
-//! offer to open it in the browser pane. Only this machine's addresses
+//! offer to open it in a browser. Only this machine's addresses
 //! count: a run's output is never a reason to open a remote page.
 use regex::Regex;
 use std::sync::OnceLock;

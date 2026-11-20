@@ -440,7 +440,7 @@ fn a_registered_feature_attaches_itself_and_jumps_walk_back_and_forward_across_f
     // Go to definition lands in another file, through the file route.
     cx.simulate_keystrokes("f12");
     let lib_link = format!("{}:2:5", lib.display());
-    assert_eq!(*opened.borrow(), [lib_link.clone()]);
+    assert_eq!(*opened.borrow(), std::slice::from_ref(&lib_link));
     window
         .update(cx, |view, w, cx| {
             assert!(view.header_parts(cx).leading.is_some(), "the arrows appear");

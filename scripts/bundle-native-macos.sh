@@ -26,11 +26,14 @@ esac
 native_name="${MONOCODE_NATIVE_APP_NAME:-Monocode Native}"
 native_bundle="$native_target/$native_name.app"
 native_binary="$native_target/monocode-gpui"
-if [ ! -f "$native_binary" ]; then
-  echo "Missing native executable: $native_binary" >&2
-  echo 'Build it with cargo first, or use npm run native:build.' >&2
-  exit 1
-fi
+native_helper="$native_target/monocode-cef-helper"
+for native_built in "$native_binary" "$native_helper"; do
+  if [ ! -f "$native_built" ]; then
+    echo "Missing native executable: $native_built" >&2
+    echo 'Build it with cargo first (-p monocode-gpui -p monocode-cef), or use npm run native:build.' >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$native_bundle/Contents/MacOS" "$native_bundle/Contents/Resources"
 # Replace the inode atomically so macOS does not reuse an older signature cache.
@@ -78,14 +81,103 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"
-if [ "$native_identity" = - ]; then
-  codesign --force --sign - "$native_bundle"
-elif [ -n "${MONOCODE_NATIVE_LOCAL_SIGNING:-}" ]; then
-  # A certificate made on this Mac (not notarized): the signature stays the
-  # same from build to build, so the keychain's "Always Allow" survives updates.
-  codesign --force --sign "$native_identity" "$native_bundle"
-else
-  codesign --force --sign "$native_identity" --options runtime --timestamp \
-    --entitlements src-tauri/Entitlements.plist "$native_bundle"
+# Signs one bundle. Ad-hoc and local signatures have no hardened runtime, so
+# they need no entitlements to load the downloaded Chromium framework.
+native_sign() {
+  local entitlements="$1" bundle="$2"
+  if [ "$native_identity" = - ]; then
+    codesign --force --sign - "$bundle"
+  elif [ -n "${MONOCODE_NATIVE_LOCAL_SIGNING:-}" ]; then
+    # A certificate made on this Mac (not notarized): the signature stays the
+    # same from build to build, so the keychain's "Always Allow" survives updates.
+    codesign --force --sign "$native_identity" "$bundle"
+  else
+    codesign --force --sign "$native_identity" --options runtime --timestamp \
+      --entitlements "$entitlements" "$bundle"
+  fi
+}
+
+# Signs code that carries no entitlements: libraries and frameworks.
+native_sign_code() {
+  if [ "$native_identity" = - ]; then
+    codesign --force --sign - "$1"
+  elif [ -n "${MONOCODE_NATIVE_LOCAL_SIGNING:-}" ]; then
+    codesign --force --sign "$native_identity" "$1"
+  else
+    codesign --force --sign "$native_identity" --timestamp "$1"
+  fi
+}
+
+native_frameworks="$native_bundle/Contents/Frameworks"
+mkdir -p "$native_frameworks"
+
+# The Chromium framework (docs/native/browser/context.md §4.3). It must be in
+# the bundle: Chromium's macOS sandbox lets the helpers read only inside the
+# app. It comes from the CEF SDK cef-dll-sys fetched for this build, so it is
+# the exact build the app was compiled against.
+native_cef="${MONOCODE_CEF_FRAMEWORK:-}"
+if [ -z "$native_cef" ]; then
+  native_cef_version="$(sed -n '/^name = "cef-dll-sys"$/{n;s/^version = ".*+\(.*\)"$/\1/p;}' crates/monocode-gpui/Cargo.lock)"
+  case "$(lipo -archs "$native_binary" 2>/dev/null || uname -m)" in
+    arm64) native_cef_arch=aarch64 ;;
+    x86_64) native_cef_arch=x86_64 ;;
+    *) echo "Unknown architecture of $native_binary" >&2; exit 1 ;;
+  esac
+  native_cef="${CEF_PATH:-crates/monocode-gpui/target/cef-sdk}/$native_cef_version/cef_macos_$native_cef_arch/Chromium Embedded Framework.framework"
 fi
+if [ ! -f "$native_cef/Chromium Embedded Framework" ]; then
+  echo "Missing the Chromium framework: $native_cef" >&2
+  echo 'Build the app with cargo first; cef-dll-sys fetches it (see .cargo/config.toml).' >&2
+  exit 1
+fi
+# ~250 MB: copied and signed again only when it or the signing identity changed.
+native_cef_dest="$native_frameworks/Chromium Embedded Framework.framework"
+native_cef_stamp="$native_target/.cef-framework-$native_name.stamp"
+native_cef_state="$native_identity|$(stat -f '%z %m' "$native_cef/Chromium Embedded Framework")"
+if [ ! -d "$native_cef_dest" ] || [ "$(cat "$native_cef_stamp" 2>/dev/null)" != "$native_cef_state" ]; then
+  rm -rf "$native_cef_dest"
+  ditto "$native_cef" "$native_cef_dest"
+  # Inside out: its libraries, then the framework.
+  for native_cef_library in "$native_cef_dest/Libraries/"*.dylib; do
+    native_sign_code "$native_cef_library"
+  done
+  native_sign_code "$native_cef_dest"
+  printf '%s' "$native_cef_state" > "$native_cef_stamp"
+fi
+
+# Chromium's child processes: one small executable in five helper bundles.
+# Chromium finds the GPU, Renderer, Plugin and Alerts helpers by adding their
+# suffix to the main helper's name, so all five carry the app's visible name.
+find "$native_frameworks" -maxdepth 1 -name '* Helper*.app' -exec rm -rf {} +
+for native_variant in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+  native_helper_name="$native_name Helper$native_variant"
+  native_helper_app="$native_frameworks/$native_helper_name.app"
+  native_helper_id="dev.usemono.gpui.helper"
+  case "$native_variant" in
+    " (GPU)") native_helper_id="$native_helper_id.gpu" ;;
+    " (Renderer)") native_helper_id="$native_helper_id.renderer" ;;
+    " (Plugin)") native_helper_id="$native_helper_id.plugin" ;;
+    " (Alerts)") native_helper_id="$native_helper_id.alerts" ;;
+  esac
+  mkdir -p "$native_helper_app/Contents/MacOS"
+  cp "$native_helper" "$native_helper_app/Contents/MacOS/$native_helper_name"
+  cat > "$native_helper_app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>$native_helper_name</string>
+<key>CFBundleIdentifier</key><string>$native_helper_id</string>
+<key>CFBundleName</key><string>$native_helper_name</string>
+<key>CFBundleDisplayName</key><string>$native_helper_name</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>$native_short_version</string>
+<key>CFBundleVersion</key><string>$native_build_version</string>
+<key>LSUIElement</key><true/>
+<key>LSFileQuarantineEnabled</key><true/>
+<key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict></plist>
+PLIST
+  native_sign crates/monocode-cef/macos/Helper.entitlements "$native_helper_app"
+done
+native_sign crates/monocode-gpui/macos/Entitlements.plist "$native_bundle"
 printf 'App: %s\n' "$native_bundle"

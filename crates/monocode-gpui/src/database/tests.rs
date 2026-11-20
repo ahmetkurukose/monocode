@@ -58,7 +58,7 @@ fn a_new_source_gets_a_console_that_survives_a_restart(cx: &mut TestAppContext) 
     cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
     cx.refresh().unwrap();
-    drop(window);
+    let _ = window;
 
     let again = open(cx, dir.path());
     again
@@ -342,7 +342,7 @@ fn open_tabs_come_back_after_a_restart_and_closed_ones_stay_closed(cx: &mut Test
             source
         })
         .unwrap();
-    drop(window);
+    let _ = window;
     let again = open(cx, dir.path());
     again
         .update(cx, |view, _, _| {
@@ -495,7 +495,7 @@ fn history_statements_go_into_the_console_without_losing_what_is_there(cx: &mut 
 }
 
 fn details() -> TableDetails {
-    use monocode_core::db::{ConstraintInfo, IndexInfo, TriggerInfo};
+    use monocode_core::db::{ConstraintInfo, IndexInfo};
     TableDetails {
         indexes: vec![
             IndexInfo {
@@ -652,7 +652,7 @@ fn an_expanded_table_shows_its_folders_and_hiding_results_survives_a_restart(
             assert!(view.results_hidden);
         })
         .unwrap();
-    drop(window);
+    let _ = window;
     let again = open(cx, dir.path());
     again
         .update(cx, |view, _, _| assert!(view.results_hidden))
@@ -720,7 +720,7 @@ fn a_console_can_be_renamed_and_the_name_sticks(cx: &mut TestAppContext) {
             source
         })
         .unwrap();
-    drop(window);
+    let _ = window;
     let again = open(cx, dir.path());
     again
         .update(cx, |view, window, cx| {

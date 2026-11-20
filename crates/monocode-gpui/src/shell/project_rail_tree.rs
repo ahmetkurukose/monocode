@@ -132,17 +132,6 @@ impl Shell {
             .collect();
         panes.sort_unstable_by(|a, b| b.cmp(a));
         terminals.extend(panes.into_iter().map(RailTerminal::Pane));
-        // The project's browser pages, newest first, after its terminals.
-        let mut pages: Vec<i64> = (self.workspace.browser_panes.iter())
-            .filter(|(pane, page)| {
-                self.workspace.tab_of(**pane).is_some()
-                    && (self.session_summaries.get(&page.owner))
-                        .is_some_and(|owner| owner.cwd == path)
-            })
-            .map(|(pane, _)| *pane)
-            .collect();
-        pages.sort_unstable();
-        terminals.extend(pages.into_iter().map(RailTerminal::Browser));
 
         let project = path.to_owned();
         let total = ids.len() + usize::from(hidden > 0) + worktree_rows.len() + terminals.len();
@@ -291,37 +280,6 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        // The browser is a pane, not an app view: its icon opens the
-        // project's page, and is lit while one of them is in front.
-        let browsing = here
-            && !self.app_view_open()
-            && (self.workspace.active)
-                .is_some_and(|pane| self.workspace.browser_panes.contains_key(&pane));
-        let target = project.clone();
-        icons.push(
-            div()
-                .id(SharedString::from(format!("rail-app-browser-{ix}")))
-                .debug_selector(move || format!("rail-app-browser-{ix}"))
-                .role(Role::Button)
-                .aria_label(format!("Browser of {name}"))
-                .aria_selected(browsing)
-                .size(px(20.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .cursor_pointer()
-                .when(browsing, |d| d.bg(content(0.1)))
-                .hover(|s| s.bg(content(0.08)))
-                .child(icon("globe", 13.).text_color(content(if browsing { 0.9 } else { 0.55 })))
-                .tooltip(|_, cx| cx.new(|_| RailTip("Browser".into())).into())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.open_project_browser(target.clone(), window, cx)
-                }))
-                .into_any_element(),
-        );
         (!icons.is_empty()).then(|| {
             div()
                 .flex_shrink_0()
@@ -774,26 +732,11 @@ impl Shell {
                     !self.app_view_open() && self.workspace.active == Some(*pane),
                 )
             }
-            RailTerminal::Browser(pane) => (
-                format!("page-{pane}"),
-                self.browser_pane_title(*pane, cx)
-                    .unwrap_or_else(|| "Page".into()),
-                !self.app_view_open() && self.workspace.active == Some(*pane),
-            ),
-        };
-        let browser = matches!(source, RailTerminal::Browser(_));
-        // A page that is asleep, or was never woken since launch, is dimmer.
-        let awake = match &source {
-            RailTerminal::Browser(pane) => {
-                (self.browser_views.get(pane)).is_some_and(|page| page.read(cx).has_page())
-            }
-            _ => true,
         };
         let ix = self.rail_index(&project);
         let ordinal = match &source {
             RailTerminal::Dock(n) => *n,
             RailTerminal::Pane(p) => 1000 + p.unsigned_abs() as usize,
-            RailTerminal::Browser(p) => 5000 + p.unsigned_abs() as usize,
         };
         let button_id = ("rail-terminal", ix * 10_000 + ordinal);
         let target = project.clone();
@@ -809,11 +752,7 @@ impl Shell {
             self.project_rail_child_button(
                 &project,
                 button_id,
-                if browser {
-                    format!("Browser page, {title}")
-                } else {
-                    format!("Terminal, {title}")
-                },
+                format!("Terminal, {title}"),
                 selected,
             )
             .debug_selector(move || selector.clone())
@@ -824,10 +763,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        icon(if browser { "globe" } else { "terminal" }, 13.)
-                            .text_color(content(if awake { 0.55 } else { 0.3 })),
-                    ),
+                    .child(icon("terminal", 13.).text_color(content(0.55))),
             )
             .child(
                 div()
@@ -839,7 +775,6 @@ impl Shell {
             .on_click(cx.listener(move |this, _, window, cx| match &click_source {
                 RailTerminal::Dock(ix) => this.focus_dock_terminal(&target, *ix, window, cx),
                 RailTerminal::Pane(pane) => this.open_terminal_pane(*pane, window, cx),
-                RailTerminal::Browser(pane) => this.open_browser_pane(*pane, window, cx),
             })),
         )
         .into_any_element()
@@ -1498,10 +1433,18 @@ mod tests {
         visual.run_until_parked();
         let options = at(visual, format!("rail-project-options-{ix}")).unwrap();
         let icons = at(visual, format!("rail-app-icons-{ix}")).unwrap();
-        let browser = at(visual, format!("rail-app-browser-{ix}")).unwrap();
+        let shown = window
+            .update(visual, |shell, _, _| {
+                (PROJECT_APPS.iter().rev())
+                    .find(|(app, _, _)| shell.workspace.preferences.project_app_shown(app))
+                    .map(|(app, _, _)| *app)
+            })
+            .unwrap()
+            .expect("an app icon is shown");
+        let last = at(visual, format!("rail-app-{shown}-{ix}")).unwrap();
         assert!(
-            browser.right() <= options.left(),
-            "the last app icon ends before the options button: {browser:?} {options:?}"
+            last.right() <= options.left(),
+            "the last app icon ends before the options button: {last:?} {options:?}"
         );
         assert!(icons.right() <= row.right());
     }
@@ -1685,7 +1628,7 @@ mod tests {
                 shell.workspace.preferences.project_rail_view = "tree".into();
                 // Closing the tab leaves the view and drops the tab.
                 let tab = shell.app_tab(AppView::Notes);
-                shell.close_title_tabs(&[tab.clone()], None, window, cx);
+                shell.close_title_tabs(std::slice::from_ref(&tab), None, window, cx);
                 assert_eq!(shell.active_app_view, None);
                 assert!(!shell.workspace.title_order.contains(&tab));
                 assert!((shell.workspace.title_order).contains(&app(AppView::Database, here)));

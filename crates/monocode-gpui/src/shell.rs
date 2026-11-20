@@ -2,10 +2,8 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
-mod automation_runs;
-mod browser_agent;
 mod browser_panes;
-mod browser_selftest;
+mod automation_runs;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -921,18 +919,11 @@ pub(crate) struct Shell {
     /// Live shells of `workspace.terminal_panes`, spawned when first shown.
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Pages of `workspace.browser_panes`, made when first shown.
-    browser_views: HashMap<i64, Entity<crate::browser::BrowserView>>,
-    /// Active checkout file watchers keyed by project path for browser reload-on-save.
-    browser_file_watches: HashMap<String, gpui::Task<()>>,
-    browser_selftest_started: bool,
-    /// Sessions the user stopped from using the browser, until allowed again.
-    browser_agent_stopped: HashSet<i64>,
-    /// The page each session's agent used last.
-    browser_agent_last: HashMap<i64, i64>,
+    browser_pages: HashMap<i64, (Entity<crate::browser::BrowserPage>, Subscription)>,
+    /// The window's one-time services (database footer, selftests) started.
+    window_services_started: bool,
     /// What sleeping projects gave back, and the pages to reopen on waking.
     project_sleep: project_sleep::ProjectSleep,
-    /// Addresses pages asked to open in windows of their own.
-    pending_browser_pages: Vec<String>,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1340,13 +1331,9 @@ impl Shell {
             sidebar_fitted_room: None,
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
-            browser_views: HashMap::new(),
-            browser_file_watches: HashMap::new(),
-            browser_selftest_started: false,
-            browser_agent_stopped: HashSet::new(),
-            browser_agent_last: HashMap::new(),
+            browser_pages: HashMap::new(),
+            window_services_started: false,
             project_sleep: Default::default(),
-            pending_browser_pages: Vec::new(),
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -4617,11 +4604,10 @@ impl Shell {
         for pane in self.workspace.prune_terminal_panes() {
             self.terminal_pane_views.remove(&pane);
         }
-        // A browser pane closed with its tab or pane frees its page.
+        // A browser pane closed with its tab or pane closes its page.
         for pane in self.workspace.prune_browser_panes() {
-            self.browser_views.remove(&pane);
+            self.browser_pages.remove(&pane);
         }
-        self.sync_browser_file_watchers(cx);
         if let Some(id) = self.workspace.active {
             self.refresh_session_mark(id, cx);
         }
@@ -6565,9 +6551,6 @@ impl Shell {
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
                         .into(),
-                    MenuAction::new("browser-start-url", "Browser start page…")
-                        .icon("globe")
-                        .into(),
                     MenuAction::new("terminal-setup", "Terminal setup…")
                         .icon("terminal")
                         .into(),
@@ -6824,8 +6807,6 @@ impl Shell {
                     self.open_project_theme(path, window, cx);
                 } else if action == "background" {
                     self.open_background_dialog(path, window, cx);
-                } else if action == "browser-start-url" {
-                    self.open_browser_start_dialog(path, window, cx);
                 } else if action == "terminal-setup" {
                     self.open_terminal_setup_dialog(path, window, cx);
                 } else if let Some(page) = action.strip_prefix("code-settings:") {
@@ -8116,7 +8097,6 @@ impl Shell {
             .filter(|id| {
                 self.workspace.mono_panes.contains_key(id)
                     || self.workspace.terminal_panes.contains_key(id)
-                    || self.workspace.browser_panes.contains_key(id)
             })
             .count();
         let multi_pane = sessions.len() + file_panes + mono_panes > 1;
@@ -8164,9 +8144,7 @@ impl Shell {
                             .then_some(PaneMark::Terminal)
                     })
                     .or_else(|| {
-                        self.workspace
-                            .browser_panes
-                            .contains_key(&id)
+                        (self.workspace.browser_panes.contains_key(&id))
                             .then_some(PaneMark::Browser)
                     }),
             ) {
@@ -9474,27 +9452,20 @@ impl Render for Shell {
             self.review_focused = false;
             window.focus(&view.read(cx).input.focus_handle(cx), cx);
         }
-        if let Some(links) = cx.try_global::<crate::browser::LinkQueue>()
-            && !links.0.is_empty()
-        {
-            let links = std::mem::take(&mut cx.global_mut::<crate::browser::LinkQueue>().0);
-            self.pending_browser_pages.extend(links);
-        }
-        for url in std::mem::take(&mut self.pending_browser_pages) {
-            // A page borrows a session's project; with none to borrow from,
-            // the link goes to the user's own browser rather than nowhere.
-            if self.terminal_owner().is_some() || self.project_session_for_terminal().is_some() {
-                self.new_browser_pane(Some(url), window, cx);
-            } else {
-                cx.open_url(&url);
-            }
-        }
-        if !std::mem::replace(&mut self.browser_selftest_started, true) {
-            self.start_browser_agent(window, cx);
+        if !std::mem::replace(&mut self.window_services_started, true) {
             self.start_database_footer(window, cx);
-            self.start_browser_selftest(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);
+            // For measuring the browser: a page at this address on launch.
+            if let Some(url) = std::env::var("MONOCODE_BROWSER_OPEN")
+                .ok()
+                .filter(|url| !url.is_empty())
+            {
+                let this = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                });
+            }
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
@@ -9896,26 +9867,14 @@ impl Render for Shell {
                     .update(cx, |updater, cx| updater.check(true, cx));
             }))
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
-            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(1, cx));
-                } else {
-                    this.step_ui_scale(1, cx);
-                }
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+                this.step_ui_scale(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(-1, cx));
-                } else {
-                    this.step_ui_scale(-1, cx);
-                }
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+                this.step_ui_scale(-1, cx);
             }))
-            .on_action(cx.listener(|this, _: &ResetZoom, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(0, cx));
-                } else {
-                    this.step_ui_scale(0, cx);
-                }
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| {
+                this.step_ui_scale(0, cx);
             }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| this.request_reload(window, cx)))
             .on_action(cx.listener(|this, _: &SidebarAppearance, window, cx| {
@@ -10338,7 +10297,6 @@ impl Render for Shell {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
             }))
-            .child(self.browser_frame(cx))
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children((self.file_history.as_ref()).map(|(dialog, _)| {
@@ -10367,6 +10325,11 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(view, _)| crate::image_lightbox::overlay(view)),
             )
+            // Hides the browser pages not painted in this frame or under an
+            // overlay; Chromium's views sit above everything GPUI draws.
+            .when(!self.browser_pages.is_empty(), |root| {
+                root.child(crate::browser::sweep())
+            })
             .map(|root| {
                 #[cfg(target_os = "linux")]
                 let caption = self.client_decorations;

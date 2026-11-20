@@ -1,0 +1,33 @@
+[package]
+workspace = "../monocode-gpui"
+name = "monocode-cef"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish = false
+description = "Monocode's Chromium engine: CEF runtime install, initialization, message pump and native browser views. Independent of GPUI."
+
+[lib]
+path = "src/lib.rs"
+
+# The Chromium child processes (renderer, GPU, network, ...). On macOS this one
+# executable is copied into the five `Monocode Helper*.app` bundles.
+[[bin]]
+name = "monocode-cef-helper"
+path = "src/bin/monocode-cef-helper.rs"
+
+[dependencies]
+# Pinned exactly: the wrapper is compiled against this CEF API version, and the
+# app bundle ships the framework from the same SDK build cef-dll-sys fetched
+# (scripts/bundle-native-macos.sh).
+cef = { version = "=156.7.0", default-features = false, features = ["sandbox"] }
+log = "0.4"
+libc = "0.2"
+async-channel = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSApplication"] }
+
+

@@ -533,17 +533,6 @@ fn glass(tint: Hsla, radius: f32) -> impl IntoElement {
     .absolute()
     .size_full()
 }
-thread_local! {
-    /// A browser page's picture is on screen under what floats.
-    static OVER_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-/// Says whether a browser page is showing its picture under the popovers.
-/// The glass takes its darkness from the app behind it; a web page is as
-/// often white, and white text on blurred white cannot be read, so the
-/// surfaces are painted as the opaque card for as long as that lasts.
-pub(crate) fn set_over_page(over: bool) {
-    OVER_PAGE.with(|cell| cell.set(over));
-}
 /// The popover surface: `tint` over a backdrop blur, or the opaque card.
 pub(crate) fn paint_glass(
     bounds: Bounds<Pixels>,
@@ -552,7 +541,7 @@ pub(crate) fn paint_glass(
     window: &mut Window,
 ) {
     let opaque = crate::theme::floating_fill();
-    let light = crate::theme::is_light() || OVER_PAGE.with(std::cell::Cell::get);
+    let light = crate::theme::is_light();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let quad = if light {
         gpui::fill(bounds, opaque)
@@ -690,6 +679,8 @@ impl Element for Placed {
         cx: &mut App,
     ) {
         self.frame.paint(window, cx);
+        // A browser page under the card hides: GPUI cannot draw over it.
+        crate::browser::cover(*surface, window);
         let Some(dismiss) = self.on_dismiss.clone() else {
             return;
         };

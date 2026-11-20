@@ -1249,7 +1249,7 @@ mod tests {
             "/backend-review".to_owned(),
             "Review the backend.".to_owned(),
         );
-        assert_eq!(offered(cx, "/backend"), [review.clone()]);
+        assert_eq!(offered(cx, "/backend"), std::slice::from_ref(&review));
         // Once it has, by name alone, the file still gives the description.
         window
             .update(cx, |view, _, cx| {

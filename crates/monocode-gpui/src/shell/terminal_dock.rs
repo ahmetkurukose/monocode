@@ -1228,7 +1228,10 @@ mod tests {
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
-                assert_eq!(shell.terminals[&project], [other_shell.clone()]);
+                assert_eq!(
+                    shell.terminals[&project],
+                    std::slice::from_ref(&other_shell)
+                );
                 assert_eq!(shell.workspace.docks[&project].terminals.len(), 1);
                 assert!(shell.workspace.docks[&project].open, "one shell is left");
             })

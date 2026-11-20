@@ -246,13 +246,6 @@ fn main() {
         }
         return;
     }
-    if cli_args.first().is_some_and(|a| a == "browser-mcp") {
-        if let Err(error) = monocode_core::browser_bridge::mcp_stdio() {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if cli_args.first().is_some_and(|a| a == "db-mcp") {
         if let Err(error) = monocode_core::db_bridge::mcp_stdio() {
             eprintln!("{error}");
@@ -514,7 +507,6 @@ fn main() {
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
-            browser::bind(cx);
             image_lightbox::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);

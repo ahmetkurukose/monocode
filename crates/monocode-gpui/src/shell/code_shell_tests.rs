@@ -818,7 +818,7 @@ fn escape_closes_a_settings_page_with_a_field_focused(cx: &mut TestAppContext) {
                 title: "Run configurations",
                 icon: "play",
                 build: Rc::new(|_, window, cx| {
-                    let field = cx.new(|cx| crate::input::Input::new(cx));
+                    let field = cx.new(crate::input::Input::new);
                     window.focus(&field.focus_handle(cx), cx);
                     field.into()
                 }),
