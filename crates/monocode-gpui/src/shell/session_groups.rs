@@ -97,9 +97,18 @@ pub(super) enum RenameTarget {
     Session(i64),
     Folder(String),
 }
+/// Where a rename's field is drawn: the sidebar's row, the project rail's
+/// row, or the title bar's tab. The field is one view, so it shows in one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RenameHost {
+    Sidebar,
+    Rail,
+    Tab,
+}
 pub(super) struct Renaming {
     pub(super) target: RenameTarget,
-    input: Entity<input::Input>,
+    pub(super) host: RenameHost,
+    pub(super) input: Entity<input::Input>,
     _events: Vec<Subscription>,
 }
 pub(super) struct LinkDialog {
@@ -161,15 +170,23 @@ impl Render for FolderSwatches {
 
 impl Shell {
     pub(super) fn rename_sidebar_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.sidebar_focus.is_focused(window) {
-            self.sidebar_target.clone()
-        } else {
-            self.session_hover
-                .or(self.workspace.active)
-                .map(RenameTarget::Session)
-        };
-        if let Some(target) = target {
-            self.start_rename(target, window, cx);
+        if self.sidebar_focus.is_focused(window) {
+            if let Some(target) = self.sidebar_target.clone() {
+                self.start_rename(target, window, cx);
+            }
+        } else if let Some(id) = self.session_hover {
+            self.start_rename(RenameTarget::Session(id), window, cx);
+        } else if let Some(id) = self.workspace.active {
+            // Nothing in the sidebar is pointed at: the title bar's tab
+            // shows the active session, so it is renamed there.
+            let tab = self.workspace.active_tab().unwrap_or(id);
+            match self.tab_rename_session(tab) {
+                Some(session) => {
+                    let host = self.tab_rename_host(tab);
+                    self.start_rename_in(RenameTarget::Session(session), host, window, cx)
+                }
+                None => self.start_rename(RenameTarget::Session(id), window, cx),
+            }
         }
     }
     pub(super) fn delete_sidebar_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -551,7 +568,10 @@ impl Shell {
                 self.store_write("pin the session", cx, move |s| s.set_pinned(&ids, pinned));
                 self.invalidate_chrome(cx);
             }
-            "rename" => self.start_rename(RenameTarget::Session(id), window, cx),
+            "rename" => {
+                let host = self.menu_rename_host;
+                self.start_rename_in(RenameTarget::Session(id), host, window, cx)
+            }
             "link-work-item" => self.open_link_dialog(id, window, cx),
             "reminder:cancel" => {
                 let occurrences: Vec<_> = self
@@ -884,6 +904,39 @@ impl Shell {
     }
 
     fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_rename_in(target, RenameHost::Sidebar, window, cx);
+    }
+    /// The session a title tab renames: its focused chat, else the chat
+    /// the tab is keyed by. `None` for a tab holding no chat.
+    pub(super) fn tab_rename_session(&self, tab: i64) -> Option<i64> {
+        [self.workspace.tab_focus(tab), tab]
+            .into_iter()
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .find(|id| self.session_summaries.contains_key(id))
+    }
+    /// Where a tab's rename is drawn: in the tab, unless it is pinned, a
+    /// card with no room for a field; then in the session's list row.
+    pub(super) fn tab_rename_host(&self, tab: i64) -> RenameHost {
+        if !self.tab_pinned(&TitleTab::Session(tab)) {
+            RenameHost::Tab
+        } else if self.project_rail_tree_on() {
+            RenameHost::Rail
+        } else {
+            RenameHost::Sidebar
+        }
+    }
+    pub(super) fn start_rename_in(
+        &mut self,
+        target: RenameTarget,
+        host: RenameHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let RenameTarget::Session(id) = target
+            && !self.session_summaries.contains_key(&id)
+        {
+            return;
+        }
         self.close_preview(cx);
         let text = match &target {
             RenameTarget::Session(id) => self.session_metadata(*id, cx).display_title(),
@@ -926,6 +979,7 @@ impl Shell {
         window.focus(&focus, cx);
         self.renaming = Some(Renaming {
             target,
+            host,
             input,
             _events: events,
         });
@@ -965,13 +1019,62 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
+    /// A session's name in a focused field, for a row outside the sidebar
+    /// (the project rail, a title tab) to draw in place of its title.
+    pub(super) fn rename_field(
+        &self,
+        id: i64,
+        host: RenameHost,
+        text_size: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let renaming = self
+            .renaming
+            .as_ref()
+            .filter(|r| r.target == RenameTarget::Session(id) && r.host == host)?;
+        Some(
+            div()
+                .id(("session-rename-field", id as u64 as usize))
+                .debug_selector(move || format!("session-rename-{id}"))
+                .key_context("SessionRename")
+                .on_action(cx.listener(|this, _: &CancelRename, window, cx| {
+                    this.finish_rename(false, window, cx)
+                }))
+                // The row under the field opens, drags or renames on a
+                // press; a press in the field only places the caret.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .flex_1()
+                .min_w_0()
+                .h(px(22.))
+                .px_1p5()
+                .flex()
+                .items_center()
+                .rounded_sm()
+                .bg(content(0.1))
+                .border_1()
+                .border_color({
+                    let mut outline = crate::theme::accent_color();
+                    outline.a = 0.4;
+                    outline
+                })
+                .text_size(px(text_size))
+                .text_color(content(1.))
+                .child(renaming.input.clone())
+                .into_any_element(),
+        )
+    }
     /// SessionRenameRow and FolderRenameRow: the name in a focused field.
     pub(super) fn rename_row(
         &self,
         target: &RenameTarget,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let renaming = self.renaming.as_ref().filter(|r| r.target == *target)?;
+        let renaming = self
+            .renaming
+            .as_ref()
+            .filter(|r| r.target == *target && r.host == RenameHost::Sidebar)?;
         if self.workspace.classic_layout {
             let folder = match target {
                 RenameTarget::Folder(id) => self.project_groups().folder(id).cloned(),
@@ -2261,6 +2364,50 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 assert!(shell.renaming.is_none());
                 assert_eq!(shell.sessions[&a].read(cx).summary.title, "First name");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_title_tab_renames_its_chat_in_the_tab(cx: &mut TestAppContext) {
+        let (window, a, _) = setup(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, w, cx| {
+                shell.open(a, w, cx);
+                let (_, items, _, _) =
+                    shell.menu_items(&MenuTarget::Tab(a), &mut Vec::new(), w, cx);
+                assert!(
+                    items.iter().any(
+                        |item| matches!(item, MenuItem::Action(action) if action.id == "rename")
+                    ),
+                    "a chat's tab offers Rename"
+                );
+                shell.run_menu(MenuTarget::Tab(a), "rename", None, w, cx);
+                let renaming = shell.renaming.as_ref().unwrap();
+                assert!(renaming.target == RenameTarget::Session(a));
+                assert_eq!(renaming.host, RenameHost::Tab);
+                renaming
+                    .input
+                    .update(cx, |i, cx| i.set_text("Named in the tab".into(), cx));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(
+            visual
+                .debug_bounds(Box::leak(format!("session-rename-{a}").into_boxed_str()))
+                .is_some(),
+            "the field is drawn in the tab"
+        );
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.renaming.is_none());
+                assert_eq!(
+                    shell.sessions[&a].read(cx).summary.title,
+                    "Named in the tab"
+                );
             })
             .unwrap();
     }

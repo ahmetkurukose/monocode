@@ -558,6 +558,7 @@ impl Shell {
             )
         };
         let done = self.unseen_finished.contains(&id);
+        let rename = self.rename_field(id, session_groups::RenameHost::Rail, 13., cx);
         let subagents = self.subagent_disclosure(id, cx);
         // An open subagent view highlights its own row instead, when listed.
         let showing_subagent = subagents.is_some()
@@ -664,27 +665,67 @@ impl Shell {
             .debug_selector(move || format!("rail-session-{id}"))
             .when(nested, |d| d.ml(px(NESTED_INDENT)))
             .child(mark)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(title)),
-            )
-            .when_some(subagents, |d, (count, chevron)| {
-                d.child(count).child(chevron)
+            .map(|d| match rename {
+                // While renamed, the field takes the title's place and
+                // the row's trailing status and buttons.
+                Some(field) => d.child(field),
+                None => d
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(title)),
+                    )
+                    .when_some(subagents, |d, (count, chevron)| {
+                        d.child(count).child(chevron)
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .flex_shrink_0()
+                            .h(px(14.))
+                            .flex()
+                            .items_center()
+                            .child(status)
+                            .child(archive),
+                    ),
             })
-            .child(
-                div()
-                    .relative()
-                    .flex_shrink_0()
-                    .h(px(14.))
-                    .flex()
-                    .items_center()
-                    .child(status)
-                    .child(archive),
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    // The first click opened the session; a double click names
+                    // it in place, as the title tab does.
+                    if event.click_count() == 2 {
+                        this.start_rename_in(
+                            session_groups::RenameTarget::Session(id),
+                            session_groups::RenameHost::Rail,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        this.open(id, window, cx);
+                    }
+                }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.open(id, window, cx))),
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.context_selection = !this.selected_sessions.contains(&id);
+                    if this.context_selection {
+                        this.selected_sessions.clear();
+                        this.selected_sessions.insert(id);
+                    }
+                    this.open_menu(
+                        MenuTarget::Session(id),
+                        Anchor::Point(event.position),
+                        window,
+                        cx,
+                    );
+                    // Its Rename edits this row, not the sidebar's.
+                    this.menu_rename_host = session_groups::RenameHost::Rail;
+                }),
+            ),
         )
         .into_any_element()
     }
@@ -1273,6 +1314,87 @@ mod tests {
             visual.debug_bounds("sidebar-filter-button").is_some(),
             "the filter menu moves into the rail with the tree"
         );
+    }
+
+    #[gpui::test]
+    fn a_session_row_renames_from_its_menu_and_a_double_click(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            crate::shell::bind_keys(cx);
+            crate::input::bind(cx);
+            crate::popover::bind(cx);
+        });
+        let (window, a, _) = window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let other = "/work/another-project";
+        tree(window, visual, &[other]);
+        let row = at(visual, format!("rail-session-{a}")).unwrap();
+        visual.simulate_mouse_down(row.center(), MouseButton::Right, Default::default());
+        visual.simulate_mouse_up(row.center(), MouseButton::Right, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                assert!(shell.menu_open(&MenuTarget::Session(a)));
+                shell.run_menu(MenuTarget::Session(a), "rename", None, w, cx);
+                let renaming = shell.renaming.as_ref().unwrap();
+                assert_eq!(renaming.host, session_groups::RenameHost::Rail);
+                renaming
+                    .input
+                    .update(cx, |i, cx| i.set_text("Named in the rail".into(), cx));
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(
+            at(visual, format!("session-rename-{a}")).is_some(),
+            "the field takes the row's title"
+        );
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.renaming.is_none());
+                assert_eq!(
+                    shell.session_metadata(a, cx).display_title(),
+                    "Named in the rail"
+                );
+            })
+            .unwrap();
+        // A double click on the row starts the same rename.
+        visual.refresh().unwrap();
+        let row = at(visual, format!("rail-session-{a}")).unwrap();
+        for click_count in [1, 2] {
+            visual.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: row.center(),
+                modifiers: Default::default(),
+                click_count,
+                first_mouse: false,
+            });
+            visual.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: row.center(),
+                modifiers: Default::default(),
+                click_count,
+            });
+        }
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                let renaming = shell.renaming.as_ref().expect("a double click renames");
+                assert_eq!(renaming.host, session_groups::RenameHost::Rail);
+            })
+            .unwrap();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.renaming.is_none());
+                assert_eq!(
+                    shell.session_metadata(a, cx).display_title(),
+                    "Named in the rail"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
