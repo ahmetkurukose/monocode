@@ -22,17 +22,20 @@ impl Shell {
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
-        let page = cx.new(|cx| BrowserPage::new(state.url, state.title, profiles, cx));
+        let zoom = state.zoom.unwrap_or(100);
+        let page = cx.new(|cx| BrowserPage::new(state.url, state.title, zoom, profiles, cx));
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let (url, title) = {
+            let (url, title, zoom) = {
                 let page = page.read(cx);
-                (page.url.clone(), page.title.clone())
+                let zoom = (page.zoom != 100).then_some(page.zoom);
+                (page.url.clone(), page.title.clone(), zoom)
             };
             if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
-                && (state.url != url || state.title != title)
+                && (state.url != url || state.title != title || state.zoom != zoom)
             {
                 state.url = url;
                 state.title = title;
+                state.zoom = zoom;
                 this.persist(cx);
             }
             this.invalidate_chrome(cx);
@@ -73,7 +76,7 @@ impl Shell {
             BrowserPane {
                 owner,
                 url: url.unwrap_or_default(),
-                title: String::new(),
+                ..Default::default()
             },
         );
         self.workspace.open(pane);
@@ -184,6 +187,7 @@ mod tests {
             owner,
             url: "http://localhost:5173/".into(),
             title: "Vite".into(),
+            ..Default::default()
         };
         state.browser_panes.insert(-1, page(1));
         // Its own tab, but its owner is gone.
@@ -202,5 +206,86 @@ mod tests {
         assert_eq!(restored.next_pane_id(), -2);
         assert_eq!(restored.session_for_pane(-1), 1);
         assert!(restored.is_detached_pane(-1));
+    }
+
+    #[test]
+    fn a_page_saves_its_zoom_only_when_it_is_not_100_percent() {
+        let page = BrowserPane {
+            owner: 1,
+            url: "http://localhost:5173/".into(),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&page).unwrap().contains("zoom"));
+        let zoomed = BrowserPane {
+            zoom: Some(125),
+            ..page
+        };
+        let saved = serde_json::to_string(&zoomed).unwrap();
+        assert_eq!(serde_json::from_str::<BrowserPane>(&saved).unwrap(), zoomed);
+    }
+
+    #[gpui::test]
+    fn a_focused_page_zooms_finds_and_takes_the_address_over_the_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.new_browser_pane(Some("http://localhost:5173/".into()), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let (pane, page, scale) = window
+            .update(cx, |shell, _, _| {
+                let (pane, (page, _)) = shell.browser_pages.iter().next().unwrap();
+                (*pane, page.clone(), shell.workspace.preferences.ui_scale)
+            })
+            .unwrap();
+        let m = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let keys = |cx: &mut gpui::TestAppContext, keys: &str| {
+            cx.simulate_keystrokes(window.into(), keys);
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |shell, window, cx| {
+                    let page = page.read(cx);
+                    (
+                        page.zoom,
+                        shell.workspace.browser_panes[&pane].zoom,
+                        shell.workspace.preferences.ui_scale,
+                        page.keyboard_state(window, cx),
+                    )
+                })
+                .unwrap()
+        };
+
+        keys(cx, &format!("{m}-= {m}-="));
+        assert_eq!(state(cx), (125, Some(125), scale, (false, false, false)));
+        keys(cx, &format!("{m}--"));
+        assert_eq!(state(cx).0, 110);
+        keys(cx, &format!("{m}-0"));
+        assert_eq!(state(cx), (100, None, scale, (false, false, false)));
+
+        keys(cx, &format!("{m}-f"));
+        assert_eq!(state(cx).3, (true, false, true));
+        keys(cx, "escape");
+        assert_eq!(state(cx).3, (false, false, false));
+
+        keys(cx, &format!("{m}-l"));
+        assert_eq!(state(cx).3, (false, true, false));
+        // From the address field, the page's shortcuts still apply.
+        keys(cx, &format!("{m}-="));
+        assert_eq!(state(cx).0, 110);
     }
 }

@@ -299,13 +299,16 @@ pub(crate) struct TerminalPane {
     pub cwd: String,
 }
 /// A browser page in the pane tree (docs/native/browser/context.md §4.5).
-/// Only its address and title are saved; the page loads again when shown.
+/// Its address, title and zoom are saved; the page loads again when shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct BrowserPane {
     pub owner: i64,
     pub url: String,
     pub title: String,
+    /// Page zoom in percent; `None` is 100%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<u16>,
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -2175,6 +2178,7 @@ mod tests {
                 owner: 1,
                 url: "http://localhost:5173".into(),
                 title: "Vite".into(),
+                ..Default::default()
             }
         );
         assert_eq!(restored.focused.get(&1), Some(&-4));

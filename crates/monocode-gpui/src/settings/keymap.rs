@@ -93,9 +93,11 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "file_editor::NavigateBack" => "Editor: Back",
         "file_editor::NavigateForward" => "Editor: Forward",
         "file_editor::Replace" => "Editor: Replace",
-        "workspace::ZoomIn" | "image_lightbox::ZoomIn" => "View: Zoom In",
-        "workspace::ZoomOut" | "image_lightbox::ZoomOut" => "View: Zoom Out",
-        "workspace::ResetZoom" | "image_lightbox::ResetZoom" => "View: Reset Zoom",
+        "workspace::ZoomIn" | "image_lightbox::ZoomIn" | "browser::ZoomIn" => "View: Zoom In",
+        "workspace::ZoomOut" | "image_lightbox::ZoomOut" | "browser::ZoomOut" => "View: Zoom Out",
+        "workspace::ResetZoom" | "image_lightbox::ResetZoom" | "browser::ResetZoom" => {
+            "View: Reset Zoom"
+        }
         "workspace::Reload" => "View: Reload",
         _ => return None,
     })

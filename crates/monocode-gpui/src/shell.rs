@@ -236,6 +236,7 @@ pub(crate) struct ActivateTab(pub isize);
 pub(crate) fn bind_keys(cx: &mut App) {
     session_groups::bind(cx);
     session_folders::bind(cx);
+    crate::browser::bind(cx);
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
     } else {

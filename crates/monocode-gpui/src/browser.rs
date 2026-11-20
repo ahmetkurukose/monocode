@@ -17,8 +17,8 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, Pixels,
-    Subscription, Window, WindowId, canvas, div, prelude::*, px,
+    AnyWindowHandle, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
+    KeyBinding, Pixels, Subscription, Window, WindowId, actions, canvas, div, prelude::*, px,
 };
 
 use crate::{
@@ -210,8 +210,117 @@ pub(crate) fn page_title(url: &str, title: &str) -> String {
     host.unwrap_or("Browser").to_owned()
 }
 
-/// A page's address or title changed; the pane saves them.
+/// A page's address, title or zoom changed; the pane saves them.
 pub(crate) struct PageChanged;
+
+// ---- Shortcuts (context.md K17) ----
+
+/// A browser page's key context. Its bindings outrank the workspace's, so
+/// ⌘+ zooms the page rather than the interface while a page is focused; the
+/// shell's shortcut forwarding adds it while Chromium has the keyboard.
+pub(crate) const KEY_CONTEXT: &str = "BrowserPage";
+const FIND_CONTEXT: &str = "BrowserFind";
+
+actions!(
+    browser,
+    [
+        FocusAddress,
+        Reload,
+        ReloadIgnoringCache,
+        Find,
+        FindNext,
+        FindPrevious,
+        CloseFind,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
+    ]
+);
+
+/// ⌘[ and ⌘] stay the workspace's Back and Forward (visited places), so
+/// page history has only the toolbar buttons.
+pub(crate) fn bind(cx: &mut App) {
+    let m = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    let page = Some(KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new(&format!("{m}-l"), FocusAddress, page),
+        KeyBinding::new(&format!("{m}-r"), Reload, page),
+        // Over the workspace's ⇧⌘R (restart the app) while a page is focused.
+        KeyBinding::new(&format!("{m}-shift-r"), ReloadIgnoringCache, page),
+        KeyBinding::new(&format!("{m}-f"), Find, page),
+        KeyBinding::new(&format!("{m}-g"), FindNext, page),
+        KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, page),
+        KeyBinding::new(&format!("{m}-="), ZoomIn, page),
+        KeyBinding::new(&format!("{m}-+"), ZoomIn, page),
+        KeyBinding::new(&format!("{m}--"), ZoomOut, page),
+        KeyBinding::new(&format!("{m}-0"), ResetZoom, page),
+        // The find field is a Composer, whose ⇧Enter would add a newline.
+        KeyBinding::new("shift-enter", FindPrevious, Some("BrowserFind > Composer")),
+        KeyBinding::new("escape", CloseFind, Some(FIND_CONTEXT)),
+    ]);
+}
+
+// ---- Zoom ----
+
+/// Chrome's zoom steps, in percent.
+const ZOOM_PRESETS: [u16; 17] = [
+    25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500,
+];
+
+/// The next preset above `percent` (`step` > 0) or below it (< 0); 0 resets.
+fn zoom_step(percent: u16, step: i32) -> u16 {
+    match step.signum() {
+        0 => 100,
+        1 => ZOOM_PRESETS
+            .iter()
+            .copied()
+            .find(|p| *p > percent)
+            .unwrap_or(ZOOM_PRESETS[ZOOM_PRESETS.len() - 1]),
+        _ => ZOOM_PRESETS
+            .iter()
+            .rev()
+            .copied()
+            .find(|p| *p < percent)
+            .unwrap_or(ZOOM_PRESETS[0]),
+    }
+}
+
+/// Chromium's zoom level for a percentage: 0 is 100%, each level ×1.2.
+fn zoom_level(percent: u16) -> f64 {
+    (f64::from(percent) / 100.).ln() / 1.2f64.ln()
+}
+
+fn zoom_percent(level: f64) -> u16 {
+    (1.2f64.powf(level) * 100.)
+        .round()
+        .clamp(1., f64::from(u16::MAX)) as u16
+}
+
+// ---- Find in page ----
+
+/// The find bar under the toolbar (⌘F).
+struct FindBar {
+    field: Entity<Input>,
+    /// Matches, and the selected one counting from 1; `None` until the page
+    /// answers.
+    result: Option<(i32, i32)>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// "3 of 12", or nothing to say yet.
+fn find_status(text: &str, result: Option<(i32, i32)>) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    match result? {
+        (0, _) => Some("No results".into()),
+        (count, active) => Some(format!("{} of {count}", active.clamp(1, count))),
+    }
+}
 
 /// One browser page in a pane: its toolbar, and the Chromium view below.
 pub(crate) struct BrowserPage {
@@ -223,6 +332,14 @@ pub(crate) struct BrowserPage {
     progress: f64,
     failure: Option<String>,
     address: Entity<Input>,
+    /// Page zoom in percent; Chromium keeps it per host ([`Self::sync_zoom`]).
+    pub zoom: u16,
+    /// The saved zoom has yet to reach Chromium: it applies to the host of
+    /// the first committed address.
+    zoom_pending: bool,
+    find: Option<FindBar>,
+    /// Where the page last drew, to take GPUI focus when Chromium gets it.
+    window: Option<AnyWindowHandle>,
     engine: Entity<Engine>,
     profiles: PathBuf,
     host: Rc<Host>,
@@ -242,6 +359,7 @@ impl BrowserPage {
     pub(crate) fn new(
         url: String,
         title: String,
+        zoom: u16,
         profiles: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -270,6 +388,10 @@ impl BrowserPage {
             progress: 0.,
             failure: None,
             address: field,
+            zoom,
+            zoom_pending: zoom != 100,
+            find: None,
+            window: None,
             engine,
             profiles,
             host: Rc::new(Host::default()),
@@ -306,6 +428,7 @@ impl BrowserPage {
         use monocode_cef::BrowserEvent;
         match event {
             BrowserEvent::Address(url) => {
+                self.sync_zoom(cx);
                 if url != self.url {
                     self.url = url.clone();
                     self.address.update(cx, |field, cx| field.set_text(url, cx));
@@ -328,6 +451,8 @@ impl BrowserPage {
                 self.can_go_forward = can_go_forward;
                 if loading {
                     self.failure = None;
+                } else {
+                    self.sync_zoom(cx);
                 }
             }
             BrowserEvent::Progress(progress) => self.progress = progress,
@@ -339,8 +464,238 @@ impl BrowserPage {
                 self.host.with_view(|view| view.load_url(&url));
             }
             BrowserEvent::Closed => {}
+            BrowserEvent::FindResult {
+                count,
+                active_ordinal,
+                final_update,
+            } => {
+                if let Some(find) = &mut self.find
+                    && (final_update || count > 0)
+                {
+                    find.result = Some((count, active_ordinal));
+                }
+            }
+            BrowserEvent::Focused => self.follow_page_focus(cx),
         }
         cx.notify();
+    }
+
+    /// Whether the find bar is open, and whether the address field or the
+    /// find field has GPUI focus.
+    #[cfg(test)]
+    pub(crate) fn keyboard_state(&self, window: &Window, cx: &App) -> (bool, bool, bool) {
+        let find = self.find.as_ref();
+        (
+            find.is_some(),
+            self.address.focus_handle(cx).is_focused(window),
+            find.is_some_and(|f| f.field.focus_handle(cx).is_focused(window)),
+        )
+    }
+
+    /// A click in the page gives Chromium the keyboard without GPUI seeing
+    /// it; GPUI focus follows, so the page's shortcuts apply.
+    fn follow_page_focus(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else { return };
+        let focus = self.focus.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                if !focus.is_focused(window) {
+                    window.focus(&focus, cx);
+                }
+            });
+        });
+    }
+
+    /// Keeps [`Self::zoom`] in step with Chromium, which keeps one level per
+    /// host: shared by the pages of a profile on that host and kept across
+    /// navigations within it. Following it, rather than forcing a level per
+    /// page, avoids rewriting the host's level under every other page on it.
+    /// The saved zoom applies once, to the first host the page commits.
+    fn sync_zoom(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.zoom_pending);
+        let wanted = self.zoom;
+        let level = self.host.view.borrow().as_ref().map(|hosted| {
+            if pending {
+                hosted.view.set_zoom_level(zoom_level(wanted));
+            }
+            hosted.view.zoom_level()
+        });
+        let Some(level) = level else {
+            self.zoom_pending = pending;
+            return;
+        };
+        let percent = zoom_percent(level);
+        if !pending && percent != self.zoom {
+            self.zoom = percent;
+            cx.emit(PageChanged);
+            cx.notify();
+        }
+    }
+
+    fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
+        if percent == self.zoom {
+            return;
+        }
+        self.zoom = percent;
+        // Before the page exists, its first address takes it.
+        if !self
+            .host
+            .with_view(|view| view.set_zoom_level(zoom_level(percent)))
+        {
+            self.zoom_pending = true;
+        }
+        cx.emit(PageChanged);
+        cx.notify();
+    }
+
+    fn reload(&mut self, ignore_cache: bool) {
+        self.host.with_view(|view| {
+            if ignore_cache {
+                view.reload_ignore_cache();
+            } else {
+                view.reload();
+            }
+        });
+    }
+
+    /// ⌘L: the address field, all of it selected.
+    fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_keyboard(window);
+        window.focus(&self.address.focus_handle(cx), cx);
+        self.address.update(cx, |field, cx| {
+            let len = field.content.len();
+            field.select_range(0..len, cx);
+        });
+    }
+
+    /// Takes the keyboard back from Chromium for a GPUI field.
+    fn take_keyboard(&self, window: &mut Window) {
+        self.host.with_view(|view| view.set_focus(false));
+        #[cfg(target_os = "macos")]
+        mac::make_gpui_first_responder(window);
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
+    }
+
+    /// ⌘F: opens the find bar, or selects its text when it is open.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let field = cx.new(|cx| Input::field("Find in page", "Find", content(0.35), cx));
+            let subscriptions = vec![
+                cx.subscribe(&field, |this, _, _: &input::Changed, cx| {
+                    this.search(true, false, cx)
+                }),
+                cx.subscribe(&field, |this, _, _: &input::Submitted, cx| {
+                    this.search(true, true, cx)
+                }),
+            ];
+            self.find = Some(FindBar {
+                field,
+                result: None,
+                _subscriptions: subscriptions,
+            });
+        }
+        let Some(field) = self.find.as_ref().map(|find| find.field.clone()) else {
+            return;
+        };
+        self.take_keyboard(window);
+        window.focus(&field.focus_handle(cx), cx);
+        field.update(cx, |field, cx| {
+            let len = field.content.len();
+            field.select_range(0..len, cx);
+        });
+        self.search(true, false, cx);
+    }
+
+    /// Searches the page for the find field's text: a new search while it
+    /// is typed, else the next or previous match.
+    fn search(&mut self, forward: bool, next: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        let text = find.field.read(cx).content.to_string();
+        if text.is_empty() {
+            find.result = None;
+            self.host.with_view(|view| view.stop_finding(true));
+        } else {
+            if !next {
+                find.result = None;
+            }
+            self.host
+                .with_view(|view| view.find(&text, forward, false, next));
+        }
+        cx.notify();
+    }
+
+    /// Esc: closes the find bar, clears its highlights and gives the page
+    /// the keyboard back.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_none() {
+            return;
+        }
+        self.host.with_view(|view| view.stop_finding(true));
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let find = self.find.as_ref()?;
+        let text = find.field.read(cx).content.to_string();
+        let status = find_status(&text, find.result);
+        let can_step = find.result.is_some_and(|(count, _)| count > 0);
+        Some(
+            div()
+                .key_context(FIND_CONTEXT)
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .h(px(30.))
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(content(0.08))
+                .child(
+                    div()
+                        .w(px(260.))
+                        .min_w_0()
+                        .h(px(22.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(content(0.05))
+                        .child(find.field.clone()),
+                )
+                .child(
+                    div()
+                        .min_w(px(64.))
+                        .px_1()
+                        .text_size(px(11.))
+                        .text_color(content(0.5))
+                        .children(status),
+                )
+                .child(
+                    icon_button_enabled(
+                        "browser-find-previous",
+                        "Previous Match",
+                        "chevron-up",
+                        can_step,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.search(false, true, cx))),
+                )
+                .child(
+                    icon_button_enabled(
+                        "browser-find-next",
+                        "Next Match",
+                        "chevron-down",
+                        can_step,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.search(true, true, cx))),
+                )
+                .child(div().flex_1())
+                .child(
+                    icon_button_enabled("browser-find-close", "Close", "x", true)
+                        .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+                ),
+        )
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -396,6 +751,26 @@ impl BrowserPage {
                     .bg(content(0.05))
                     .child(self.address.clone()),
             )
+            .when(self.zoom != 100, |d| {
+                d.child(
+                    div()
+                        .id("browser-zoom")
+                        .role(gpui::Role::Button)
+                        .aria_label("Reset Zoom")
+                        .flex_shrink_0()
+                        .px_2()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(content(0.6))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .child(format!("{}%", self.zoom))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
+                )
+            })
     }
 
     /// Instead of the page while Chromium is not running yet.
@@ -476,7 +851,8 @@ impl BrowserPage {
 }
 
 impl Render for BrowserPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window = Some(window.window_handle());
         if self.engine.read(cx).state == EngineState::Idle {
             self.start_engine(cx);
         }
@@ -486,11 +862,29 @@ impl Render for BrowserPage {
         };
         div()
             .id("browser-page")
+            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
+            .on_action(
+                cx.listener(|this, _: &FocusAddress, window, cx| this.focus_address(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &Reload, _, _| this.reload(false)))
+            .on_action(cx.listener(|this, _: &ReloadIgnoringCache, _, _| this.reload(true)))
+            .on_action(cx.listener(|this, _: &Find, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.search(true, true, cx)))
+            .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.search(false, true, cx)))
+            .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_find(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ZoomIn, _, cx| this.set_zoom(zoom_step(this.zoom, 1), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(zoom_step(this.zoom, -1), cx)),
+            )
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
             .size_full()
             .flex()
             .flex_col()
             .child(self.toolbar(cx))
+            .children(self.find_bar(cx))
             .when_some(self.failure.clone(), |d, failure| {
                 d.child(
                     div()
@@ -767,6 +1161,23 @@ mod mac {
     use objc2::{MainThreadOnly, define_class, runtime::NSObjectProtocol};
     use objc2_app_kit::NSView;
 
+    /// Makes GPUI's own view AppKit's first responder, so typed keys reach a
+    /// GPUI field instead of the Chromium page that had them.
+    pub(super) fn make_gpui_first_responder(window: &gpui::Window) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+        // SAFETY: GPUI keeps its content view alive with the window.
+        let view = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
+        if let Some(native) = view.window() {
+            native.makeFirstResponder(Some(view));
+        }
+    }
+
     define_class!(
         /// Clips a page to its pane. Flipped, so the page's frame is top-left
         /// based like GPUI's.
@@ -826,6 +1237,12 @@ mod monocode_cef {
             user_gesture: bool,
         },
         Closed,
+        FindResult {
+            count: i32,
+            active_ordinal: i32,
+            final_update: bool,
+        },
+        Focused,
     }
 
     /// Never created: [`runtime::start`] always fails here.
@@ -838,6 +1255,13 @@ mod monocode_cef {
         pub fn reload(&self) {}
         pub fn stop(&self) {}
         pub fn set_focus(&self, _: bool) {}
+        pub fn reload_ignore_cache(&self) {}
+        pub fn find(&self, _: &str, _: bool, _: bool, _: bool) {}
+        pub fn stop_finding(&self, _: bool) {}
+        pub fn set_zoom_level(&self, _: f64) {}
+        pub fn zoom_level(&self) -> f64 {
+            0.
+        }
         pub fn close(&self) {}
     }
 }
@@ -875,6 +1299,41 @@ mod tests {
             Some(dir.path().join("X Helper.app/Contents/MacOS/X Helper"))
         );
         assert_eq!(find_helper(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn zoom_steps_through_chromes_presets() {
+        assert_eq!(zoom_step(100, 1), 110);
+        assert_eq!(zoom_step(100, -1), 90);
+        assert_eq!(zoom_step(150, 0), 100);
+        assert_eq!(zoom_step(500, 1), 500);
+        assert_eq!(zoom_step(25, -1), 25);
+        // Between presets: another page set the host's level some other way.
+        assert_eq!(zoom_step(120, 1), 125);
+        assert_eq!(zoom_step(120, -1), 110);
+        for percent in ZOOM_PRESETS {
+            assert_eq!(zoom_percent(zoom_level(percent)), percent);
+        }
+        assert_eq!(zoom_level(100), 0.);
+        assert!((zoom_level(120) - 1.).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_find_bar_counts_matches_once_the_page_answers() {
+        assert_eq!(find_status("", Some((3, 1))), None);
+        assert_eq!(find_status("rust", None), None);
+        assert_eq!(
+            find_status("rust", Some((0, 0))).as_deref(),
+            Some("No results")
+        );
+        assert_eq!(
+            find_status("rust", Some((12, 3))).as_deref(),
+            Some("3 of 12")
+        );
+        assert_eq!(
+            find_status("rust", Some((12, 0))).as_deref(),
+            Some("1 of 12")
+        );
     }
 
     #[test]
