@@ -50,6 +50,54 @@ pub struct Snapshot {
     pub extra_usage_balance: Option<f64>,
     #[serde(default)]
     pub identity: Option<crate::accounts::Identity>,
+    /// Limits that count one model only, next to the account-wide windows.
+    #[serde(default)]
+    pub scoped: Vec<ScopedLimit>,
+    /// Where the weekly usage went, by product.
+    #[serde(default)]
+    pub breakdown: Vec<Share>,
+    #[serde(default)]
+    pub credits: Option<Credits>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScopedLimit {
+    pub label: String,
+    pub window: Window,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Share {
+    pub label: String,
+    pub percent: f64,
+}
+/// Pay-as-you-go usage past the plan limits.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Credits {
+    pub enabled: bool,
+    pub used: f64,
+    pub limit: Option<f64>,
+    pub currency: String,
+    pub out_of_credits: bool,
+}
+impl Credits {
+    pub fn money(&self, amount: f64) -> String {
+        if self.currency.eq_ignore_ascii_case("USD") {
+            format!("${amount:.2}")
+        } else {
+            format!("{amount:.2} {}", self.currency)
+        }
+    }
+    pub fn summary(&self) -> String {
+        if self.out_of_credits {
+            return "Out of credits".into();
+        }
+        if !self.enabled {
+            return "Off".into();
+        }
+        match self.limit {
+            Some(limit) => format!("{} of {}", self.money(self.used), self.money(limit)),
+            None => format!("{} used", self.money(self.used)),
+        }
+    }
 }
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResetCredits {
@@ -347,6 +395,14 @@ pub fn now_ms() -> i64 {
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
+/// The local wall-clock time of a reset: "Nov 25, 07:00".
+pub fn local_time(at: i64) -> Option<String> {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(at)
+        .single()
+        .map(|time| time.format("%b %-d, %H:%M").to_string())
+}
 pub fn duration(ms: i64) -> String {
     if ms <= 0 {
         return "now".into();
@@ -452,7 +508,79 @@ fn parse_claude(value: &Value) -> Result<Snapshot, FetchError> {
     Ok(Snapshot {
         windows,
         updated_at: now_ms(),
+        scoped: claude_scoped(value),
+        breakdown: claude_breakdown(value),
+        credits: claude_credits(value),
         ..Default::default()
+    })
+}
+fn claude_scoped(value: &Value) -> Vec<ScopedLimit> {
+    value["limits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let label = row["scope"]["model"]["display_name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let minutes = match row["group"].as_str()? {
+                "weekly" => 10_080,
+                "session" | "five_hour" => 300,
+                _ => return None,
+            };
+            Some(ScopedLimit {
+                label: label.into(),
+                window: window(row, minutes, &["percent", "utilization"])?,
+            })
+        })
+        .collect()
+}
+fn claude_breakdown(value: &Value) -> Vec<Share> {
+    value["seven_day_breakdown"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let percent = number(row, &["percent"])?.clamp(0., 100.);
+            let label = row["display_name"].as_str().filter(|s| !s.is_empty())?;
+            (percent > 0.).then(|| Share {
+                label: label.into(),
+                percent,
+            })
+        })
+        .collect()
+}
+fn claude_credits(value: &Value) -> Option<Credits> {
+    let spend = &value["spend"];
+    let extra = &value["extra_usage"];
+    let minor = |money: &Value| {
+        let amount = money["amount_minor"].as_f64()?;
+        Some(amount / 10f64.powi(money["exponent"].as_i64().unwrap_or(2) as i32))
+    };
+    let scale = 10f64.powi(extra["decimal_places"].as_i64().unwrap_or(2) as i32);
+    let enabled = spend["enabled"]
+        .as_bool()
+        .or_else(|| extra["is_enabled"].as_bool())?;
+    let reason = spend["disabled_reason"]
+        .as_str()
+        .or_else(|| extra["disabled_reason"].as_str());
+    // An account that never turned credits on has nothing to report.
+    if !enabled && reason.is_none() && extra["credits_ever_enabled"] != true {
+        return None;
+    }
+    Some(Credits {
+        enabled,
+        used: minor(&spend["used"])
+            .or_else(|| Some(extra["used_credits"].as_f64()? / scale))
+            .unwrap_or(0.),
+        limit: minor(&spend["limit"]).or_else(|| Some(extra["monthly_limit"].as_f64()? / scale)),
+        currency: spend["used"]["currency"]
+            .as_str()
+            .or_else(|| extra["currency"].as_str())
+            .unwrap_or("USD")
+            .into(),
+        out_of_credits: !enabled && reason == Some("out_of_credits"),
     })
 }
 
@@ -612,6 +740,65 @@ mod tests {
         assert_eq!(snapshot.windows[1].used_percent, 0.);
         assert!(parse_claude(&json!({})).unwrap_err().unavailable);
         assert!(!parse_claude(&json!(null)).unwrap_err().unavailable);
+    }
+    #[test]
+    fn claude_reads_model_limits_product_shares_and_credits() {
+        let snapshot = parse_claude(&json!({
+            "five_hour": null,
+            "seven_day": {"utilization": 13.0, "resets_at": "2026-11-25T04:00:00Z"},
+            "limits": [
+                {"kind":"weekly_all","group":"weekly","percent":13,"scope":null},
+                {"kind":"weekly_scoped","group":"weekly","percent":17,
+                 "resets_at":"2026-11-25T04:00:00Z",
+                 "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}},
+                {"kind":"future","group":"future","percent":1,
+                 "scope":{"model":{"display_name":"Other"}}}
+            ],
+            "extra_usage": {"is_enabled":false,"monthly_limit":20000,"used_credits":0.0,
+                "decimal_places":2,"currency":"USD","disabled_reason":"out_of_credits",
+                "credits_ever_enabled":true},
+            "spend": {"used":{"amount_minor":150,"currency":"USD","exponent":2},
+                "limit":{"amount_minor":20000,"currency":"USD","exponent":2},
+                "enabled":false,"disabled_reason":"out_of_credits"},
+            "seven_day_breakdown": {"rows":[
+                {"key":"claude_code","display_name":"Claude Code","percent":99},
+                {"key":"chat","display_name":"Chats","percent":0},
+                {"key":"cowork","display_name":"Cowork","percent":1}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.scoped.len(), 1);
+        assert_eq!(snapshot.scoped[0].label, "Fable");
+        assert_eq!(snapshot.scoped[0].window.used_percent, 17.);
+        assert_eq!(snapshot.scoped[0].window.minutes, 10_080);
+        assert_eq!(
+            snapshot
+                .breakdown
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Claude Code", "Cowork"]
+        );
+        let credits = snapshot.credits.unwrap();
+        assert_eq!(credits.summary(), "Out of credits");
+        assert_eq!((credits.used, credits.limit), (1.5, Some(200.)));
+        let on = Credits {
+            enabled: true,
+            out_of_credits: false,
+            ..credits
+        };
+        assert_eq!(on.summary(), "$1.50 of $200.00");
+        // Older responses carry only extra_usage; untouched accounts show nothing.
+        let old = parse_claude(&json!({"seven_day":{"utilization":1},
+            "extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":1234.0}}))
+        .unwrap();
+        assert_eq!(old.credits.unwrap().summary(), "$12.34 of $50.00");
+        let never = parse_claude(&json!({"seven_day":{"utilization":1},
+            "extra_usage":{"is_enabled":false,"disabled_reason":null}}))
+        .unwrap();
+        assert!(never.credits.is_none() && never.scoped.is_empty());
+        assert!(local_time(1_795_579_200_000).is_some());
     }
     #[test]
     fn reset_countdowns_match_the_footer() {
