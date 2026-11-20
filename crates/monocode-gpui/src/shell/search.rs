@@ -324,6 +324,13 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
+    /// An archived conversation opened from search is back in use: it leaves
+    /// the archive so the rail lists the tab it now has.
+    fn unarchive_opened(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.session_metadata(id, cx).summary.archived {
+            self.toggle_archive(id, cx);
+        }
+    }
     fn open_search_session(
         &mut self,
         id: i64,
@@ -333,6 +340,7 @@ impl Shell {
     ) {
         if let Some(view) = self.ensure_session(id, cx) {
             self.open(id, window, cx);
+            self.unarchive_opened(id, cx);
             if let Some((row, query)) = jump {
                 view.update(cx, |v, cx| v.reveal_search(row, query, cx));
             }
@@ -365,6 +373,7 @@ impl Shell {
                     Ok(summary) => {
                         this.add(summary, cx);
                         this.open(id, window, cx);
+                        this.unarchive_opened(id, cx);
                         if let Some((row, query)) = jump {
                             this.sessions[&id].update(cx, |v, cx| v.reveal_search(row, query, cx));
                         }
@@ -423,6 +432,50 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    #[gpui::test]
+    fn opening_an_archived_conversation_from_search_unarchives_it(cx: &mut TestAppContext) {
+        use super::super::project_rail::ProjectRailRow;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, a, _) = crate::shell::tests::window(cx);
+        let project = "/work/another-project";
+        let listed = |shell: &Shell, cx: &App| {
+            shell
+                .project_rail_tree_children(project, cx)
+                .iter()
+                .any(|row| matches!(row, ProjectRailRow::Session { id, .. } if *id == a))
+        };
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(listed(shell, cx));
+                shell.toggle_archive(a, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                assert!(shell.session_metadata(a, cx).summary.archived);
+                assert!(
+                    shell.workspace.tab_of(a).is_none(),
+                    "archiving closes the tab"
+                );
+                assert!(!listed(shell, cx));
+                shell.open_search_session(a, None, w, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.workspace.active, Some(a));
+                assert!(!shell.session_metadata(a, cx).summary.archived);
+                let stored = locked(&shell.store).unwrap().sessions().unwrap();
+                assert!(!stored.iter().find(|s| s.id == a).unwrap().archived);
+                assert!(
+                    listed(shell, cx),
+                    "the reopened session is back in the rail"
+                );
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn app_search_restores_draft_and_opens_cross_project_result(cx: &mut TestAppContext) {
         cx.update(|cx| {
