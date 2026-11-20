@@ -390,13 +390,13 @@ impl Driver {
 
         // From quick open's commands, typed.
         let known = self.runs().len();
-        self.keys(cx, "cmd-shift-p").await;
+        self.keys(cx, "cmd-p").await;
         self.pause(cx, 300).await;
         self.type_text(cx, "Run: Pytest").await;
         self.pause(cx, 500).await;
         let rows = self
             .shell(cx, |shell, _, cx| {
-                (shell.quick_open.as_ref())
+                (shell.palette.as_ref())
                     .map(|open| open.picker().read(cx).row_labels())
                     .unwrap_or_default()
             })

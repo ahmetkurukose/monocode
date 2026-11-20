@@ -511,7 +511,8 @@ impl Shell {
     /// and would sit on top of any of them.
     fn browser_covered(&self, cx: &App) -> bool {
         self.menu.is_some()
-            || self.quick_open.is_some()
+            || self.palette.is_some()
+            || self.everywhere.is_some()
             || self.image_lightbox.is_some()
             || self.remote_project_picker.is_some()
             || self.link_dialog.is_some()

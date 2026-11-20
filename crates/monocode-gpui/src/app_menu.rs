@@ -65,10 +65,11 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Project…", OpenProject),
-            MenuItem::action("Search…", FocusSearch),
+            MenuItem::action("Search Everywhere…", SearchEverywhere),
             MenuItem::action("Go to File…", GoToFile),
+            MenuItem::action("Find in Files…", FindInFiles),
+            MenuItem::action("Find in Files Panel…", SearchFiles),
             MenuItem::action("Command Palette…", OpenCommandPalette),
-            MenuItem::action("Find in Files…", SearchFiles),
             MenuItem::separator(),
             MenuItem::action("Save", Save),
             MenuItem::action("Reload File", ReloadFile),

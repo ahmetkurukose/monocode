@@ -505,7 +505,7 @@ fn a_registered_process_is_listed_with_its_memory_and_can_be_stopped() {
 }
 
 #[gpui::test]
-fn quick_open_lists_a_features_commands_and_the_rows_of_its_prefix_mode(cx: &mut TestAppContext) {
+fn search_lists_a_features_commands_and_the_rows_of_its_prefix_mode(cx: &mut TestAppContext) {
     let (window, mut visual, _) = shell(cx);
     let visual = &mut visual;
     let dir = tempfile::tempdir().unwrap();
@@ -552,38 +552,49 @@ fn quick_open_lists_a_features_commands_and_the_rows_of_its_prefix_mode(cx: &mut
             cx,
         );
     });
-    let rows = |window: WindowHandle<Shell>, cx: &mut VisualTestContext| {
-        window
-            .update(cx, |shell, _, cx| {
-                let open = shell.quick_open.as_ref().unwrap();
-                open.picker().read(cx).row_labels()
-            })
-            .unwrap()
-    };
     window
         .update(visual, |shell, window, cx| {
-            shell.open_quick_open(true, window, cx);
-            shell.set_quick_open_query(">run: py".into(), cx);
+            shell.open_palette(window, cx);
+            shell.set_palette_query("run: pytest".into(), cx);
         })
         .unwrap();
     visual.run_until_parked();
+    let palette_rows = window
+        .update(visual, |shell, _, cx| {
+            let open = shell.palette.as_ref().unwrap();
+            open.picker().read(cx).row_labels()
+        })
+        .unwrap();
     assert_eq!(
-        rows(window, visual),
-        [("Run: pytest".to_owned(), PROJECT.to_owned())]
+        palette_rows.first(),
+        Some(&("Run: pytest".to_owned(), PROJECT.to_owned())),
+        "{palette_rows:?}"
     );
     window
         .update(visual, |shell, _, cx| {
-            let picker = shell.quick_open.as_ref().unwrap().picker().clone();
+            let picker = shell.palette.as_ref().unwrap().picker().clone();
             picker.update(cx, |picker, cx| picker.pick_row(0, cx));
         })
         .unwrap();
     visual.run_until_parked();
     assert_eq!(*ran.borrow(), [PROJECT]);
+    let rows = |window: WindowHandle<Shell>, cx: &mut VisualTestContext| {
+        window
+            .update(cx, |shell, _, cx| {
+                let open = shell.everywhere.as_ref().unwrap();
+                open.view.read(cx).row_labels()
+            })
+            .unwrap()
+    };
     window
         .update(visual, |shell, window, cx| {
-            assert!(shell.quick_open.is_none());
-            shell.open_quick_open(false, window, cx);
-            shell.set_quick_open_query("@index".into(), cx);
+            assert!(shell.palette.is_none());
+            shell.open_everywhere(
+                Some(crate::everywhere::Tab::All),
+                Some("@index".into()),
+                window,
+                cx,
+            );
         })
         .unwrap();
     visual.run_until_parked();
@@ -596,8 +607,8 @@ fn quick_open_lists_a_features_commands_and_the_rows_of_its_prefix_mode(cx: &mut
     );
     window
         .update(visual, |shell, _, cx| {
-            let picker = shell.quick_open.as_ref().unwrap().picker().clone();
-            picker.update(cx, |picker, cx| picker.pick_row(0, cx));
+            let view = shell.everywhere.as_ref().unwrap().view.clone();
+            view.update(cx, |view, cx| view.pick_row(0, cx));
         })
         .unwrap();
     visual.run_until_parked();

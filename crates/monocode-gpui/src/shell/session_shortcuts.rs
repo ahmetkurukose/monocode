@@ -13,7 +13,8 @@ impl Shell {
             || self.settings.is_some()
             || self.app_search.is_some()
             || self.mono_active(cx)
-            || self.quick_open.is_some()
+            || self.palette.is_some()
+            || self.everywhere.is_some()
             || self.image_lightbox.is_some()
             || self.menu.is_some()
             || self.renaming.is_some()
@@ -183,14 +184,14 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.open(active, window, cx);
-                shell.open_quick_open(false, window, cx);
+                shell.open_palette(window, cx);
             })
             .unwrap();
         cx.simulate_keystrokes(window.into(), &shortcut());
         window
             .update(cx, |shell, window, cx| {
                 assert!(!shell.sessions[&active].read(cx).summary.archived);
-                shell.close_quick_open(window, cx);
+                shell.close_palette(window, cx);
                 shell.sessions[&active]
                     .update(cx, |session, cx| session.toggle_model_menu(window, cx));
             })

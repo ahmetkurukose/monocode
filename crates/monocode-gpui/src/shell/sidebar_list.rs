@@ -712,9 +712,9 @@ impl Shell {
                                 .font_weight(FontWeight::NORMAL)
                                 .text_color(content(0.4))
                                 .child(if cfg!(target_os = "macos") {
-                                    "⌘K"
+                                    "⇧⇧"
                                 } else {
-                                    "Ctrl K"
+                                    "Shift Shift"
                                 }),
                         ),
                 )
@@ -963,7 +963,7 @@ mod tests {
         visual.simulate_click(search.center(), Default::default());
         visual.run_until_parked();
         window
-            .update(visual, |shell, _, _| assert!(shell.app_search.is_some()))
+            .update(visual, |shell, _, _| assert!(shell.everywhere.is_some()))
             .unwrap();
     }
 

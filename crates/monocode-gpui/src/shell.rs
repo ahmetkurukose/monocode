@@ -44,8 +44,8 @@ mod project_rail_worktrees;
 mod project_removal;
 mod project_settings;
 mod project_sleep;
+mod everywhere;
 mod quick_composer;
-mod quick_open;
 mod rails;
 mod remote_projects;
 mod remote_sessions;
@@ -160,6 +160,10 @@ actions!(
         OpenSettings,
         GoToFile,
         OpenCommandPalette,
+        SearchEverywhere,
+        FindInFiles,
+        SearchAgents,
+        SwitchProject,
         OpenInbox,
         OpenNotes,
         GitCommit,
@@ -243,7 +247,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-t"), NewCodex, context),
         KeyBinding::new(&format!("{modifier}-shift-n"), NewClaude, context),
         KeyBinding::new(&format!("{modifier}-o"), OpenProject, context),
-        KeyBinding::new(&format!("{modifier}-p"), GoToFile, context),
+        // ⌘P runs commands; searching anything is ⇧⇧ (or ⌘K).
+        KeyBinding::new(&format!("{modifier}-p"), OpenCommandPalette, context),
         KeyBinding::new(&format!("{modifier}-shift-p"), OpenCommandPalette, context),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, context),
         KeyBinding::new(&format!("{modifier}-alt-k"), GitCommit, context),
@@ -259,7 +264,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-]"), VisitForward, context),
         KeyBinding::new("escape", DismissMenu, context),
         KeyBinding::new(&format!("{modifier}-b"), ToggleSidebar, context),
-        KeyBinding::new(&format!("{modifier}-k"), FocusSearch, context),
+        KeyBinding::new(&format!("{modifier}-k"), SearchEverywhere, context),
         KeyBinding::new(&format!("{modifier}-shift-f"), SearchFiles, context),
         KeyBinding::new(&format!("{modifier}-alt-t"), CloseOtherTabs, context),
         KeyBinding::new(&format!("{modifier}-shift-]"), NextTab, context),
@@ -654,7 +659,15 @@ struct SessionPreview {
 
 pub(crate) struct Shell {
     monos: Option<Entity<crate::monos::Monos>>,
-    quick_open: Option<quick_open::Open>,
+    /// Search Everywhere (⇧⇧, ⌘K).
+    everywhere: Option<everywhere::EverywhereOpen>,
+    /// Its query and tab when it last closed.
+    saved_everywhere: Option<(String, crate::everywhere::Tab)>,
+    /// The command palette (⌘P).
+    palette: Option<everywhere::PaletteOpen>,
+    shift_taps: everywhere::ShiftTaps,
+    /// Typed into the composer of the next conversation created.
+    next_session_draft: Option<String>,
     image_lightbox: Option<(Entity<crate::image_lightbox::ImageLightbox>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
@@ -1126,7 +1139,11 @@ impl Shell {
             .unwrap_or_default();
         let mut this = Self {
             monos: None,
-            quick_open: None,
+            everywhere: None,
+            saved_everywhere: None,
+            palette: None,
+            shift_taps: Default::default(),
+            next_session_draft: None,
             image_lightbox: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
@@ -1377,6 +1394,15 @@ impl Shell {
                 cx,
             )
         });
+        // Every keystroke, a bound shortcut (⇧⇥) included, breaks a ⇧⇧. GPUI
+        // also reports a lone modifier's release as a keystroke named after
+        // it: that is the tap itself.
+        this.observations.push(cx.observe_keystrokes(|this, event, _, _| {
+            let key = event.keystroke.key.as_str();
+            if !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+                this.shift_taps.reset()
+            }
+        }));
         this.observations.push(
             cx.subscribe(&monos, |this, _, _: &crate::monos::Changed, cx| {
                 this.sync_mono_search(cx);
@@ -1584,6 +1610,7 @@ impl Shell {
                     this.git.update(cx, |git, cx| git.reload(cx));
                 }
                 this.sync_search_session(id, cx);
+                this.sync_everywhere_session(id, cx);
                 this.orchestration_session_changed(id, cx);
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
@@ -4756,8 +4783,12 @@ impl Shell {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or(reference);
-                    this.open_quick_open(false, window, cx);
-                    this.set_quick_open_query(name, cx);
+                    this.open_everywhere(
+                        Some(crate::everywhere::Tab::Files),
+                        Some(name),
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -4991,8 +5022,9 @@ impl Shell {
         self.resize = None;
         self.drop_peek();
     }
+    /// ⌘K and the sidebar's search button: Search Everywhere on All.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_app_search(window, cx);
+        self.open_everywhere(Some(crate::everywhere::Tab::All), None, window, cx);
     }
 
     pub(super) fn select_project(
@@ -5205,6 +5237,14 @@ impl Shell {
                     Ok((summary, settings)) => {
                         let id = summary.id;
                         this.add(summary, cx);
+                        // "Ask a new agent" from Search Everywhere: its query
+                        // waits in the composer for Enter.
+                        if let Some(draft) = this.next_session_draft.take()
+                            && let Some(view) = this.sessions.get(&id)
+                        {
+                            let input = view.read(cx).input.clone();
+                            input.update(cx, |input, cx| input.set_text(draft, cx));
+                        }
                         if let Some(folder) = &folder {
                             let groups = this.groups.entry(cwd.clone()).or_default();
                             groups.add_to_folder(folder, id);
@@ -5816,15 +5856,15 @@ impl Shell {
     }
     fn file_search_button(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let label = if cfg!(target_os = "macos") {
-            "Search files (⌘P)"
+            "Search Everywhere (⇧⇧)"
         } else {
-            "Search files (Ctrl+P)"
+            "Search Everywhere (Shift Shift)"
         };
         icon_button("titlebar-file-search", label, "search")
             .debug_selector(|| "titlebar-file-search".into())
             .flex_shrink_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| this.open_quick_open(false, window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.open_everywhere(None, None, window, cx)))
     }
     fn diff_stat_room(&self, cx: &App) -> f32 {
         if self.mono_active(cx) || !self.git.read(cx).available() {
@@ -7621,10 +7661,10 @@ impl Shell {
                                     d.child(
                                         icon_button("sidebar-search", "Search", "search")
                                             .debug_selector(|| "sidebar-search-button".into())
-                                            .when(self.app_search.is_some(), |d| d.bg(content(0.1)))
+                                            .when(self.everywhere.is_some(), |d| d.bg(content(0.1)))
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.app_search.is_some() {
-                                                    this.close_app_search(window, cx)
+                                                if this.everywhere.is_some() {
+                                                    this.close_everywhere(window, cx)
                                                 } else {
                                                     this.focus_search(window, cx)
                                                 }
@@ -9577,6 +9617,19 @@ impl Render for Shell {
             .key_context("Workspace")
             .track_focus(&self.focus)
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
+            // ⇧⇧ opens Search Everywhere; any key or click between the taps
+            // means Shift was used for something else.
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                    this.shift_changed(&event.modifiers, window, cx)
+                },
+            ))
+            .capture_key_down(cx.listener(|this, _: &gpui::KeyDownEvent, _, _| {
+                this.shift_taps.reset()
+            }))
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, _| {
+                this.shift_taps.reset()
+            }))
             .on_action(cx.listener(|this, _: &ArchiveSession, window, cx| {
                 this.archive_active_session(window, cx)
             }))
@@ -9636,13 +9689,28 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &GoToFile, window, cx| {
-                    this.open_quick_open(false, window, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &GoToFile, window, cx| {
+                this.open_everywhere(Some(crate::everywhere::Tab::Files), None, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
-                this.open_quick_open(true, window, cx)
+                this.open_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| {
+                this.open_everywhere(Some(crate::everywhere::Tab::All), None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FindInFiles, window, cx| {
+                this.open_everywhere(Some(crate::everywhere::Tab::Content), None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SearchAgents, window, cx| {
+                this.open_everywhere(Some(crate::everywhere::Tab::Agents), None, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchProject, window, cx| {
+                this.open_everywhere(
+                    Some(crate::everywhere::Tab::Projects),
+                    Some(String::new()),
+                    window,
+                    cx,
+                )
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(crate::settings::Section::General, window, cx)
@@ -9879,8 +9947,12 @@ impl Render for Shell {
                     this.close_remote_project(window, cx);
                     return;
                 }
-                if this.quick_open.is_some() {
-                    this.close_quick_open(window, cx);
+                if this.palette.is_some() {
+                    this.close_palette(window, cx);
+                    return;
+                }
+                if this.everywhere.is_some() {
+                    this.close_everywhere(window, cx);
                     return;
                 }
                 if this.app_search.is_some() {
@@ -10143,7 +10215,8 @@ impl Render for Shell {
             .children(self.link_modal(window, cx))
             .children(self.action_modal(window, cx))
             .children(self.resource_modal(window, cx))
-            .children(self.quick_open_modal(window, cx))
+            .children(self.everywhere_modal(window, cx))
+            .children(self.palette_modal(window, cx))
             .children(self.git_overlays(window, cx))
             .children(self.search_modal(window, cx))
             .children(self.remote_project_modal(window, cx))

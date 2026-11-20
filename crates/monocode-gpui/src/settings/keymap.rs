@@ -52,10 +52,11 @@ pub(crate) fn apply(prefs: &Preferences, cx: &mut App) {
 fn command(binding: &KeyBinding) -> Option<&'static str> {
     let keys = binding.keystrokes().first()?.unparse();
     Some(match binding.action().name() {
-        "workspace::GoToFile" => "App: Go to File",
-        "workspace::OpenCommandPalette" => "App: Command Palette",
+        "workspace::OpenCommandPalette" if keys.ends_with("-p") && !keys.contains("shift") => {
+            "App: Command Palette"
+        }
         "workspace::OpenSettings" => "App: Settings",
-        "workspace::FocusSearch" => "App: Search",
+        "workspace::SearchEverywhere" => "App: Search",
         "workspace::OpenProject" => "App: Open Project",
         "workspace::ToggleSidebar" => "App: Toggle Sidebar",
         "workspace::ToggleRightPanel" => "App: Toggle Session Sidebar",

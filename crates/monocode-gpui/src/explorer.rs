@@ -402,6 +402,13 @@ impl Explorer {
         self.selected = Some(path);
         self.rebuild(cx);
     }
+    /// Opens the search panel with `query` typed, from Search Everywhere.
+    pub(crate) fn search_for(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_search(window, cx);
+        if let Some(search) = &self.search {
+            search.update(cx, |search, cx| search.set_query(query, cx));
+        }
+    }
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_project(cx);
         self.menu = None;
