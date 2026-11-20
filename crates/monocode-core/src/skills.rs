@@ -1261,7 +1261,7 @@ mod tests {
             "---\nname: fmt\ndescription: Personal fmt\n---\n",
         );
 
-        // Windows: verify both backslash separator handling and case-insensitivity
+        // Windows: verify both backslash separator handling and case-insensitivity.
         let raw_project_path = project
             .0
             .join(".agents/skills/fmt/SKILL.md")
