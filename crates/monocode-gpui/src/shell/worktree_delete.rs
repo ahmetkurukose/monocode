@@ -59,9 +59,13 @@ fn inspect(cwd: &Path, path: &Path, store: &Database) -> Result<DeleteInfo, Stri
     })
 }
 
-/// Tests make the sessions' detach fail after a successful removal.
+// Tests make the sessions' detach fail after a successful removal.
+// Per thread: the test dispatcher runs background work on the test's own thread, and
+// other tests running in parallel must not see it.
 #[cfg(test)]
-static FAIL_DETACH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_DETACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Move the sessions using `path` (removed) to the main checkout, marked removed.
 fn detach_sessions(
@@ -70,7 +74,7 @@ fn detach_sessions(
     main: &Path,
 ) -> Result<Vec<(Session, monocode_core::agent::Settings)>, String> {
     #[cfg(test)]
-    if FAIL_DETACH.load(std::sync::atomic::Ordering::Relaxed) {
+    if FAIL_DETACH.get() {
         return Err("database is locked".into());
     }
     locked(store)?.detach_worktree(path, &main.to_string_lossy())
@@ -264,21 +268,23 @@ impl Shell {
                 });
                 return;
             }
-            // Recheck after the worker, then delete the conversations first.
-            let pending = this.update_in(cx, |this, window, cx| {
+            // Recheck after the worker. Sessions are deleted only after Git removed the
+            // worktree, so a failed removal never costs them; check now that they can be.
+            let pending = this.update(cx, |this, cx| {
                 if let Some(error) = this.worktree_in_use(&path, &ids, cx) {
                     return Err(format!("This worktree is now in use. {error}"));
+                }
+                if delete_sessions
+                    && let Some(blocker) =
+                        ids.iter().find_map(|id| this.session_delete_blocker(*id, cx))
+                {
+                    return Err(format!("{blocker}, or keep its sessions."));
                 }
                 // From here until it finishes, nothing new may start there.
                 this.removing_worktrees.insert(
                     path.clone(),
                     worktree::remove::mark_removing(Path::new(&path)),
                 );
-                if delete_sessions {
-                    for id in &ids {
-                        this.delete_session(*id, window, cx);
-                    }
-                }
                 Ok((this.group_writes.take(), this.store.clone()))
             });
             let (writes, store) = match pending {
@@ -296,23 +302,6 @@ impl Shell {
             }
             let (worker_cwd, worker_path) = (cwd.clone(), path.clone());
             let work = cx.background_executor().spawn(async move {
-                if delete_sessions {
-                    let db = locked(&store)?;
-                    let paths = db.session_worktrees()?;
-                    if db.sessions()?.iter().any(|s| {
-                        is_equal_or_inside(
-                            paths
-                                .get(&s.id)
-                                .and_then(|p| p.as_deref())
-                                .unwrap_or(&s.cwd),
-                            &worker_path,
-                        )
-                    }) {
-                        return Err(
-                            "Some sessions could not be deleted, so the worktree was kept.".into(),
-                        );
-                    }
-                }
                 let main = worktree::layout::main_checkout(Path::new(&worker_cwd))?;
                 let removed = worktree::remove::remove(
                     Path::new(&worker_cwd),
@@ -322,7 +311,8 @@ impl Shell {
                 )?;
                 let mut removed = removed;
                 // The worktree is gone either way; failing to move its sessions off it
-                // is reported, not a failed removal.
+                // is reported, not a failed removal. Sessions about to be deleted are
+                // moved too, so one whose deletion fails still points at a real folder.
                 let detached = match detach_sessions(&store, &worker_path, &main) {
                     Ok(detached) => detached,
                     Err(error) => {
@@ -335,7 +325,8 @@ impl Shell {
                 Ok::<_, String>((removed, detached, main))
             });
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let removed_ok = result.is_ok();
                 let result = result.map(|(removed, detached, main)| {
                     for (summary, settings) in detached {
                         this.session_summaries.insert(summary.id, summary.clone());
@@ -350,6 +341,13 @@ impl Shell {
                     (removed, main)
                 });
                 this.finish_worktree_removal(&path, result, cx);
+                // Only now that the worktree is gone; one that fails to delete stays,
+                // moved to the main checkout, and reports why.
+                if removed_ok && delete_sessions {
+                    for id in &ids {
+                        this.delete_session(*id, window, cx);
+                    }
+                }
             });
         })
         .detach();
@@ -1197,15 +1195,47 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_failed_removal_keeps_the_sessions_it_was_asked_to_delete(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, main, root) = repo();
+        let (window, paths, sessions) = shell(cx, &main, &root, &["stuck"], &[0]);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        open(window, visual, &main, &paths[0]);
+        click(visual, "worktree-delete-sessions");
+        // Git cannot remove the folder from a read-only parent.
+        let parent = paths[0].parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        click(visual, "worktree-delete-confirm");
+        mode(0o755).unwrap();
+        assert!(paths[0].is_dir(), "the removal failed");
+        assert!(open_dialog(window, visual));
+        assert!(visual.debug_bounds("worktree-delete-failed").is_some());
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.session_summaries.contains_key(&sessions[0].id));
+                let db = locked(&shell.store).unwrap();
+                assert!(
+                    db.sessions()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s.id == sessions[0].id)
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn sessions_that_cannot_be_detached_after_removal_are_a_warning(cx: &mut TestAppContext) {
         let (_temp, main, root) = repo();
         let (window, paths, _) = shell(cx, &main, &root, &["gone"], &[0]);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         open(window, visual, &main, &paths[0]);
-        FAIL_DETACH.store(true, std::sync::atomic::Ordering::Relaxed);
+        FAIL_DETACH.set(true);
         click(visual, "worktree-delete-confirm");
-        FAIL_DETACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        FAIL_DETACH.set(false);
         assert!(!paths[0].exists());
         assert!(!open_dialog(window, visual), "the removal still finishes");
         window

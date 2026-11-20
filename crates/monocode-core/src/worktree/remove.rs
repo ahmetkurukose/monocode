@@ -237,8 +237,8 @@ fn relink(main: &Path, worktree: &Path, rel: &str) {
 }
 
 /// Remove a worktree: discard parked providers, unlink our shared symlinks,
-/// `git worktree remove [--force]`, delete a managed worktree's merged branch, prune,
-/// and delete the meta. Legacy/external worktrees never lose their branch.
+/// `git worktree remove [--force]` (which also forgets a missing one, and only that one),
+/// delete a managed worktree's merged branch, and delete the meta. Legacy/external worktrees never lose their branch.
 pub fn remove(
     cwd: &Path,
     path: &Path,
@@ -259,7 +259,9 @@ pub fn remove(
     crate::provider::discard_worktree(&pre.path);
     let spelled = pre.path.to_string_lossy().into_owned();
     if pre.missing {
-        git(&main, &["worktree", "prune"])?;
+        // Forgets only this entry. `git worktree prune` would also drop every other
+        // prunable worktree, e.g. one on a volume that is not mounted right now.
+        git(&main, &["worktree", "remove", "--", spelled.as_str()])?;
     } else {
         let mut unlinked = Vec::new();
         for rel in &pre.shared_links {
@@ -297,11 +299,6 @@ pub fn remove(
             Ok(_) => removed.branch_deleted = true,
             Err(_) => removed.preserved_branch = Some(pre.branch.clone()),
         }
-    }
-    if let Err(e) = git(&main, &["worktree", "prune"]) {
-        removed
-            .warnings
-            .push(format!("Could not prune worktrees: {e}"));
     }
     let forgotten = {
         let s = lock(store);
@@ -472,6 +469,30 @@ mod tests {
         assert!(preflight(Path::new("remote://e/x"), &inner)
             .unwrap_err()
             .contains("remote"));
+    }
+
+    #[test]
+    fn worktree_remove_of_a_missing_folder_forgets_only_that_worktree() {
+        let (_t, main, root) = fixture::repo();
+        let store = fixture::store();
+        let gone = make(&main, &root, &store, "gone");
+        let away = make(&main, &root, &store, "away");
+        // Both folders are missing, e.g. `away` sits on an unmounted volume.
+        std::fs::remove_dir_all(&gone.path).unwrap();
+        std::fs::remove_dir_all(&away.path).unwrap();
+        assert!(preflight(&main, &gone.path).unwrap().missing);
+        remove(&main, &gone.path, &RemoveOptions::default(), &store).unwrap();
+        let listed: Vec<String> = catalog::registered(&main)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        let key = |p: &Path| meta::key(p);
+        assert!(listed.iter().all(|p| key(Path::new(p)) != key(&gone.path)));
+        assert!(
+            listed.iter().any(|p| key(Path::new(p)) == key(&away.path)),
+            "the other missing worktree stays registered: {listed:?}"
+        );
     }
 
     #[test]

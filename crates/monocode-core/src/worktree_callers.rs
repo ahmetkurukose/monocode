@@ -239,13 +239,30 @@ mod tests {
         let m = meta::load(&lock(&store), Path::new(&tree.path))
             .unwrap()
             .unwrap();
-        assert_eq!(m.base_ref, "HEAD");
+        let current = git::git(&main, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(m.base_ref, current.trim(), "HEAD is recorded as its branch");
         let session = for_session(&main, None, "api session", 3, CreatedBy::Api, &store).unwrap();
         assert_eq!(head(&session.path), head(&main));
         for by in [CreatedBy::Automation, CreatedBy::Mobile] {
             let made = for_session(&main, None, "from elsewhere", 4, by, &store).unwrap();
             assert_eq!(head(&made.path), head(&main), "{by:?} starts from HEAD");
         }
+        // HEAD is the caller's own: from a linked worktree, that worktree's commit.
+        let linked = Path::new(&tree.path);
+        git::git(linked, &["commit", "-q", "--allow-empty", "-m", "Linked"]).unwrap();
+        let child = for_session(
+            linked,
+            None,
+            "from linked",
+            5,
+            CreatedBy::Automation,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(head(&child.path), head(linked));
+        assert_ne!(head(&child.path), head(&main));
+        let m = meta::load(&lock(&store), &child.path).unwrap().unwrap();
+        assert_eq!(m.base_ref, "api/one");
         // The dialog's callers keep the repository's default base.
         let dialog = named(&main, "from-dialog", None, false, CreatedBy::Dialog, &store).unwrap();
         assert_ne!(dialog.head, head(&main));

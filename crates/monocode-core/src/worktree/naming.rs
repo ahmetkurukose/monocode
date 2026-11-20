@@ -104,9 +104,11 @@ pub fn branch_for(slug: &str, prefix: &BranchPrefix, cwd: &Path) -> String {
 
 static CLAIMS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
-/// Holds a destination path for one in-process creation; released on drop.
+/// Holds a destination path for one creation; released on drop. In-process by a set;
+/// [`pick`] adds file locks under the repository's Git directory so another process
+/// (a second app instance, the monos host) cannot take the same path or branch either.
 #[derive(Debug)]
-pub struct Claim(PathBuf);
+pub struct Claim(PathBuf, Vec<std::fs::File>);
 impl Claim {
     pub fn path(&self) -> &Path {
         &self.0
@@ -130,7 +132,43 @@ pub fn claim(path: &Path) -> Option<Claim> {
         .insert(path.clone());
     // The guard is released above: constructing a Claim that is then dropped must not
     // re-lock (or release someone else's claim).
-    inserted.then(|| Claim(path))
+    inserted.then(|| Claim(path, Vec::new()))
+}
+
+/// An exclusive lock, across processes, on `what` in this repository: `None` when
+/// another process holds it. The OS drops it when the file closes or the process dies.
+/// Unlockable (no Git directory, no lock support) counts as free: never worse than
+/// the in-process claim alone.
+fn lock_across_processes(cwd: &Path, what: &str) -> Option<Option<std::fs::File>> {
+    use sha2::{Digest, Sha256};
+    let Ok(common) = super::git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return Some(None);
+    };
+    let dir = Path::new(common.trim()).join("monocode").join("claims");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Some(None);
+    }
+    let name: String = Sha256::digest(what.as_bytes())
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{name}.lock")))
+    else {
+        return Some(None);
+    };
+    match file.try_lock() {
+        Ok(()) => Some(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(_)) => Some(None),
+    }
 }
 
 pub struct PickRequest<'a> {
@@ -195,7 +233,8 @@ pub fn branch_exists(cwd: &Path, branch: &str) -> bool {
 
 /// Try `slug`, `slug-2` … `slug-100`; see spec §3. A candidate is taken when its path
 /// exists, is registered with Git (even as a missing/prunable worktree), is claimed by
-/// another in-process creation, or (without an explicit branch) its branch exists.
+/// another creation (in this process, or another one: path or branch), or (without an
+/// explicit branch) its branch exists.
 pub fn pick(req: &PickRequest) -> Result<Picked, String> {
     if let Some(branch) = req.branch {
         crate::git::valid_branch(req.cwd, branch)?;
@@ -240,9 +279,25 @@ pub fn pick(req: &PickRequest) -> Result<Picked, String> {
                 branch
             }
         };
-        let Some(claim) = claim(&path) else {
+        let Some(mut claim) = claim(&path) else {
             continue;
         };
+        // Taken by another process: its `worktree add` could otherwise fail ours, and
+        // our rollback must never undo its worktree or branch.
+        let Some(on_branch) = lock_across_processes(req.cwd, &format!("branch:{branch}")) else {
+            if req.branch.is_some() {
+                return Err(format!(
+                    "Another worktree is being created on {branch}. Try again in a moment."
+                ));
+            }
+            continue;
+        };
+        let Some(at_path) =
+            lock_across_processes(req.cwd, &format!("path:{}", super::meta::key(&path)))
+        else {
+            continue;
+        };
+        claim.1.extend(at_path.into_iter().chain(on_branch));
         if req.branch.is_none() {
             crate::git::valid_branch(req.cwd, &branch)?;
         }
@@ -365,6 +420,21 @@ mod tests {
         drop(held);
         drop(p);
         assert_eq!(pick(&req("busy")).unwrap().slug, "busy");
+        // Another process's claim (a file lock) on the path, or on an explicit branch.
+        let key = super::super::meta::key(&repo_dir.join("elsewhere"));
+        let other = lock_across_processes(&main, &format!("path:{key}")).unwrap();
+        assert!(other.is_some(), "the lock is supported here");
+        assert_eq!(pick(&req("elsewhere")).unwrap().slug, "elsewhere-2");
+        drop(other);
+        assert_eq!(pick(&req("elsewhere")).unwrap().slug, "elsewhere");
+        let mine = |slug: &'static str| PickRequest {
+            branch: Some("mine"),
+            ..req(slug)
+        };
+        let other = lock_across_processes(&main, "branch:mine").unwrap();
+        assert!(pick(&mine("mine")).unwrap_err().contains("being created"));
+        drop(other);
+        assert_eq!(pick(&mine("mine")).unwrap().branch, "mine");
         // Prefix applies per candidate.
         run(&main, &["branch", "me/pre"]);
         let p = pick(&PickRequest {

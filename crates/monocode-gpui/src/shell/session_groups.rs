@@ -767,7 +767,8 @@ impl Shell {
         self.invalidate_chrome(cx);
     }
 
-    pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Why [`Self::delete_session`] would refuse `id` right now: a pane it owns is open.
+    pub(super) fn session_delete_blocker(&self, id: i64, cx: &App) -> Option<&'static str> {
         if self.workspace.review_owners.iter().any(|(pane, owner)| {
             *owner == id
                 && (self.workspace.tab_of(*pane).is_some()
@@ -776,9 +777,7 @@ impl Shell {
                         .get(pane)
                         .is_some_and(|r| r.read(cx).unsaved_files(cx)))
         }) {
-            self.error = Some("Close this session's detached file panes before deleting it".into());
-            cx.notify();
-            return;
+            return Some("Close this session's detached file panes before deleting it");
         }
         if self
             .workspace
@@ -786,9 +785,7 @@ impl Shell {
             .iter()
             .any(|(pane, t)| t.owner == id && self.workspace.tab_of(*pane).is_some())
         {
-            self.error = Some("Close this session's terminal panes before deleting it".into());
-            cx.notify();
-            return;
+            return Some("Close this session's terminal panes before deleting it");
         }
         if self
             .workspace
@@ -796,7 +793,14 @@ impl Shell {
             .iter()
             .any(|(pane, b)| b.owner == id && self.workspace.tab_of(*pane).is_some())
         {
-            self.error = Some("Close this session's browser pages before deleting it".into());
+            return Some("Close this session's browser pages before deleting it");
+        }
+        None
+    }
+
+    pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(blocker) = self.session_delete_blocker(id, cx) {
+            self.error = Some(blocker.into());
             cx.notify();
             return;
         }

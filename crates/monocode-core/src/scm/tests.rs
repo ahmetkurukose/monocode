@@ -769,6 +769,48 @@ fn sync_counts_unpushed_commits() {
 }
 
 #[test]
+fn a_worktree_branch_targets_its_recorded_base() {
+    let (repo, origin) = (tmp(), tmp());
+    let repo = repo.path();
+    assert!(init_git_commit(repo, &[("a.txt", "alpha\n")]));
+    with_origin(repo, origin.path());
+    // develop is one commit ahead of main on the remote.
+    assert!(git(repo, &["checkout", "-b", "develop"]));
+    std::fs::write(repo.join("d.txt"), "d\n").unwrap();
+    stage_file(repo, "d.txt").unwrap();
+    commit(repo, "develop work", false).unwrap();
+    assert!(git(repo, &["push", "origin", "develop"]));
+    // A worktree branch Monocode started from origin/develop.
+    assert!(git(repo, &["checkout", "-b", "feature"]));
+    assert!(git(
+        repo,
+        &["config", "branch.feature.base", "origin/develop"]
+    ));
+    std::fs::write(repo.join("a.txt"), "beta\n").unwrap();
+    stage_file(repo, "a.txt").unwrap();
+    commit(repo, "feature work", false).unwrap();
+    let index = index(repo);
+    assert_eq!(index.default_branch.as_deref(), Some("main"));
+    assert_eq!(index.pr_base.as_deref(), Some("develop"));
+    assert_eq!(
+        (index.ahead, index.ahead_of_default),
+        (1, 1),
+        "only the feature commit, not develop's"
+    );
+    let range = range_context(repo).unwrap();
+    assert_eq!(range.base, "develop");
+    assert!(range.commit_summary.contains("feature work"));
+    assert!(!range.commit_summary.contains("develop work"));
+    // A base the remote no longer has falls back to the default branch.
+    assert!(git(repo, &["config", "branch.feature.base", "origin/gone"]));
+    assert_eq!(range_context(repo).unwrap().base, "main");
+    assert_eq!(
+        super::diff_index(repo).unwrap().pr_base.as_deref(),
+        Some("main")
+    );
+}
+
+#[test]
 fn feature_branch_without_upstream_counts_and_ranges() {
     let (repo, origin) = (tmp(), tmp());
     let repo = repo.path();
