@@ -392,9 +392,10 @@ impl Conversation {
         // may never end (a dev server), the turn never finishes. Messages
         // queued while the agent was still working would wait behind it
         // forever, so they steer too, in queue order.
+        // A deferred message steers too: its refusal already cleared `ready`
+        // for the turn that refused it, so it can only steer a later turn.
         let yielded = !self.background.tasks.is_empty();
-        // A deferred message was already refused once; it goes as the next turn.
-        let steers = |m: &Message| m.steer || (yielded && !m.deferred && m.can_steer());
+        let steers = |m: &Message| m.steer || (yielded && m.can_steer());
         let messages = &self.follow_ups.state.messages;
         // Paused queues allow explicit continuations after Stop. During normal
         // delivery a later steer must wait for the deferred turn's receipt.
@@ -411,8 +412,11 @@ impl Conversation {
             .as_ref()
             .and_then(|id| available.iter().find(|m| &m.id == id))
             .or_else(|| {
+                // An explicit steer may pass the queue. Steering only because
+                // background work is left keeps queue order: the head below
+                // goes, so a message with a mode is never passed.
                 self.busy
-                    .then(|| available.iter().find(|m| steers(m)))
+                    .then(|| available.iter().find(|m| m.steer))
                     .flatten()
             })
             .or_else(|| available.first());
