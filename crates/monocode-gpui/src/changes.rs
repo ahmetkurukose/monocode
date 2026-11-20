@@ -1092,7 +1092,13 @@ impl Changes {
         let has_open_pr = self.pr.as_ref().is_some_and(|p| p.state == "open");
         let on_default = Self::on_default(Some(index));
         let diverged = ahead > 0 && behind > 0;
-        let files = index.files.len();
+        // Unversioned files never reach a pull request, so only tracked
+        // uncommitted changes keep Create PR off.
+        let tracked = index
+            .files
+            .iter()
+            .filter(|f| !crate::commit_form::is_untracked(f))
+            .count();
         let can_publish = index.upstream.is_none();
         let can_sync = index.upstream.is_some() && (ahead > 0 || behind > 0);
         let can_create_pr = index.branch.is_some()
@@ -1100,7 +1106,7 @@ impl Changes {
             && !has_open_pr
             && !on_default
             && !diverged
-            && files == 0
+            && tracked == 0
             && index.ahead_of_default > 0
             && behind == 0;
         let can_view_pr = has_open_pr && self.pr.as_ref().is_some_and(|p| !p.url.is_empty());
