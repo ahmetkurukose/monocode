@@ -1261,8 +1261,8 @@ fn chat_composer_matches_the_session_box_and_opens_the_model_list(cx: &mut TestA
     assert_eq!(attach.size, gpui::size(px(26.), px(26.)));
     let meter = visual.debug_bounds("mono-context-meter").unwrap();
     assert!(
-        (f32::from(meter.center().x) - f32::from(send.center().x)).abs() < 0.5,
-        "the context meter sits under send: {meter:?} vs {send:?}"
+        (f32::from(meter.right()) - f32::from(send.right())).abs() < 0.5,
+        "the context meter lines up with send's right edge: {meter:?} vs {send:?}"
     );
     let chat = visual.update(|_, cx| s.manager.read(cx).chat().unwrap());
     for draft in [
