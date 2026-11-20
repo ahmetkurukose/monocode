@@ -21,6 +21,14 @@ pub(super) struct WorktreeUi {
     pub delete: Option<super::worktree_delete::DeleteDialog>,
     pub kept: Vec<super::worktree_delete::KeptBranch>,
     pub next_kept: u64,
+    /// Worktrees being merged into their base.
+    pub merging: std::collections::HashSet<String>,
+    /// The last merge's outcome, shown until dismissed.
+    pub merged: Option<String>,
+    /// Merges asked for without a window (a chat's pill): (project, path, delete).
+    pub pending_merges: Vec<(String, String, bool)>,
+    /// Agents' deletes of the worktree their own turn runs in, until the turn ends.
+    pub after_turn: Vec<super::worktree_app::DeleteAfterTurn>,
     /// Open switchers and the project each lists.
     /// (The menu builds its flyout from `&Shell`.)
     switchers: std::cell::RefCell<Vec<(String, gpui::WeakEntity<WorktreeSwitcher>)>>,

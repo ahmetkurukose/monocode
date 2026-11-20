@@ -565,7 +565,7 @@ mod tests {
             meta.created_by,
             monocode_core::worktree::CreatedBy::Automation
         );
-        assert_eq!(meta.base_ref, "HEAD");
+        assert_eq!(meta.base_ref, "topic", "HEAD is recorded as its branch");
         let made = std::process::Command::new("git")
             .current_dir(&cwd)
             .args(["rev-parse", "HEAD"])

@@ -579,6 +579,12 @@ impl Shell {
                 RightTab::Files,
             ),
             ("right-panel-history", "History", "clock", RightTab::Graph),
+            (
+                "right-panel-worktrees",
+                "Worktrees",
+                "git-branch-2",
+                RightTab::Worktrees,
+            ),
         ];
         if self.terminal_in_panel(cx) {
             tabs.insert(
@@ -965,7 +971,7 @@ mod tests {
             };
             let label_selector = Box::leak(format!("{}-label", selectors[1]).into_boxed_str());
             let mut full_label_width = None;
-            for width in [420., 290., 270., 260., 220., 420.] {
+            for width in [420., 320., 270., 260., 220., 420.] {
                 window
                     .update(visual, |shell, _, cx| {
                         shell.workspace.new_layout_boxy = boxy;
@@ -998,7 +1004,7 @@ mod tests {
                         assert_eq!(label.size.width, full_width);
                     }
                     full_label_width = Some(label.size.width);
-                } else if width == 290. {
+                } else if width == 320. {
                     let label = visual.debug_bounds(label_selector).unwrap();
                     assert!(label.size.width > px(0.));
                     assert!(label.size.width < full_label_width.unwrap());

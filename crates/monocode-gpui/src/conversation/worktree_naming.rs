@@ -4,7 +4,7 @@ use monocode_core::git::{self, naming};
 
 impl Conversation {
     pub(super) fn generate_worktree_branch(&mut self, message: &str, cx: &mut Context<Self>) {
-        if message.trim().is_empty() {
+        if message.trim().is_empty() || self.worktree_named {
             return;
         }
         let text = self.background_text_model(cx);

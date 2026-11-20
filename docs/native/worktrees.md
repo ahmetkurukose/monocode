@@ -201,7 +201,41 @@ call just created, delete meta; never touch pre-existing branches.
    the same request id waits for the finished session instead of a half-made one; the
    database lock is not held while Git runs.
 
-## 8. Test isolation
+## 8. Merging back, the Worktrees tab and agents
+
+- **Base**: the local branch `branch.<b>.base` names (`origin/main` means local `main`);
+  `worktree::merge::{status, merge, base_of, find, delete_merged_branch}`. `status`
+  reports commits to merge (`ahead`), `behind`, uncommitted tracked files and the checkout
+  that has the base checked out.
+- **Merge** (`merge::merge`): only commits; uncommitted tracked changes refuse it. With the
+  base checked out (usually the main checkout) it runs `git merge --no-edit <tip>` there;
+  a conflict is aborted and reported, nothing changes. A base checked out nowhere is
+  fast-forwarded or gets a `merge-tree` + `commit-tree` merge commit, moved with a
+  compare-and-swap `update-ref`.
+- **Merge & delete** (`Shell::merge_worktree`): merge, then the usual removal with the
+  branch deleted when the base has it (`delete_merged_branch`, even if `branch -d`
+  judges it against another HEAD). Local files that would be lost open the Delete
+  dialog (agents get an error and may pass `force`). A "Merged …" toast reports it.
+- **Chats of a deleted worktree** move to the checkout of its base (`detach_worktree(…, to)`):
+  they carry on there (`worktree_removed` false); without such a checkout, the old
+  behaviour (main checkout, marked removed). The rail follows `session_worktrees`.
+- **Chat pill**: a session in a worktree whose branch has commits its base lacks, with
+  nothing uncommitted, offers "Merge to <base>" and "Merge to <base> & delete worktree";
+  it is the pill's main action once the Git work is committed.
+- **Worktrees tab** (right panel, `worktrees_pane.rs`): every working copy with to-merge /
+  behind / uncommitted / merged / missing / locked chips, chat count, and Open, Merge,
+  Merge & delete, Delete…, New worktree. Reloads with the rail's worktree lists.
+- **Agents** (Operator threads and Monos): `worktrees.merge {path?,branch?,delete?,force?}`
+  and `worktrees.delete {path?,branch?,force?,deleteSessions?}` run the same Shell paths.
+  Without path or branch an Operator thread means its own worktree; deleting the worktree
+  the caller's turn runs in waits until that turn ends (`worktree_ui.after_turn`).
+- **Rail**: worktree rows are open by default; `Workspace.project_rail_worktrees_collapsed`
+  remembers the ones the user closed.
+- **Names**: the composer's new worktree asks the model for its name first (up to 8 s,
+  `git::naming::generate_within`), so the folder and the branch share it; on timeout the
+  prompt's first words are used and the branch is renamed later as before.
+
+## 9. Test isolation
 
 `layout::default_root()` honours `MONOCODE_WORKTREE_ROOT` (set and non-empty) before the home
 directory. Tests never write to the real `~/monocode`: `layout::isolate_for_tests()` sets the

@@ -1211,8 +1211,9 @@ impl Changes {
             })
             .when(show_create, |d| {
                 let title = index
-                    .default_branch
+                    .pr_base
                     .as_ref()
+                    .or(index.default_branch.as_ref())
                     .map_or("Create pull request".to_owned(), |b| {
                         format!("Create a pull request into {b}")
                     });

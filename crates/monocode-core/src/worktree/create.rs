@@ -217,7 +217,9 @@ pub fn create(
             return Err(format!("There is no branch named {branch}"));
         }
     } else {
-        let resolved = base::resolve(&main, req.base.as_deref(), repo.default_base.as_deref())?;
+        // Resolved in the caller's checkout: refs are shared, but `HEAD` is the caller's
+        // own (an automation run from a linked worktree starts from that worktree).
+        let resolved = base::resolve(&req.cwd, req.base.as_deref(), repo.default_base.as_deref())?;
         warnings.extend(resolved.warnings.iter().cloned());
         if let (Some((remote, branch)), true) = (&resolved.remote, req.fetch) {
             progress(Phase::Fetching);
@@ -228,16 +230,23 @@ pub fn create(
                 ));
             }
         }
-        let sha = base::commit_of(&main, &resolved)?;
-        let kind = if resolved.commit {
+        let sha = base::commit_of(&req.cwd, &resolved)?;
+        // Record what `HEAD` meant at creation: its branch, else (detached) the commit.
+        let head_branch = (resolved.qualified == "HEAD")
+            .then(|| git(&req.cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok())
+            .flatten()
+            .map(|b| b.trim().to_owned())
+            .filter(|b| !b.is_empty());
+        let commit = resolved.commit || (resolved.qualified == "HEAD" && head_branch.is_none());
+        let kind = if commit {
             StartKind::Commit
         } else {
             StartKind::Base
         };
-        let reference = if resolved.commit {
+        let reference = if commit {
             sha.clone()
         } else {
-            resolved.reference.clone()
+            head_branch.unwrap_or_else(|| resolved.reference.clone())
         };
         (Mode::New { sha }, reference, kind)
     };

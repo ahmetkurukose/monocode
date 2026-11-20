@@ -1548,6 +1548,7 @@ impl Store {
         &self,
         path: &str,
         main: &str,
+        to: Option<&str>,
     ) -> Result<Vec<(Session, Settings)>, String> {
         let tx = sql(self.conn.unchecked_transaction())?;
         let mut out = Vec::new();
@@ -1557,15 +1558,7 @@ impl Store {
             if !crate::files::is_equal_or_inside(execution, path) {
                 continue;
             }
-            settings.worktree_cwd = Some(execution.into());
-            settings.worktree_removed = true;
-            settings.revision += 1;
-            settings.new_worktree = false;
-            settings.worktree_base = None;
-            if crate::files::is_equal_or_inside(&session.cwd, path) {
-                session.cwd = main.into();
-            }
-            session.provider_id = None;
+            super::detach_session(&mut session, &mut settings, path, main, to);
             self.shared_patch(
                 session.id,
                 &[

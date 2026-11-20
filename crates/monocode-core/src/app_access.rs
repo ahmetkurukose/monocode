@@ -31,6 +31,8 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
             | "notes.write"
             | "worktrees.list"
             | "worktrees.create"
+            | "worktrees.merge"
+            | "worktrees.delete"
             | "api.list"
             | "api.read"
             | "api.run"

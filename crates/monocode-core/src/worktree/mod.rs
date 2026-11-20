@@ -49,6 +49,11 @@
 //! remove::remove(cwd, path, opts: &RemoveOptions, store: &Mutex<Store>) -> Result<Removed, String>
 //! remove::force_delete_branch(cwd: &Path, branch: &str) -> Result<(), String>
 //!
+//! merge::status(worktree: &Path) -> Result<merge::Status, String>       // base, ahead/behind, dirty, target checkout
+//! merge::merge(worktree: &Path) -> Result<merge::Merged, String>        // into its base; a conflict changes nothing
+//! merge::base_branch(cwd, branch) -> Option<String>                    // branch.<b>.base as a local branch
+//! merge::checkout_of(cwd, branch) -> Option<PathBuf>
+//!
 //! meta::key(path: &Path) -> String                                    // files::path_key(canonical path)
 //! meta::{load, save, delete, all}(store, …)                           // `worktree:<key>`
 //! meta::{repo_prefs, save_repo_prefs}(store, main, …)                 // `worktree-repo:<key>`
@@ -66,6 +71,7 @@ pub mod config;
 pub mod content;
 pub mod create;
 pub mod layout;
+pub mod merge;
 pub mod meta;
 pub mod naming;
 pub mod remove;

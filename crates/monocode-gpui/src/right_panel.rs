@@ -61,6 +61,8 @@ pub(crate) enum RightTab {
     Files,
     Changes,
     Graph,
+    /// The project's worktrees and where each stands against its base.
+    Worktrees,
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
     Terminal,
@@ -81,6 +83,7 @@ impl Serialize for RightTab {
             Self::Files | Self::Extra(_) => "files",
             Self::Changes => "changes",
             Self::Graph => "graph",
+            Self::Worktrees => "worktrees",
             Self::Terminal => "terminal",
         })
     }
@@ -91,6 +94,7 @@ impl RightTab {
             Self::Files => "Explorer",
             Self::Changes => "Changes",
             Self::Graph => "History",
+            Self::Worktrees => "Worktrees",
             Self::Terminal => "Terminal",
             Self::Extra(tab) => tab.0,
         }
@@ -101,6 +105,7 @@ impl RightTab {
             Self::Files => "files",
             Self::Changes => "changes",
             Self::Graph => "graph",
+            Self::Worktrees => "worktrees",
             Self::Terminal => "terminal",
             Self::Extra(tab) => tab.0,
         }
@@ -109,7 +114,10 @@ impl RightTab {
     /// Changes has no tab; the title bar's diff stat opens it.
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
-        for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
+        for tab in order
+            .iter()
+            .chain(&[Self::Files, Self::Graph, Self::Worktrees])
+        {
             if !matches!(tab, Self::Terminal | Self::Changes | Self::Extra(_)) && !out.contains(tab)
             {
                 out.push(*tab);
@@ -284,6 +292,7 @@ pub(crate) struct RightPanel {
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
     pub history: Entity<History>,
+    pub worktrees: Entity<crate::worktrees_pane::WorktreesPane>,
     focus: FocusHandle,
     tab: RightTab,
     order: Vec<RightTab>,
@@ -327,6 +336,7 @@ impl RightPanel {
             changes
         });
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
+        let worktrees = cx.new(|cx| crate::worktrees_pane::WorktreesPane::new(git.clone(), cx));
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),
@@ -343,17 +353,18 @@ impl RightPanel {
             explorer,
             changes,
             history,
+            worktrees,
             tab,
             order: RightTab::normalize(&order),
             shown: false,
             sidebar_tab: None,
             terminal_tab: false,
             top_inset: 0.,
-            tab_width: tabs_width(3),
+            tab_width: tabs_width(4),
             drag: None,
             reveal: None,
             skip_click: false,
-            tab_bounds: (0..4).map(|_| Default::default()).collect(),
+            tab_bounds: (0..5).map(|_| Default::default()).collect(),
             extras: Vec::new(),
             strip: Vec::new(),
             _subscriptions: subscriptions,
@@ -501,11 +512,15 @@ impl RightPanel {
         self.history.update(cx, |h, cx| {
             h.set_enabled(shown && tab == RightTab::Graph, cx)
         });
+        self.worktrees.update(cx, |w, cx| {
+            w.set_enabled(shown && tab == RightTab::Worktrees, cx)
+        });
     }
     pub(crate) fn focus_pane(&self, window: &mut Window, cx: &mut App) {
         let focus = match (self.shown, self.tab) {
             (true, RightTab::Files) => self.explorer.focus_handle(cx),
             (true, RightTab::Graph) => self.history.focus_handle(cx),
+            (true, RightTab::Worktrees) => self.worktrees.focus_handle(cx),
             (true, tab @ RightTab::Extra(_)) => (self.extra(tab))
                 .and_then(|extra| extra.focus.clone())
                 .unwrap_or_else(|| self.focus.clone()),
@@ -623,6 +638,9 @@ impl RightPanel {
                     RightTab::Files => ("right-panel-tab-Explorer", "file-script", tab.label()),
                     RightTab::Changes => ("right-panel-tab-Changes", "git-branch", tab.label()),
                     RightTab::Graph => ("right-panel-tab-History", "clock", tab.label()),
+                    RightTab::Worktrees => {
+                        ("right-panel-tab-Worktrees", "git-branch-2", tab.label())
+                    }
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal", tab.label()),
                     RightTab::Extra(ExtraTab(id)) => match self.extra(tab) {
                         Some(extra) => (id, extra.icon, extra.title),
@@ -727,6 +745,11 @@ impl Render for RightPanel {
                 .clone()
                 .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
                 .into_any_element(),
+            RightTab::Worktrees => self
+                .worktrees
+                .clone()
+                .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+                .into_any_element(),
             // The shell paints the terminal over this pane.
             RightTab::Terminal => div().into_any_element(),
             tab @ RightTab::Extra(_) => div()
@@ -765,11 +788,11 @@ mod tests {
     fn tab_order_keeps_known_tabs_once() {
         assert_eq!(
             RightTab::normalize(&[RightTab::Graph, RightTab::Graph]),
-            [RightTab::Graph, RightTab::Files]
+            [RightTab::Graph, RightTab::Files, RightTab::Worktrees]
         );
         assert_eq!(
             RightTab::normalize(&[RightTab::Changes, RightTab::Graph]),
-            [RightTab::Graph, RightTab::Files]
+            [RightTab::Graph, RightTab::Files, RightTab::Worktrees]
         );
         assert_eq!(format_integer(1234567), "1,234,567");
         assert_eq!(format_integer(12), "12");

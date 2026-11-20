@@ -50,6 +50,21 @@ pub fn for_session(
     created_by: CreatedBy,
     store: &Mutex<Store>,
 ) -> Result<SessionWorktree, String> {
+    for_session_named(cwd, base_ref, prompt, None, session, created_by, store)
+}
+
+/// [`for_session`] with a name already chosen (e.g. generated from the prompt before
+/// the worktree is made, so the folder and the branch share it); `None` or an
+/// unusable name falls back to the prompt's first words.
+pub fn for_session_named(
+    cwd: &Path,
+    base_ref: Option<&str>,
+    prompt: &str,
+    name: Option<&str>,
+    session: i64,
+    created_by: CreatedBy,
+    store: &Mutex<Store>,
+) -> Result<SessionWorktree, String> {
     if crate::files::remote::is_remote(cwd) {
         return git::create_worktree(cwd, base_ref.unwrap_or("HEAD"), session).map(|path| {
             SessionWorktree {
@@ -61,7 +76,12 @@ pub fn for_session(
     let request = CreateRequest {
         base: base_for(created_by, base_ref),
         created_by,
-        ..CreateRequest::new(cwd, &worktree::naming::from_prompt(prompt))
+        ..CreateRequest::new(
+            cwd,
+            &name
+                .and_then(|n| worktree::naming::slug(n).ok())
+                .unwrap_or_else(|| worktree::naming::from_prompt(prompt)),
+        )
     };
     worktree::create::create(&request, store, &|_| {}).map(|created| SessionWorktree {
         path: created.path,
@@ -218,6 +238,38 @@ mod tests {
     }
 
     #[test]
+    fn a_session_worktree_named_beforehand_shares_the_name_with_its_branch() {
+        let (temp, main) = repo();
+        let root = temp.path().canonicalize().unwrap().join("workspaces");
+        let store = store(&root);
+        let made = for_session_named(
+            &main,
+            None,
+            "bu projedeki tab yönetme biçiminden hoşlanmıyorum",
+            Some("worktree-experience-audit"),
+            1,
+            CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        assert!(made.path.ends_with("worktree-experience-audit"));
+        let branch = git::git(&made.path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "worktree-experience-audit");
+        // An unusable name falls back to the prompt.
+        let made = for_session_named(
+            &main,
+            None,
+            "fix the build",
+            Some("..."),
+            2,
+            CreatedBy::Composer,
+            &store,
+        )
+        .unwrap();
+        assert!(made.path.ends_with("fix-the-build"));
+    }
+
+    #[test]
     fn api_worktrees_start_from_head_validate_branches_and_may_shadow_origin_names() {
         let (temp, main) = repo();
         let root = temp.path().canonicalize().unwrap().join("workspaces");
@@ -239,13 +291,30 @@ mod tests {
         let m = meta::load(&lock(&store), Path::new(&tree.path))
             .unwrap()
             .unwrap();
-        assert_eq!(m.base_ref, "HEAD");
+        let current = git::git(&main, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(m.base_ref, current.trim(), "HEAD is recorded as its branch");
         let session = for_session(&main, None, "api session", 3, CreatedBy::Api, &store).unwrap();
         assert_eq!(head(&session.path), head(&main));
         for by in [CreatedBy::Automation, CreatedBy::Mobile] {
             let made = for_session(&main, None, "from elsewhere", 4, by, &store).unwrap();
             assert_eq!(head(&made.path), head(&main), "{by:?} starts from HEAD");
         }
+        // HEAD is the caller's own: from a linked worktree, that worktree's commit.
+        let linked = Path::new(&tree.path);
+        git::git(linked, &["commit", "-q", "--allow-empty", "-m", "Linked"]).unwrap();
+        let child = for_session(
+            linked,
+            None,
+            "from linked",
+            5,
+            CreatedBy::Automation,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(head(&child.path), head(linked));
+        assert_ne!(head(&child.path), head(&main));
+        let m = meta::load(&lock(&store), &child.path).unwrap().unwrap();
+        assert_eq!(m.base_ref, "api/one");
         // The dialog's callers keep the repository's default base.
         let dialog = named(&main, "from-dialog", None, false, CreatedBy::Dialog, &store).unwrap();
         assert_ne!(dialog.head, head(&main));

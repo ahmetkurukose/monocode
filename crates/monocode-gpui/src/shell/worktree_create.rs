@@ -356,8 +356,8 @@ impl Shell {
                 .project_rail_expanded
                 .insert(pending.project.clone());
             self.workspace
-                .project_rail_worktrees_expanded
-                .insert(path.clone());
+                .project_rail_worktrees_collapsed
+                .remove(&path);
         }
         if path_key(&self.workspace.project) == path_key(&pending.project) {
             self.select_worktree(Some(focus), window, cx);
@@ -410,6 +410,7 @@ impl Shell {
     /// Cards for failed creations (Retry / Dismiss) and creation warnings.
     pub(super) fn worktree_notices(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut cards = self.kept_branch_cards(cx);
+        cards.extend(self.merged_notice(cx));
         for pending in self.pending_worktrees.iter().filter(|p| p.error.is_some()) {
             let id = pending.id;
             let message = format!(

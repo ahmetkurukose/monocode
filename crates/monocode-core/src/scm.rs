@@ -74,8 +74,13 @@ pub struct DiffIndex {
     pub remote: Option<String>,
     pub upstream: Option<String>,
     pub default_branch: Option<String>,
+    /// The branch a pull request goes into: the worktree's recorded base, else the
+    /// default branch. Absent from older remote hosts.
+    #[serde(default)]
+    pub pr_base: Option<String>,
     pub ahead: i64,
     pub behind: i64,
+    /// Commits ahead of the pull request's base ([`Self::pr_base`]).
     pub ahead_of_default: i64,
     pub head_pushed: bool,
 }
@@ -474,7 +479,8 @@ pub fn selected_context(cwd: &Path, paths: &[String]) -> Result<StagedContext, S
     })
 }
 
-/// Commits and diff between the default branch and HEAD, for PR text generation.
+/// Commits and diff between the pull request's base (the worktree's recorded base, else
+/// the default branch) and HEAD, for PR text generation.
 pub fn range_context(cwd: &Path) -> Result<RangeContext, String> {
     if remote_workspace::is_remote(cwd) {
         return remote_workspace::command("git_range_context", json!({"cwd":cwd}));
@@ -483,16 +489,8 @@ pub fn range_context(cwd: &Path) -> Result<RangeContext, String> {
     let root = root.as_path();
     let head = git_branch(root).ok_or_else(|| "Not on a branch".to_string())?;
     let remote = git_remote_name(root);
-    let default_branch = git_default_branch(root, remote.as_deref())
+    let (base, base_ref) = git_pr_base(root, Some(&head), remote.as_deref())
         .ok_or_else(|| "Could not resolve the default branch".to_string())?;
-    let base_ref = match &remote {
-        Some(remote)
-            if git_ref_exists(root, &format!("refs/remotes/{remote}/{default_branch}")) =>
-        {
-            format!("{remote}/{default_branch}")
-        }
-        _ => default_branch.clone(),
-    };
     let spec = format!("{base_ref}...HEAD");
     let commit_summary =
         git_run(root, &["log", "--format=%s", &format!("{base_ref}..HEAD")]).unwrap_or_default();
@@ -502,7 +500,7 @@ pub fn range_context(cwd: &Path) -> Result<RangeContext, String> {
         return Err("No commits to include in a pull request".into());
     }
     Ok(RangeContext {
-        base: default_branch,
+        base,
         head,
         commit_summary,
         diff_summary,
@@ -786,6 +784,7 @@ fn diff_index_with(root: &Path, include_sync: bool) -> DiffIndex {
         remote: sync.remote,
         upstream: sync.upstream,
         default_branch: sync.default_branch,
+        pr_base: sync.pr_base,
         ahead: sync.ahead,
         behind: sync.behind,
         ahead_of_default: sync.ahead_of_default,
@@ -1453,6 +1452,7 @@ struct Sync {
     remote: Option<String>,
     upstream: Option<String>,
     default_branch: Option<String>,
+    pr_base: Option<String>,
     ahead: i64,
     behind: i64,
     ahead_of_default: i64,
@@ -1463,10 +1463,12 @@ fn sync_for(root: &Path) -> Sync {
     let remote = git_remote_name(root);
     let upstream = git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
     let default_branch = git_default_branch(root, remote.as_deref());
-    let default_ref = match (&remote, &default_branch) {
-        (Some(remote), Some(branch)) => Some(format!("{remote}/{branch}")),
-        _ => None,
-    };
+    let base = remote.as_deref().and_then(|remote| {
+        git_pr_base(root, git_branch(root).as_deref(), Some(remote))
+            .filter(|(name, _)| git_ref_exists(root, &format!("refs/remotes/{remote}/{name}")))
+    });
+    let pr_base = base.as_ref().map(|(name, _)| name.clone());
+    let default_ref = base.map(|(_, compare)| compare);
     let (ahead, behind) = if upstream.is_some() {
         git_ahead_behind(root, "@{upstream}")
     } else if let Some(base) = default_ref.as_deref() {
@@ -1495,6 +1497,7 @@ fn sync_for(root: &Path) -> Sync {
         remote,
         upstream,
         default_branch,
+        pr_base,
         ahead,
         behind,
         ahead_of_default,
@@ -1542,6 +1545,41 @@ fn git_default_branch(root: &Path, remote: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// The branch a pull request from `branch` goes into, and the ref to compare HEAD with:
+/// the base Monocode recorded when it made the branch's worktree (`branch.<b>.base`,
+/// e.g. `origin/develop`) while that is another branch the remote still has; else the
+/// default branch (`origin/<default>` when the remote has it).
+fn git_pr_base(
+    root: &Path,
+    branch: Option<&str>,
+    remote: Option<&str>,
+) -> Option<(String, String)> {
+    if let (Some(branch), Some(remote)) = (branch, remote) {
+        let recorded = git_stdout(root, &["config", "--get", &format!("branch.{branch}.base")]);
+        if let Some(recorded) = recorded {
+            let name = recorded
+                .strip_prefix(&format!("{remote}/"))
+                .unwrap_or(&recorded);
+            if !name.is_empty()
+                && name != branch
+                && git_ref_exists(root, &format!("refs/remotes/{remote}/{name}"))
+            {
+                return Some((name.to_owned(), format!("{remote}/{name}")));
+            }
+        }
+    }
+    let default_branch = git_default_branch(root, remote)?;
+    let compare = match remote {
+        Some(remote)
+            if git_ref_exists(root, &format!("refs/remotes/{remote}/{default_branch}")) =>
+        {
+            format!("{remote}/{default_branch}")
+        }
+        _ => default_branch.clone(),
+    };
+    Some((default_branch, compare))
 }
 
 fn git_ref_exists(root: &Path, spec: &str) -> bool {
