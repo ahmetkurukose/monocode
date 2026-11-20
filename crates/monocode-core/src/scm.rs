@@ -387,7 +387,12 @@ pub fn staged_context(cwd: &Path) -> Result<StagedContext, String> {
         summary = git_run(root, &["diff", "HEAD", "--stat", "--", "."]).unwrap_or_default();
         patch = git_run(root, &["diff", "HEAD", "--no-ext-diff", "--", "."]).unwrap_or_default();
         if let Some(untracked) = git_run(root, &["ls-files", "--others", "--exclude-standard"]) {
-            let names = untracked.trim();
+            let names = untracked
+                .lines()
+                .filter(|name| !name.ends_with('/'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let names = names.trim();
             if !names.is_empty() {
                 if !summary.trim().is_empty() {
                     summary.push('\n');
@@ -874,7 +879,9 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
         return;
     };
     for rel in stdout.split('\0') {
-        if rel.is_empty() {
+        // A nested repository (a worktree, a clone) is listed as `dir/`. It is
+        // not this repository's file: committing it would add a gitlink.
+        if rel.is_empty() || rel.ends_with('/') {
             continue;
         }
         let relative = path_to_js(Path::new(rel));

@@ -20,6 +20,7 @@ mod code_editor;
 mod code_insight;
 mod code_shell;
 mod commit_dialog;
+mod commit_form;
 mod composer_completion;
 mod composer_motion;
 mod composer_runner;

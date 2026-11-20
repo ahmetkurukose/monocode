@@ -1834,7 +1834,7 @@ impl Shell {
         self.git.update(cx, |git, cx| git.set_project(project, cx));
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
-            changes.update(cx, |c, _| c.text_provider = kind);
+            changes.update(cx, |c, cx| c.set_text_provider(kind, cx));
         }
         self.sync_right_panel(cx);
     }
@@ -2140,10 +2140,9 @@ impl Shell {
             return;
         }
         let git = self.git.clone();
-        let (tab, order, view) = (
+        let (tab, order) = (
             self.workspace.right_panel_tab,
             self.workspace.right_panel_tabs.clone(),
-            self.workspace.changes_view,
         );
         let strip = self.workspace.right_panel_strip.clone();
         let terminal_tab = self.terminal_in_panel(cx);
@@ -2234,7 +2233,6 @@ impl Shell {
             },
         ));
         let changes = panel.read(cx).changes.clone();
-        changes.update(cx, |c, cx| c.set_view(view, cx));
         self.observations
             .push(cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
                 match event {
@@ -2254,16 +2252,12 @@ impl Shell {
             window,
             |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
                 crate::changes::ChangesEvent::Overlays => cx.notify(),
-                crate::changes::ChangesEvent::View(view) => {
-                    this.workspace.changes_view = *view;
-                    this.persist(cx);
-                }
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review(
                         crate::review::ReviewTab::Changes {
                             cwd: cwd.clone(),
                             path: path.clone(),
-                            staged: Some(*staged),
+                            staged: *staged,
                         },
                         window,
                         cx,

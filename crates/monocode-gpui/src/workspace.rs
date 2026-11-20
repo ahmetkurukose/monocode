@@ -148,7 +148,6 @@ pub(crate) struct Workspace {
     pub right_panel_tab: crate::right_panel::RightTab,
     pub right_panel_width: f32,
     pub right_panel_tabs: Vec<crate::right_panel::RightTab>,
-    pub changes_view: crate::changes::ChangesView,
     /// Each tab's file/review pane beside its chat.
     pub reviews: std::collections::HashMap<i64, crate::review::ReviewState>,
     /// Independent file panes use negative IDs in the layout tree. Their
@@ -486,7 +485,6 @@ impl Default for Workspace {
             right_panel_tab: Default::default(),
             right_panel_width: crate::right_panel::WIDTH_DEFAULT,
             right_panel_tabs: crate::right_panel::RightTab::normalize(&[]),
-            changes_view: Default::default(),
             reviews: Default::default(),
             review_owners: Default::default(),
             terminal_panes: Default::default(),

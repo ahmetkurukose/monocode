@@ -46,7 +46,6 @@ pub(crate) const DIFF_ADD: u32 = 0x6ee7b7;
 pub(crate) const DIFF_DEL: u32 = 0xfda4af;
 // Tailwind v4.
 pub(crate) const AMBER_400: u32 = 0xffb900;
-pub(crate) const SKY_400: u32 = 0x00bcff;
 pub(crate) const RED_400: u32 = 0xff6467;
 /// `--color-background-base` in the default dark theme, hsl(240 0% 9%).
 pub(crate) const BACKGROUND_BASE: u32 = 0x171717;

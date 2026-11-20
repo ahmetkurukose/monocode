@@ -347,16 +347,13 @@ impl Monos {
                 .unwrap_or(Kind::Codex);
             let changes = cx.new(|cx| {
                 let mut view = crate::changes::Changes::new(git.clone(), window, cx);
-                view.text_provider = provider;
+                view.set_text_provider(provider, cx);
                 view
             });
             let event_key = key.clone();
             let changes_event = cx.subscribe(
                 &changes,
-                move |this, view, event: &crate::changes::ChangesEvent, cx| match event {
-                    crate::changes::ChangesEvent::View(mode) => {
-                        view.update(cx, |v, cx| v.set_view(*mode, cx))
-                    }
+                move |this, _, event: &crate::changes::ChangesEvent, cx| match event {
                     crate::changes::ChangesEvent::Overlays => {}
                     crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                         this.open_change_review(&event_key, cwd, path.as_deref(), *staged, cx)
@@ -401,7 +398,7 @@ impl Monos {
         key: &(String, String),
         cwd: &str,
         path: Option<&str>,
-        staged: bool,
+        staged: Option<bool>,
         cx: &mut Context<Self>,
     ) {
         // A retained surface never follows another Mono's current selection.
@@ -462,7 +459,7 @@ impl Monos {
                 crate::review::ReviewTab::Changes {
                     cwd: cwd.into(),
                     path: path.map(str::to_owned),
-                    staged: Some(staged),
+                    staged,
                 },
                 cx,
             )

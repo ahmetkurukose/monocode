@@ -525,7 +525,7 @@ impl Shell {
             || self.notification_state.whats_new.is_some()
             || self.resources.read(cx).is_open()
             || (self.right_panel.as_ref())
-                .is_some_and(|panel| panel.read(cx).changes.read(cx).has_overlay())
+                .is_some_and(|panel| panel.read(cx).changes.read(cx).has_overlay(cx))
     }
 
     /// Frees what loaded pages hold when the rules say so: off screen too

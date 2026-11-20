@@ -196,6 +196,22 @@ fn diff_index_lists_modified_and_untracked() {
 }
 
 #[test]
+fn diff_index_leaves_out_nested_repositories() {
+    let dir = tmp();
+    let dir = dir.path();
+    assert!(init_git_commit(dir, &[("a.txt", "alpha\n")]));
+    // A linked worktree inside the checkout, as `.claude/worktrees/x` is.
+    assert!(git(dir, &["worktree", "add", "-q", ".claude/worktrees/x"]));
+    std::fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+    let index = index(dir);
+    let names: Vec<&str> = index.files.iter().map(|f| f.relative.as_str()).collect();
+    assert_eq!(names, ["new.txt"]);
+    assert_eq!(index.additions, 1);
+    assert_eq!(diff_stats(dir).unwrap().files, 1);
+}
+
+#[test]
 fn diff_index_reports_added_and_deleted() {
     let dir = tmp();
     let dir = dir.path();

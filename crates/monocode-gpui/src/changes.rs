@@ -1,13 +1,13 @@
-//! GitChangesPanel.tsx in the inset layout: the Changes header with branch
-//! actions, the commit box, sync and pull-request actions, and the staged
-//! and unstaged files as a list or a tree. Every Git call runs off-thread,
+//! The Changes panel: the header with branch actions, the commit box, sync
+//! and pull-request actions, and the changed files as a tree with a checkbox
+//! each. The files, the message and the commit are the commit form the Commit
+//! window shows too ([`crate::commit_form`]). Every Git call runs off-thread,
 //! one mutation at a time per checkout.
 use crate::{
     branch_popup::{BranchPopup, PopupEvent},
     commit_dialog::{CommitDialog, CommitDialogEvent},
-    file_icons::file_type_icon,
+    commit_form::{CommitForm, CommitFormEvent, Surface},
     git_status::{GitChanged, ProjectGit},
-    input::{self, Input},
     popover::{
         Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
         menu_popover, popover,
@@ -18,17 +18,15 @@ use crate::{
     update_dialog::{Source, UpdateDialog, UpdateDialogEvent},
 };
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FontWeight, Hsla, PromptLevel, Role,
-    SharedString, Subscription, Task, Window, div, prelude::*, px, rgb, uniform_list,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, FontWeight, Hsla, PromptLevel,
+    Role, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
-    scm::{self, ChangedFile, DiffIndex, Pr, UpdateMethod},
+    scm::{self, DiffIndex, Pr, UpdateMethod},
 };
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -37,45 +35,17 @@ use std::{
     time::Duration,
 };
 
-const MOD: &str = if cfg!(target_os = "macos") {
-    "⌘"
-} else {
-    "Ctrl+"
-};
-const ROW: f32 = 28.;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ChangesView {
-    #[default]
-    List,
-    Tree,
-}
 pub(crate) enum ChangesEvent {
-    View(ChangesView),
     /// A dialog or the branch switcher opened or closed: the shell redraws.
     Overlays,
     /// A file's review, or all of one side's when `path` is None.
     OpenDiff {
         cwd: String,
         path: Option<String>,
-        staged: bool,
+        staged: Option<bool>,
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-enum Kind2 {
-    Staged,
-    Unstaged,
-}
-impl Kind2 {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Staged => "staged",
-            Self::Unstaged => "unstaged",
-        }
-    }
-}
 /// Where the branch switcher opens.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum BranchPlace {
@@ -88,121 +58,6 @@ pub(crate) enum BranchPlace {
     Footer,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum FileAction {
-    Stage,
-    Unstage,
-    Discard,
-}
-
-/// One 28px line of the scrolling list.
-#[derive(Clone)]
-enum Line {
-    Section(Kind2),
-    File {
-        kind: Kind2,
-        file: usize,
-        depth: Option<usize>,
-    },
-    Dir {
-        kind: Kind2,
-        path: String,
-        name: String,
-        depth: usize,
-        status: Option<String>,
-        open: bool,
-    },
-}
-
-#[derive(Default)]
-struct ChangeDir {
-    name: String,
-    path: String,
-    dirs: Vec<ChangeDir>,
-    files: Vec<usize>,
-    status: Option<String>,
-}
-/// buildChangeTree / sortChangeDir: folders first, names compared as
-/// `localeCompare` roughly does, and a status shared by every descendant.
-fn build_tree(files: &[ChangedFile], members: &[usize]) -> ChangeDir {
-    let mut root = ChangeDir::default();
-    for &ix in members {
-        let segments: Vec<&str> = files[ix].relative.split('/').collect();
-        let mut node = &mut root;
-        for segment in &segments[..segments.len() - 1] {
-            let path = if node.path.is_empty() {
-                segment.to_string()
-            } else {
-                format!("{}/{segment}", node.path)
-            };
-            let pos = match node.dirs.iter().position(|d| d.path == path) {
-                Some(pos) => pos,
-                None => {
-                    node.dirs.push(ChangeDir {
-                        name: segment.to_string(),
-                        path,
-                        ..Default::default()
-                    });
-                    node.dirs.len() - 1
-                }
-            };
-            node = &mut node.dirs[pos];
-        }
-        node.files.push(ix);
-    }
-    sort_dir(&mut root, files);
-    root
-}
-fn locale_key(s: &str) -> (String, String) {
-    (s.to_lowercase(), s.to_owned())
-}
-fn sort_dir(dir: &mut ChangeDir, files: &[ChangedFile]) -> Option<String> {
-    dir.dirs.sort_by_key(|d| locale_key(&d.name));
-    dir.files
-        .sort_by_key(|&ix| locale_key(basename(&files[ix].relative)));
-    let mut status: Option<String> = None;
-    let mut mixed = false;
-    let mut merge = |next: Option<String>| match (next, &status) {
-        (None, _) => mixed = true,
-        (Some(n), None) => status = Some(n),
-        (Some(n), Some(s)) if &n != s => mixed = true,
-        _ => {}
-    };
-    for child in &mut dir.dirs {
-        merge(sort_dir(child, files));
-    }
-    for &ix in &dir.files {
-        merge(Some(files[ix].status.clone()));
-    }
-    dir.status = if mixed { None } else { status };
-    dir.status.clone()
-}
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-fn dirname(relative: &str) -> &str {
-    match relative.rfind('/') {
-        Some(i) if i > 0 => &relative[..i],
-        _ => "",
-    }
-}
-fn status_letter(status: &str) -> &'static str {
-    match status {
-        "untracked" => "U",
-        "added" => "A",
-        "deleted" => "D",
-        _ => "M",
-    }
-}
-pub(crate) fn status_color(status: &str) -> Hsla {
-    rgb(match status {
-        "untracked" => SKY_400,
-        "added" => DIFF_ADD,
-        "deleted" => DIFF_DEL,
-        _ => AMBER_400,
-    })
-    .into()
-}
 fn sync_status_label(index: &DiffIndex) -> String {
     let plural = |n: i64| if n == 1 { "" } else { "s" };
     if index.ahead > 0 && index.behind > 0 {
@@ -234,25 +89,16 @@ pub(crate) struct Changes {
     git: Entity<ProjectGit>,
     cwd: String,
     enabled: bool,
-    pub(crate) text_provider: Kind,
-    message: Entity<Input>,
-    amend: Option<(Option<String>, Option<String>)>,
+    /// The files, the message and the commit, shared with the Commit window.
+    form: Entity<CommitForm>,
+    /// Takes ⌘⌥Z and ⌘⌥A for the picked file once the list is clicked.
+    list_focus: FocusHandle,
     busy: Option<String>,
     status: Option<String>,
     status_clear: Option<Task<()>>,
     pr: Option<Pr>,
     pr_branch: Option<String>,
     pr_request: u64,
-    generate_cancel: Option<Arc<AtomicBool>>,
-    staged_open: bool,
-    changes_open: bool,
-    view: ChangesView,
-    collapsed: HashSet<String>,
-    selected: Option<(String, Kind2)>,
-    /// The row under the pointer, which shows its actions. Kept as state
-    /// rather than a group-hover `display`, so layout and paint always agree.
-    hovered: Option<usize>,
-    lines: Vec<Line>,
     menu: Option<OpenMenu>,
     branch_anchor: AnchorSlot,
     commit_anchor: AnchorSlot,
@@ -274,34 +120,30 @@ pub(crate) struct Changes {
 impl EventEmitter<ChangesEvent> for Changes {}
 
 impl Changes {
-    pub(crate) fn new(git: Entity<ProjectGit>, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let message = cx.new(Input::commit_message);
+    pub(crate) fn new(
+        git: Entity<ProjectGit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let form = cx.new(|cx| CommitForm::new(git.clone(), window, cx));
         let subscriptions = vec![
             cx.observe(&git, |this, _, cx| this.index_changed(cx)),
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.index_changed(cx)),
-            cx.subscribe(&message, |_, _, _: &input::Changed, cx| cx.notify()),
+            cx.observe(&form, |_, _, cx| cx.notify()),
+            cx.subscribe(&form, Self::form_event),
         ];
         let mut this = Self {
             git,
             cwd: String::new(),
             enabled: false,
-            text_provider: Kind::Claude,
-            message,
-            amend: None,
+            form,
+            list_focus: cx.focus_handle(),
             busy: None,
             status: None,
             status_clear: None,
             pr: None,
             pr_branch: None,
             pr_request: 0,
-            generate_cancel: None,
-            staged_open: true,
-            changes_open: true,
-            view: ChangesView::List,
-            collapsed: HashSet::new(),
-            selected: None,
-            hovered: None,
-            lines: Vec::new(),
             menu: None,
             branch_anchor: AnchorSlot::default(),
             commit_anchor: AnchorSlot::default(),
@@ -316,12 +158,55 @@ impl Changes {
             switch_anchor: AnchorSlot::default(),
             _subscriptions: subscriptions,
         };
-        this.rebuild(cx);
+        this.index_changed(cx);
         this
     }
-    pub(crate) fn set_view(&mut self, view: ChangesView, cx: &mut Context<Self>) {
-        self.view = view;
-        self.rebuild(cx);
+    /// The provider of the conversation in this checkout: it writes commit
+    /// messages and pull requests.
+    pub(crate) fn set_text_provider(&mut self, provider: Kind, cx: &mut Context<Self>) {
+        self.form
+            .update(cx, |form, _| form.text_provider = provider);
+    }
+    fn form_event(
+        &mut self,
+        _: Entity<CommitForm>,
+        event: &CommitFormEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            CommitFormEvent::Selected(Surface::Panel) => {
+                let form = self.form.read(cx);
+                let Some(file) = form.selected_file() else {
+                    return;
+                };
+                // A deleted file has nothing left to open.
+                if file.status == "deleted" {
+                    return;
+                }
+                cx.emit(ChangesEvent::OpenDiff {
+                    cwd: self.cwd.clone(),
+                    path: Some(file.path.clone()),
+                    staged: None,
+                });
+            }
+            CommitFormEvent::Committed { pushed, error } => {
+                self.close_commit_dialog(cx);
+                if !error {
+                    self.set_status(
+                        if *pushed {
+                            "Committed and pushed"
+                        } else {
+                            "Committed"
+                        },
+                        cx,
+                    );
+                }
+                self.load_pr(cx);
+                cx.emit(ChangesEvent::Overlays);
+            }
+            _ => {}
+        }
+        cx.notify();
     }
     pub(crate) fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.enabled == enabled {
@@ -348,31 +233,23 @@ impl Changes {
         let git = self.git.read(cx);
         let project = git.project().to_owned();
         if project != self.cwd {
-            // Checkouts don't share drafts or in-flight generation.
+            // The form resets itself for the new checkout.
             self.cwd = project;
-            self.cancel_generate();
-            self.amend = None;
             self.pr = None;
             self.pr_branch = None;
-            self.selected = None;
-            self.message
-                .update(cx, |m, cx| m.set_text(String::new(), cx));
+            self.form.update(cx, |form, _| form.has_open_pr = false);
         }
-        let index = self.git.read(cx).index.clone();
-        if let Some((branch, head)) = &self.amend
-            && (index.as_ref().map(|i| &i.branch) != Some(branch)
-                || index.as_ref().map(|i| &i.head) != Some(head))
-        {
-            self.amend = None;
-            self.message
-                .update(cx, |m, cx| m.set_text(String::new(), cx));
-        }
-        let branch = index.as_ref().and_then(|i| i.branch.clone());
+        let branch = self
+            .git
+            .read(cx)
+            .index
+            .as_ref()
+            .and_then(|i| i.branch.clone());
         if self.enabled && branch != self.pr_branch {
             self.pr_branch = branch;
             self.load_pr(cx);
         }
-        self.rebuild(cx);
+        cx.notify();
     }
     fn load_pr(&mut self, cx: &mut Context<Self>) {
         self.pr_request += 1;
@@ -385,6 +262,7 @@ impl Changes {
             .and_then(|i| i.branch.clone());
         if self.cwd.is_empty() || self.cwd == "~" || branch.is_none() {
             self.pr = None;
+            self.form.update(cx, |form, _| form.has_open_pr = false);
             return;
         }
         let path = PathBuf::from(&self.cwd);
@@ -395,6 +273,8 @@ impl Changes {
             let pr = work.await.ok().flatten();
             let _ = this.update(cx, |this, cx| {
                 if this.pr_request == request {
+                    let open = pr.as_ref().is_some_and(|p| p.state == "open");
+                    this.form.update(cx, |form, _| form.has_open_pr = open);
                     this.pr = pr;
                     cx.notify();
                 }
@@ -402,69 +282,6 @@ impl Changes {
         })
         .detach();
     }
-    fn staged_unstaged(index: Option<&DiffIndex>) -> (Vec<usize>, Vec<usize>) {
-        let files = index.map_or(&[][..], |i| &i.files[..]);
-        (
-            (0..files.len()).filter(|&i| files[i].staged).collect(),
-            (0..files.len()).filter(|&i| files[i].unstaged).collect(),
-        )
-    }
-    fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let index = self.git.read(cx).index.clone();
-        let (staged, unstaged) = Self::staged_unstaged(index.as_ref());
-        let files = index.as_ref().map_or(&[][..], |i| &i.files[..]);
-        let mut lines = Vec::new();
-        for (kind, members, open) in [
-            (Kind2::Staged, &staged, self.staged_open),
-            (Kind2::Unstaged, &unstaged, self.changes_open),
-        ] {
-            if members.is_empty() {
-                continue;
-            }
-            lines.push(Line::Section(kind));
-            if !open {
-                continue;
-            }
-            match self.view {
-                ChangesView::List => lines.extend(members.iter().map(|&file| Line::File {
-                    kind,
-                    file,
-                    depth: None,
-                })),
-                ChangesView::Tree => {
-                    let tree = build_tree(files, members);
-                    self.push_dir(&tree, kind, 0, &mut lines);
-                }
-            }
-        }
-        self.lines = lines;
-        self.hovered = None;
-        cx.notify();
-    }
-    fn push_dir(&self, dir: &ChangeDir, kind: Kind2, depth: usize, lines: &mut Vec<Line>) {
-        for child in &dir.dirs {
-            let open = !self
-                .collapsed
-                .contains(&format!("{}:{}", kind.key(), child.path));
-            lines.push(Line::Dir {
-                kind,
-                path: child.path.clone(),
-                name: child.name.clone(),
-                depth,
-                status: child.status.clone(),
-                open,
-            });
-            if open {
-                self.push_dir(child, kind, depth + 1, lines);
-            }
-        }
-        lines.extend(dir.files.iter().map(|&file| Line::File {
-            kind,
-            file,
-            depth: Some(depth),
-        }));
-    }
-
     fn set_status(&mut self, text: &str, cx: &mut Context<Self>) {
         self.status = Some(text.into());
         self.status_clear = Some(cx.spawn(async move |this, cx| {
@@ -512,7 +329,7 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.form.read(cx).busy.is_some() {
             return;
         }
         self.busy = Some(busy);
@@ -534,170 +351,39 @@ impl Changes {
         .detach();
     }
 
-    fn run_file(
-        &mut self,
-        file: ChangedFile,
-        action: FileAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.busy.is_some() {
-            return;
-        }
-        let relative = file.relative.clone();
-        let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            this.run_git(
-                relative.clone(),
-                move |path| match action {
-                    FileAction::Stage => scm::stage_file(&path, &relative),
-                    FileAction::Unstage => scm::unstage_file(&path, &relative),
-                    FileAction::Discard => scm::discard_file(&path, &relative),
-                },
-                |_, _, _| {},
-                window,
-                cx,
-            );
-        };
-        if action != FileAction::Discard {
-            start(self, window, cx);
-            return;
-        }
-        let name = basename(&file.relative).to_owned();
-        let untracked = file.status == "untracked";
-        let ask = Self::confirm(
-            if untracked {
-                format!("Delete untracked file {name}?")
-            } else {
-                format!("Discard changes in {name}? This cannot be undone.")
-            },
-            if untracked { "Delete" } else { "Discard" },
-            window,
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if ask.await {
-                let _ = this.update_in(cx, start);
-            }
-        })
-        .detach();
-    }
-    fn run_all(&mut self, action: FileAction, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some() {
-            return;
-        }
-        let key = match action {
-            FileAction::Stage => "stage",
-            FileAction::Unstage => "unstage",
-            FileAction::Discard => "discard",
-        };
-        let start = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            this.run_git(
-                key.into(),
-                move |path| match action {
-                    FileAction::Stage => scm::stage_all(&path),
-                    FileAction::Unstage => scm::unstage_all(&path),
-                    FileAction::Discard => scm::discard_all(&path),
-                },
-                |_, _, _| {},
-                window,
-                cx,
-            );
-        };
-        if action != FileAction::Discard {
-            start(self, window, cx);
-            return;
-        }
-        let index = self.index(cx);
-        let (_, unstaged) = Self::staged_unstaged(index.as_ref());
-        let Some(index) = index.filter(|_| !unstaged.is_empty()) else {
-            return;
-        };
-        let only = &index.files[unstaged[0]];
-        let n = unstaged.len();
-        let untracked_only = n == 1 && only.status == "untracked";
-        let message = if untracked_only {
-            format!("Delete untracked file {}?", basename(&only.relative))
-        } else if n == 1 {
-            format!(
-                "Discard changes in {}? This cannot be undone.",
-                basename(&only.relative)
-            )
-        } else {
-            format!("Discard all unstaged changes in {n} files? This cannot be undone.")
-        };
-        let ask = Self::confirm(
-            message,
-            if untracked_only { "Delete" } else { "Discard" },
-            window,
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if ask.await {
-                let _ = this.update_in(cx, start);
-            }
-        })
-        .detach();
-    }
-    fn run_folder(
-        &mut self,
-        relative: String,
-        stage: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = format!("{}:{relative}", if stage { "stage" } else { "unstage" });
-        self.run_git(
-            key,
-            move |path| {
-                if stage {
-                    scm::stage_file(&path, &relative)
-                } else {
-                    scm::unstage_file(&path, &relative)
-                }
-            },
-            |_, _, _| {},
-            window,
-            cx,
-        );
-    }
-
-    /// IntelliJ's Commit window: pick files from a tree, review each diff.
+    /// IntelliJ's Commit window: the same form as this panel, with each
+    /// file's diff.
     pub(crate) fn open_commit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.commit_dialog.is_some() || self.cwd.is_empty() {
             return;
         }
         // The window may open from a view that never showed this panel.
         self.git.update(cx, |git, cx| git.changed(cx));
-        let git = self.git.clone();
-        let cwd = self.cwd.clone();
-        let draft = self.message.read(cx).content.to_string();
-        let provider = self.text_provider;
-        let dialog = cx.new(|cx| CommitDialog::new(git, cwd, draft, provider, window, cx));
-        let subscription = cx.subscribe_in(
-            &dialog,
-            window,
-            |this, _, event: &CommitDialogEvent, window, cx| {
-                this.commit_dialog = None;
-                match event {
-                    CommitDialogEvent::Close => {}
-                    CommitDialogEvent::Finished(error) => {
-                        this.message
-                            .update(cx, |m, cx| m.set_text(String::new(), cx));
-                        this.amend = None;
-                        this.mutated(cx);
-                        match error {
-                            None => this.set_status("Committed", cx),
-                            Some(error) => Self::fail(error.clone(), window, cx),
-                        }
-                    }
-                }
-                cx.emit(ChangesEvent::Overlays);
-                cx.notify();
-            },
-        );
+        self.menu = None;
+        let form = self.form.clone();
+        form.update(cx, |form, cx| {
+            form.dialog_open = true;
+            cx.notify();
+        });
+        let dialog = cx.new(|cx| CommitDialog::new(form, window, cx));
+        let subscription = cx.subscribe(&dialog, |this, _, event: &CommitDialogEvent, cx| {
+            let CommitDialogEvent::Close = event;
+            this.close_commit_dialog(cx);
+            cx.emit(ChangesEvent::Overlays);
+            cx.notify();
+        });
         self.commit_dialog = Some((dialog, subscription));
         cx.emit(ChangesEvent::Overlays);
         cx.notify();
+    }
+    /// The window went away, however it closed: the panel takes the message
+    /// box back.
+    fn close_commit_dialog(&mut self, cx: &mut Context<Self>) {
+        self.commit_dialog = None;
+        self.form.update(cx, |form, cx| {
+            form.dialog_open = false;
+            cx.notify();
+        });
     }
 
     /// Fetch and merge (or rebase onto) the upstream, then show what came in.
@@ -938,173 +624,8 @@ impl Changes {
             cx,
         );
     }
-    fn cancel_generate(&mut self) {
-        if let Some(cancel) = self.generate_cancel.take() {
-            cancel.store(true, Ordering::SeqCst);
-            if self.busy.as_deref() == Some("generate") {
-                self.busy = None;
-            }
-        }
-    }
-    /// pickTextHarness: the background model picked in Settings, else the
-    /// conversation's provider when installed, else Claude Code, then Codex.
-    pub(crate) fn text_harness(&self, cx: &App) -> Option<TextHarness> {
-        let chosen = cx
-            .try_global::<crate::settings::Preferences>()
-            .and_then(|p| p.background_text_model());
-        pick_text_harness(self.text_provider, chosen)
-    }
-    fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let has_files = self.index(cx).is_some_and(|i| !i.files.is_empty());
-        if !has_files || self.busy.is_some() || self.generate_cancel.is_some() {
-            return;
-        }
-        let Some(harness) = self.text_harness(cx) else {
-            Self::fail(
-                "No provider CLI is installed to write a commit message.".into(),
-                window,
-                cx,
-            );
-            return;
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.generate_cancel = Some(cancel.clone());
-        self.busy = Some("generate".into());
-        cx.notify();
-        let cwd = PathBuf::from(&self.cwd);
-        let flag = cancel.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { generate_commit_message(harness, cwd, flag, None) });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
-                this.generate_cancel = None;
-                this.busy = None;
-                match result {
-                    Ok(message) => this.message.update(cx, |m, cx| m.set_text(message, cx)),
-                    Err(error) => Self::fail(error, window, cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-    fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.amend.take().is_some() {
-            cx.notify();
-            return;
-        }
-        let path = PathBuf::from(&self.cwd);
-        let work = cx
-            .background_executor()
-            .spawn(async move { scm::head_message(&path) });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(head) => {
-                    if this.message.read(cx).content.trim().is_empty() {
-                        this.message.update(cx, |m, cx| m.set_text(head, cx));
-                    }
-                    let index = this.index(cx);
-                    this.amend = Some((
-                        index.as_ref().and_then(|i| i.branch.clone()),
-                        index.and_then(|i| i.head),
-                    ));
-                    cx.notify();
-                }
-                Err(error) => Self::fail(error, window, cx),
-            });
-        })
-        .detach();
-    }
-
-    fn can_commit(&self, cx: &App) -> bool {
-        let index = self.git.read(cx).index.as_ref();
-        let staged = index.is_some_and(|i| i.files.iter().any(|f| f.staged));
-        (staged || self.amend.is_some())
-            && !self.message.read(cx).content.trim().is_empty()
-            && self.busy.is_none()
-    }
     fn on_default(index: Option<&DiffIndex>) -> bool {
         index.is_some_and(|i| i.branch.is_some() && i.branch == i.default_branch)
-    }
-    fn commit(&mut self, push: bool, create_pr: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_commit(cx) {
-            return;
-        }
-        let index = self.index(cx);
-        let mut questions = Vec::new();
-        if (push || create_pr)
-            && Self::on_default(index.as_ref())
-            && let Some(branch) = index.as_ref().and_then(|i| i.branch.clone())
-        {
-            questions.push((
-                if create_pr {
-                    format!("Create a pull request from default branch \"{branch}\"?")
-                } else {
-                    format!("Push to default branch \"{branch}\"?")
-                },
-                "OK",
-            ));
-        }
-        if self.amend.is_some() && index.as_ref().is_some_and(|i| i.head_pushed) {
-            questions.push((
-                "Amend a commit that is already pushed? MonoCode cannot push the result. You will need a force push from the terminal.".into(),
-                "Amend",
-            ));
-        }
-        self.menu = None;
-        cx.spawn_in(window, async move |this, cx| {
-            for (question, ok) in questions {
-                let Ok(ask) =
-                    this.update_in(cx, |_, window, cx| Self::confirm(question, ok, window, cx))
-                else {
-                    return;
-                };
-                if !ask.await {
-                    return;
-                }
-            }
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.commit_now(push, create_pr, window, cx)
-            });
-        })
-        .detach();
-    }
-    fn commit_now(
-        &mut self,
-        push: bool,
-        create_pr: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let message = self.message.read(cx).content.to_string();
-        let amend = self.amend.is_some();
-        let pr = create_pr.then(|| self.text_harness(cx));
-        self.run_git(
-            if create_pr { "pr" } else { "commit" }.into(),
-            move |path| {
-                scm::commit(&path, &message, amend)?;
-                if push || create_pr {
-                    scm::push(&path)?;
-                }
-                Ok(())
-            },
-            move |this, window, cx| {
-                this.amend = None;
-                this.message
-                    .update(cx, |m, cx| m.set_text(String::new(), cx));
-                if let Some(harness) = pr {
-                    this.open_created_pr(harness, window, cx);
-                }
-            },
-            window,
-            cx,
-        );
     }
     /// generatePrContent, `gh pr create`, then the browser.
     fn open_created_pr(
@@ -1155,7 +676,7 @@ impl Changes {
                     .unwrap_or_default()
             )
         });
-        let harness = self.text_harness(cx);
+        let harness = self.form.read(cx).text_harness(cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(question) = question {
                 let Ok(ask) = this.update_in(cx, |_, window, cx| {
@@ -1221,28 +742,25 @@ impl Changes {
                 ]
             }
             MenuKind::Commit => {
-                let (can_push, can_push_pr) = self.push_options(cx);
+                let (can_push, can_pr) = self.push_options(cx);
+                let form = self.form.read(cx);
                 vec![
                     MenuAction::new("dialog", "Commit…")
                         .disabled(self.busy.is_some())
                         .into(),
                     MenuItem::Separator,
-                    MenuAction::new("push", "Commit & Push")
+                    MenuAction::new("push", form.push_label())
                         .disabled(!can_push)
                         .into(),
-                    MenuAction::new("push-pr", "Commit, Push & Create PR")
-                        .disabled(!can_push_pr)
-                        .into(),
-                    MenuItem::Separator,
-                    MenuAction::new("amend", "Amend Last Commit")
-                        .checked(self.amend.is_some())
+                    MenuAction::new("push-pr", form.pr_label())
+                        .disabled(!can_pr)
                         .into(),
                 ]
             }
         };
         let (label, width) = match kind {
             MenuKind::Branch => ("Branch actions", 214.),
-            MenuKind::Commit => ("Commit options", 192.),
+            MenuKind::Commit => ("Commit options", 214.),
         };
         let menu = cx.new(|cx| {
             Menu::new(label, items, window, cx)
@@ -1270,7 +788,6 @@ impl Changes {
                         "unstash" => this.open_stash_dialog(StashIntent::Manage, window, cx),
                         "push" => this.commit(true, false, window, cx),
                         "push-pr" => this.commit(true, true, window, cx),
-                        "amend" => this.toggle_amend(window, cx),
                         _ => {}
                     }
                 }
@@ -1284,17 +801,22 @@ impl Changes {
         });
         cx.notify();
     }
+    /// The form's push options, off while a panel action runs.
     fn push_options(&self, cx: &App) -> (bool, bool) {
-        let index = self.git.read(cx).index.as_ref();
-        let has_remote = index.is_some_and(|i| i.remote.is_some());
-        let diverged = index.is_some_and(|i| i.ahead > 0 && i.behind > 0);
-        let head_pushed = index.is_some_and(|i| i.head_pushed);
-        let can_push = self.can_commit(cx)
-            && has_remote
-            && !diverged
-            && (self.amend.is_none() || !head_pushed);
-        let open_pr = self.pr.as_ref().is_some_and(|p| p.state == "open");
-        (can_push, can_push && !open_pr && !Self::on_default(index))
+        let (can_push, can_pr) = self.form.read(cx).push_options(cx);
+        let idle = self.busy.is_none();
+        (can_push && idle, can_pr && idle)
+    }
+    fn can_commit(&self, cx: &App) -> bool {
+        self.busy.is_none() && self.form.read(cx).can_commit(cx)
+    }
+    fn commit(&mut self, push: bool, create_pr: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.menu = None;
+        self.form
+            .update(cx, |form, cx| form.commit(push, create_pr, window, cx));
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1435,35 +957,28 @@ impl Changes {
             })
     }
 
-    fn commit_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn commit_box(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let index = self.git.read(cx).index.clone();
-        let has_files = index.as_ref().is_some_and(|i| !i.files.is_empty());
-        let generating = self.busy.as_deref() == Some("generate");
-        let can_generate = has_files && self.busy.is_none();
+        let form = self.form.read(cx);
         let can_commit = self.can_commit(cx);
-        let amend = self.amend.is_some();
+        let form_busy = form.busy.is_some();
+        let commit_label = form.commit_label();
+        let dialog_open = form.dialog_open;
+        let draft = form.message.read(cx).content.to_string();
+        let message = form.message.clone();
+        let error = form.error_line();
         let can_open_menu =
-            index.as_ref().is_some_and(|i| i.branch.is_some()) && self.busy.is_none();
+            index.as_ref().is_some_and(|i| i.branch.is_some()) && self.busy.is_none() && !form_busy;
         let menu_open = self
             .menu
             .as_ref()
             .is_some_and(|m| m.kind == MenuKind::Commit);
-        let placeholder = if amend {
-            format!("Amend message ({MOD}↩ to amend)")
-        } else {
-            format!("Message ({MOD}↩ to commit)")
-        };
-        self.message
-            .update(cx, |m, cx| m.set_placeholder(placeholder, cx));
+        let generate = CommitForm::generate_button(&self.form, window, cx);
+        let amend_toggle = CommitForm::amend_toggle(&self.form, window, cx);
         // `bg-content` buttons with `text-background-base`, 40% when unavailable.
         let solid: Hsla = content(1.);
         let face = if can_commit { solid } else { content(0.4) };
         let ink = crate::theme::background_base();
-        let generate_label = if generating {
-            "Cancel commit message generation"
-        } else {
-            "Generate commit message"
-        };
         div()
             .flex_shrink_0()
             .border_b_1()
@@ -1483,61 +998,28 @@ impl Changes {
                             .text_size(px(13.))
                             .line_height(px(20.))
                             .text_color(content(1.))
-                            .when(self.busy.is_some(), |d| d.opacity(0.4))
-                            .child(self.message.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("generate-commit-message")
-                            .role(Role::Button)
-                            .aria_label(generate_label)
-                            .group("generate")
-                            .absolute()
-                            .top_1()
-                            .right_1()
-                            .size(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(content(0.1))
-                            .when(!generating && !can_generate, |d| d.opacity(0.4))
-                            .when(generating || can_generate, |d| {
-                                d.hover(|s| s.bg(content(0.2)))
-                            })
-                            .child(if generating {
-                                div()
-                                    .relative()
-                                    .size(px(14.))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .group_hover("generate", |s| s.opacity(0.))
-                                            .child(spinner("generate-spin", "loader", 14.)),
-                                    )
-                                    .child(
-                                        icon("x", 14.)
-                                            .absolute()
-                                            .text_color(content(1.))
-                                            .opacity(0.)
-                                            .group_hover("generate", |s| s.opacity(1.)),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                icon("wand", 12.).text_color(content(1.)).into_any_element()
-                            })
-                            .when(generating || can_generate, |d| {
-                                d.on_click(cx.listener(move |this, _, window, cx| {
-                                    if generating {
-                                        this.cancel_generate();
-                                        cx.notify();
-                                    } else {
-                                        this.generate(window, cx);
-                                    }
-                                }))
+                            .when(self.busy.is_some() || form_busy, |d| d.opacity(0.4))
+                            // The Commit window holds the message box while it is open.
+                            .map(|d| {
+                                if dialog_open {
+                                    d.max_h(px(152.))
+                                        .overflow_hidden()
+                                        .when(draft.trim().is_empty(), |d| {
+                                            d.text_color(content(0.35))
+                                        })
+                                        .child(if draft.trim().is_empty() {
+                                            "Commit message".to_owned()
+                                        } else {
+                                            draft
+                                        })
+                                } else {
+                                    d.child(message)
+                                }
                             }),
-                    ),
+                    )
+                    .when(!dialog_open, |d| d.child(generate)),
             )
+            .child(div().mt(px(6.)).child(amend_toggle))
             .child(
                 div()
                     .relative()
@@ -1548,7 +1030,7 @@ impl Changes {
                         div()
                             .id("commit")
                             .role(Role::Button)
-                            .aria_label(if amend { "Amend Commit" } else { "Commit" })
+                            .aria_label(commit_label)
                             .h(px(28.))
                             .min_w_0()
                             .flex_1()
@@ -1562,7 +1044,7 @@ impl Changes {
                             .bg(face)
                             .text_color(ink)
                             .child(icon("check-2", 14.).text_color(ink))
-                            .child(if amend { "Amend Commit" } else { "Commit" })
+                            .child(commit_label)
                             .when(can_commit, |d| {
                                 d.on_click(cx.listener(|this, _, window, cx| {
                                     this.commit(false, false, window, cx)
@@ -1597,6 +1079,7 @@ impl Changes {
                             }),
                     ),
             )
+            .when_some(error, |d, error| d.child(div().mt(px(6.)).child(error)))
             .when_some(index, |d, index| d.child(self.sync_actions(&index, cx)))
     }
 
@@ -1770,417 +1253,6 @@ impl Changes {
             })
             .into_any_element()
     }
-
-    fn hover_line(&mut self, ix: usize, hovering: bool, cx: &mut Context<Self>) {
-        let next = if hovering {
-            Some(ix)
-        } else if self.hovered == Some(ix) {
-            None
-        } else {
-            self.hovered
-        };
-        if next != self.hovered {
-            self.hovered = next;
-            cx.notify();
-        }
-    }
-    fn line(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let index = self.git.read(cx).index.clone();
-        let files = index.as_ref().map_or(&[][..], |i| &i.files[..]);
-        let busy = self.busy.is_some();
-        match self.lines[ix].clone() {
-            Line::Section(kind) => {
-                let (title, open) = match kind {
-                    Kind2::Staged => ("Staged Changes", self.staged_open),
-                    Kind2::Unstaged => ("Changes", self.changes_open),
-                };
-                let count = files
-                    .iter()
-                    .filter(|f| match kind {
-                        Kind2::Staged => f.staged,
-                        Kind2::Unstaged => f.unstaged,
-                    })
-                    .count();
-                let tree = self.view == ChangesView::Tree;
-                let actions: Vec<(&'static str, &'static str, &'static str)> = match kind {
-                    Kind2::Staged => vec![
-                        ("open-all-staged", "Open All Changes", "file-diff"),
-                        ("unstage-all", "Unstage All Changes", "minus-sign"),
-                    ],
-                    Kind2::Unstaged => vec![
-                        ("open-all-unstaged", "Open All Changes", "file-diff"),
-                        ("discard-all", "Discard All Changes", "undo"),
-                        ("stage-all", "Stage All Changes", "plus"),
-                    ],
-                };
-                div()
-                    .h(px(ROW))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px(px(6.))
-                    .child(
-                        div()
-                            .id(("section", ix))
-                            .role(Role::Button)
-                            .aria_label(title)
-                            .aria_expanded(open)
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                icon(
-                                    if open {
-                                        "chevron-down"
-                                    } else {
-                                        "chevron-right"
-                                    },
-                                    14.,
-                                )
-                                .text_color(content(0.5)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(10.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(content(0.55))
-                                    .child(title.to_uppercase()),
-                            )
-                            .child(
-                                div()
-                                    .ml_1()
-                                    .h_4()
-                                    .min_w_4()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .bg(accent_color().opacity(0.8))
-                                    .px_1()
-                                    .text_size(px(8.))
-                                    .text_color(white(1.))
-                                    .child(count.to_string()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                match kind {
-                                    Kind2::Staged => this.staged_open = !this.staged_open,
-                                    Kind2::Unstaged => this.changes_open = !this.changes_open,
-                                }
-                                this.rebuild(cx);
-                            })),
-                    )
-                    .child(
-                        icon_action(
-                            ("view", ix),
-                            if tree { "View as List" } else { "View as Tree" },
-                            if tree { "list-bullet" } else { "folder-tree" },
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.view = match this.view {
-                                ChangesView::List => ChangesView::Tree,
-                                ChangesView::Tree => ChangesView::List,
-                            };
-                            cx.emit(ChangesEvent::View(this.view));
-                            this.rebuild(cx);
-                        })),
-                    )
-                    .children(actions.into_iter().map(|(id, label, path)| {
-                        icon_action(id, label, path, true)
-                            .on_click(cx.listener(move |this, _, window, cx| match id {
-                                "unstage-all" => this.run_all(FileAction::Unstage, window, cx),
-                                "discard-all" => this.run_all(FileAction::Discard, window, cx),
-                                "stage-all" => this.run_all(FileAction::Stage, window, cx),
-                                _ => cx.emit(ChangesEvent::OpenDiff {
-                                    cwd: this.cwd.clone(),
-                                    path: None,
-                                    staged: kind == Kind2::Staged,
-                                }),
-                            }))
-                            .into_any_element()
-                    }))
-                    .into_any_element()
-            }
-            Line::Dir {
-                kind,
-                path,
-                name,
-                depth,
-                status,
-                open,
-            } => {
-                let key = format!("{}:{path}", kind.key());
-                let stage = kind == Kind2::Unstaged;
-                let folder = path.clone();
-                div()
-                    .id(("change-dir", ix))
-                    .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                        this.hover_line(ix, *hovering, cx)
-                    }))
-                    .h(px(ROW))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pl(px(8. + depth as f32 * 12.))
-                    .pr_2()
-                    .text_color(content(1.))
-                    .hover(|s| s.bg(content(0.05)))
-                    .child(
-                        div()
-                            .id(("change-dir-toggle", ix))
-                            .role(Role::TreeItem)
-                            .aria_label(SharedString::from(path.clone()))
-                            .aria_expanded(open)
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .size_4()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        icon(
-                                            if open {
-                                                "chevron-down"
-                                            } else {
-                                                "chevron-right"
-                                            },
-                                            14.,
-                                        )
-                                        .text_color(content(0.5)),
-                                    ),
-                            )
-                            .child(file_type_icon(&name, true, open, 16.))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(name.clone()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.collapsed.remove(&key) {
-                                    this.collapsed.insert(key.clone());
-                                }
-                                this.rebuild(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .map(|d| {
-                                if self.hovered == Some(ix) {
-                                    d.flex()
-                                } else {
-                                    d.hidden()
-                                }
-                            })
-                            .items_center()
-                            .child(
-                                icon_action(
-                                    ("dir-action", ix),
-                                    format!(
-                                        "{} Changes in {path}",
-                                        if stage { "Stage" } else { "Unstage" }
-                                    ),
-                                    if stage { "plus" } else { "minus-sign" },
-                                    !busy,
-                                )
-                                .when(!busy, |d| {
-                                    d.on_click(cx.listener(move |this, _, window, cx| {
-                                        this.run_folder(folder.clone(), stage, window, cx)
-                                    }))
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(status.as_deref().map_or(content(0.4), status_color)),
-                            ),
-                    )
-                    .into_any_element()
-            }
-            Line::File { kind, file, depth } => {
-                let Some(file) = files.get(file).cloned() else {
-                    return div().h(px(ROW)).into_any_element();
-                };
-                let active = self
-                    .selected
-                    .as_ref()
-                    .is_some_and(|(rel, k)| rel == &file.relative && *k == kind);
-                let name = basename(&file.relative).to_owned();
-                let dir = if depth.is_some() {
-                    ""
-                } else {
-                    dirname(&file.relative)
-                };
-                let relative = file.relative.clone();
-                let open_path = file.path.clone();
-                let can_open = file.status != "deleted";
-                let row_file = file.clone();
-                let stage_file = file.clone();
-                div()
-                    .id(("change-row", ix))
-                    .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                        this.hover_line(ix, *hovering, cx)
-                    }))
-                    .h(px(ROW))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pr_2()
-                    .map(|d| match depth {
-                        Some(depth) => d.pl(px(8. + depth as f32 * 12.)),
-                        None => d.pl_2(),
-                    })
-                    .text_color(content(1.))
-                    .when(active, |d| d.bg(selection()))
-                    .when(!active, |d| d.hover(|s| s.bg(content(0.05))))
-                    .child(
-                        div()
-                            .id(("change-open", ix))
-                            .role(Role::Button)
-                            .aria_label(SharedString::from(file.relative.clone()))
-                            .h_full()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .when(depth.is_some(), |d| d.child(div().size_4().flex_shrink_0()))
-                            .child(file_type_icon(&name, false, false, 16.))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .items_baseline()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(name),
-                                    )
-                                    .when(!dir.is_empty(), |d| {
-                                        d.child(
-                                            div()
-                                                .ml(px(6.))
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(11.))
-                                                .text_color(content(0.4))
-                                                .child(dir.to_owned()),
-                                        )
-                                    }),
-                            )
-                            .when(can_open, |d| {
-                                d.on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected = Some((relative.clone(), kind));
-                                    cx.emit(ChangesEvent::OpenDiff {
-                                        cwd: this.cwd.clone(),
-                                        path: Some(open_path.clone()),
-                                        staged: kind == Kind2::Staged,
-                                    });
-                                    cx.notify();
-                                }))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .items_center()
-                            .map(|d| {
-                                if active || self.hovered == Some(ix) {
-                                    d.flex()
-                                } else {
-                                    d.hidden()
-                                }
-                            })
-                            .when(kind == Kind2::Unstaged, |d| {
-                                d.child(
-                                    icon_action(("discard", ix), "Discard Changes", "undo", !busy)
-                                        .when(!busy, |d| {
-                                            d.on_click(cx.listener(move |this, _, window, cx| {
-                                                this.run_file(
-                                                    row_file.clone(),
-                                                    FileAction::Discard,
-                                                    window,
-                                                    cx,
-                                                )
-                                            }))
-                                        }),
-                                )
-                            })
-                            .child(
-                                icon_action(
-                                    ("stage", ix),
-                                    if kind == Kind2::Staged {
-                                        "Unstage Changes"
-                                    } else {
-                                        "Stage Changes"
-                                    },
-                                    if kind == Kind2::Staged {
-                                        "minus-sign"
-                                    } else {
-                                        "plus"
-                                    },
-                                    !busy,
-                                )
-                                .when(!busy, |d| {
-                                    d.on_click(cx.listener(move |this, _, window, cx| {
-                                        let action = if kind == Kind2::Staged {
-                                            FileAction::Unstage
-                                        } else {
-                                            FileAction::Stage
-                                        };
-                                        this.run_file(stage_file.clone(), action, window, cx)
-                                    }))
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .flex()
-                            .justify_end()
-                            .font_family(crate::fonts::mono())
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(status_color(&file.status))
-                            .child(status_letter(&file.status)),
-                    )
-                    .into_any_element()
-            }
-        }
-    }
 }
 
 /// A provider CLI and model for one-off text, `None` for its default model.
@@ -2327,8 +1399,7 @@ impl Render for Changes {
             }),
             _ => None,
         };
-        let count = self.lines.len();
-        let entity = cx.entity();
+        let row_menu = self.form.read(cx).menu_overlay(Surface::Panel, cx);
         let menu = self.menu.as_ref().map(|open| {
             let anchor = match open.kind {
                 MenuKind::Branch => self.branch_anchor.clone(),
@@ -2346,7 +1417,7 @@ impl Render for Changes {
             .flex_col()
             .overflow_hidden()
             .child(self.header(cx))
-            .child(self.commit_box(cx))
+            .child(self.commit_box(window, cx))
             .map(|d| match empty {
                 Some(text) => d.child(
                     div().py_1().child(
@@ -2359,16 +1430,35 @@ impl Render for Changes {
                     ),
                 ),
                 None => d.child(
-                    uniform_list("change-lines", count, move |range, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            range.map(|ix| this.line(ix, cx)).collect::<Vec<_>>()
-                        })
-                    })
-                    .py_1()
-                    .flex_1()
-                    .min_h_0(),
+                    div()
+                        .id("change-files")
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .track_focus(&self.list_focus)
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, window, cx| window.focus(&this.list_focus, cx)),
+                        )
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if this
+                                .form
+                                .update(cx, |form, cx| form.key(Surface::Panel, event, cx))
+                            {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .when(self.form.read(cx).busy.is_some(), |d| d.opacity(0.6))
+                        .child(
+                            CommitForm::file_list(&self.form, Surface::Panel, cx)
+                                .py_1()
+                                .flex_1()
+                                .min_h_0(),
+                        ),
                 ),
             })
+            .children(row_menu)
             .children(menu)
             .children(if self.overlays_in_shell {
                 Vec::new()
@@ -2422,8 +1512,13 @@ impl Changes {
     /// The windows this panel opens. The shell draws them, so they appear
     /// from the menu bar even where the panel itself is not on screen.
     /// Whether a dialog or picker of this panel is open over the window.
-    pub(crate) fn has_overlay(&self) -> bool {
-        self.commit_dialog.is_some()
+    pub(crate) fn has_overlay(&self, cx: &App) -> bool {
+        self.form
+            .read(cx)
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.surface == Surface::Panel)
+            || self.commit_dialog.is_some()
             || self.update_dialog.is_some()
             || self.stash_dialog.is_some()
             || self.branch_picker.is_some()
@@ -2431,6 +1526,9 @@ impl Changes {
 
     pub(crate) fn overlays(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
+        if let Some(confirm) = CommitForm::pending_overlay(&self.form, Surface::Panel, window, cx) {
+            out.push(crate::modal::window_overlay(window, confirm).into_any_element());
+        }
         if let Some((dialog, _)) = &self.commit_dialog {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
@@ -2527,35 +1625,5 @@ mod tests {
                 assert_eq!(request, changes.pr_request);
             })
             .unwrap();
-    }
-    fn f(relative: &str, status: &str) -> ChangedFile {
-        ChangedFile {
-            path: format!("/r/{relative}"),
-            relative: relative.into(),
-            status: status.into(),
-            additions: 0,
-            deletions: 0,
-            staged: false,
-            unstaged: true,
-        }
-    }
-    #[test]
-    fn tree_nests_sorts_and_rolls_status_up() {
-        let files = vec![
-            f("src/b.rs", "modified"),
-            f("src/a.rs", "modified"),
-            f("README.md", "added"),
-            f("src/ui/x.rs", "untracked"),
-        ];
-        let tree = build_tree(&files, &[0, 1, 2, 3]);
-        assert_eq!(tree.files, [2]);
-        let src = &tree.dirs[0];
-        assert_eq!(src.name, "src");
-        assert_eq!(src.files, [1, 0]);
-        assert_eq!(src.status, None);
-        assert_eq!(src.dirs[0].status.as_deref(), Some("untracked"));
-        assert_eq!(status_letter("untracked"), "U");
-        assert_eq!(dirname("a/b/c.rs"), "a/b");
-        assert_eq!(dirname("c.rs"), "");
     }
 }
