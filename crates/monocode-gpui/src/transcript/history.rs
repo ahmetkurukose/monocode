@@ -225,6 +225,7 @@ impl TranscriptView {
         let mut source = page.rows;
         source.append(&mut self.source);
         self.source = source;
+        self.invalidate_subagents(0);
         for (turn, info) in page.turns {
             self.turns.entry(turn).or_insert(info);
         }
@@ -410,6 +411,7 @@ impl TranscriptView {
             following: self.list.is_following_tail(),
         });
         self.source = Vec::new();
+        self.invalidate_subagents(0);
         self.source_bytes = 0;
         self.history_start = 0;
         self.history_loading = false;
@@ -461,6 +463,7 @@ impl TranscriptView {
         self.drop_older_history();
         // Reopening also handles a source that became empty in another window.
         self.source = Vec::new();
+        self.invalidate_subagents(0);
         self.source_bytes = 0;
         self.messages = Vec::new();
         self.rows = Vec::new();

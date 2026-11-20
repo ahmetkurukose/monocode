@@ -1706,6 +1706,8 @@ fn run_operation(
                                 Ok(events) => pending.extend(events),
                                 Err(error) => pending.push(Event::FollowUpFailed { id, error }),
                             }
+                        } else if matches!(control.decision, Decision::StopTask) {
+                            protocol.stop_task(&control.id, &mut stdin)?;
                         } else {
                             protocol.respond(control, &mut stdin)?;
                         }

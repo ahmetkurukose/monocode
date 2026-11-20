@@ -364,6 +364,7 @@ fn agent(
     cx: &mut Context<TranscriptView>,
 ) -> AnyElement {
     let name = run.display_name();
+    let open_label = format!("Open {name}");
     let failed = matches!(call.state, ToolState::Failed | ToolState::Cancelled);
     let active = view.streaming
         && call.state == ToolState::Running
@@ -487,6 +488,32 @@ fn agent(
                     )
                 }),
         )
+        // Orca's subagent head: the subagent's own view, from its row.
+        .when(!view.mono && !view.document, |d| {
+            let id = call.id.clone();
+            d.child(
+                div()
+                    .id(SharedString::from(format!("{key}:open")))
+                    .debug_selector(move || format!("subagent-open-{start}"))
+                    .role(Role::Button)
+                    .aria_label(open_label)
+                    .size(px(20.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .invisible()
+                    .group_hover("subagent-row", |s| s.visible())
+                    .hover(|s| s.bg(content(0.1)))
+                    .child(icon("maximize-2", 13.).text_color(content(0.5)))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(crate::response_actions::Request::OpenSubagent { id: id.clone() });
+                    })),
+            )
+        })
         .child(if has_detail {
             icon("chevron-right", 14.)
                 .flex_shrink_0()
@@ -653,7 +680,7 @@ pub(crate) fn prose_summary(text: &str) -> String {
         .join(" ")
 }
 
-fn agent_trail(
+pub(super) fn agent_trail(
     view: &mut TranscriptView,
     parent: &ToolCall,
     run: &AgentRun,
@@ -965,7 +992,7 @@ fn agent_step(
     row.into_any_element()
 }
 
-fn markdown_text(
+pub(super) fn markdown_text(
     view: &mut TranscriptView,
     text: &str,
     identity: &str,

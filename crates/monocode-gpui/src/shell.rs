@@ -6,19 +6,19 @@ mod automation_runs;
 mod browser_agent;
 mod browser_panes;
 mod browser_selftest;
-#[cfg(feature = "selftest")]
-mod code_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
-mod database_footer;
 #[cfg(test)]
 #[path = "code_insight/shell_tests.rs"]
 mod code_insight_tests;
+#[cfg(feature = "selftest")]
+mod code_selftest;
 mod code_shell;
 #[cfg(test)]
 mod code_shell_tests;
+mod database_footer;
 mod database_send;
 mod file_panes;
 mod github_star;
@@ -38,6 +38,7 @@ mod orchestration;
 mod picker_preferences;
 mod pinned_tabs;
 mod project_rail;
+mod project_rail_subagents;
 mod project_rail_tree;
 mod project_rail_worktrees;
 mod project_removal;
@@ -714,6 +715,12 @@ pub(crate) struct Shell {
     history_recency: HashMap<i64, u64>,
     history_clock: u64,
     session_marks: HashMap<i64, Entity<SessionMark>>,
+    /// Sessions whose running subagents the tree lists. Child lists start
+    /// collapsed so a spawning subagent cannot shift the rail; a reload
+    /// folds them again.
+    expanded_subagents: HashSet<i64>,
+    /// The tree's subagent spinners, by subagent id.
+    subagent_marks: HashMap<String, Entity<SessionMark>>,
     tab_marks: HashMap<i64, Entity<SessionMark>>,
     /// The live agents card's spinners, apart from the sidebar rows' marks.
     live_marks: HashMap<i64, Entity<SessionMark>>,
@@ -1167,6 +1174,8 @@ impl Shell {
             history_recency: HashMap::new(),
             history_clock: 0,
             session_marks: HashMap::new(),
+            expanded_subagents: HashSet::new(),
+            subagent_marks: HashMap::new(),
             tab_marks: HashMap::new(),
             live_marks: HashMap::new(),
             live_agents_expanded: false,
@@ -1547,6 +1556,13 @@ impl Shell {
                 transcript.apply_preferences(&self.workspace.preferences, cx)
             });
         });
+        self.observations.push(cx.subscribe(
+            &view,
+            |this, _, _: &crate::conversation::SubagentsChanged, cx| {
+                this.projects_frame.update(cx, |_, cx| cx.notify());
+                this.notify_sidebar(cx);
+            },
+        ));
         self.observations
             .push(cx.subscribe(&view, move |this, _, _: &SessionChanged, cx| {
                 let Some(view) = this.sessions.get(&id) else {
@@ -10102,7 +10118,11 @@ impl Render for Shell {
                             open.target,
                             MenuTarget::Databases | MenuTarget::DatabaseImport
                         ),
-                        |p| p.side(Side::Top).align(crate::popover::Align::End).max_height(560.),
+                        |p| {
+                            p.side(Side::Top)
+                                .align(crate::popover::Align::End)
+                                .max_height(560.)
+                        },
                     )
                     .when(open.target == MenuTarget::RunningTerminals, |p| {
                         p.side(Side::Top).align(crate::popover::Align::End)

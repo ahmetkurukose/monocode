@@ -117,7 +117,8 @@ pub(super) fn mark_last(row: &mut ProjectRailRow) {
         | ProjectRailRow::More { last, .. }
         | ProjectRailRow::Worktree { last, .. }
         | ProjectRailRow::WorktreeSession { last, .. }
-        | ProjectRailRow::PendingWorktree { last, .. } => *last = true,
+        | ProjectRailRow::PendingWorktree { last, .. }
+        | ProjectRailRow::Subagent { last, .. } => *last = true,
         _ => {}
     }
 }

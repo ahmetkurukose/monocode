@@ -27,6 +27,7 @@ impl Conversation {
             }
         }
         self.background.tasks = tasks;
+        self.publish_subagents(cx);
         cx.notify();
     }
 

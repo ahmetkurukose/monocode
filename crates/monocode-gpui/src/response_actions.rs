@@ -31,6 +31,10 @@ pub(crate) enum Request {
         kind: TransferKind,
         anchor: AnchorSlot,
     },
+    /// Open a subagent's own view in place of the session's transcript.
+    OpenSubagent {
+        id: String,
+    },
 }
 #[derive(Clone)]
 pub(crate) struct Transfer {
