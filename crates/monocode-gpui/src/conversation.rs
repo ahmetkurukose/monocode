@@ -3322,7 +3322,10 @@ impl Conversation {
                                     this.context_hovered = *hovered;
                                     cx.notify();
                                 }))
-                                .child(crate::context_meter::ring(ratio.unwrap_or(0.)))
+                                .child(crate::context_meter::bar(
+                                    "context-skull",
+                                    ratio.unwrap_or(0.),
+                                ))
                                 .when(self.context_hovered, |d| {
                                     d.child(
                                         popover(
@@ -3348,7 +3351,23 @@ impl Conversation {
                                                             .text_color(content(0.5))
                                                             .child(detail),
                                                     )
-                                                }),
+                                                })
+                                                .when_some(
+                                                    ratio.and_then(crate::context_meter::advice),
+                                                    |d, advice| {
+                                                        d.child(
+                                                            div()
+                                                                .pt(px(4.))
+                                                                .text_size(px(11.))
+                                                                .text_color(
+                                                                    crate::context_meter::tint(
+                                                                        ratio.unwrap_or(0.),
+                                                                    ),
+                                                                )
+                                                                .child(advice),
+                                                        )
+                                                    },
+                                                ),
                                         ),
                                     )
                                 }),
