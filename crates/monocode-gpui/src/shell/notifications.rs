@@ -41,8 +41,12 @@ pub(super) struct State {
     pub(super) whats_new: Option<(Entity<WhatsNew>, Subscription, FocusHandle)>,
     permission: Permission,
     permission_probe: Option<Receiver<Permission>>,
+    /// Badge-only authorization request, polled to repaint an early badge.
+    badge_probe: Option<Receiver<Permission>>,
     announcements: approvals::InputAnnouncements,
     responding: HashSet<i64>,
+    /// Sessions whose last turn finished and the user has not looked at yet.
+    pub(super) finished: HashSet<i64>,
     sequence: u64,
     badge: usize,
     sounds_enabled: bool,
@@ -84,8 +88,10 @@ impl State {
             whats_new: None,
             permission: Permission::Unsupported,
             permission_probe: None,
+            badge_probe: None,
             announcements: Default::default(),
             responding: HashSet::new(),
+            finished: HashSet::new(),
             sequence: 0,
             badge: 0,
             sounds_enabled: workspace.preferences.sounds,
@@ -156,6 +162,7 @@ impl Shell {
             Some(crate::sound::Cue::Finished),
             cx,
         );
+        self.reconcile_dock_badge(cx);
     }
 
     pub(super) fn bind_notices(&mut self, cx: &mut Context<Self>) {
@@ -302,6 +309,7 @@ impl Shell {
                             Some(crate::sound::Cue::Finished),
                             cx,
                         );
+                        this.reconcile_dock_badge(cx);
                     }
                 },
             ));
@@ -324,11 +332,22 @@ impl Shell {
         .detach();
     }
 
+    /// Install the notification bridge: permission, Dock badge, and the poll.
     pub(super) fn start_native_notifications(&mut self, cx: &mut Context<Self>) {
         platform::set_dock_badge(0);
+        // macOS 12+ ignores Dock badges until the app has been granted the
+        // badge option, which the Notifications toggle may never have asked for.
+        self.notification_state.badge_probe = platform::request_badge_authorization();
         if platform::initialize() {
             self.notification_state.permission = Permission::Prompt;
-            self.notification_state.permission_probe = Some(platform::permission());
+            // A stored toggle means the user opted in; macOS stays undecided
+            // until the app asks, and until then banners and the badge stay off.
+            self.notification_state.permission_probe =
+                Some(if self.workspace.preferences.notifications {
+                    platform::request_permission()
+                } else {
+                    platform::permission()
+                });
         }
         self.notification_state.badge = 0;
         self.process_notification_inputs(cx);
@@ -342,9 +361,23 @@ impl Shell {
                             .permission_probe
                             .as_ref()
                             .and_then(|rx| rx.try_recv().ok());
+                        let badge_granted = this
+                            .notification_state
+                            .badge_probe
+                            .as_ref()
+                            .and_then(|rx| rx.try_recv().ok());
+                        if let Some(permission) = badge_granted {
+                            this.notification_state.badge_probe = None;
+                            if permission == Permission::Granted {
+                                platform::set_dock_badge(this.notification_state.badge);
+                            }
+                        }
                         if let Some(permission) = permission {
                             this.notification_state.permission = permission;
                             this.notification_state.permission_probe = None;
+                            // macOS drops badge writes made before the grant, and the
+                            // cached count does not change on its own: resend it.
+                            platform::set_dock_badge(this.notification_state.badge);
                             cx.notify();
                         }
                         for target in platform::drain_clicks() {
@@ -418,15 +451,7 @@ impl Shell {
         self.notification_state.approvals.update(cx, |notices, _| {
             notices.track_pending(&snapshots);
         });
-        let badge = delivery::dock_badge_count(
-            snapshots
-                .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
-        );
-        if badge != self.notification_state.badge {
-            self.notification_state.badge = badge;
-            platform::set_dock_badge(badge);
-        }
+        self.reconcile_dock_badge(cx);
         for (session, input) in self.notification_state.announcements.reconcile(&snapshots) {
             if let Ok(id) = session.session_id.parse()
                 && let Some(view) = self.notification_chat(id, cx)
@@ -448,16 +473,17 @@ impl Shell {
         }
     }
 
+    /// True when the user can actually see this session's chat right now.
     pub(super) fn notice_session_visible(&self, id: i64, cx: &App) -> bool {
         if self.app_view_open() || self.settings.is_some() || self.search_page() {
             return false;
         }
         if self.mono_active(cx) {
-            return self
-                .monos
-                .as_ref()
-                .and_then(|m| m.read(cx).active_notification_session(cx))
-                == Some(id);
+            return self.monos.as_ref().is_some_and(|monos| {
+                let monos = monos.read(cx);
+                monos.active_notification_session(cx) == Some(id)
+                    || (self.workspace.right_panel_open && monos.routed_session() == Some(id))
+            });
         }
         self.workspace.active_tab().is_some_and(|tab| {
             self.workspace
@@ -465,12 +491,34 @@ impl Shell {
                 .leaf_ids()
                 .into_iter()
                 .any(|pane| {
-                    self.workspace.session_for_pane(pane) == id
+                    (self.workspace.session_for_pane(pane) == id
+                        && self
+                            .workspace
+                            .reviews
+                            .get(&pane)
+                            .is_none_or(|review| !review.chat_hidden)
+                        || self.mono_pane_chat_id(pane, cx) == Some(id))
                         && !self.workspace.is_detached_pane(pane)
                 })
         })
     }
 
+    /// A Mono split pane shows its Mono's chat, which `session_for_pane`
+    /// cannot map: the pane carries the Mono id, not the chat session id.
+    fn mono_pane_chat_id(&self, pane: i64, cx: &App) -> Option<i64> {
+        let mono = self.mono_pane_id(pane)?;
+        Some(
+            self.monos
+                .as_ref()?
+                .read(cx)
+                .open_chat(mono)?
+                .read(cx)
+                .summary
+                .id,
+        )
+    }
+
+    /// One pass per render: snapshots for the banners, then the reminders.
     pub(super) fn sync_notices(&mut self, window: &Window, cx: &mut Context<Self>) {
         let now = monocode_core::time::now_ms();
         // This runs on every Shell frame; borrow the preferences below instead
@@ -492,6 +540,7 @@ impl Shell {
             let chat = view.read(cx);
             let id = chat.summary.id;
             live_ids.insert(id);
+            let visible = self.window_active && self.notice_session_visible(id, cx);
             if chat.responding() {
                 self.notification_state.responding.insert(id);
             } else if self.notification_state.responding.remove(&id) && !chat.busy {
@@ -510,7 +559,14 @@ impl Shell {
                 }
             }
             directories.insert(id.to_string(), chat.summary.cwd.clone());
-            let mono_visible = self.mono_active(cx) && self.notice_session_visible(id, cx);
+            let mono_visible = self.mono_active(cx) && visible;
+            // A Mono split pane keeps its pane id in `active`, not the chat id.
+            let focused = self.workspace.active == Some(id)
+                || self
+                    .workspace
+                    .active
+                    .and_then(|pane| self.mono_pane_chat_id(pane, cx))
+                    == Some(id);
             snapshots.push(SessionInputs {
                 session_id: id.to_string(),
                 title: chat.display_title().to_owned(),
@@ -520,8 +576,8 @@ impl Shell {
                 inbox_ask: false,
                 orchestration_worker: self.orchestration_worker(id),
                 conversation_focused: self.window_active
-                    && (self.workspace.active == Some(id) || mono_visible)
-                    && self.notice_session_visible(id, cx)
+                    && (focused || mono_visible)
+                    && visible
                     && chat.composer_focused(window, cx),
             });
         }
@@ -530,15 +586,6 @@ impl Shell {
             .retain(|id| live_ids.contains(id));
         for id in quiet {
             self.mobile_turn_ended(id);
-        }
-        let badge = delivery::dock_badge_count(
-            snapshots
-                .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
-        );
-        if self.notification_state.badge != badge {
-            self.notification_state.badge = badge;
-            platform::set_dock_badge(badge);
         }
         let announcements = self.notification_state.announcements.reconcile(&snapshots);
         for (session, input) in announcements {
@@ -564,6 +611,8 @@ impl Shell {
                 cx,
             );
         }
+        // After the completions above, so a turn that ended this frame counts now.
+        self.reconcile_dock_badge(cx);
         let prefs = &self.workspace.preferences;
         self.notification_state.approvals.update(cx, |notices, cx| {
             notices.sync(
@@ -611,6 +660,44 @@ impl Shell {
         });
     }
 
+    /// Drop completion marks the user has already seen, then push the badge:
+    /// one count per session that waits for input or finished unseen. Call it
+    /// after any event that changes either side; render is not guaranteed.
+    pub(super) fn reconcile_dock_badge(&mut self, cx: &mut Context<Self>) {
+        let chats = self.notification_chats(cx);
+        let snapshot: Vec<_> = chats
+            .iter()
+            .map(|view| {
+                let chat = view.read(cx);
+                let id = chat.summary.id;
+                let seen = chat.responding()
+                    || chat.summary.archived
+                    || self
+                        .monos
+                        .as_ref()
+                        .is_some_and(|monos| monos.read(cx).floating_shows_session(id, cx))
+                    || (self.window_active && self.notice_session_visible(id, cx));
+                (id, seen, chat.has_pending_notification_inputs())
+            })
+            .collect();
+        for (id, seen, _) in &snapshot {
+            if *seen {
+                self.notification_state.finished.remove(id);
+            }
+        }
+        let finished = &self.notification_state.finished;
+        let count = delivery::dock_badge_count(
+            snapshot
+                .iter()
+                .map(|(id, _, pending)| (*id, *pending || finished.contains(id))),
+        );
+        if count != self.notification_state.badge {
+            self.notification_state.badge = count;
+            platform::set_dock_badge(count);
+        }
+    }
+
+    /// Forward a finished, input, or reminder notice to the phone and the OS.
     pub(super) fn deliver_session_notice(
         &mut self,
         summary: &Session,
@@ -619,6 +706,9 @@ impl Shell {
         cue: Option<crate::sound::Cue>,
         cx: &mut Context<Self>,
     ) {
+        if category == "agentFinished" {
+            self.notification_state.finished.insert(summary.id);
+        }
         self.notify_mobile(summary, category, body, cx);
         self.dispatch_notice(
             summary,

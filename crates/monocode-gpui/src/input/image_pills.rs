@@ -33,8 +33,10 @@ impl Input {
         if text.is_empty() {
             return;
         }
-        self.content = format!("{}{text}{}", &self.content[..at], &self.content[at..]).into();
         let end = at + text.len();
+        // Attaching is a step of its own: undo takes the markers back out.
+        self.record_undo(super::history::EditKind::Other, &(at..at), end, cx);
+        self.content = format!("{}{text}{}", &self.content[..at], &self.content[at..]).into();
         if let Some(marked) = &self.marked
             && marked.start >= at
         {
@@ -61,6 +63,11 @@ impl Input {
         if self.code.is_some() {
             return;
         }
+        // Earlier steps hold the old numbering, which would bring back
+        // markers for an image that is gone or now has another number. That
+        // holds even when no marker is in the text now: an undone attach or
+        // a deleted pill is still in the history.
+        self.history.clear();
         let edits = image_markers::removal_edits(&self.content, removed, count);
         if edits.is_empty() {
             return;

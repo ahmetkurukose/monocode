@@ -1698,3 +1698,46 @@ fn a_files_history_follows_it_through_a_rename_and_starts_with_what_is_uncommitt
     );
     assert_eq!(texts(&fresh[0]).1, "new\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn metadata_stdout_drains_output_larger_than_a_pipe() {
+    let (status, bytes) = metadata_stdout(
+        Command::new("/bin/sh").args([
+            "-c",
+            "i=0; while [ $i -lt 12000 ]; do printf 'metadata line\\n'; i=$((i+1)); done",
+        ]),
+        Duration::from_secs(5),
+    )
+    .expect("metadata output should not block on a full pipe");
+    assert!(status.success());
+    assert_eq!(bytes.len(), 12000 * "metadata line\n".len());
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_stdout_kills_and_reaps_a_stalled_child() {
+    let started = Instant::now();
+    let output = metadata_stdout(
+        Command::new("/bin/sh").args(["-c", "printf started; exec sleep 10"]),
+        Duration::from_millis(50),
+    );
+    assert!(output.is_none());
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_lookup_keeps_a_timeout_apart_from_a_missing_upstream() {
+    let lookup = |script: &str, timeout: Duration| {
+        upstream_from_lookup(metadata_stdout(
+            Command::new("/bin/sh").args(["-c", script]),
+            timeout,
+        ))
+    };
+    let limit = Duration::from_secs(5);
+    assert_eq!(lookup("printf 'origin/main\\n'", limit), Ok(true));
+    // What git prints nothing and exits 128 for: no upstream configured.
+    assert_eq!(lookup("exit 128", limit), Ok(false));
+    assert!(lookup("exec sleep 10", Duration::from_millis(50)).is_err());
+}

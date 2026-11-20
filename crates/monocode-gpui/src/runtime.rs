@@ -35,6 +35,7 @@ pub(crate) struct Update {
     pub(crate) provider_turn_id: Option<String>,
     pub(crate) turn_ready: bool,
     pub(crate) follow_up_delivered: Vec<String>,
+    pub(crate) follow_up_refused: Vec<String>,
     pub(crate) follow_up_errors: Vec<(String, String)>,
     pub(crate) delivered: Option<String>,
     pub(crate) start: usize,
@@ -56,6 +57,8 @@ pub(crate) struct Update {
     pub(crate) questions_resolved: Vec<String>,
     pub(crate) handoff: Option<Option<monocode_core::agent::Handoff>>,
     pub(crate) status: String,
+    /// Clean local completion accounts for every steer written to the provider.
+    pub(crate) steers_settled: bool,
     pub(crate) finished: bool,
 }
 fn publish(
@@ -75,6 +78,28 @@ fn publish(
         std::thread::sleep(Duration::from_millis(4));
     }
 }
+/// Quitting is process-wide and one-way, so a test that quits runs alone in a
+/// fresh copy of the test binary. True in that copy; the parent checks its result.
+#[cfg(test)]
+pub(crate) fn runs_alone(test: &str) -> bool {
+    const ALONE: &str = "MONOCODE_QUIT_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(ALONE, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 pub(crate) fn locked(store: &Database) -> Result<std::sync::MutexGuard<'_, Store>, String> {
     store
         .lock()
@@ -121,6 +146,7 @@ fn run_turn_using(
         prompt,
         mut settings,
     } = input;
+    let _registration = monocode_core::process::register_turn(cancel.clone());
     if settings.account.root.is_none() && settings.account.id != monocode_core::accounts::DEFAULT {
         settings.account.root = locked(&store)
             .ok()
@@ -153,6 +179,11 @@ fn run_turn_using(
         .unwrap_or_default();
     let mut usage_limit = None;
     let result = (|| {
+        // Launched just before the quit, this turn would only be cancelled, and
+        // saving its prompt would mark the message delivered. Leave it queued.
+        if settings.mono_message_id.is_some() && monocode_core::process::shutting_down() {
+            return Err("Stopped".into());
+        }
         if let Some(reason) = locked(&store)?.edit_recovery_reason(summary.id)? {
             return Err(reason);
         }
@@ -243,6 +274,7 @@ fn run_turn_using(
                 provider_turn_id: None,
                 turn_ready: false,
                 follow_up_delivered: Vec::new(),
+                follow_up_refused: Vec::new(),
                 follow_up_errors: Vec::new(),
                 delivered: settings.mono_message_id.clone(),
                 start,
@@ -269,6 +301,7 @@ fn run_turn_using(
                     "Connecting…"
                 }
                 .into(),
+                steers_settled: false,
                 finished: false,
             },
         )?;
@@ -306,6 +339,7 @@ fn run_turn_using(
                     provider_turn_id: None,
                     turn_ready: false,
                     follow_up_delivered: Vec::new(),
+                    follow_up_refused: Vec::new(),
                     follow_up_errors: Vec::new(),
                     delivered: None,
                     start: transcript.rows.len(),
@@ -325,6 +359,7 @@ fn run_turn_using(
                     questions_resolved: Vec::new(),
                     handoff: None,
                     status: "Connecting…".into(),
+                    steers_settled: false,
                     finished: false,
                 },
             )?;
@@ -355,6 +390,7 @@ fn run_turn_using(
                     provider_turn_id: None,
                     turn_ready: false,
                     follow_up_delivered: Vec::new(),
+                    follow_up_refused: Vec::new(),
                     follow_up_errors: Vec::new(),
                     delivered: None,
                     start: transfer_row,
@@ -374,6 +410,7 @@ fn run_turn_using(
                     questions_resolved: Vec::new(),
                     handoff: None,
                     status: "Preparing handoff…".into(),
+                    steers_settled: false,
                     finished: false,
                 },
             )?;
@@ -416,6 +453,7 @@ fn run_turn_using(
                     provider_turn_id: None,
                     turn_ready: false,
                     follow_up_delivered: Vec::new(),
+                    follow_up_refused: Vec::new(),
                     follow_up_errors: Vec::new(),
                     delivered: None,
                     start: transfer_row,
@@ -435,6 +473,7 @@ fn run_turn_using(
                     questions_resolved: Vec::new(),
                     handoff: Some(Some(prepared)),
                     status: "Connecting…".into(),
+                    steers_settled: false,
                     finished: false,
                 },
             )?;
@@ -685,6 +724,7 @@ fn run_turn_using(
                 let mut handoff = None;
                 let mut turn_ready = false;
                 let mut follow_up_delivered = Vec::new();
+                let mut follow_up_refused = Vec::new();
                 let mut follow_up_errors = Vec::new();
                 let mut boundary = false;
                 let mut commands = None;
@@ -750,6 +790,7 @@ fn run_turn_using(
                             accepted_messages.push(message.id.clone());
                             follow_up_delivered.push(message.id);
                         }
+                        Event::FollowUpRefused { id, .. } => follow_up_refused.push(id),
                         Event::FollowUpFailed { id, error } => follow_up_errors.push((id, error)),
                         Event::BeginAssistant => {
                             if transcript
@@ -936,6 +977,7 @@ fn run_turn_using(
                             provider_turn_id,
                             turn_ready,
                             follow_up_delivered,
+                            follow_up_refused,
                             follow_up_errors,
                             delivered: None,
                             start,
@@ -955,6 +997,7 @@ fn run_turn_using(
                             questions_resolved,
                             handoff,
                             status,
+                            steers_settled: false,
                             finished: false,
                         },
                     )
@@ -987,8 +1030,14 @@ fn run_turn_using(
         }
         result
     })();
-    let cancelled =
-        cancel.load(Ordering::Relaxed) || result.as_ref().is_err_and(|error| error == "Stopped");
+    // A provider killed or cancelled by the quit was interrupted, not failed.
+    // A turn that completed while the app was quitting is not an error, though
+    // its steers count as unsettled: the quit froze the queue anyway.
+    let quitting = monocode_core::process::shutting_down() && result.is_err();
+    let cancelled = quitting
+        || cancel.load(Ordering::Relaxed)
+        || result.as_ref().is_err_and(|error| error == "Stopped");
+    let steers_settled = result.is_ok() && !cancelled;
     let handoff = prepared_handoff.map(|mut ready| {
         if handoff_accepted {
             None
@@ -1035,7 +1084,9 @@ fn run_turn_using(
                 monocode_core::tool::ToolState::Failed
             };
             if tool.output.is_empty() {
-                tool.output = if cancelled {
+                tool.output = if quitting {
+                    monocode_core::process::INTERRUPTED_BY_QUIT.into()
+                } else if cancelled {
                     "Cancelled".into()
                 } else {
                     result.as_ref().err().cloned().unwrap_or_else(|| {
@@ -1129,6 +1180,7 @@ fn run_turn_using(
         provider_turn_id: None,
         turn_ready: false,
         follow_up_delivered: accepted_messages,
+        follow_up_refused: Vec::new(),
         follow_up_errors: Vec::new(),
         delivered: initial_delivery,
         start,
@@ -1147,6 +1199,7 @@ fn run_turn_using(
         questions: Vec::new(),
         questions_resolved: Vec::new(),
         handoff,
+        steers_settled: steers_settled && status == "Ready",
         status,
         finished: true,
     });

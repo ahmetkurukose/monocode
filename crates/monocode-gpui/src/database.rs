@@ -2918,7 +2918,8 @@ impl DatabaseView {
         };
         self.consoles[ix]
             .editor
-            .update(cx, |input, cx| input.set_text(sql, cx));
+            // Undoable: the query this replaces is the user's own.
+            .update(cx, |input, cx| input.replace_all(sql, cx));
         let paging = Paging {
             schema: schema.to_owned(),
             table: table.to_owned(),

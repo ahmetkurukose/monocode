@@ -1717,6 +1717,9 @@ impl Shell {
                             });
                         }
                         this.refresh_session_mark(id, cx);
+                        // Archiving hides the session without a render here, and
+                        // the badge would keep counting it until the next event.
+                        this.reconcile_dock_badge(cx);
                         if archived && this.workspace.tab_of(id).is_some() {
                             this.close_pane(id, window, cx);
                         } else {
@@ -2681,7 +2684,7 @@ impl Shell {
             } else {
                 "\n\n"
             };
-            input.set_text(format!("{draft}{separator}{}\n\n", text.trim()), cx);
+            input.replace_all(format!("{draft}{separator}{}\n\n", text.trim()), cx);
         });
         self.chat_hidden_off(id, cx);
         self.pending_composer_focus = Some(id);

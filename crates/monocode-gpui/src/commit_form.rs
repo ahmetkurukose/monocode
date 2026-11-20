@@ -568,7 +568,8 @@ impl CommitForm {
                 this.generate_cancel = None;
                 this.busy = None;
                 match result {
-                    Ok(text) => this.set_message(text, cx),
+                    // Undoable: the user may want their own words back.
+                    Ok(text) => this.message.update(cx, |m, cx| m.replace_all(text, cx)),
                     Err(error) => this.error = Some(error),
                 }
                 cx.notify();
@@ -604,7 +605,7 @@ impl CommitForm {
                 match result {
                     Ok(head) => {
                         if this.message.read(cx).content.trim().is_empty() {
-                            this.set_message(head, cx);
+                            this.message.update(cx, |m, cx| m.replace_all(head, cx));
                         }
                         let index = this.index(cx);
                         this.amend = Some((

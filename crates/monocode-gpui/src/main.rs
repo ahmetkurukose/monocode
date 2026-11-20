@@ -137,6 +137,7 @@ fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
         return;
     }
+    hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
@@ -151,8 +152,22 @@ fn quit(cx: &mut App) {
     .detach();
 }
 
+/// Shutdown gives running turns a moment to stop and save. Get out of the way
+/// at once so the quit feels immediate. Only macOS can hide an application;
+/// elsewhere minimize its windows.
+fn hide_while_shutting_down(cx: &mut App) {
+    if cfg!(target_os = "macos") {
+        cx.hide();
+        return;
+    }
+    for window in cx.windows() {
+        let _ = window.update(cx, |_, window, _| window.minimize_window());
+    }
+}
+
 /// Quit, then relaunch the same app once this process has exited.
 fn restart(cx: &mut App) {
+    hide_while_shutting_down(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
@@ -204,6 +219,13 @@ fn plist_data_mode(plist: &str) -> Option<bool> {
     }
 }
 fn main() {
+    // A MonoCode started from another one's agent or terminal inherits that
+    // app's marker. Anything this app starts without `process::isolate`
+    // (terminals, runs, a CLI typed by hand) would otherwise carry it and
+    // look like the other app's orphan to the launch reaper once that app
+    // quits. `isolate` sets this app's own id on the processes it owns.
+    // SAFETY: first statement of `main`; no other thread exists yet.
+    unsafe { std::env::remove_var("MONOCODE_HARNESS_PARENT") };
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }
@@ -448,6 +470,14 @@ fn main() {
         db.write_rows(s.id, 0, &fixtures::visual_story().rows)
             .unwrap();
     }
+    // A crash, force-quit or kill leaves provider processes running. Stop them
+    // off the launch path.
+    std::thread::spawn(|| {
+        let reaped = monocode_core::orphans::reap();
+        if reaped > 0 {
+            eprintln!("Stopped {reaped} provider processes left by the previous run");
+        }
+    });
     let mut sessions = db.sessions().expect("read native sessions");
     if sessions.is_empty() {
         sessions.push(db.create("codex", &cwd).expect("create initial session"));
