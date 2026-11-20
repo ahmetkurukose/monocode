@@ -703,7 +703,7 @@ impl Shell {
                             cx,
                         );
                     } else {
-                        this.open(id, window, cx);
+                        this.open_main_agent(id, window, cx);
                     }
                 }),
             )

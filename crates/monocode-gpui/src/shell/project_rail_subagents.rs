@@ -165,6 +165,24 @@ impl Shell {
         mark
     }
 
+    /// Open the session at its main agent, closing a subagent's view.
+    pub(super) fn open_main_agent(
+        &mut self,
+        session: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(session, window, cx);
+        if let Some(view) = self.sessions.get(&session).cloned() {
+            view.update(cx, |chat, cx| {
+                if chat.open_subagent_id(cx).is_some() {
+                    chat.open_subagent(None, cx);
+                }
+            });
+        }
+        self.projects_frame.update(cx, |_, cx| cx.notify());
+    }
+
     /// Open the session, then the subagent's own view in its pane.
     fn open_subagent_from_rail(
         &mut self,
@@ -444,6 +462,22 @@ mod tests {
         visual.simulate_click(back.center(), Default::default());
         visual.run_until_parked();
         assert!(at(visual, "subagent-status".into()).is_none());
+
+        // From a subagent's view, the session's own row leads back to the
+        // main agent.
+        let first = at(visual, "rail-subagent-call-1".into()).unwrap();
+        visual.simulate_click(first.center(), Default::default());
+        visual.run_until_parked();
+        assert!(at(visual, "subagent-status".into()).is_some());
+        let session = at(visual, format!("rail-session-{a}")).unwrap();
+        visual.simulate_click(session.center(), Default::default());
+        visual.run_until_parked();
+        assert!(at(visual, "subagent-status".into()).is_none());
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.sessions[&a].read(cx).open_subagent_id(cx), None);
+            })
+            .unwrap();
 
         // The turn ends: finished subagents leave the rail.
         window
