@@ -19,6 +19,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         provider_turn_id: None,
         turn_ready: false,
         follow_up_delivered: vec![],
+        follow_up_refused: vec![],
         follow_up_errors: vec![],
         delivered: None,
         start: 0,
@@ -38,6 +39,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         questions_resolved: vec![],
         handoff: None,
         status: status.into(),
+        steers_settled: false,
         finished,
     }
 }
