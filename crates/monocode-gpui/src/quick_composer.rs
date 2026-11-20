@@ -641,7 +641,7 @@ impl QuickComposer {
             return;
         };
         self.input.update(cx, |input, cx| {
-            input.set_text(format!("/{} ", command.name()), cx)
+            input.replace_all(format!("/{} ", command.name()), cx)
         });
         self.picker = None;
         cx.notify();

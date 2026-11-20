@@ -46,7 +46,7 @@ impl Input {
         if !items.is_empty() {
             items.push(MenuItem::Separator);
         }
-        if self.code.is_some() {
+        if !self.read_only && !self.secret {
             items.extend([
                 action("undo", "Undo", "Z", self.history_available(false)),
                 action(

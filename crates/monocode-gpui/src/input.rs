@@ -14,10 +14,12 @@ use unicode_segmentation::UnicodeSegmentation;
 mod code;
 mod command;
 mod context_menu;
+mod history;
 mod image_pills;
 mod mention;
 mod spelling;
 pub(crate) use command::{Command, CommandRemoved};
+use history::EditKind;
 use mention::{DisplayLayout, MentionIcon};
 
 const MAX_BYTES: usize = 64 * 1024;
@@ -125,8 +127,6 @@ pub fn bind(cx: &mut App) {
         "ctrl"
     };
     cx.bind_keys([
-        KeyBinding::new(&format!("{modifier}-z"), Undo, Some("CodeEditor")),
-        KeyBinding::new(&format!("{modifier}-shift-z"), Redo, Some("CodeEditor")),
         KeyBinding::new("ctrl-space", Complete, Some("CodeEditor")),
         KeyBinding::new("cmd-alt-[", FoldCode, Some("CodeEditor")),
         KeyBinding::new("cmd-alt-]", UnfoldCode, Some("CodeEditor")),
@@ -144,6 +144,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
     ]);
     cx.bind_keys([
+        KeyBinding::new(&format!("{modifier}-z"), Undo, Some("Composer")),
+        KeyBinding::new(&format!("{modifier}-shift-z"), Redo, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-a"), SelectAll, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-c"), Copy, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-v"), Paste, Some("Composer")),
@@ -169,6 +171,7 @@ pub fn bind(cx: &mut App) {
         ]);
     } else {
         cx.bind_keys([
+            KeyBinding::new("ctrl-y", Redo, Some("Composer")),
             KeyBinding::new("ctrl-home", DocumentStart, Some("Composer")),
             KeyBinding::new("ctrl-end", DocumentEnd, Some("Composer")),
             KeyBinding::new("ctrl-shift-home", SelectDocumentStart, Some("Composer")),
@@ -213,6 +216,10 @@ pub fn bind(cx: &mut App) {
 pub struct Input {
     context_menu: Option<context_menu::EditingMenu>,
     code: Option<code::Code>,
+    history: history::History,
+    /// Set by Backspace/Delete so the edit they make joins a deleting run,
+    /// with the caret undo puts back.
+    edit_kind: Option<(EditKind, Option<usize>)>,
     focus: FocusHandle,
     height: f32,
     single_line: bool,
@@ -265,11 +272,16 @@ impl Input {
     /// Keep authentication text out of drawing, accessibility and clipboard.
     pub(crate) fn set_secret(&mut self, secret: bool) {
         self.secret = secret;
+        if secret {
+            self.history.clear();
+        }
     }
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             context_menu: None,
             code: None,
+            history: Default::default(),
+            edit_kind: None,
             focus: cx.focus_handle(),
             height: MIN_HEIGHT,
             single_line: false,
@@ -529,6 +541,7 @@ impl Input {
         }
         let text = self.content.to_string();
         self.content = "".into();
+        self.history.clear();
         self.lines.clear();
         self.selection = 0..0;
         self.reversed = false;
@@ -550,7 +563,13 @@ impl Input {
         }
         yields
     }
+    /// Load text the person did not type, such as another item's value.
+    /// Undo starts over; use [`Self::replace_all`] to keep it.
     pub(crate) fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.history.clear();
+        self.load_text(text, cx);
+    }
+    fn load_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         self.clear_folds();
@@ -694,6 +713,8 @@ impl Input {
         });
         self.selection = offset..offset;
         self.reversed = false;
+        // Typing after a move is a new step, even back at the same offset.
+        self.history.break_run();
         cx.notify();
     }
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -712,6 +733,12 @@ impl Input {
         if self.selection.start > self.selection.end {
             self.reversed = !self.reversed;
             self.selection = self.selection.end..self.selection.start;
+        }
+        // Moving a selection ends a typing run, as a caret move does. The
+        // one-character selection Backspace/Delete makes is no move: it keeps
+        // a deleting run whole.
+        if !matches!(self.edit_kind, Some((EditKind::Deleting, _))) {
+            self.history.break_run();
         }
         cx.notify();
     }
@@ -1028,12 +1055,14 @@ impl Input {
             return;
         }
         if self.selection.is_empty() {
+            self.edit_kind = Some((EditKind::Deleting, Some(self.cursor())));
             self.select_to(self.prev(self.cursor()), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn delete(&mut self, _: &Delete, w: &mut Window, cx: &mut Context<Self>) {
         if self.selection.is_empty() {
+            self.edit_kind = Some((EditKind::Deleting, Some(self.cursor())));
             self.select_to(self.next(self.cursor()), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
@@ -1078,6 +1107,8 @@ impl Input {
     }
     fn paste(&mut self, _: &Paste, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            // A pasted character is not part of a typing run.
+            self.edit_kind = Some((EditKind::Other, None));
             self.replace_text_in_range(None, &text.replace("\r\n", "\n"), w, cx);
         }
     }
@@ -1307,6 +1338,7 @@ impl EntityInputHandler for Input {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let edit_kind = self.edit_kind.take();
         if self.read_only {
             return;
         }
@@ -1360,7 +1392,6 @@ impl EntityInputHandler for Input {
             );
             normalized = limit_utf16(&normalized, remaining);
         }
-        self.record_undo();
         let text = bounded(
             &normalized,
             (if self.code.is_some() {
@@ -1370,6 +1401,27 @@ impl EntityInputHandler for Input {
             })
             .saturating_sub(self.content.len() - (r.end - r.start)),
         );
+        if !r.is_empty() || !text.is_empty() {
+            let kind = match edit_kind {
+                Some((kind, caret)) => {
+                    // Undo puts the caret back, not the one-character
+                    // selection Backspace/Delete makes to remove it.
+                    if let Some(caret) = caret {
+                        self.selection = caret..caret;
+                    }
+                    kind
+                }
+                None if corrected.is_none()
+                    && r.is_empty()
+                    && !text.contains('\n')
+                    && text.graphemes(true).count() == 1 =>
+                {
+                    EditKind::Typing
+                }
+                None => EditKind::Other,
+            };
+            self.record_undo(kind, &r, r.start + text.len(), cx);
+        }
         self.map_code_folds(&r, text.len());
         self.content = format!(
             "{}{}{}",
@@ -1414,7 +1466,7 @@ impl EntityInputHandler for Input {
             );
             normalized = limit_utf16(&normalized, remaining);
         }
-        self.record_undo();
+        self.record_undo(EditKind::Other, &r, r.start, cx);
         let text = bounded(
             &normalized,
             (if self.code.is_some() {
@@ -2149,8 +2201,8 @@ mod native_input_tests {
                 assert!(!input.selecting);
             })
             .unwrap();
-        // Cut is first, Copy second. Exercise the real menu's keyboard path.
-        cx.simulate_keystrokes(window.into(), "down enter");
+        // Undo, Redo, Cut, then Copy. Exercise the real menu's keyboard path.
+        cx.simulate_keystrokes(window.into(), "down down down enter");
         cx.run_until_parked();
         window
             .update(cx, |input, w, cx| {
@@ -2174,7 +2226,7 @@ mod native_input_tests {
             })
             .unwrap();
         cx.refresh().unwrap();
-        cx.simulate_keystrokes(window.into(), "down down enter");
+        cx.simulate_keystrokes(window.into(), "down down down down enter");
         cx.run_until_parked();
         window
             .update(cx, |input, w, _| {

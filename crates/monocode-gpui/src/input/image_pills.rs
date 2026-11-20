@@ -33,8 +33,10 @@ impl Input {
         if text.is_empty() {
             return;
         }
-        self.content = format!("{}{text}{}", &self.content[..at], &self.content[at..]).into();
         let end = at + text.len();
+        // Attaching is a step of its own: undo takes the markers back out.
+        self.record_undo(super::history::EditKind::Other, &(at..at), end, cx);
+        self.content = format!("{}{text}{}", &self.content[..at], &self.content[at..]).into();
         if let Some(marked) = &self.marked
             && marked.start >= at
         {
@@ -69,6 +71,9 @@ impl Input {
         let text = image_markers::apply(&self.content, &edits, &mut offsets);
         // A composition spanning a rewritten marker cannot be carried over.
         self.marked = None;
+        // Earlier steps hold the old numbering, which would bring back
+        // markers for an image that is gone or now has another number.
+        self.history.clear();
         self.content = text.into();
         self.lines.clear();
         self.selection = self.clip_range(offsets[0]..offsets[1]);
