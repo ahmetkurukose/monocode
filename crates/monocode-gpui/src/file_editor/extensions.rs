@@ -489,7 +489,7 @@ impl FileEditor {
         }
         let hub = code_editor::hub(cx);
         let history = hub.read(cx).history();
-        if !history.is_empty() {
+        if history.is_walkable() {
             let arrow = |id: &'static str, label: &'static str, path, enabled: bool, back: bool| {
                 icon_action(id, label, path, enabled)
                     .size(px(18.))
