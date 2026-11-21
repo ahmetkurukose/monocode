@@ -67,6 +67,11 @@ pub(crate) fn set_root(profiles: PathBuf) {
     PROFILES.with(|p| *p.borrow_mut() = Some(profiles));
 }
 
+/// Before CEF shuts down: lets go of the request contexts.
+pub(crate) fn forget_all() {
+    CONTEXTS.with(|c| c.borrow_mut().clear());
+}
+
 /// The request context a page of `profile` is created with. `None` is the
 /// global context, which is the default profile.
 pub(crate) fn request_context(profile: &Profile) -> Option<cef::RequestContext> {

@@ -411,6 +411,41 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn a_popup_closed_before_its_tab_adopted_it_opens_at_its_address(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open(session, window, cx);
+                shell.new_browser_pane(Some("http://localhost:5173/".into()), window, cx);
+                let opener = shell.workspace.active.unwrap();
+                // A `window.open` popup that waited too long, or whose opener
+                // closed: Chromium closed it, so there is nothing to adopt.
+                shell.open_browser_page_beside(
+                    opener,
+                    "http://localhost:5173/login".into(),
+                    false,
+                    Some(u64::MAX),
+                    window,
+                    cx,
+                );
+                let tabs = shell.workspace.group_tabs(opener);
+                let popup = *tabs.last().unwrap();
+                assert_eq!(tabs, [session, opener, popup]);
+                assert_eq!(shell.workspace.active, Some(opener));
+                assert_eq!(
+                    shell.workspace.browser_panes[&popup].url,
+                    "http://localhost:5173/login"
+                );
+                let page = shell.browser_pages[&popup].0.read(cx);
+                assert_eq!(page.url, "http://localhost:5173/login");
+            })
+            .unwrap();
+    }
+
     #[test]
     fn a_page_saves_its_zoom_only_when_it_is_not_100_percent() {
         let page = BrowserPane {

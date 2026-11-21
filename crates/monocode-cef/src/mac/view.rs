@@ -51,6 +51,14 @@ pub(crate) fn reparent(native: *mut c_void, parent: *mut c_void) {
     parent.addSubview(&view);
 }
 
+/// Takes CEF's view out of its parent, which lets it go: a closing browser
+/// is destroyed with its view.
+pub(crate) fn detach(native: *mut c_void) {
+    if let Some(view) = view(native) {
+        view.removeFromSuperview();
+    }
+}
+
 pub(crate) fn set_hidden(native: *mut c_void, hidden: bool) {
     if let Some(view) = view(native) {
         view.setHidden(hidden);
