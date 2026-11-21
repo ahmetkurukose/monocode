@@ -8,6 +8,65 @@ use crate::theme::*;
 use gpui::{AnyElement, Context, FontWeight, div, prelude::*, px};
 
 impl SettingsView {
+    /// "Allow external CDP connections" and its "Copy endpoint" (context.md
+    /// K27): what Playwright's `connectOverCDP` or dev-browser `--connect`
+    /// take for the selected project's pages.
+    fn external_cdp_row(
+        &self,
+        p: &crate::settings::Preferences,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut description = "Tools outside Monocode, such as Playwright or dev-browser, may drive this project's pages through a private local address. Sessions Monocode starts get it on their own.".to_owned();
+        match &self.browser_endpoint {
+            Some(Ok(())) => description.push_str(" Endpoint copied."),
+            Some(Err(error)) => description.push_str(&format!(" {error}.")),
+            None => {}
+        }
+        let can_copy = p.browser_external_cdp && self.ctx.browser_scope.is_some();
+        self.row(
+            Some("browser-external-cdp"),
+            false,
+            "Allow external CDP connections (Playwright, dev-browser)",
+            Some(description.into()),
+            vec![
+                secondary_button(
+                    "browser-copy-cdp-endpoint",
+                    "Copy endpoint",
+                    false,
+                    !can_copy,
+                )
+                .child("Copy endpoint")
+                .when(can_copy, |d| {
+                    d.on_click(cx.listener(|this, _, _, cx| this.copy_cdp_endpoint(cx)))
+                })
+                .into_any_element(),
+                self.toggle(
+                    "browser-external-cdp",
+                    "Allow external CDP connections",
+                    p.browser_external_cdp,
+                    false,
+                    cx,
+                    |this, on, cx| {
+                        this.browser_endpoint = None;
+                        this.update(cx, |p| p.browser_external_cdp = on)
+                    },
+                ),
+            ],
+        )
+    }
+
+    /// Copies the selected project's CDP endpoint, or says why it cannot.
+    pub(in crate::settings) fn copy_cdp_endpoint(&mut self, cx: &mut Context<Self>) {
+        let Some(scope) = self.ctx.browser_scope.clone() else {
+            return;
+        };
+        self.browser_endpoint = Some(
+            monocode_core::browser::proxy::endpoint(&scope)
+                .map(|url| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url))),
+        );
+        cx.notify();
+    }
+
     pub(super) fn general_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let alerts = vec![
@@ -180,6 +239,7 @@ impl SettingsView {
                     |this, on, cx| this.update(cx, |p| p.browser_all_links = on),
                 )],
             ));
+            workspace.push(self.external_cdp_row(&p, cx));
         }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(

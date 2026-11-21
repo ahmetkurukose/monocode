@@ -596,6 +596,7 @@ fn main() {
                         )
                     });
                     code_agent::install(&shell, cx);
+                    shell::browser_agent::start(cx);
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
                     #[cfg(target_os = "macos")]
                     {

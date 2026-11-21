@@ -3,6 +3,26 @@
 use super::*;
 use crate::settings::{ArchivedSession, Section, SettingsContext, SettingsEvent, SettingsView};
 impl Shell {
+    /// The scope Settings' "Copy endpoint" hands out (K27): the selected
+    /// project, with its focused session, or none outside a project.
+    pub(super) fn browser_endpoint_scope(&self) -> Option<monocode_core::browser::Scope> {
+        if self.workspace.project.is_empty() {
+            return None;
+        }
+        let project = monocode_core::files::path_key(&self.workspace.project);
+        let session = (self.workspace.active)
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .filter(|session| {
+                (self.session_summaries.get(session))
+                    .is_some_and(|s| monocode_core::files::path_key(&s.cwd) == project)
+            })
+            .unwrap_or_default();
+        Some(monocode_core::browser::Scope {
+            session,
+            project: self.workspace.project.clone(),
+        })
+    }
+
     fn settings_context(&self, cx: &App) -> SettingsContext {
         let mut archived: Vec<_> = self
             .order
@@ -108,6 +128,7 @@ impl Shell {
             catalogs,
             classic: self.workspace.classic_layout,
             new_layout_boxy: self.workspace.new_layout_boxy,
+            browser_scope: self.browser_endpoint_scope(),
             cwd: self.workspace.project.clone(),
             project_label: self.project_label(&self.workspace.project),
             archived,
@@ -365,6 +386,12 @@ impl Shell {
         monocode_core::accounts::set_claude_entrypoint(
             self.workspace.preferences.claude_entrypoint,
         );
+        // Turning it off closes the clients' connections: only on a change.
+        let external_cdp =
+            cfg!(target_os = "macos") && self.workspace.preferences.browser_external_cdp;
+        if monocode_core::browser::proxy::enabled() != external_cdp {
+            monocode_core::browser::proxy::set_enabled(external_cdp);
+        }
         if let Some(monos) = &self.monos {
             let prefs = self.workspace.preferences.clone();
             monos.update(cx, |m, cx| m.set_preferences(prefs, cx));

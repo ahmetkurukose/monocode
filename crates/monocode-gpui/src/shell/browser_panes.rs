@@ -14,14 +14,18 @@ impl Shell {
             .unwrap_or_else(|| std::env::temp_dir().join("monocode-browser"))
     }
 
-    fn browser_page(&mut self, pane: i64, cx: &mut Context<Self>) -> Option<Entity<BrowserPage>> {
+    pub(super) fn browser_page(
+        &mut self,
+        pane: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BrowserPage>> {
         if let Some((page, _)) = self.browser_pages.get(&pane) {
             return Some(page.clone());
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
         let zoom = state.zoom.unwrap_or(100);
-        let profile = self.browser_profile(state.owner);
+        let profile = self.browser_pane_profile(pane);
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
@@ -202,6 +206,18 @@ impl Shell {
         }
     }
 
+    /// The profile pane `pane`'s page browses with: a throwaway one of its
+    /// own when an agent asked for that (K22), else its project's.
+    pub(super) fn browser_pane_profile(&self, pane: i64) -> crate::browser::Profile {
+        match self.workspace.browser_panes.get(&pane) {
+            Some(state) => match &state.ephemeral {
+                Some(name) => crate::browser::Profile::Ephemeral(name.clone()),
+                None => self.browser_profile(state.owner),
+            },
+            None => crate::browser::Profile::Default,
+        }
+    }
+
     fn browser_page_request(
         &mut self,
         pane: i64,
@@ -234,10 +250,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(owner) = self.workspace.browser_panes.get(&opener).map(|b| b.owner) else {
+        let Some(opener_state) = self.workspace.browser_panes.get(&opener).cloned() else {
             return;
         };
-        let pane = self.create_browser_pane(owner, url);
+        let pane = self.create_browser_pane(opener_state.owner, url);
+        // An agent's page opens agent pages, in its own profile.
+        if let Some(state) = self.workspace.browser_panes.get_mut(&pane) {
+            state.opened_by = opener_state.opened_by;
+            state.ephemeral = opener_state.ephemeral;
+        }
         let active = self.workspace.active;
         if self.workspace.tab_of(opener).is_some() {
             self.workspace.place_tab_after(pane, opener);
@@ -280,10 +301,8 @@ impl Shell {
             isolated.insert(key);
         }
         let pages: Vec<_> = (self.browser_pages.iter())
-            .filter_map(|(pane, (page, _))| {
-                let owner = self.workspace.browser_panes.get(pane)?.owner;
-                Some((page.clone(), self.browser_profile(owner)))
-            })
+            .filter(|(pane, _)| self.workspace.browser_panes.contains_key(pane))
+            .map(|(pane, (page, _))| (page.clone(), self.browser_pane_profile(*pane)))
             .collect();
         for (page, profile) in pages {
             page.update(cx, |page, cx| page.set_profile(profile, cx));
