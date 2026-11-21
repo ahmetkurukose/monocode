@@ -7703,6 +7703,8 @@ impl Render for Shell {
                     this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
                 });
             }
+            // For testing the agent layer from outside (development only).
+            self.start_browser_agent_dev_hook(cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);

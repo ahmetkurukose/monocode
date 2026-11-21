@@ -61,7 +61,53 @@ fn ephemeral_profile_name() -> String {
     format!("agent-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The session id of the dev hook's scope: no real session has it.
+const DEV_HOOK_SESSION: i64 = i64::MAX - 1;
+
 impl Shell {
+    /// Development hook, not a user feature: with
+    /// `MONOCODE_BROWSER_AGENT_DEV=<file>` set, the app issues the browser
+    /// bridge's environment for a synthetic session whose project is
+    /// `MONOCODE_BROWSER_AGENT_DEV_PROJECT` or the window's project (the
+    /// project `MONOCODE_BROWSER_OPEN`'s page belongs to), turns the external
+    /// CDP endpoint on, and writes `{bridge_env, cdp_endpoint, scope}` as
+    /// JSON to the file. A script then drives `browser-mcp` and the endpoint
+    /// as an agent would.
+    pub(super) fn start_browser_agent_dev_hook(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = std::env::var_os("MONOCODE_BROWSER_AGENT_DEV").filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let project = std::env::var("MONOCODE_BROWSER_AGENT_DEV_PROJECT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| self.workspace.project.clone());
+        let written = (|| -> Result<(), String> {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let bridge_env = monocode_core::browser::bridge::environment(
+                DEV_HOOK_SESSION,
+                std::path::Path::new(&project),
+                &executable,
+            )?;
+            self.workspace.preferences.browser_external_cdp = true;
+            self.apply_preferences(cx);
+            let scope = Scope {
+                session: DEV_HOOK_SESSION,
+                project: project.clone(),
+            };
+            let cdp_endpoint = monocode_core::browser::proxy::endpoint(&scope)?;
+            let json = serde_json::json!({
+                "bridge_env": bridge_env,
+                "cdp_endpoint": cdp_endpoint,
+                "scope": {"session": DEV_HOOK_SESSION, "project": project},
+            });
+            std::fs::write(&file, json.to_string()).map_err(|e| e.to_string())
+        })();
+        if let Err(error) = written {
+            eprintln!("MONOCODE_BROWSER_AGENT_DEV: {error}");
+        }
+    }
+
     /// Whether `scope` may use the page of `pane` (K21).
     fn agent_scope_has(&self, state: &BrowserPane, scope: &Scope) -> bool {
         if state.opened_by == Some(scope.session) {
