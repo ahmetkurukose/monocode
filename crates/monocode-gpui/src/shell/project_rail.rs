@@ -465,9 +465,10 @@ impl Shell {
         if cfg!(target_os = "macos")
             && !self.workspace.project_rail_open
             && self.settings.is_none()
-            && self.classic_surface_open(cx)
+            && (self.classic_surface_open(cx) || self.strips_titlebar)
         {
-            // Destination headers live beside the rail. Keep its divider below
+            // Destination headers, or the group strips as the title bar,
+            // live beside the rail. Keep its divider below
             // the traffic lights, at the same height as the sessions view.
             div()
                 .w(px(width))
@@ -967,7 +968,7 @@ impl Shell {
     }
     fn project_rail_compact_actions(&mut self, cx: &mut Context<Self>) -> AnyElement {
         use classic_sidebar::ClassicSidebarTab;
-        let workspace_active = !self.app_view_open() && !self.mono_active(cx);
+        let workspace_active = !self.mono_active(cx);
         let inbox_unread = self
             .inbox
             .as_ref()
@@ -1206,16 +1207,10 @@ impl Shell {
                         )
                     })
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        if this.app_view_label() == Some(view.label()) {
+                        if this.active_app_view() == Some(view) {
                             this.close_app_view(w, cx);
                         } else {
-                            match view {
-                                workspace::AppView::Inbox => this.open_inbox(w, cx),
-                                workspace::AppView::Notes => this.open_notes(w, cx),
-                                workspace::AppView::Automations => this.open_automations(w, cx),
-                                workspace::AppView::Database => this.open_database(w, cx),
-                                workspace::AppView::Api => this.open_api(w, cx),
-                            }
+                            this.open_app(view, w, cx);
                         }
                     }))
                 }),
@@ -1485,8 +1480,7 @@ impl Shell {
             .iter()
             .position(|p| p == &path)
             .unwrap_or(ix);
-        let selected =
-            self.workspace.project == path && !self.app_view_open() && !self.mono_active(cx);
+        let selected = self.workspace.project == path;
         let label = self.project_label(&path);
         let tooltip = label.clone();
         let asleep = self.project_asleep(&path);
@@ -2403,12 +2397,11 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
-            let (projects, sidebar, tabs, transcript) = window
+            let (projects, sidebar, transcript) = window
                 .update(visual, |shell, _, cx| {
                     (
                         shell.projects_frame.clone(),
                         shell.sidebar_frame.clone(),
-                        shell.tabs_frame.clone(),
                         shell.sessions[&active].read(cx).transcript.clone(),
                     )
                 })
@@ -2416,7 +2409,6 @@ mod tests {
             let before = [
                 projects.read_with(visual, |v, _| v.renders),
                 sidebar.read_with(visual, |v, _| v.renders),
-                tabs.read_with(visual, |v, _| v.renders),
             ];
             assert!(before.iter().all(|count| *count > 0));
             window
@@ -2449,7 +2441,6 @@ mod tests {
                 "streaming must reuse the project rail"
             );
             assert_eq!(sidebar.read_with(visual, |v, _| v.renders), before[1]);
-            assert_eq!(tabs.read_with(visual, |v, _| v.renders), before[2]);
             let before = transcript.read_with(visual, |v, _| v.render_passes);
             if !compact {
                 let inbox = visual.debug_bounds("sidebar-navigation-Inbox").unwrap();

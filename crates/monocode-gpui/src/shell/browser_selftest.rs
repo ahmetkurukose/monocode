@@ -141,7 +141,6 @@ impl Shell {
                     "viewport": [size.width.as_f32(), size.height.as_f32()],
                     "layout_leaves": this.workspace.layout(pane).leaf_ids(),
                     "mono_active": this.mono_active(cx),
-                    "search": this.search_page(),
                     "page": page(this).map(|page| page.read(cx).diagnostics()),
                     "active": this.workspace.active,
                     "tab": this.workspace.tab_of(pane),

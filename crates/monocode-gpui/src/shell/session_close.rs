@@ -53,7 +53,7 @@ impl Shell {
 
     /// Ask what closing `panes` does to their sessions, then run `then` with
     /// the sessions to archive once they have closed. Cancel runs nothing.
-    fn ask_close_sessions(
+    pub(super) fn ask_close_sessions(
         &mut self,
         panes: &[i64],
         window: &mut Window,
@@ -421,18 +421,15 @@ impl Shell {
         );
     }
 
-    /// ⌘W and a split pane's close button: one pane of a split, or the tab.
+    /// ⌘W and a split pane's close button: one tab of a group or pane of a
+    /// split, else the title tab.
     pub(super) fn request_close_pane(
         &mut self,
         id: i64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let split = self
-            .workspace
-            .tab_of(id)
-            .is_some_and(|tab| self.workspace.layout(tab).is_split());
-        if !split {
+        if !self.closes_inside_its_tab(id) {
             self.request_close(id, window, cx);
             return;
         }

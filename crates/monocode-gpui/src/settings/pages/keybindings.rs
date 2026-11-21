@@ -133,6 +133,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "Tab: Reopen Closed",
+        keys: "⌘⇧T",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
         command: "Tab: Next",
         keys: "⌘⇧]",
         when: "Always",

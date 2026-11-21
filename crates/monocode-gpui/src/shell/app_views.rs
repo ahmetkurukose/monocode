@@ -1,136 +1,28 @@
 //! The three application destinations share one navigation and focus boundary.
+use super::tab_router::OpenIn;
 use super::*;
 use crate::{automations, inbox, notes};
 
 pub(super) use crate::workspace::AppView;
 
 impl Shell {
+    /// The app view in the focused pane.
+    pub(super) fn active_app_view(&self) -> Option<AppView> {
+        match self.focused_view()? {
+            TitleTab::App(view) | TitleTab::ProjectApp { view, .. } => Some(*view),
+            _ => None,
+        }
+    }
+
+    /// Whether an app view's pane has focus.
     pub(super) fn app_view_open(&self) -> bool {
-        self.active_app_view.is_some()
+        self.active_app_view().is_some()
     }
 
     pub(super) fn app_view_label(&self) -> Option<&'static str> {
-        self.active_app_view.map(|view| match view {
-            AppView::Inbox => "Inbox",
-            AppView::Notes => "Notes",
-            AppView::Automations => "Automations",
-            AppView::Database => "Database",
-            AppView::Api => "API",
-        })
+        self.active_app_view().map(AppView::label)
     }
 
-    pub(super) fn app_title_tab(
-        &self,
-        view: AppView,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let active = self.active_app_view == Some(view);
-        let close = active || width >= TAB_CLOSE_MIN_WIDTH;
-        div()
-            .id(SharedString::from(format!(
-                "app-title-tab-{}",
-                view.label()
-            )))
-            .debug_selector(move || format!("app-title-tab-{}", view.label()))
-            .group("app-title-tab")
-            .role(Role::Tab)
-            .aria_label(view.label())
-            .aria_selected(active)
-            .cursor_pointer()
-            .w(px(width))
-            .h(px(TITLE_BAR_HEIGHT))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .relative()
-            .child(
-                title_tab_plate(active, false)
-                    .text_color(content(if active { 1. } else { 0.5 }))
-                    .w_full()
-                    .min_w_0()
-                    .when(close && width >= TAB_CLOSE_MIN_WIDTH, |d| d.pr_7())
-                    .when(width < NARROW_TAB, |d| {
-                        d.px(px(((width - TAB_TILE.w) / 2.).max(0.)))
-                    })
-                    .gap(px(TAB_TILE_GAP))
-                    .group_hover("app-title-tab", |s| {
-                        s.text_color(content(1.)).bg(title_tab_fill(active, true))
-                    })
-                    .child(mark_tile(
-                        &TAB_TILE,
-                        Face::Neutral,
-                        icon(view.icon(), 14.).text_color(crate::tab_tile::tile_ink()),
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(px(TITLE_TAB_TEXT_SIZE))
-                            .child(view.label()),
-                    ),
-            )
-            .when(close, |d| {
-                d.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "close-app-tab-{}",
-                            view.label()
-                        )))
-                        .debug_selector(move || format!("close-app-tab-{}", view.label()))
-                        .role(Role::Button)
-                        .aria_label(format!("Close {}", view.label()))
-                        .absolute()
-                        .right_1()
-                        .top(px(10.))
-                        .size(px(20.))
-                        .rounded_sm()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .opacity(0.)
-                        .group_hover("app-title-tab", |s| s.opacity(1.))
-                        .hover(|s| s.bg(content(0.1)))
-                        .child(icon("close", 12.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_title_tabs(&[this.app_tab(view)], None, window, cx);
-                        })),
-                )
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event, _, cx| {
-                    this.start_tab_drag(this.app_tab(view), event, cx)
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.open_menu(
-                        MenuTarget::AppTab(view),
-                        Anchor::Point(event.position),
-                        window,
-                        cx,
-                    )
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_title_tabs(&[this.app_tab(view)], None, window, cx);
-                }),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if std::mem::take(&mut this.skip_tab_click) {
-                    return;
-                }
-                this.open_title_tab(&this.app_tab(view), window, cx);
-            }))
-    }
     /// Reads how many notes the store holds for the sidebar's Notes row.
     pub(super) fn load_note_count(&mut self, cx: &mut Context<Self>) {
         let store = self.store.clone();
@@ -151,76 +43,112 @@ impl Shell {
         .detach();
     }
 
+    /// Notes saves what it holds whenever its pane loses focus or closes.
     pub(super) fn leave_app_views(&mut self, cx: &mut Context<Self>) {
-        if self.active_app_view == Some(AppView::Notes)
+        if self.active_app_view() == Some(AppView::Notes)
             && let Some(notes) = &self.notes
         {
             notes.update(cx, |notes, cx| notes.flush(cx));
         }
-        self.active_app_view = None;
         self.invalidate_chrome(cx);
     }
 
+    /// Close the focused app view's tab; its group's next tab takes over.
     pub(super) fn close_app_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_app_views(cx);
-        // Coming back to a sleeping project shows its sleep screen; only the
-        // user's own open wakes it.
-        if self.workspace.active.is_none() && !self.project_asleep(&self.workspace.project) {
-            let previous = self
-                .workspace
-                .project_focus
-                .get(&self.workspace.project)
-                .copied()
-                .filter(|id| self.workspace.tab_of(*id).is_some());
-            if let Some(id) = previous {
-                self.activate_session(id, window, cx);
-            }
+        if let Some(view) = self.active_app_view() {
+            self.close_view_tab(&TitleTab::App(view), window, cx);
         }
-        self.ensure_project_session(window, cx);
-        self.update_chat_visibility(cx);
-        self.sync_right_panel(cx);
-        self.focus_active(window, cx);
-        if let Some(tab) = self.active_title_tab(cx) {
-            self.remember_title_tab(tab);
-        }
-        self.persist(cx);
-        cx.notify();
     }
 
     fn prepare_app_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_app_search(cx);
         self.close_preview(cx);
         self.close_menu(cx);
         if self.settings.is_some() {
             self.close_settings(window, cx);
         }
-        if let Some(monos) = self.monos.clone() {
-            monos.update(cx, |monos, cx| monos.close(cx));
-        }
         self.navigation_revision += 1;
-        self.review_focused = false;
         self.pending_composer_focus = None;
     }
 
+    /// Open `view` as a tab of the current scope (one per scope).
     fn show_app_view(&mut self, view: AppView, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_app_view != Some(view) {
-            self.leave_app_views(cx);
-        }
-        self.active_app_view = Some(view);
-        if !self.workspace.classic_layout || self.project_app_scope(view) {
-            self.remember_title_tab(self.app_tab(view));
-            self.reveal_active_tab(cx);
-        }
-        self.update_chat_visibility(cx);
-        self.sync_right_panel(cx);
-        self.invalidate_chrome(cx);
-        self.focus_app_view(window, cx);
-        self.persist(cx);
-        cx.notify();
+        self.open_view_tab(TitleTab::App(view), OpenIn::default(), window, cx);
     }
 
-    pub(super) fn app_view_body(&self) -> Option<AnyElement> {
-        match self.active_app_view? {
+    /// Open any app view, as the sidebar, rail and menus do.
+    pub(super) fn open_app(&mut self, view: AppView, window: &mut Window, cx: &mut Context<Self>) {
+        match view {
+            AppView::Inbox => self.open_inbox(window, cx),
+            AppView::Notes => self.open_notes(window, cx),
+            AppView::Automations => self.open_automations(window, cx),
+            AppView::Database => self.open_database(window, cx),
+            AppView::Api => self.open_api(window, cx),
+        }
+    }
+
+    /// Make `view`'s entity if need be, without refreshing it. False when
+    /// it cannot be made yet (Automations before its service is up).
+    pub(super) fn ensure_app_entity(
+        &mut self,
+        view: AppView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match view {
+            AppView::Notes => {
+                if self.notes.is_none() {
+                    self.make_notes(window, cx);
+                    self.ready_notes(cx);
+                }
+            }
+            AppView::Inbox => self.ensure_background_inbox(window, cx),
+            AppView::Automations => {
+                if self.automations.is_none() {
+                    let Some(service) = self.automation_state.service.clone() else {
+                        self.initialize_automations(cx);
+                        return false;
+                    };
+                    self.make_automations(service, window, cx);
+                    self.ready_automations(cx);
+                }
+            }
+            AppView::Database => {
+                self.ensure_database(window, cx);
+            }
+            AppView::Api => {
+                self.ensure_api(cx);
+            }
+        }
+        true
+    }
+
+    /// Make `view` ready for the current scope: made, given the project
+    /// and refreshed.
+    pub(super) fn ready_app_view(
+        &mut self,
+        view: AppView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.ensure_app_entity(view, window, cx) {
+            return;
+        }
+        match view {
+            AppView::Notes => self.ready_notes(cx),
+            AppView::Inbox => {
+                if let Some(inbox) = &self.inbox {
+                    inbox.update(cx, |inbox, cx| inbox.refresh(cx));
+                }
+            }
+            AppView::Automations => self.ready_automations(cx),
+            AppView::Database => self.ready_database(window, cx),
+            AppView::Api => self.ready_api(cx),
+        }
+    }
+
+    /// `view`'s entity as an element, once it is made.
+    pub(super) fn app_view_element(&self, view: AppView) -> Option<AnyElement> {
+        match view {
             AppView::Notes => self.notes.clone().map(IntoElement::into_any_element),
             AppView::Inbox => self.inbox.clone().map(IntoElement::into_any_element),
             AppView::Automations => self.automations.clone().map(IntoElement::into_any_element),
@@ -229,8 +157,29 @@ impl Shell {
         }
     }
 
+    /// An app view's entity, when it has been made.
+    pub(super) fn app_view_handle(&self, view: AppView) -> Option<gpui::AnyView> {
+        match view {
+            AppView::Notes => self.notes.clone().map(Into::into),
+            AppView::Inbox => self.inbox.clone().map(Into::into),
+            AppView::Automations => self.automations.clone().map(Into::into),
+            AppView::Database => self.database.clone().map(Into::into),
+            AppView::Api => self.api.clone().map(Into::into),
+        }
+    }
+
+    /// The focused app view (or Search page) takes the keyboard. False when
+    /// no view pane has focus.
     pub(super) fn focus_app_view(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let focus = match self.active_app_view {
+        if let Some(pane) = self.workspace.active
+            && self.workspace.view_panes.get(&pane) == Some(&TitleTab::Search)
+        {
+            if let Some(open) = self.search_panes.get(&pane) {
+                window.focus(&open.view.focus_handle(cx), cx);
+            }
+            return true;
+        }
+        let focus = match self.active_app_view() {
             Some(AppView::Notes) => self.notes.as_ref().map(|view| view.focus_handle(cx)),
             Some(AppView::Inbox) => self.inbox.as_ref().map(|view| view.focus_handle(cx)),
             Some(AppView::Automations) => {
@@ -246,30 +195,32 @@ impl Shell {
         true
     }
 
-    pub(super) fn open_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prepare_app_view(window, cx);
-        if self.notes.is_none() {
-            let view = cx.new(|cx| notes::Notes::new(self.store.clone(), cx));
-            self.app_view_events.push(cx.subscribe_in(
-                &view,
-                window,
-                |this, _, event: &notes::Event, window, cx| match event {
-                    notes::Event::Close => this.close_app_view(window, cx),
-                    notes::Event::OpenSource(id) => this.open(*id, window, cx),
-                    notes::Event::AddToChat(note) => this.note_to_chat(note.clone(), window, cx),
-                },
-            ));
-            self.app_view_events
-                .push(cx.observe(&view, |this, notes, cx| {
-                    if let Some(count) = notes.read(cx).count()
-                        && this.note_count != Some(count)
-                    {
-                        this.note_count = Some(count);
-                        this.notify_sidebar(cx);
-                    }
-                }));
-            self.notes = Some(view);
-        }
+    fn make_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| notes::Notes::new(self.store.clone(), cx));
+        self.app_view_events.push(cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &notes::Event, window, cx| match event {
+                notes::Event::Close => {
+                    this.close_view_tab(&TitleTab::App(AppView::Notes), window, cx)
+                }
+                notes::Event::OpenSource(id) => this.open(*id, window, cx),
+                notes::Event::AddToChat(note) => this.note_to_chat(note.clone(), window, cx),
+            },
+        ));
+        self.app_view_events
+            .push(cx.observe(&view, |this, notes, cx| {
+                if let Some(count) = notes.read(cx).count()
+                    && this.note_count != Some(count)
+                {
+                    this.note_count = Some(count);
+                    this.notify_sidebar(cx);
+                }
+            }));
+        self.notes = Some(view);
+    }
+
+    fn ready_notes(&mut self, cx: &mut Context<Self>) {
         if let Some(notes) = &self.notes {
             let cwd = self.workspace.project.clone();
             let projects = self.workspace.projects.clone();
@@ -281,6 +232,11 @@ impl Shell {
                 notes.refresh(cx);
             });
         }
+    }
+
+    pub(super) fn open_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_app_view(window, cx);
+        self.ready_app_view(AppView::Notes, window, cx);
         self.show_app_view(AppView::Notes, window, cx);
     }
 
@@ -302,7 +258,9 @@ impl Shell {
                 &view,
                 window,
                 |this, _, event: &inbox::Event, window, cx| match event {
-                    inbox::Event::Close => this.close_app_view(window, cx),
+                    inbox::Event::Close => {
+                        this.close_view_tab(&TitleTab::App(AppView::Inbox), window, cx)
+                    }
                     inbox::Event::OpenSession(id) => this.open(*id, window, cx),
                     inbox::Event::StartSession { item, prompt } => {
                         this.start_inbox_session(item.as_ref().clone(), prompt.clone(), cx);
@@ -344,37 +302,50 @@ impl Shell {
     }
 
     pub(super) fn open_automations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(service) = self.automation_state.service.clone() else {
+        if self.automation_state.service.is_none() {
             self.automation_state.open_requested = Some(self.navigation_revision);
             self.initialize_automations(cx);
             return;
-        };
-        self.prepare_app_view(window, cx);
-        if self.automations.is_none() {
-            let cwd = self.workspace.project.clone();
-            let projects = self.workspace.projects.clone();
-            let view = cx.new(|cx| automations::Automations::new(service, cwd, projects, cx));
-            view.update(cx, |view, cx| view.set_database(self.store.clone(), cx));
-            self.app_view_events.push(cx.subscribe_in(
-                &view,
-                window,
-                |this, _, event: &automations::Event, window, cx| match event {
-                    automations::Event::Close => this.close_app_view(window, cx),
-                    automations::Event::Launch(run) => {
-                        this.launch_automation(run.as_ref().clone(), true, cx)
-                    }
-                    automations::Event::OpenSession(id) => {
-                        let native = locked(&this.store)
-                            .ok()
-                            .and_then(|store| store.resolve_existing_session_id(id));
-                        if let Some(id) = native {
-                            this.open(id, window, cx);
-                        }
-                    }
-                },
-            ));
-            self.automations = Some(view);
         }
+        self.prepare_app_view(window, cx);
+        self.ready_app_view(AppView::Automations, window, cx);
+        self.show_app_view(AppView::Automations, window, cx);
+    }
+
+    fn make_automations(
+        &mut self,
+        service: super::automation_runs::ServiceHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = self.workspace.project.clone();
+        let projects = self.workspace.projects.clone();
+        let view = cx.new(|cx| automations::Automations::new(service, cwd, projects, cx));
+        view.update(cx, |view, cx| view.set_database(self.store.clone(), cx));
+        self.app_view_events.push(cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &automations::Event, window, cx| match event {
+                automations::Event::Close => {
+                    this.close_view_tab(&TitleTab::App(AppView::Automations), window, cx)
+                }
+                automations::Event::Launch(run) => {
+                    this.launch_automation(run.as_ref().clone(), true, cx)
+                }
+                automations::Event::OpenSession(id) => {
+                    let native = locked(&this.store)
+                        .ok()
+                        .and_then(|store| store.resolve_existing_session_id(id));
+                    if let Some(id) = native {
+                        this.open(id, window, cx);
+                    }
+                }
+            },
+        ));
+        self.automations = Some(view);
+    }
+
+    fn ready_automations(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = &self.automations {
             let cwd = self.workspace.project.clone();
             let projects = self.workspace.projects.clone();
@@ -393,7 +364,6 @@ impl Shell {
                 view.refresh(cx);
             });
         }
-        self.show_app_view(AppView::Automations, window, cx);
     }
 
     /// The Database view, made if need be, without showing it.
@@ -411,7 +381,9 @@ impl Shell {
             &view,
             window,
             |this, _, event: &crate::database::Event, window, cx| match event {
-                crate::database::Event::Close => this.close_app_view(window, cx),
+                crate::database::Event::Close => {
+                    this.close_view_tab(&TitleTab::App(AppView::Database), window, cx)
+                }
             },
         ));
         self.database = Some(view.clone());
@@ -420,12 +392,16 @@ impl Shell {
 
     pub(super) fn open_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prepare_app_view(window, cx);
+        self.ready_app_view(AppView::Database, window, cx);
+        self.show_app_view(AppView::Database, window, cx);
+    }
+
+    fn ready_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.ensure_database(window, cx);
         let scope =
             (self.project_app_scope(AppView::Database)).then(|| self.workspace.project.clone());
         let projects = self.workspace.projects.clone();
         view.update(cx, |view, cx| view.set_scope(scope, projects, cx));
-        self.show_app_view(AppView::Database, window, cx);
     }
 
     /// The API view, made if need be, without showing it.
@@ -531,12 +507,16 @@ impl Shell {
 
     pub(super) fn open_api(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prepare_app_view(window, cx);
+        self.ready_app_view(AppView::Api, window, cx);
+        self.show_app_view(AppView::Api, window, cx);
+    }
+
+    fn ready_api(&mut self, cx: &mut Context<Self>) {
         let view = self.ensure_api(cx);
         let scope = (self.project_app_scope(AppView::Api)).then(|| self.workspace.project.clone());
         let projects = self.workspace.projects.clone();
         let current = self.workspace.project.clone();
         view.update(cx, |view, cx| view.set_scope(scope, projects, current, cx));
-        self.show_app_view(AppView::Api, window, cx);
     }
 
     fn note_to_chat(

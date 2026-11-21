@@ -147,14 +147,11 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Shell {
-    pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
+    pub(super) fn classic_titlebar_spans_window(&self, _: &gpui::App) -> bool {
         cfg!(target_os = "macos")
             && self.workspace.classic_layout
             && !self.workspace.project_rail_open
             && self.settings.is_none()
-            && !self.classic_app_surface()
-            && !self.search_page()
-            && !self.mono_active(cx)
     }
     /// Switch navigation layouts without changing the new layout's frame style.
     pub(super) fn toggle_layout(&mut self, cx: &mut Context<Self>) {
@@ -182,19 +179,8 @@ impl Shell {
     }
     pub(super) fn layout_changed(&mut self, cx: &mut Context<Self>) {
         let classic = self.workspace.boxy_layout();
-        if let Some(view) = self.active_app_view
-            && (!self.workspace.classic_layout || self.project_app_scope(view))
-        {
-            self.remember_title_tab(self.app_tab(view));
-        }
-        if !self.workspace.classic_layout
-            && let Some(id) = self.monos.as_ref().and_then(|m| m.read(cx).active.clone())
-        {
-            self.remember_title_tab(self.mono_tab(id));
-            self.reveal_active_tab(cx);
-        }
-        if let Some(search) = &self.app_search {
-            search.view.update(cx, |v, cx| v.set_classic(classic, cx));
+        for search in self.search_views() {
+            search.update(cx, |v, cx| v.set_classic(classic, cx));
         }
         self.usage_footer
             .update(cx, |footer, cx| footer.set_classic(classic, cx));
@@ -262,84 +248,149 @@ impl Shell {
             )
             .child(card_corner_mask(false));
         let footer = self.footer_row(cx);
-        vec![
+        // With the strips as the title bar, the card rises to just below
+        // the window's top; the navigation and the corner float over the
+        // room the sidebar header and the top strips leave.
+        let strips = self.strips_titlebar;
+        let title_row = (!strips).then(|| {
             div()
                 .h(px(TITLE_BAR_HEIGHT))
                 .flex_shrink_0()
                 .bg(inset_chrome_wash())
                 .child(self.titlebar(window, cx))
-                .into_any_element(),
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .relative()
-                .when(sidebar_width > 0., |d| {
-                    d.child(
-                        // Keep the sidebar still beneath the moving card. Clip
-                        // its covered part so text cannot bleed through the
-                        // translucent workspace or receive covered clicks.
-                        div()
-                            .id("sidebar-frame")
-                            .debug_selector(|| "sidebar-frame".into())
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .w(px(sidebar_width))
-                            .h_full()
-                            .overflow_hidden()
-                            .bg(inset_chrome_wash())
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(self.workspace.sidebar_width))
-                                    .h_full()
-                                    .opacity(self.sidebar_fraction)
-                                    .child(self.sidebar_contents()),
-                            ),
-                    )
-                })
-                .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
-                .child(
+                .into_any_element()
+        });
+        let overlay = strips.then(|| {
+            let navigation = self.navigation(cx);
+            let corner = self.panel_toggle(window, cx);
+            let room = super::client_controls_width(window) - super::corner_controls_width(window);
+            [
+                div()
+                    .debug_selector(|| "strip-navigation".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .child(navigation)
+                    .into_any_element(),
+                div()
+                    .debug_selector(|| "strip-corner".into())
+                    .absolute()
+                    .top_0()
+                    .right(px(room))
+                    .h(px(TITLE_BAR_HEIGHT))
+                    .child(corner)
+                    .into_any_element(),
+            ]
+        });
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .relative()
+            .when(sidebar_width > 0., |d| {
+                d.child(
+                    // Keep the sidebar still beneath the moving card. Clip
+                    // its covered part so text cannot bleed through the
+                    // translucent workspace or receive covered clicks.
                     div()
-                        .id("main-pane-frame")
-                        .debug_selector(|| "main-pane-frame".into())
-                        .relative()
-                        .flex_1()
-                        .min_w_0()
+                        .id("sidebar-frame")
+                        .debug_selector(|| "sidebar-frame".into())
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .w(px(sidebar_width))
                         .h_full()
-                        .flex()
-                        .flex_col()
-                        .pr_1p5()
-                        .pl(px(6. * (1. - self.sidebar_fraction)))
+                        .overflow_hidden()
+                        .bg(inset_chrome_wash())
                         .child(
                             div()
                                 .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(self.workspace.sidebar_width))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .opacity(self.sidebar_fraction)
+                                .when(strips, |d| {
+                                    // The navigation's row heads the sidebar.
+                                    d.child(
+                                        titlebar_drag_area()
+                                            .w_full()
+                                            .h(px(TITLE_BAR_HEIGHT))
+                                            .flex_shrink_0(),
+                                    )
+                                })
+                                .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
+                        ),
+                )
+            })
+            .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
+            .child(
+                div()
+                    .id("main-pane-frame")
+                    .debug_selector(|| "main-pane-frame".into())
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .pr_1p5()
+                    .pl(px(6. * (1. - self.sidebar_fraction)))
+                    .when(strips, |d| {
+                        d.pt(px(super::group_strip::CARD_TOP_GAP)).child(
+                            titlebar_drag_area()
+                                .bg(inset_chrome_wash())
+                                .absolute()
+                                .top_0()
+                                .left_0()
                                 .right_0()
+                                .h(px(super::group_strip::CARD_TOP_GAP)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(6.))
+                            .bg(inset_chrome_wash()),
+                    )
+                    .when(self.sidebar_fraction < 1., |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left_0()
                                 .top_0()
                                 .bottom_0()
-                                .w(px(6.))
+                                .w(px(6. * (1. - self.sidebar_fraction)))
                                 .bg(inset_chrome_wash()),
                         )
-                        .when(self.sidebar_fraction < 1., |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(px(6. * (1. - self.sidebar_fraction)))
-                                    .bg(inset_chrome_wash()),
-                            )
-                        })
-                        .child(card)
-                        .child(footer),
-                )
-                .children(self.sidebar_resize(cx))
-                .into_any_element(),
-        ]
+                    })
+                    .child(card)
+                    .child(footer),
+            )
+            .children(self.sidebar_resize(cx))
+            .into_any_element();
+        if let Some(overlay) = overlay {
+            return vec![
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .child(body)
+                    .children(overlay)
+                    .into_any_element(),
+            ];
+        }
+        title_row
+            .into_iter()
+            .chain([body.into_any_element()])
+            .collect()
     }
     fn classic_body(
         &mut self,
@@ -364,27 +415,28 @@ impl Shell {
             .filter(|_| right_shown && self.settings.is_none())
             .map(|panel| self.right_panel_frame(panel, right_width, full, window, cx));
         let footer = (!self.classic_surface_open(cx)).then(|| self.footer_row(cx));
-        let spans_window = self.classic_titlebar_spans_window(cx);
+        // The strips along the top are the title bar: no row above them, and
+        // the navigation floats over the sidebar's header as in the new layout.
+        let strips = self.strips_titlebar;
+        let spans_window = self.classic_titlebar_spans_window(cx) && !strips;
         let original = self.workspace.classic_layout;
         let compact_surface = cfg!(target_os = "macos")
             && original
             && !self.workspace.project_rail_open
             && self.settings.is_none()
             && self.classic_surface_open(cx);
-        let tab_bar = if spans_window || (original && self.search_page()) {
+        let tab_bar = if strips || spans_window {
             None
-        } else if original && self.classic_app_surface() {
-            Some(self.titlebar_controls_space(self.classic_app_surface_header(cx), window))
-        } else if original && self.mono_active(cx) {
-            let bar = self.classic_mono_header(cx);
-            Some(self.titlebar_controls_space(bar, window))
         } else {
             Some(self.titlebar(window, cx))
         };
         let show_navigation = !spans_window;
         let navigation = show_navigation.then(|| self.navigation(cx));
-        let corner = (self.settings.is_none() && (!original || self.project_rail_tree_on()))
-            .then(|| self.panel_toggle(window, cx));
+        // The original layout's corner holds the toggle of a Mono tab's
+        // overview, which it once kept in the Mono's own header.
+        let corner = (self.settings.is_none()
+            && (!original || self.project_rail_tree_on() || self.mono_active(cx)))
+        .then(|| self.panel_toggle(window, cx));
         let body = div()
             .flex_1()
             .min_h_0()
@@ -421,17 +473,20 @@ impl Shell {
                                 .flex()
                                 .flex_col()
                                 .opacity(self.sidebar_fraction)
-                                .when(!original, |d| {
-                                    d.child(
-                                        // The traffic lights head the sidebar, where
-                                        // the window's top is; the toggle floats
-                                        // above them (see below).
-                                        titlebar_drag_area()
-                                            .w_full()
-                                            .h(px(TITLE_BAR_HEIGHT))
-                                            .flex_shrink_0(),
-                                    )
-                                })
+                                .when(
+                                    !original || (strips && self.navigation_over_sidebar()),
+                                    |d| {
+                                        d.child(
+                                            // The traffic lights head the sidebar, where
+                                            // the window's top is; the toggle floats
+                                            // above them (see below).
+                                            titlebar_drag_area()
+                                                .w_full()
+                                                .h(px(TITLE_BAR_HEIGHT))
+                                                .flex_shrink_0(),
+                                        )
+                                    },
+                                )
                                 .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
                         ),
                 )
@@ -538,10 +593,7 @@ impl Shell {
         6. + tabs + self.diff_stat_room(cx) + CORNER_BUTTONS_WIDTH + 12. + controls
     }
     fn corner_tabs_shown(&self) -> bool {
-        self.workspace.right_panel_open
-            && !self.app_view_open()
-            && self.settings.is_none()
-            && !self.search_page()
+        self.workspace.right_panel_open && self.settings.is_none()
     }
     /// Classic: the panel toggle holds the corner while Explorer, Terminal (when
     /// it lives in the panel) and History start at the panel's left edge. The
@@ -559,8 +611,7 @@ impl Shell {
                 .child(self.file_search_button(cx))
                 .into_any_element();
         }
-        let panel_off = self.app_view_open();
-        let changes = !panel_off && self.git.read(cx).has_changes();
+        let changes = self.git.read(cx).has_changes();
         let open = self.corner_tabs_shown();
         let current = self
             .right_panel
@@ -657,11 +708,9 @@ impl Shell {
             .child(self.file_search_button(cx).mx(px(CORNER_CONTROL_GAP)))
             .child(
                 // Closed, the toggle carries the changes dot itself.
-                panel_button(!panel_off, !open && changes).when(!panel_off, |d| {
-                    d.on_click(
-                        cx.listener(|this, _, window, cx| this.toggle_right_panel(window, cx)),
-                    )
-                }),
+                panel_button(true, !open && changes).on_click(
+                    cx.listener(|this, _, window, cx| this.toggle_right_panel(window, cx)),
+                ),
             )
             .into_any_element()
     }
@@ -722,15 +771,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        if let Some(search) = self.app_search.as_ref().filter(|s| !s.panel) {
-            return div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .flex()
-                .overflow_hidden()
-                .child(search.view.clone());
-        }
         if let Some(settings) = &self.settings {
             return div()
                 .flex_1()
@@ -759,31 +799,8 @@ impl Shell {
                         // Every project lands on a blank session, as in
                         // Monocode; this is empty only while one is created.
                         .child({
-                            if let Some(monos) =
-                                self.monos.clone().filter(|m| m.read(cx).active.is_some())
-                            {
-                                let session = monos.read(cx).active_notification_session(cx);
-                                let linked = session.and_then(|id| self.linked_notice(id, cx));
-                                div()
-                                    .relative()
-                                    .size_full()
-                                    .child(self.mono_bounds.layout_probe())
-                                    .child(monos)
-                                    .children(self.drop_hint(super::mono_panes::MONO_VIEW))
-                                    .children(linked.map(|notice| {
-                                        div()
-                                            .absolute()
-                                            .top(px(12.))
-                                            .right(px(12.))
-                                            .w(px(320.))
-                                            .max_w_full()
-                                            .child(notice)
-                                    }))
-                                    .into_any_element()
-                            } else {
-                                let body = self.workspace_body(window, cx);
-                                self.with_dock(body, window, cx)
-                            }
+                            let body = self.workspace_body(window, cx);
+                            self.with_dock(body, window, cx)
                         }),
                 ),
             )
@@ -840,7 +857,7 @@ impl Shell {
         }
         let classic = self.workspace.boxy_layout();
         // The terminal group sits one footer gap on; alone, the chip takes its inset margin.
-        let alone = self.app_view_open() || self.workspace.project.is_empty();
+        let alone = self.workspace.project.is_empty();
         Some(
             div()
                 .flex_shrink_0()
@@ -1041,13 +1058,9 @@ mod tests {
                 .unwrap();
             visual.run_until_parked();
             assert!(visual.debug_bounds("right-panel-frame").is_none());
-            let toggle = visual
-                .debug_bounds(if classic {
-                    "classic-mono-overview"
-                } else {
-                    "toggle-right-panel"
-                })
-                .unwrap();
+            // A Mono is a tab in both layouts: the corner's toggle opens
+            // its overview.
+            let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
             visual.simulate_click(toggle.center(), Default::default());
             visual.run_until_parked();
             assert!(visual.debug_bounds("mono-overview-panel").is_some());
@@ -1106,10 +1119,12 @@ mod tests {
             if classic {
                 assert!(visual.debug_bounds("right-panel-frame").is_none());
             } else {
-                assert_eq!(
-                    visual.debug_bounds("right-panel-frame").unwrap(),
-                    mono_bounds
-                );
+                // The session's group strips are the title bar, so the card
+                // rises to the window's top; the panel keeps its column.
+                let frame = visual.debug_bounds("right-panel-frame").unwrap();
+                assert_eq!(frame.left(), mono_bounds.left());
+                assert_eq!(frame.size.width, mono_bounds.size.width);
+                assert_eq!(frame.bottom(), mono_bounds.bottom());
             }
             assert!(visual.debug_bounds("mono-overview-panel").is_none());
             if !classic {
@@ -1124,7 +1139,7 @@ mod tests {
                 .unwrap();
             visual.run_until_parked();
             if classic {
-                let toggle = visual.debug_bounds("classic-mono-overview").unwrap();
+                let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
                 visual.simulate_click(toggle.center(), Default::default());
                 visual.run_until_parked();
             }

@@ -495,73 +495,6 @@ impl Monos {
             cx.emit(ShowDetails(id));
         }
     }
-    /// TitleBar.tsx's MonoTitle, used by the original full-width Mono view.
-    pub(crate) fn original_title(&self, inset: f32, cx: &App) -> AnyElement {
-        let Some(mono) = self.current() else {
-            return div().flex_1().min_w_0().into_any_element();
-        };
-        let state = self
-            .chats
-            .get(&mono.id)
-            .map(|chat| chat.read(cx).mono_status())
-            .unwrap_or("idle");
-        let status = match state {
-            "working" => "Working",
-            "needs-you" => "Needs you",
-            _ => "Idle",
-        };
-        div()
-            .id("original-mono-title")
-            .debug_selector(|| "original-mono-title".into())
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .pl(px(inset))
-            .pr_4()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(avatar::avatar(
-                &mono.mascot,
-                mono.color,
-                state,
-                16.,
-                state == "idle",
-            ))
-            .child(
-                div()
-                    .debug_selector(|| "original-mono-name".into())
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(content(1.))
-                    .child(mono.label()),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "original-mono-status".into())
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .font_weight(gpui::FontWeight::NORMAL)
-                    .text_color(if state == "needs-you" {
-                        accent_color()
-                    } else {
-                        content(0.45)
-                    })
-                    .child(status),
-            )
-            .into_any_element()
-    }
-    pub(crate) fn open_current_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.active.clone() else {
-            return;
-        };
-        self.settings = Some(SettingsSection::General);
-        window.focus(&self.settings_focus, cx);
-        self.reload_files(&id, cx);
-        cx.notify();
-    }
     pub(crate) fn current(&self) -> Option<&Mono> {
         self.active.as_deref().and_then(|id| self.roster.get(id))
     }
@@ -1100,8 +1033,17 @@ impl Monos {
         self.changed(cx);
     }
     pub(crate) fn open(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.prefs.monos || self.roster.get(id).is_none() {
+        if !self.show(id, cx) {
             return;
+        }
+        cx.emit(TabOpened(id.into()));
+        self.focus_active(window, cx);
+    }
+    /// Make `id` the Mono this page shows, as its tab gains focus, without
+    /// asking the workspace for a tab. False when there is no such Mono.
+    pub(crate) fn show(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.prefs.monos || self.roster.get(id).is_none() {
+            return false;
         }
         if self.active.as_deref() != Some(id) {
             self.save_open_file(cx);
@@ -1118,8 +1060,6 @@ impl Monos {
         self.active = Some(id.into());
         self.ensure_chat(id, cx);
         self.reload_files(id, cx);
-        cx.emit(TabOpened(id.into()));
-        self.focus_active(window, cx);
         if let Some(view) = self.chats.get(id) {
             let count = view.read(cx).mono_rows(cx).len();
             if let Some(mono) = self.roster.get_mut(id) {
@@ -1127,6 +1067,8 @@ impl Monos {
             }
         }
         self.save(cx);
+        cx.notify();
+        true
     }
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_none()
@@ -1512,106 +1454,6 @@ impl Monos {
                     .children(self.background_modal())
             })
             .into_any_element()
-    }
-    pub(crate) fn title_tab(&self, id: &str, width: f32, cx: &Context<Self>) -> Option<AnyElement> {
-        self.roster.get(id).map(|mono| {
-            let id = mono.id.clone();
-            let close = id.clone();
-            let active = self.active.as_deref() == Some(&id);
-            let selector = format!("mono-title-tab-{id}");
-            let group: SharedString = selector.clone().into();
-            div()
-                .id(SharedString::from(format!("mono-title-{id}")))
-                .debug_selector(move || selector.clone())
-                .role(Role::Tab)
-                .aria_label(mono.label())
-                .aria_selected(active)
-                .h(px(TITLE_BAR_HEIGHT))
-                .w(px(width))
-                .flex_shrink_0()
-                .relative()
-                .flex()
-                .items_center()
-                .group(group.clone())
-                .child(
-                    title_tab_plate(active, false)
-                        .w_full()
-                        .min_w_0()
-                        .pr_7()
-                        .gap(px(crate::tab_tile::TAB_TILE_GAP))
-                        .group_hover(group.clone(), move |s| {
-                            s.opacity(1.).bg(title_tab_fill(active, true))
-                        })
-                        .child(crate::tab_tile::mark_tile(
-                            &crate::tab_tile::TAB_TILE,
-                            crate::tab_tile::Face::Neutral,
-                            avatar::avatar(&mono.mascot, mono.color, "idle", 14., true),
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(20.))
-                                .text_size(px(TITLE_TAB_TEXT_SIZE))
-                                .text_color(content(if active { 1. } else { 0.5 }))
-                                .group_hover(group.clone(), |s| s.text_color(content(1.)))
-                                .child(crate::tab_label::tab_label(mono.label())),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("close-mono-tab")
-                        .debug_selector(|| "close-mono-tab-button".into())
-                        .role(Role::Button)
-                        .aria_label("Close Mono tab")
-                        .absolute()
-                        .right_1()
-                        .top(px(10.))
-                        .size(px(20.))
-                        .rounded_sm()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .opacity(0.)
-                        .group_hover(group, |s| s.opacity(1.))
-                        .hover(|s| s.bg(content(0.1)))
-                        .child(icon("close", 12.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            let owner = this.owner.clone();
-                            let close = close.clone();
-                            window.defer(cx, move |window, cx| {
-                                let _ = owner.update(cx, |shell, cx| {
-                                    shell.close_mono_tab(&close, window, cx)
-                                });
-                            });
-                        })),
-                )
-                .on_mouse_up(
-                    MouseButton::Middle,
-                    cx.listener({
-                        let id = id.clone();
-                        move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            let owner = this.owner.clone();
-                            let id = id.clone();
-                            window.defer(cx, move |window, cx| {
-                                let _ = owner
-                                    .update(cx, |shell, cx| shell.close_mono_tab(&id, window, cx));
-                            });
-                        }
-                    }),
-                )
-                .on_click(cx.listener(move |this, _, w, cx| {
-                    let owner = this.owner.clone();
-                    let id = id.clone();
-                    w.defer(cx, move |w, cx| {
-                        let _ = owner.update(cx, |shell, cx| shell.click_mono_tab(&id, w, cx));
-                    });
-                }))
-                .into_any_element()
-        })
     }
 }
 impl gpui::Render for Monos {

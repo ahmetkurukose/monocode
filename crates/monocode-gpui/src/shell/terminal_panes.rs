@@ -153,40 +153,43 @@ impl Shell {
             })
     }
 
-    /// A dock tab dropped on a pane edge or on the title strip leaves the
-    /// dock with its shell. Anywhere else it stays in the dock.
+    /// A dock tab dropped on a pane edge leaves the dock with its shell.
+    /// Anywhere else it stays in the dock.
     pub(super) fn drop_dock_terminal(
         &mut self,
         ix: usize,
         over: Option<(i64, Edge)>,
-        insert: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if over.is_none() && insert.is_none() {
-            return;
-        }
-        let Some(owner) = self.terminal_owner() else {
+        let Some((target, edge)) = over else {
             return;
         };
-        let project = self.workspace.project.clone();
-        let Some(terminal) = self
-            .terminals
-            .get(&project)
-            .and_then(|t| t.get(ix))
-            .cloned()
-        else {
-            return;
-        };
-        let over = over.map(|(target, edge)| (self.resolve_mono_target(target, cx), edge));
         // Never take the shell out of the dock without somewhere to put it:
         // a terminal pane no tab holds is pruned, and its shell stops.
-        if insert.is_none()
-            && over.is_none_or(|(target, _)| self.workspace.tab_of(target).is_none())
-        {
+        if self.workspace.tab_of(target).is_none() {
             return;
         }
         let before = self.active_leaves();
+        let Some(pane) = self.take_dock_terminal(ix, cx) else {
+            return;
+        };
+        self.workspace.place(pane, target, edge);
+        self.begin_pane_motion(before, cx);
+        self.fit_sidebar(cx);
+        self.open_terminal_pane(pane, window, cx);
+    }
+
+    /// Take dock terminal `ix` out of the dock as a terminal pane no layout
+    /// holds yet; the caller places it at once.
+    pub(super) fn take_dock_terminal(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<i64> {
+        let owner = self.terminal_owner()?;
+        let project = self.workspace.project.clone();
+        let terminal = self
+            .terminals
+            .get(&project)
+            .and_then(|t| t.get(ix))
+            .cloned()?;
         if let Some(live) = self.terminals.get_mut(&project) {
             live.remove(ix);
         }
@@ -208,20 +211,12 @@ impl Shell {
             .terminal_panes
             .insert(pane, TerminalPane { owner, cwd });
         self.terminal_pane_views.insert(pane, terminal);
-        if let Some(to) = insert {
-            self.workspace.open(pane);
-            self.reorder_title_tab(&TitleTab::Session(pane), to, cx);
-            self.pane_motion = None;
-        } else if let Some((target, edge)) = over {
-            self.workspace.place(pane, target, edge);
-            self.begin_pane_motion(before, cx);
-        }
-        self.fit_sidebar(cx);
-        self.open_terminal_pane(pane, window, cx);
+        Some(pane)
     }
 
-    /// Title bar placement: a fresh shell opens as its own title tab. With
-    /// no session to borrow a scope from, it opens in the dock instead.
+    /// Title bar placement: a fresh shell opens as a tab of the focused
+    /// group (the scope's first tab makes its title tab). With no session to
+    /// borrow a scope from, it opens in the dock instead.
     pub(super) fn new_title_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An app view (the Inbox, say) has no active session to borrow; the
         // project's own sessions can lend their scope, without being opened.
@@ -250,7 +245,7 @@ impl Shell {
             .terminal_panes
             .insert(pane, TerminalPane { owner, cwd });
         self.terminal_pane_views.insert(pane, terminal);
-        self.workspace.open(pane);
+        self.place_or_open(pane, OpenIn::default(), cx);
         self.pane_motion = None;
         self.fit_sidebar(cx);
         self.open_terminal_pane(pane, window, cx);
@@ -259,9 +254,6 @@ impl Shell {
     /// Title bar placement, cmd-shift-j: a fresh shell as a pane beside the
     /// focused one. With no focused pane it opens as its own title tab.
     pub(super) fn split_title_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.app_view_open() {
-            return;
-        }
         let target = self
             .workspace
             .active
@@ -297,9 +289,9 @@ impl Shell {
         let Some(owner) = self.workspace.terminal_panes.get(&pane).map(|t| t.owner) else {
             return;
         };
-        let Some(tab) = self.workspace.tab_of(pane) else {
+        if self.workspace.tab_of(pane).is_none() {
             return;
-        };
+        }
         if let Some(session) = self.ensure_session(owner, cx) {
             self.workspace.project = session.read(cx).summary.cwd.clone();
         }
@@ -316,7 +308,11 @@ impl Shell {
             .insert(self.workspace.project.clone(), pane);
         self.history.record(pane);
         self.review_focused = false;
-        self.remember_title_tab(TitleTab::Session(tab));
+        self.merge_scope_tabs(cx);
+        // Showing a hidden tab can rekey its title tab: look it up after.
+        if let Some(tab) = self.workspace.tab_of(pane) {
+            self.remember_title_tab(TitleTab::Session(tab));
+        }
         self.reveal_active_tab(cx);
         self.focus_terminal_pane(window, cx);
         self.persist(cx);
@@ -343,11 +339,10 @@ impl Shell {
         true
     }
 
-    /// A terminal pane: its split header over the shell.
+    /// A terminal pane's shell, under its group's strip.
     pub(super) fn terminal_pane_surface(
         &mut self,
         pane: i64,
-        split: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let view = self.terminal_pane_view(pane, cx);
@@ -359,9 +354,6 @@ impl Shell {
             .size_full()
             .flex()
             .flex_col()
-            .when_some(split.filter(|p| *p > 0.), |d, p| {
-                d.child(self.split_header(pane, p, true, cx))
-            })
             .child(div().flex_1().min_h_0().min_w_0().children(
                 // The grid shapes every line; redraw it only when the
                 // terminal itself changes.
@@ -526,10 +518,12 @@ mod tests {
                 active
             })
             .unwrap();
+        let db = tempfile::tempdir().unwrap();
         window
-            .update(&mut visual, |shell, _, cx| {
-                shell.active_app_view = Some(crate::workspace::AppView::Database);
-                shell.invalidate_chrome(cx);
+            .update(&mut visual, |shell, w, cx| {
+                shell.database_dir = db.path().to_owned();
+                shell.open_database(w, cx);
+                assert!(shell.app_view_open());
             })
             .unwrap();
         visual.run_until_parked();
@@ -717,25 +711,30 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_dock_tab_pulled_onto_the_title_strip_becomes_its_own_tab(cx: &mut TestAppContext) {
+    fn a_dock_tab_pulled_onto_a_group_strip_joins_that_group(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         let (mut visual, project, shell_id) = dock_with_one_terminal(window, b, cx);
-        let strip = window
-            .update(&mut visual, |shell, _, _| shell.tab_scroll.bounds())
+        let strip = visual
+            .debug_bounds(Box::leak(format!("group-strip-space-{b}").into_boxed_str()))
             .unwrap();
-        pull_dock_tab(&mut visual, point(strip.right() - px(4.), strip.center().y));
+        pull_dock_tab(&mut visual, strip.center());
         window
             .update(&mut visual, |shell, _, cx| {
                 let (&pane, _) = shell.workspace.terminal_panes.iter().next().unwrap();
                 assert_eq!(shell.terminal_pane_views[&pane].entity_id(), shell_id);
                 assert!(shell.terminals[&project].is_empty());
-                assert_eq!(shell.workspace.tab_of(pane), Some(pane));
-                assert!(!shell.workspace.layout(pane).is_split());
-                let visible = shell.visible_tabs(cx);
-                assert_eq!(visible.last(), Some(&TitleTab::Session(pane)));
-                assert_eq!(shell.active_title_tab(cx), Some(TitleTab::Session(pane)));
+                // The last tab of the chat's group, shown in its place.
+                assert_eq!(shell.workspace.group_tabs(b), [b, pane]);
+                assert_eq!(shell.workspace.visible_of(b), Some(pane));
+                assert!(
+                    !shell
+                        .workspace
+                        .layout(shell.workspace.tab_of(pane).unwrap())
+                        .is_split()
+                );
+                assert_eq!(shell.workspace.active, Some(pane));
                 assert_eq!(
-                    shell.tab_copy(pane, cx).headline,
+                    shell.tab_face(pane, cx).unwrap().title,
                     shell.terminal_pane_title(pane, cx).unwrap()
                 );
             })
@@ -759,12 +758,17 @@ mod tests {
                     let project = shell.workspace.project.clone();
                     assert_eq!(shell.terminals[&project].len(), 1);
                     let pulled = shell.terminals[&project][0].clone();
-                    // Onto the title strip, then onto the chat's right edge.
-                    let (over, insert) = match edge {
-                        None => (None, Some(shell.visible_tabs(cx).len())),
-                        Some(edge) => (Some((b, edge)), None),
-                    };
-                    shell.drop_dock_terminal(0, over, insert, w, cx);
+                    // Onto the chat's strip, then onto the chat's right edge.
+                    match edge {
+                        None => {
+                            let drop = super::super::group_strip::GroupDrop::Strip {
+                                group: shell.workspace.visible_of(b).unwrap(),
+                                index: shell.workspace.group_tabs(b).len(),
+                            };
+                            shell.drop_into_group(DragSource::DockTerminal(0), drop, w, cx);
+                        }
+                        Some(edge) => shell.drop_dock_terminal(0, Some((b, edge)), w, cx),
+                    }
                     assert!(shell.terminal_pane_views.values().any(|t| *t == pulled));
                     // The panel stays open on a new shell.
                     assert!(shell.workspace.right_panel_open);
@@ -813,7 +817,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn title_bar_terminals_open_as_their_own_tabs(cx: &mut TestAppContext) {
+    fn title_bar_terminals_open_as_tabs_of_the_focused_group(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         cx.update(|cx| {
             bind_keys(cx);
@@ -829,7 +833,8 @@ mod tests {
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        // Each cmd-j opens another terminal tab; the dock stays closed.
+        // Each cmd-j opens another terminal tab in the chat's group; the dock
+        // stays closed.
         visual.simulate_keystrokes("cmd-j");
         visual.run_until_parked();
         visual.simulate_keystrokes("cmd-j");
@@ -842,7 +847,8 @@ mod tests {
                 let mut panes: Vec<i64> = shell.workspace.terminal_panes.keys().copied().collect();
                 panes.sort();
                 for pane in &panes {
-                    assert_eq!(shell.workspace.tab_of(*pane), Some(*pane));
+                    assert_eq!(shell.workspace.tab_of(*pane), shell.workspace.tab_of(b));
+                    assert!(shell.workspace.group_tabs(b).contains(pane));
                     assert_eq!(shell.workspace.terminal_panes[pane].owner, b);
                 }
                 let active = shell.active_title_tab(cx).unwrap();
@@ -853,15 +859,23 @@ mod tests {
         assert!(visual.debug_bounds("terminal-dock").is_none());
         // The tabs replace the footer's terminal button.
         assert!(visual.debug_bounds("footer-terminal").is_none());
-        // The plus button asks for a session or a terminal.
-        let plus = visual.debug_bounds("new-tab").unwrap().center();
+        // The group's plus button asks for a session or a terminal.
+        let visible = window
+            .update(&mut visual, |shell, _, _| {
+                shell.workspace.visible_of(b).unwrap()
+            })
+            .unwrap();
+        let plus = visual
+            .debug_bounds(Box::leak(format!("group-add-{visible}").into_boxed_str()))
+            .unwrap()
+            .center();
         visual.simulate_click(plus, Modifiers::default());
         visual.run_until_parked();
         window
             .update(&mut visual, |shell, window, cx| {
-                assert!(shell.menu_open(&MenuTarget::NewTab));
+                assert!(shell.menu_open(&MenuTarget::GroupAdd(visible)));
                 shell.close_menu(cx);
-                shell.run_menu(MenuTarget::NewTab, "terminal", None, window, cx);
+                shell.run_menu(MenuTarget::GroupAdd(visible), "terminal", None, window, cx);
                 assert_eq!(shell.workspace.terminal_panes.len(), 3);
                 assert!(
                     first
@@ -875,10 +889,10 @@ mod tests {
             .unwrap();
     }
 
-    /// The plus menu's New terminal worked beside a session tab but did
-    /// nothing while the Inbox tab was showing.
+    /// New terminal worked beside a session tab but did nothing while the
+    /// Inbox tab was showing.
     #[gpui::test]
-    fn new_terminal_from_the_plus_menu_works_while_the_inbox_is_showing(cx: &mut TestAppContext) {
+    fn new_title_terminal_works_while_the_inbox_is_showing(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         cx.update(|cx| {
             bind_keys(cx);
@@ -917,11 +931,10 @@ mod tests {
             .unwrap();
         window
             .update(&mut visual, |shell, window, cx| {
-                shell.run_menu(MenuTarget::NewTab, "terminal", None, window, cx);
+                shell.new_title_terminal(window, cx);
                 let panes: Vec<i64> = shell.workspace.terminal_panes.keys().copied().collect();
                 assert_eq!(panes.len(), 1, "a terminal opened");
-                assert!(!shell.app_view_open(), "and the Inbox gave way to it");
-                assert_eq!(shell.workspace.active, Some(panes[0]));
+                assert_eq!(shell.workspace.active, Some(panes[0]), "in front");
                 assert_eq!(shell.order.len(), sessions, "without starting a session");
                 assert!(
                     shell.workspace.tab_of(b).is_none(),
@@ -938,7 +951,8 @@ mod tests {
                 shell.new_terminal(window, cx);
                 let project = shell.workspace.project.clone();
                 assert_eq!(shell.terminals.get(&project).map_or(0, Vec::len), 1);
-                assert!(!shell.app_view_open());
+                // The Inbox is a tab: the dock opens beside it.
+                assert!(shell.app_view_open(), "the Inbox stays in front");
             })
             .unwrap();
     }

@@ -488,10 +488,14 @@ fn a_leading_at_sign_still_finds_files_and_text_where_there_are_no_symbols(
         })
         .unwrap();
     use crate::everywhere::Tab;
+    let root = rig.root.to_string_lossy().into_owned();
     let ask = |cx: &mut VisualTestContext, typed: &str, tab: Tab| -> Vec<String> {
         let typed = typed.to_owned();
         window
             .update(cx, |shell, window, cx| {
+                // A file pane brings its chat's project to the front; the
+                // search is about the rig's.
+                shell.workspace.project = root.clone();
                 shell.open_everywhere(Some(tab), Some(typed), window, cx);
             })
             .unwrap();
@@ -514,7 +518,11 @@ fn a_leading_at_sign_still_finds_files_and_text_where_there_are_no_symbols(
     // name looked for.
     open_file(window, cx, &css);
     let found = ask(cx, "@types", Tab::All);
-    assert_eq!(found.first().map(String::as_str), Some("shapes.d.ts"), "{found:?}");
+    assert_eq!(
+        found.first().map(String::as_str),
+        Some("shapes.d.ts"),
+        "{found:?}"
+    );
     // A file with symbols in front: on All, `@` searches its symbols.
     open_file(window, cx, &store);
     assert_eq!(ask(cx, "@sto", Tab::All), ["Store"]);

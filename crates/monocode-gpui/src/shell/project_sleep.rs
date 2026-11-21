@@ -1234,7 +1234,8 @@ mod tests {
                 assert_eq!(shell.workspace.active, None);
                 assert!(shell.sessions.is_empty(), "sleeping loads no chat");
                 // Leaving an app view returns to the sleep screen, not a chat.
-                shell.active_app_view = Some(crate::workspace::AppView::Inbox);
+                shell.open_inbox(w, cx);
+                assert!(shell.app_view_open());
                 shell.close_app_view(w, cx);
                 assert!(shell.project_asleep(MONOCODE));
                 assert_eq!(shell.workspace.active, None);

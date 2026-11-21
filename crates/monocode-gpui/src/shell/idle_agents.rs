@@ -4,10 +4,7 @@ use super::*;
 impl Shell {
     pub(crate) fn keep_visible_idle_agents(&self, cx: &App) {
         let mut ids = Vec::new();
-        if !self.app_view_open()
-            && !self.mono_active(cx)
-            && let Some(tab) = self.workspace.active_tab()
-        {
+        if let Some(tab) = self.workspace.active_tab() {
             ids.extend(
                 self.workspace
                     .layout(tab)

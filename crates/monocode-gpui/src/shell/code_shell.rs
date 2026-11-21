@@ -80,9 +80,6 @@ impl Shell {
         &self,
         cx: &App,
     ) -> Option<(i64, Entity<crate::file_editor::FileEditor>)> {
-        if self.app_view_open() {
-            return None;
-        }
         let pane = self.workspace.active?;
         let editor = self.reviews.get(&pane)?.read(cx).active_editor()?;
         Some((pane, editor))
@@ -253,9 +250,6 @@ impl Shell {
             .or_default()
             .push(terminal.clone());
         if reveal && project == self.workspace.project {
-            if self.app_view_open() {
-                self.close_app_view(window, cx);
-            }
             self.dock_tab_scroll.scroll_to_item(added);
             if self.terminal_in_panel(cx) {
                 if let Some(dock) = self.workspace.docks.get_mut(project) {
@@ -361,9 +355,6 @@ impl Shell {
         };
         if project != self.workspace.project {
             self.select_project(project.clone(), window, cx);
-        }
-        if self.app_view_open() {
-            self.close_app_view(window, cx);
         }
         let Some(dock) = self.workspace.docks.get_mut(&project) else {
             return false;
@@ -540,7 +531,7 @@ impl Shell {
     pub(super) fn code_chips(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let classic = self.workspace.boxy_layout();
         // With no terminal group after them the last chip takes the footer's inset.
-        let alone = self.app_view_open() || self.workspace.project.is_empty();
+        let alone = self.workspace.project.is_empty();
         let shown: Vec<_> = (chips::all(cx).into_iter())
             .filter_map(|chip| Some(((chip.state)(cx)?, chip.id)))
             .collect();

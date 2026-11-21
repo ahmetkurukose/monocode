@@ -9,10 +9,8 @@ impl Shell {
         if self.archive_shortcut_held {
             return;
         }
-        if self.app_view_open()
-            || self.settings.is_some()
+        if self.settings.is_some()
             || self.app_search.is_some()
-            || self.mono_active(cx)
             || self.palette.is_some()
             || self.everywhere.is_some()
             || self.image_lightbox.is_some()

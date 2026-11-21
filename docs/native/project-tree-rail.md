@@ -120,7 +120,8 @@ Two kinds, both enumerable for every project:
   (shell.rs:4337-4356) → `activate_session` (:4400-4442), which sets `workspace.project` from the
   session's cwd (:4425). So `open(id)` on a session of another project already switches project.
   `open` also routes pane ids to `open_file_pane` / `open_mono_pane` / `open_terminal_pane` (:4338-4349).
-- Title tab click: `open_title_tab` (title_tabs.rs:182-214) → `open(tab_focus)`.
+- Tab click: a group strip's tab (`select_group_tab`, `shell/group_strip.rs`) shows that tab;
+  the old title strip and `open_title_tab` are gone (`docs/native/tab-groups.md`).
 
 ### 2.5 Preferences end-to-end
 - `Preferences` (settings/preferences.rs:9-112, `#[serde(default)]`), defaults :118-196,

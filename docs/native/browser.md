@@ -7,7 +7,8 @@ macOS only. File and line references are from the tree at `01cd52fe`.
 
 A browser inside Monocode that is good enough to develop against, and no more:
 
-- Opens as a **pane**: a title tab of its own, or split beside a chat, a file or a terminal.
+- Opens as a **pane**: a tab of a tab group (`docs/native/tab-groups.md`), stacked with or
+  split beside a chat, a file or a terminal.
 - Runs on the system **WebKit** (`WKWebView`). No Chromium, no Swift code, no new
   dependency: `objc2-web-kit 0.3` is already in `monocode-gpui/Cargo.toml:69`.
 - **Agents drive it over MCP**: open a page, read it, click, type, take a screenshot, read
@@ -74,7 +75,7 @@ and wait for WebKit's completion handler. §3.6 covers it.
 The workspace knows panes with negative ids that borrow a session's project and worktree:
 file panes (`review_owners`), Mono panes (`mono_panes`), and **terminal panes**
 (`terminal_panes: HashMap<i64, TerminalPane { owner, cwd }>`, `workspace.rs:268-271`,
-`shell/terminal_panes.rs`). A terminal pane can be a title tab or sit in a split, is pruned
+`shell/terminal_panes.rs`). A terminal pane is a tab of a group like any other, is pruned
 when its owner goes (`Workspace::restore`), is confirmed before closing, and is listed
 under its project in the tree rail (`project_rail_tree.rs`, `RailTerminal::Pane`).
 **The browser pane follows this pattern**, not the app-view pattern: an app view replaces
@@ -121,8 +122,8 @@ BrowserProfile          a WebKit data store: cookies, cache, storage
 - Rail: a globe icon in `PROJECT_APPS` opens the project's most recent browser pane, or a
   new one at the project's start address (§3.8). The project's open pages are listed
   under it in the tree with the terminals, each with a sleeping/live mark.
-- A browser pane is a title tab by default. Dragging it onto a chat splits it, as a
-  terminal pane does. "Open beside chat" is in the tab's menu.
+- A browser pane opens as a tab of the focused group (the router in
+  `shell/tab_router.rs`). Dragging its tab onto a pane's edge splits it, as for any tab.
 - Links: a `http(s)` link in a transcript or a terminal opens in the project's browser
   pane (setting: `In Monocode | In my browser`, default in Monocode). "Open in my
   browser" is in the link's menu.

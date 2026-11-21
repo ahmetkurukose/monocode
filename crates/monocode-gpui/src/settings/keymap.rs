@@ -64,6 +64,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         "workspace::NewCodex" if keys.ends_with("-t") => "Tab: New",
         "workspace::CloseOtherTabs" => "Tab: Close Others",
         "workspace::CloseAllTabs" => "Tab: Close All",
+        "workspace::ReopenClosedTab" => "Tab: Reopen Closed",
         "workspace::NextTab" if keys == "ctrl-tab" => "Tab: Cycle Next",
         "workspace::PreviousTab" if keys == "ctrl-shift-tab" => "Tab: Cycle Previous",
         "workspace::NextTab" => "Tab: Next",

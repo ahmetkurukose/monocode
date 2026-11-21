@@ -91,6 +91,30 @@ impl ProjectApps {
     }
 }
 
+/// The tabs stacked in one split region (docs/native/tab-groups.md). A group
+/// has no id: its visible tab is the member that is a leaf of a layout, and
+/// a leaf no group lists is a group of one, so only real stacks are saved.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TabGroup {
+    /// Pane ids in strip order, pinned ones first.
+    pub tabs: Vec<i64>,
+    pub pinned: Vec<i64>,
+    /// The tab the next preview open replaces; never pinned.
+    pub preview: Option<i64>,
+    /// Most recently shown first. Closing the visible tab shows its head.
+    #[serde(skip)]
+    pub mru: Vec<i64>,
+}
+
+impl TabGroup {
+    /// Worth keeping: a stack, or a lone tab that is pinned or a preview.
+    fn worth_keeping(&self) -> bool {
+        self.tabs.len() > 1
+            || (!self.tabs.is_empty() && (!self.pinned.is_empty() || self.preview.is_some()))
+    }
+}
+
 /// A named section of projects in the original project navigation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -153,8 +177,8 @@ pub(crate) struct Workspace {
     /// Independent file panes use negative IDs in the layout tree. Their
     /// originating session supplies project/worktree scope and Add to Chat.
     pub review_owners: HashMap<i64, i64>,
-    /// Monos dragged into a split, by their negative pane IDs. Each keeps the
-    /// Mono tab it came from, which it becomes again once it stands alone.
+    /// Monos as tabs, by their negative pane IDs. Each keeps the Mono it
+    /// shows and the scope (project and worktree) it opened in.
     pub mono_panes: HashMap<i64, TitleTab>,
     /// Terminals pulled out of a dock into a split or onto the title strip,
     /// by their negative pane IDs. Like file panes, each borrows its owner
@@ -162,8 +186,20 @@ pub(crate) struct Workspace {
     pub terminal_panes: HashMap<i64, TerminalPane>,
     /// Browser pages, by their negative pane IDs, like terminal panes.
     pub browser_panes: HashMap<i64, BrowserPane>,
+    /// App views, Search and Monos as panes, by their negative pane IDs.
+    /// They have no owner session. `TitleTab::ProjectApp` never goes here:
+    /// see its note on older builds.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub view_panes: HashMap<i64, TitleTab>,
+    /// The scope (`Shell::tab_scope`'s key) each view pane opened in; a Mono
+    /// pane's scope is in its `TitleTab::Mono`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub view_scopes: HashMap<i64, String>,
     /// Split trees of tabs with more than one pane, by tab key.
     pub layouts: HashMap<i64, PaneNode>,
+    /// Hidden tabs stacked under layout leaves; see `TabGroup`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TabGroup>,
     /// The pane each split tab returns to when it is activated.
     pub focused: HashMap<i64, i64>,
     /// Each project's terminal dock (ProjectTerminalDock), by project path.
@@ -490,7 +526,10 @@ impl Default for Workspace {
             terminal_panes: Default::default(),
             browser_panes: Default::default(),
             mono_panes: Default::default(),
+            view_panes: Default::default(),
+            view_scopes: Default::default(),
             layouts: Default::default(),
+            groups: Vec::new(),
             focused: Default::default(),
             docks: Default::default(),
             actions: HashMap::new(),
@@ -675,11 +714,54 @@ impl Workspace {
                 && sessions.iter().any(|(known, _)| *known == pane.owner)
         });
         known.extend(state.browser_panes.keys().copied());
+        let (owners, monos, terminals, browsers) = (
+            &state.review_owners,
+            &state.mono_panes,
+            &state.terminal_panes,
+            &state.browser_panes,
+        );
+        state.view_panes.retain(|id, view| {
+            *id < 0
+                && !owners.contains_key(id)
+                && !monos.contains_key(id)
+                && !terminals.contains_key(id)
+                && !browsers.contains_key(id)
+                && !matches!(view, TitleTab::Session(_) | TitleTab::ProjectApp { .. })
+        });
+        known.extend(state.view_panes.keys().copied());
+        let views = &state.view_panes;
+        state.view_scopes.retain(|id, _| views.contains_key(id));
+        // A visible tab that is gone hands its leaf to the next known hidden
+        // tab of its group, so the rest of the stack survives.
+        let saved_leaves: HashSet<i64> = (state.tabs.iter())
+            .flat_map(|tab| {
+                (state.layouts.get(tab).cloned())
+                    .unwrap_or_else(|| leaf(*tab))
+                    .leaf_ids()
+            })
+            .collect();
+        let mut stand_ins: Vec<(i64, i64)> = Vec::new();
+        for group in &mut state.groups {
+            let gone: Vec<i64> = (group.tabs.iter().copied())
+                .filter(|id| saved_leaves.contains(id) && !known.contains(id))
+                .collect();
+            group.tabs.retain(|id| known.contains(id));
+            let hidden: Vec<i64> = (group.tabs.iter().copied())
+                .filter(|id| !saved_leaves.contains(id))
+                .filter(|id| !stand_ins.iter().any(|(_, used)| used == id))
+                .collect();
+            stand_ins.extend(gone.into_iter().zip(hidden));
+        }
         let mut seen = HashSet::new();
         let mut layouts = std::mem::take(&mut state.layouts);
         let mut focused = std::mem::take(&mut state.focused);
         for tab in std::mem::take(&mut state.tabs) {
-            let layout = layouts.remove(&tab).unwrap_or_else(|| leaf(tab));
+            let mut layout = layouts.remove(&tab).unwrap_or_else(|| leaf(tab));
+            for (from, to) in &stand_ins {
+                if layout.contains(*from) {
+                    layout = layout.replace_leaf(*from, *to);
+                }
+            }
             let Some(layout) = layout.retain(&mut |id| known.contains(&id) && seen.insert(id))
             else {
                 continue;
@@ -707,9 +789,11 @@ impl Workspace {
                 state.layouts.insert(key, layout);
             }
         }
+        state.normalize_groups();
         state.settle_mono_panes();
         state.prune_terminal_panes();
         state.prune_browser_panes();
+        state.prune_view_panes();
         state.normalize_title_order();
         if state
             .desktop_project_preferences
@@ -750,6 +834,8 @@ impl Workspace {
                         })
                 });
         }
+        // Focus is always on screen: a hidden tab gives way to its group's.
+        state.active = state.active.map(|id| state.visible_of(id).unwrap_or(id));
         if saved.is_none()
             && let Some((id, _)) = sessions.iter().find(|(_, path)| path == cwd)
         {
@@ -1041,12 +1127,13 @@ impl Workspace {
             || self.terminal_panes.contains_key(&id)
             || self.browser_panes.contains_key(&id)
     }
-    /// File, Mono and terminal panes share the negative IDs below every
-    /// session.
+    /// File, Mono, terminal, browser and view panes share the negative IDs
+    /// below every session.
     pub fn next_pane_id(&self) -> i64 {
         self.review_owners
             .keys()
             .chain(self.mono_panes.keys())
+            .chain(self.view_panes.keys())
             .chain(self.terminal_panes.keys())
             .chain(self.browser_panes.keys())
             .copied()
@@ -1055,26 +1142,35 @@ impl Workspace {
             .min(0)
             - 1
     }
+    #[cfg(test)]
     pub fn mono_pane(&self, mono: &str) -> Option<i64> {
         self.mono_panes.iter().find_map(|(pane, tab)| {
             matches!(tab, TitleTab::Mono { id, .. } if id == mono).then_some(*pane)
         })
     }
+    /// Monos and view panes have no owner session, so they never scope or
+    /// key a tab while a conversation's pane is there to.
+    fn is_ownerless(&self, id: i64) -> bool {
+        self.mono_panes.contains_key(&id) || self.view_panes.contains_key(&id)
+    }
     /// The pane that scopes a tab to a project: its focus, unless that is a
-    /// Mono, which works across projects.
+    /// Mono or view pane, which works across projects.
     pub fn scope_pane(&self, tab: i64) -> i64 {
         let focus = self.tab_focus(tab);
-        if !self.mono_panes.contains_key(&focus) {
+        if !self.is_ownerless(focus) {
             return focus;
         }
         self.layout(tab)
             .leaf_ids()
             .into_iter()
-            .find(|id| !self.mono_panes.contains_key(id))
+            .find(|id| !self.is_ownerless(*id))
             .unwrap_or(focus)
     }
     /// Focus a session, opening it as its own tab unless a tab holds it.
     pub fn open(&mut self, id: i64) {
+        if self.leaf_tab(id).is_none() && self.show(id) {
+            return;
+        }
         match self.tab_of(id) {
             Some(tab) => {
                 if self.layouts.contains_key(&tab) {
@@ -1095,6 +1191,11 @@ impl Workspace {
         };
         let ix = self.tabs.iter().position(|t| *t == tab).unwrap_or(0);
         let layout = self.layout(tab);
+        let leaves = layout.leaf_ids();
+        let members: HashSet<i64> = leaves.iter().flat_map(|id| self.group_tabs(*id)).collect();
+        // Hidden tabs close with the title tab that shows their group.
+        self.groups
+            .retain(|group| !group.tabs.iter().any(|id| leaves.contains(id)));
         self.tabs.remove(ix);
         self.tab_workspaces.remove(&tab);
         self.title_order
@@ -1103,7 +1204,7 @@ impl Workspace {
             .retain(|_, entry| *entry != TitleTab::Session(tab));
         self.layouts.remove(&tab);
         self.focused.remove(&tab);
-        self.project_focus.retain(|_, id| !layout.contains(*id));
+        self.project_focus.retain(|_, id| !members.contains(id));
         if self
             .active
             .is_some_and(|active| self.tab_of(active).is_none())
@@ -1115,8 +1216,16 @@ impl Workspace {
                 .map(|tab| self.tab_focus(*tab));
         }
     }
-    /// The title tab holding a session.
+    /// The title tab holding a session, through its group's visible tab
+    /// when it is a hidden one.
     pub fn tab_of(&self, id: i64) -> Option<i64> {
+        self.leaf_tab(id).or_else(|| {
+            let visible = self.visible_of(id).filter(|visible| *visible != id)?;
+            self.leaf_tab(visible)
+        })
+    }
+    /// The title tab whose layout shows `id` as a leaf.
+    fn leaf_tab(&self, id: i64) -> Option<i64> {
         self.tabs.iter().copied().find(|tab| {
             *tab == id
                 || self
@@ -1131,12 +1240,21 @@ impl Workspace {
     pub fn layout(&self, tab: i64) -> PaneNode {
         self.layouts.get(&tab).cloned().unwrap_or_else(|| leaf(tab))
     }
-    /// Every session shown in some tab.
+    /// Every session shown in some tab, hidden group tabs included, each
+    /// group in strip order.
     pub fn open_sessions(&self) -> Vec<i64> {
-        self.tabs
-            .iter()
-            .flat_map(|tab| self.layout(*tab).leaf_ids())
-            .collect()
+        let mut seen = HashSet::new();
+        let mut open = Vec::new();
+        for tab in &self.tabs {
+            for id in self.layout(*tab).leaf_ids() {
+                for member in self.group_tabs(id) {
+                    if seen.insert(member) {
+                        open.push(member);
+                    }
+                }
+            }
+        }
+        open
     }
     /// The pane a tab activates.
     pub fn tab_focus(&self, tab: i64) -> i64 {
@@ -1155,14 +1273,14 @@ impl Workspace {
         let focus = self.focused.remove(&tab);
         self.layouts.remove(&tab);
         // A tab is keyed by a conversation when it holds one, never a Mono.
-        let key = if layout.contains(tab) && !self.mono_panes.contains_key(&tab) {
+        let key = if layout.contains(tab) && !self.is_ownerless(tab) {
             tab
         } else {
             let leaves = layout.leaf_ids();
             leaves
                 .iter()
                 .copied()
-                .find(|id| !self.mono_panes.contains_key(id))
+                .find(|id| !self.is_ownerless(*id))
                 .unwrap_or(leaves[0])
         };
         self.tabs[ix] = key;
@@ -1189,14 +1307,34 @@ impl Workspace {
         }
         key
     }
-    /// Take a session out of whichever tab holds it. A tab left empty
-    /// closes; the active session moves to a neighbouring pane.
+    /// Take a session out of whichever tab holds it. A hidden group tab
+    /// just leaves its group; a visible one hands its leaf to the group's
+    /// most recently used tab. Otherwise the leaf goes: a tab left empty
+    /// closes, and the active session moves to a neighbouring pane.
     fn take_out(&mut self, id: i64) {
         let Some(tab) = self.tab_of(id) else {
             return;
         };
-        let layout = self.layout(tab);
         self.project_focus.retain(|_, focus| *focus != id);
+        if self.leaf_tab(id).is_none() {
+            self.leave_group(id);
+            return;
+        }
+        if let Some(next) = self.group_mru_next(id) {
+            let was_focused = self.focused.get(&tab) == Some(&id);
+            let key = self.set_layout(tab, self.layout(tab).replace_leaf(id, next));
+            self.leave_group(id);
+            self.touch(next);
+            if self.active == Some(id) {
+                self.active = Some(next);
+            }
+            if was_focused {
+                self.focus_in_tab(key, next);
+            }
+            return;
+        }
+        self.leave_group(id);
+        let layout = self.layout(tab);
         match layout.remove(id) {
             Some(rest) => {
                 let next = layout.sibling(id).unwrap_or_else(|| rest.first_leaf());
@@ -1211,12 +1349,13 @@ impl Workspace {
             None => self.close(id),
         }
     }
-    /// Close one pane of a split tab. False when it is the tab's only pane.
+    /// Close one pane of a split tab, or one tab of a group. False when it
+    /// is the tab's only pane and its group's only tab.
     pub fn close_pane(&mut self, id: i64) -> bool {
         let Some(tab) = self.tab_of(id) else {
             return false;
         };
-        if !self.layout(tab).is_split() {
+        if !self.layout(tab).is_split() && self.group_tabs(id).len() <= 1 {
             return false;
         }
         self.take_out(id);
@@ -1230,7 +1369,7 @@ impl Workspace {
     }
     /// cmd-d: a new session beside the focused pane.
     pub fn split(&mut self, new: i64, dir: SplitDir) {
-        let Some(focused) = self.active else {
+        let Some(focused) = self.active.and_then(|id| self.visible_of(id)) else {
             self.open(new);
             return;
         };
@@ -1246,10 +1385,16 @@ impl Workspace {
     }
     /// A pane, tab-strip session or sidebar session dropped on a pane edge.
     pub fn place(&mut self, id: i64, target: i64, edge: Edge) {
-        if id == target || self.tab_of(target).is_none() {
+        let Some(target) = self.visible_of(target) else {
+            return;
+        };
+        if id == target {
             return;
         }
-        let same = self.tab_of(id) == self.tab_of(target);
+        // A tab that shares a group leaves it for a leaf of its own.
+        let same = self.leaf_tab(id).is_some()
+            && self.leaf_tab(id) == self.leaf_tab(target)
+            && self.group_tabs(id).len() <= 1;
         if !same {
             self.take_out(id);
         }
@@ -1260,101 +1405,16 @@ impl Workspace {
         self.focused.insert(key, id);
         self.active = Some(id);
     }
-    /// A whole title tab dropped on a pane edge: its tree moves intact.
-    pub fn place_tab(&mut self, source: i64, target: i64, edge: Edge) {
-        let Some(target_tab) = self.tab_of(target) else {
-            return;
-        };
-        if source == target_tab || !self.tabs.contains(&source) {
-            return;
+    /// Mono panes no tab holds any more, forgotten.
+    pub fn settle_mono_panes(&mut self) -> Vec<i64> {
+        let open: HashSet<_> = self.open_sessions().into_iter().collect();
+        let gone: Vec<_> = (self.mono_panes.keys().copied())
+            .filter(|id| !open.contains(id))
+            .collect();
+        for id in &gone {
+            self.mono_panes.remove(id);
         }
-        let incoming = self.layout(source);
-        let focus = self.tab_focus(source);
-        self.tabs.retain(|t| *t != source);
-        self.tab_workspaces.remove(&source);
-        self.title_order
-            .retain(|entry| *entry != TitleTab::Session(source));
-        self.layouts.remove(&source);
-        self.focused.remove(&source);
-        let key = self.set_layout(
-            target_tab,
-            self.layout(target_tab).place_layout(incoming, target, edge),
-        );
-        self.focused.insert(key, focus);
-        self.active = Some(focus);
-    }
-    /// A Mono tab dropped on a pane edge leaves the strip for the split.
-    pub fn place_mono(&mut self, mono: TitleTab, target: i64, edge: Edge) -> Option<i64> {
-        if !matches!(mono, TitleTab::Mono { .. }) || self.tab_of(target).is_none() {
-            return None;
-        }
-        let pane = self.next_pane_id();
-        self.title_order.retain(|entry| *entry != mono);
-        self.scope_focus.retain(|_, entry| *entry != mono);
-        self.mono_panes.insert(pane, mono);
-        self.place(pane, target, edge);
-        Some(pane)
-    }
-    /// The visible Mono becomes a split's first pane, its tab keeping its
-    /// slot, so a tab or pane can be dropped beside it.
-    pub fn mono_tab_pane(&mut self, mono: TitleTab) -> i64 {
-        let pane = self.next_pane_id();
-        self.tabs.push(pane);
-        for entry in self
-            .title_order
-            .iter_mut()
-            .chain(self.scope_focus.values_mut())
-            .chain(self.pinned_tabs.iter_mut())
-        {
-            if *entry == mono {
-                *entry = TitleTab::Session(pane);
-            }
-        }
-        if !self.title_order.contains(&TitleTab::Session(pane)) {
-            self.title_order.push(TitleTab::Session(pane));
-        }
-        self.mono_panes.insert(pane, mono);
-        self.active = Some(pane);
-        pane
-    }
-    /// A Mono pane left alone in its tab becomes its Mono tab again, in the
-    /// same slot; one no tab holds is forgotten. Returns the Mono when it
-    /// had focus, for the caller to show.
-    pub fn settle_mono_panes(&mut self) -> Option<TitleTab> {
-        let mut focused = None;
-        let panes: Vec<_> = self.mono_panes.keys().copied().collect();
-        for pane in panes {
-            match self.tab_of(pane) {
-                Some(tab) if self.layout(tab).is_split() => continue,
-                Some(tab) => {
-                    let mono = self.mono_panes[&pane].clone();
-                    self.tabs.retain(|t| *t != tab);
-                    self.tab_workspaces.remove(&tab);
-                    self.layouts.remove(&tab);
-                    self.focused.remove(&tab);
-                    let present = self.title_order.contains(&mono);
-                    self.title_order
-                        .retain(|entry| !(present && *entry == TitleTab::Session(tab)));
-                    for entry in self
-                        .title_order
-                        .iter_mut()
-                        .chain(self.scope_focus.values_mut())
-                        .chain(self.pinned_tabs.iter_mut())
-                    {
-                        if *entry == TitleTab::Session(tab) {
-                            *entry = mono.clone();
-                        }
-                    }
-                    if self.active == Some(pane) {
-                        self.active = None;
-                        focused = Some(mono);
-                    }
-                }
-                None => {}
-            }
-            self.mono_panes.remove(&pane);
-        }
-        focused
+        gone
     }
     /// Terminal panes no tab holds any more, forgotten. Their shells stop
     /// with them, so the caller drops their views.
@@ -1388,11 +1448,13 @@ impl Workspace {
         }
         gone
     }
-    /// A pane dragged onto the tab strip becomes its own tab at `to`.
+    /// Pane `id` becomes its own title tab at `to`: how workspaces saved
+    /// before tab groups held several title tabs of one scope.
+    #[cfg(test)]
     pub fn detach(&mut self, id: i64, to: usize) {
         if !self
             .tab_of(id)
-            .is_some_and(|tab| self.layout(tab).is_split())
+            .is_some_and(|tab| self.layout(tab).is_split() || self.group_tabs(id).len() > 1)
         {
             return;
         }
@@ -1426,6 +1488,23 @@ impl Workspace {
         let Some(tab) = self.tab_of(from) else {
             return;
         };
+        // `to` takes `from`'s slot in its group.
+        for group in &mut self.groups {
+            for id in group
+                .tabs
+                .iter_mut()
+                .chain(group.pinned.iter_mut())
+                .chain(group.mru.iter_mut())
+                .chain(group.preview.iter_mut())
+            {
+                if *id == from {
+                    *id = to;
+                }
+            }
+        }
+        if self.leaf_tab(from).is_none() {
+            return;
+        }
         let key = self.set_layout(tab, self.layout(tab).replace_leaf(from, to));
         if self.layouts.contains_key(&key) {
             self.focused.insert(key, to);
@@ -1439,6 +1518,12 @@ impl Workspace {
     pub fn place_sash(&mut self, tab: i64, path: &[usize], index: usize, boundary: f32) {
         if let Some(layout) = self.layouts.get_mut(&tab) {
             layout.place_sash(path, index, boundary);
+        }
+    }
+    /// A split tab's panes share its room equally.
+    pub fn equalize(&mut self, tab: i64) {
+        if let Some(layout) = self.layouts.get_mut(&tab) {
+            layout.equalize();
         }
     }
     pub fn sash_range(&self, tab: i64, path: &[usize], index: usize) -> Option<(f32, f32, f32)> {
@@ -1464,6 +1549,334 @@ impl Workspace {
         let order = &self.title_order;
         self.pinned_tabs
             .retain(|tab| order.contains(tab) && seen.insert(tab.clone()));
+    }
+}
+
+/// Tab groups (docs/native/tab-groups.md).
+impl Workspace {
+    /// The stored group listing `id`. A leaf no group lists has none.
+    pub fn group_of(&self, id: i64) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| group.tabs.contains(&id))
+    }
+    /// The tabs of `id`'s group in strip order: just `id` for a leaf of
+    /// its own, nothing when it is not open.
+    pub fn group_tabs(&self, id: i64) -> Vec<i64> {
+        match self.group_of(id) {
+            Some(ix) if self.visible_of(id).is_some() => self.groups[ix].tabs.clone(),
+            _ if self.leaf_tab(id).is_some() => vec![id],
+            _ => Vec::new(),
+        }
+    }
+    /// The tab of `id`'s group that is on screen: `id` itself for a leaf.
+    pub fn visible_of(&self, id: i64) -> Option<i64> {
+        if self.leaf_tab(id).is_some() {
+            return Some(id);
+        }
+        let group = &self.groups[self.group_of(id)?];
+        (group.tabs.iter().copied())
+            .find(|member| *member != id && self.leaf_tab(*member).is_some())
+    }
+    /// The tab that takes over when `id` closes: the group's most recently
+    /// used other tab, else its right neighbour, else its left one.
+    pub fn group_mru_next(&self, id: i64) -> Option<i64> {
+        let group = &self.groups[self.group_of(id)?];
+        if let Some(next) = (group.mru.iter()).find(|m| **m != id && group.tabs.contains(m)) {
+            return Some(*next);
+        }
+        let ix = group.tabs.iter().position(|m| *m == id)?;
+        (group.tabs.get(ix + 1).copied()).or_else(|| ix.checked_sub(1).map(|ix| group.tabs[ix]))
+    }
+    /// Bring `id` on screen and focus it. A hidden tab takes its group's
+    /// leaf; the title tab is rekeyed when that leaf was its key.
+    pub fn show(&mut self, id: i64) -> bool {
+        let Some(visible) = self.visible_of(id) else {
+            return false;
+        };
+        let Some(tab) = self.leaf_tab(visible) else {
+            return false;
+        };
+        if visible != id {
+            self.set_layout(tab, self.layout(tab).replace_leaf(visible, id));
+            self.touch(visible);
+        }
+        if let Some(tab) = self.leaf_tab(id) {
+            self.focus_in_tab(tab, id);
+        }
+        self.touch(id);
+        self.active = Some(id);
+        true
+    }
+    /// Close one tab: a hidden one leaves its group, a visible one hands
+    /// over to its group's MRU tab, and a group's last tab closes its pane
+    /// (or the whole title tab when that was its only pane).
+    #[cfg(test)]
+    pub fn close_in_group(&mut self, id: i64) -> bool {
+        if self.close_pane(id) {
+            return true;
+        }
+        if self.tab_of(id).is_none() {
+            return false;
+        }
+        self.close(id);
+        true
+    }
+    /// Stack `id` in `beside`'s group at `index`, else right after the
+    /// visible tab, never before the pinned ones. An open `id` moves here
+    /// from wherever it was; one already in this group is only reordered.
+    pub fn add_to_group(&mut self, id: i64, beside: i64, index: Option<usize>, show: bool) -> bool {
+        let Some(visible) = self.visible_of(beside) else {
+            return false;
+        };
+        if self.group_tabs(beside).contains(&id) {
+            if let Some(to) = index {
+                self.move_in_group(id, to);
+            }
+            if show {
+                self.show(id);
+            }
+            return true;
+        }
+        self.take_out(id);
+        let Some(visible) = self.visible_of(visible) else {
+            return false;
+        };
+        let ix = self.ensure_group(visible);
+        let group = &mut self.groups[ix];
+        let after = group.tabs.iter().position(|m| *m == visible).unwrap_or(0) + 1;
+        let at = index
+            .unwrap_or(after)
+            .clamp(group.pinned.len(), group.tabs.len());
+        group.tabs.insert(at, id);
+        if !group.mru.contains(&visible) {
+            group.mru.insert(0, visible);
+        }
+        group.mru.push(id);
+        if show {
+            self.show(id);
+        }
+        true
+    }
+    /// Reorder `id` within its group; pinned tabs stay ahead of the rest.
+    pub fn move_in_group(&mut self, id: i64, to: usize) -> bool {
+        let Some(ix) = self.group_of(id) else {
+            return false;
+        };
+        let group = &mut self.groups[ix];
+        let from = group.tabs.iter().position(|m| *m == id).unwrap();
+        let pinned = group.pinned.len();
+        let to = if group.pinned.contains(&id) {
+            to.min(pinned - 1)
+        } else {
+            to.clamp(pinned, group.tabs.len() - 1)
+        };
+        if from == to {
+            return false;
+        }
+        group.tabs.remove(from);
+        group.tabs.insert(to, id);
+        let tabs = group.tabs.clone();
+        group
+            .pinned
+            .sort_by_key(|m| tabs.iter().position(|t| t == m));
+        true
+    }
+    /// Pin `id` at the end of its group's pinned tabs, or unpin it to just
+    /// after them. A pinned tab is never the preview.
+    pub fn set_pinned(&mut self, id: i64, pinned: bool) -> bool {
+        let Some(visible) = self.visible_of(id) else {
+            return false;
+        };
+        let ix = self.ensure_group(visible);
+        let group = &mut self.groups[ix];
+        if group.pinned.contains(&id) == pinned {
+            self.prune_groups();
+            return false;
+        }
+        group.tabs.retain(|m| *m != id);
+        if pinned {
+            group.tabs.insert(group.pinned.len(), id);
+            group.pinned.push(id);
+            if group.preview == Some(id) {
+                group.preview = None;
+            }
+        } else {
+            group.pinned.retain(|m| *m != id);
+            group.tabs.insert(group.pinned.len(), id);
+        }
+        self.prune_groups();
+        true
+    }
+    /// Mark the preview tab of `member`'s group (`None` clears it). Only an
+    /// unpinned tab of that group can be the preview.
+    pub fn set_preview(&mut self, member: i64, preview: Option<i64>) -> bool {
+        let Some(visible) = self.visible_of(member) else {
+            return false;
+        };
+        if let Some(preview) = preview
+            && !self.group_tabs(member).contains(&preview)
+        {
+            return false;
+        }
+        let ix = self.ensure_group(visible);
+        let group = &mut self.groups[ix];
+        if preview.is_some_and(|p| group.pinned.contains(&p)) {
+            self.prune_groups();
+            return false;
+        }
+        let changed = group.preview != preview;
+        group.preview = preview;
+        self.prune_groups();
+        changed
+    }
+    /// The preview tab of `id`'s group.
+    pub fn preview_of_group(&self, id: i64) -> Option<i64> {
+        self.groups[self.group_of(id)?].preview
+    }
+    /// Fold a whole title tab into `target`'s group: each of its panes,
+    /// with its own group's hidden tabs, is stacked there in order. No pane
+    /// closes; the source title tab is gone.
+    pub fn merge_tab_into(&mut self, source: i64, target: i64) -> bool {
+        let Some(visible) = self.visible_of(target) else {
+            return false;
+        };
+        if !self.tabs.contains(&source) || self.tab_of(visible) == Some(source) {
+            return false;
+        }
+        let leaves = self.layout(source).leaf_ids();
+        let incoming: Vec<i64> = leaves.iter().flat_map(|id| self.group_tabs(*id)).collect();
+        self.groups
+            .retain(|group| !group.tabs.iter().any(|id| leaves.contains(id)));
+        self.tabs.retain(|t| *t != source);
+        self.tab_workspaces.remove(&source);
+        self.title_order
+            .retain(|entry| *entry != TitleTab::Session(source));
+        self.scope_focus
+            .retain(|_, entry| *entry != TitleTab::Session(source));
+        self.pinned_tabs
+            .retain(|entry| *entry != TitleTab::Session(source));
+        self.layouts.remove(&source);
+        self.focused.remove(&source);
+        let ix = self.ensure_group(visible);
+        let group = &mut self.groups[ix];
+        for id in incoming {
+            if !group.tabs.contains(&id) {
+                group.tabs.push(id);
+            }
+        }
+        if self.active.is_some_and(|id| self.leaf_tab(id).is_none()) {
+            self.active = Some(visible);
+        }
+        self.normalize_groups();
+        true
+    }
+    /// Keep groups coherent: members are open panes listed once, each group
+    /// has exactly one visible tab, pinned tabs lead and the preview is an
+    /// unpinned member. Lone plain tabs are not stored.
+    pub fn normalize_groups(&mut self) {
+        let leaves: HashSet<i64> = (self.tabs.iter())
+            .flat_map(|tab| self.layout(*tab).leaf_ids())
+            .collect();
+        let pane = |id: &i64| {
+            self.review_owners.contains_key(id)
+                || self.mono_panes.contains_key(id)
+                || self.view_panes.contains_key(id)
+                || self.terminal_panes.contains_key(id)
+                || self.browser_panes.contains_key(id)
+        };
+        let mut seen = HashSet::new();
+        let mut groups = Vec::new();
+        for mut group in std::mem::take(&mut self.groups) {
+            group
+                .tabs
+                .retain(|id| (leaves.contains(id) || *id > 0 || pane(id)) && seen.insert(*id));
+            let visible: Vec<i64> = (group.tabs.iter().copied())
+                .filter(|id| leaves.contains(id))
+                .collect();
+            // A group with no tab on screen has nowhere to be shown.
+            let Some(first) = visible.first().copied() else {
+                continue;
+            };
+            // Two visible tabs are two groups; the hidden ones stay with the first.
+            for other in visible.into_iter().skip(1) {
+                group.tabs.retain(|id| *id != other);
+                groups.push(TabGroup {
+                    tabs: vec![other],
+                    pinned: (group.pinned.contains(&other).then_some(other))
+                        .into_iter()
+                        .collect(),
+                    preview: (group.preview == Some(other)).then_some(other),
+                    mru: Vec::new(),
+                });
+            }
+            debug_assert!(group.tabs.contains(&first));
+            let tabs = group.tabs.clone();
+            group.pinned = (tabs.iter().copied())
+                .filter(|id| group.pinned.contains(id))
+                .collect();
+            let pinned = group.pinned.clone();
+            group.tabs = (pinned.iter().copied())
+                .chain(tabs.into_iter().filter(|id| !pinned.contains(id)))
+                .collect();
+            group.preview = group
+                .preview
+                .filter(|id| group.tabs.contains(id) && !pinned.contains(id));
+            let tabs = group.tabs.clone();
+            let mut mru_seen = HashSet::new();
+            group
+                .mru
+                .retain(|id| tabs.contains(id) && mru_seen.insert(*id));
+            groups.push(group);
+        }
+        self.groups = groups;
+        self.prune_groups();
+    }
+    /// View panes no tab holds any more, forgotten.
+    pub fn prune_view_panes(&mut self) -> Vec<i64> {
+        let open: HashSet<_> = self.open_sessions().into_iter().collect();
+        let gone: Vec<_> = (self.view_panes.keys().copied())
+            .filter(|id| !open.contains(id))
+            .collect();
+        for id in &gone {
+            self.view_panes.remove(id);
+            self.view_scopes.remove(id);
+        }
+        gone
+    }
+    /// The group around a visible tab, created as a group of one if needed.
+    fn ensure_group(&mut self, visible: i64) -> usize {
+        self.group_of(visible).unwrap_or_else(|| {
+            self.groups.push(TabGroup {
+                tabs: vec![visible],
+                ..Default::default()
+            });
+            self.groups.len() - 1
+        })
+    }
+    /// Drop `id` from its group, its pin, preview and recency included.
+    fn leave_group(&mut self, id: i64) {
+        if let Some(ix) = self.group_of(id) {
+            let group = &mut self.groups[ix];
+            group.tabs.retain(|m| *m != id);
+            group.pinned.retain(|m| *m != id);
+            group.mru.retain(|m| *m != id);
+            if group.preview == Some(id) {
+                group.preview = None;
+            }
+            self.prune_groups();
+        }
+    }
+    /// `id` becomes its group's most recently used tab.
+    fn touch(&mut self, id: i64) {
+        if let Some(ix) = self.group_of(id) {
+            let mru = &mut self.groups[ix].mru;
+            mru.retain(|m| *m != id);
+            mru.insert(0, id);
+        }
+    }
+    fn prune_groups(&mut self) {
+        self.groups.retain(TabGroup::worth_keeping);
     }
 }
 
@@ -1655,6 +2068,15 @@ mod tests {
         }
         assert_eq!(h.back.len(), 50);
     }
+    /// A Mono split beside `target`, as a Mono pane.
+    fn place_mono(s: &mut Workspace, mono: TitleTab, target: i64, edge: Edge) -> i64 {
+        let pane = s.next_pane_id();
+        s.title_order.retain(|entry| *entry != mono);
+        s.scope_focus.retain(|_, entry| *entry != mono);
+        s.mono_panes.insert(pane, mono);
+        s.place(pane, target, edge);
+        pane
+    }
     fn mono(id: &str) -> TitleTab {
         TitleTab::Mono {
             id: id.into(),
@@ -1663,22 +2085,17 @@ mod tests {
         }
     }
     #[test]
-    fn a_mono_joins_a_split_and_becomes_its_tab_again_when_alone() {
+    fn a_mono_pane_stays_a_pane_and_a_closed_tab_forgets_it() {
         let mut s = Workspace::default();
         s.open(1);
-        s.title_order.push(mono("m"));
         s.open(2);
-        let pane = s.place_mono(mono("m"), 1, Edge::Right).unwrap();
+        let pane = place_mono(&mut s, mono("m"), 1, Edge::Right);
         assert!(pane < 0);
         assert_eq!(s.layout(1).leaf_ids(), vec![1, pane]);
         assert_eq!(s.active, Some(pane));
         assert_eq!(s.scope_pane(1), 1, "a Mono never scopes its tab");
-        assert_eq!(
-            s.title_order,
-            vec![TitleTab::Session(1), TitleTab::Session(2)]
-        );
         assert_eq!(s.mono_pane("m"), Some(pane));
-        assert_eq!(s.settle_mono_panes(), None);
+        assert!(s.settle_mono_panes().is_empty());
         // Restarting keeps the Mono in its split.
         let saved = serde_json::to_string(&s).unwrap();
         let restored = Workspace::restore(
@@ -1688,41 +2105,13 @@ mod tests {
         );
         assert_eq!(restored.layout(1).leaf_ids(), vec![1, pane]);
         assert_eq!(restored.mono_pane("m"), Some(pane));
-        // Detached to the strip, it is the Mono tab again in the same slot.
-        s.detach(pane, 1);
-        assert_eq!(s.settle_mono_panes(), Some(mono("m")));
-        assert_eq!(
-            s.title_order,
-            vec![TitleTab::Session(1), mono("m"), TitleTab::Session(2)]
-        );
-        assert!(s.mono_panes.is_empty());
-        assert_eq!(s.tabs, vec![1, 2]);
-    }
-    #[test]
-    fn a_tab_dropped_on_the_visible_mono_splits_beside_it() {
-        let mut s = Workspace::default();
-        s.open(1);
-        s.title_order.push(mono("m"));
-        let pane = s.mono_tab_pane(mono("m"));
-        assert_eq!(
-            s.title_order,
-            vec![TitleTab::Session(1), TitleTab::Session(pane)]
-        );
-        s.place_tab(1, pane, Edge::Left);
-        assert_eq!(s.tabs, vec![1], "the conversation keys the tab");
-        assert_eq!(s.layout(1).leaf_ids(), vec![1, pane]);
-        assert_eq!(s.title_order, vec![TitleTab::Session(1)]);
-        assert_eq!(s.settle_mono_panes(), None);
-        // Closing the conversation's pane leaves the Mono on its own.
-        assert!(s.close_pane(1));
-        assert_eq!(s.settle_mono_panes(), Some(mono("m")));
-        assert_eq!(s.title_order, vec![mono("m")]);
-        assert!(s.tabs.is_empty());
+        // Alone in its tab it is still a pane: a Mono is an ordinary tab.
+        s.close_pane(1);
+        assert!(s.settle_mono_panes().is_empty());
+        assert_eq!(s.mono_pane("m"), Some(pane));
         // A closed tab forgets its Mono pane.
-        s.open(1);
-        s.place_mono(mono("m"), 1, Edge::Bottom);
-        s.close(1);
-        assert_eq!(s.settle_mono_panes(), None);
+        s.close(pane);
+        assert_eq!(s.settle_mono_panes(), [pane]);
         assert!(s.mono_panes.is_empty());
     }
     #[test]
@@ -1784,17 +2173,260 @@ mod tests {
         assert_eq!(s.tab_workspaces[&3], "/selected");
         assert!(!s.layouts.contains_key(&2));
         assert!(!s.close_pane(3));
-        // A whole tab dropped on a pane moves in intact.
-        s.split(5, SplitDir::Down);
-        s.place_tab(3, 4, Edge::Left);
-        assert_eq!(s.tabs, [2, 4]);
-        assert!(!s.tab_workspaces.contains_key(&3));
-        assert_eq!(s.layout(4).leaf_ids(), [3, 5, 4]);
-        assert_eq!(s.active, Some(5));
+    }
+    /// A title tab of 1 whose group stacks 4 and 5 hidden behind it.
+    fn stacked() -> Workspace {
+        let mut s = Workspace::default();
+        s.open(1);
+        assert!(s.add_to_group(4, 1, None, false));
+        assert!(s.add_to_group(5, 4, None, false));
+        s
+    }
+    #[test]
+    fn a_hidden_tab_is_open_through_its_group_but_not_a_leaf() {
+        let s = stacked();
+        assert_eq!(s.group_tabs(5), [1, 5, 4]);
+        assert_eq!(s.layout(1).leaf_ids(), [1]);
+        assert_eq!((s.tab_of(4), s.tab_of(5)), (Some(1), Some(1)));
+        assert_eq!(s.visible_of(4), Some(1));
+        assert_eq!(s.open_sessions(), [1, 5, 4]);
+        assert_eq!(s.active, Some(1));
+        assert_eq!(s.tabs, [1]);
+        // Without groups a leaf is a group of one.
+        let mut plain = Workspace::default();
+        plain.open(7);
+        assert_eq!(plain.group_tabs(7), [7]);
+        assert!(plain.group_tabs(8).is_empty());
+        assert!(plain.groups.is_empty());
+    }
+    #[test]
+    fn showing_a_hidden_tab_swaps_the_leaf_and_rekeys_the_title_tab() {
+        let mut s = stacked();
+        s.tab_workspaces.insert(1, "/w".into());
+        assert!(s.show(4));
+        assert_eq!(s.tabs, [4], "a single-pane tab is keyed by what it shows");
+        assert_eq!(s.title_order, [TitleTab::Session(4)]);
+        assert_eq!(s.tab_workspaces[&4], "/w");
+        assert_eq!(s.layout(4).leaf_ids(), [4]);
+        assert_eq!((s.active, s.tab_of(1)), (Some(4), Some(4)));
+        // In a split, the key pane gives way and the tab stays keyed.
+        s.split(2, SplitDir::Right);
+        assert_eq!(s.layout(4).leaf_ids(), [4, 2]);
+        assert!(s.show(5));
+        let tab = s.tab_of(2).unwrap();
+        assert!(s.tabs == [tab] && s.layout(tab).contains(tab));
+        assert_eq!(s.layout(tab).leaf_ids(), [5, 2]);
+        assert_eq!((s.active, s.tab_focus(tab)), (Some(5), 5));
+        assert_eq!(s.open_sessions(), [1, 5, 4, 2]);
+        // Opening a hidden tab shows it.
+        s.open(1);
+        assert_eq!(s.layout(s.tab_of(2).unwrap()).leaf_ids(), [1, 2]);
+        assert_eq!(s.active, Some(1));
+    }
+    #[test]
+    fn closing_a_visible_tab_shows_the_most_recently_used_one() {
+        let mut s = stacked();
+        s.add_to_group(6, 1, None, false);
+        assert_eq!(s.group_tabs(1), [1, 6, 5, 4]);
+        s.show(4);
+        s.show(1);
+        // Recency is 1, 4, …: 4 takes over, not the neighbour 6.
+        assert!(s.close_in_group(1));
+        assert_eq!(s.tabs, [4]);
+        assert_eq!(s.active, Some(4));
+        assert_eq!(s.group_tabs(4), [6, 5, 4]);
+        // A hidden tab just leaves.
+        assert!(s.close_in_group(5));
+        assert_eq!(s.group_tabs(4), [6, 4]);
+        assert_eq!(s.tabs, [4]);
+        // With no recency left, the neighbour takes over.
+        assert!(s.close_in_group(4));
+        assert_eq!((s.tabs.clone(), s.active), (vec![6], Some(6)));
+        assert!(s.groups.is_empty(), "a lone plain tab is not stored");
+        // The last tab closes the title tab as before.
+        assert!(s.close_in_group(6));
+        assert!(s.tabs.is_empty());
+        assert!(!s.close_in_group(6));
+    }
+    #[test]
+    fn closing_a_title_tab_drops_its_groups_hidden_tabs_included() {
+        let mut s = stacked();
+        s.open(2);
         s.close(5);
         assert_eq!(s.tabs, [2]);
-        assert_eq!(s.tab_workspaces.len(), 1);
+        assert!(s.groups.is_empty());
+        assert!(s.tab_of(4).is_none());
+        assert_eq!(s.open_sessions(), [2]);
+    }
+    #[test]
+    fn adding_an_open_tab_to_a_group_moves_it() {
+        let mut s = stacked();
+        s.open(2);
+        s.open(3);
+        // A whole other title tab's only pane joins: its tab closes.
+        assert!(s.add_to_group(2, 4, None, true));
+        assert_eq!(s.tabs, [2, 3], "shown, 2 keys the tab");
+        assert_eq!(s.group_tabs(1), [1, 2, 5, 4]);
         assert_eq!(s.active, Some(2));
+        assert_eq!(s.layout(2).leaf_ids(), [2]);
+        // A hidden tab of another group moves without a copy left behind.
+        s.open(3);
+        assert!(s.add_to_group(5, 3, Some(0), false));
+        assert_eq!(s.group_tabs(3), [5, 3]);
+        assert_eq!(s.group_tabs(2), [1, 2, 4]);
+        assert_eq!(s.open_sessions().len(), 5);
+        // Within its group it is only reordered.
+        assert!(s.add_to_group(4, 2, Some(0), false));
+        assert_eq!(s.group_tabs(2), [4, 1, 2]);
+    }
+    #[test]
+    fn pinned_tabs_lead_their_group_and_a_preview_is_never_pinned() {
+        let mut s = stacked();
+        assert!(s.set_preview(1, Some(4)));
+        assert_eq!(s.preview_of_group(5), Some(4));
+        assert!(s.set_pinned(4, true));
+        assert_eq!(s.group_tabs(1), [4, 1, 5]);
+        assert_eq!(s.preview_of_group(1), None);
+        assert!(!s.set_preview(1, Some(4)));
+        // New and moved tabs stay after the pinned ones.
+        assert!(s.move_in_group(5, 0));
+        assert_eq!(s.group_tabs(1), [4, 5, 1]);
+        assert!(!s.move_in_group(4, 2), "a pinned tab stays among the pins");
+        s.add_to_group(6, 1, Some(0), false);
+        assert_eq!(s.group_tabs(1), [4, 6, 5, 1]);
+        assert!(s.set_pinned(4, false));
+        assert_eq!(s.group_tabs(1), [4, 6, 5, 1]);
+        assert!(s.set_pinned(5, true));
+        assert_eq!(s.group_tabs(1), [5, 4, 6, 1]);
+        // A lone tab keeps its pin as a group of one.
+        let mut lone = Workspace::default();
+        lone.open(9);
+        assert!(lone.set_pinned(9, true));
+        assert_eq!(lone.groups.len(), 1);
+        assert!(lone.set_pinned(9, false));
+        assert!(lone.groups.is_empty());
+    }
+    #[test]
+    fn a_hidden_tab_dropped_on_an_edge_gets_its_own_pane() {
+        let mut s = stacked();
+        s.place(4, 1, Edge::Right);
+        assert_eq!(s.layout(1).leaf_ids(), [1, 4]);
+        assert_eq!(s.group_tabs(1), [1, 5]);
+        assert_eq!(s.group_tabs(4), [4]);
+        assert_eq!(s.active, Some(4));
+        // The visible tab of a stack leaves too; its group shows the next.
+        s.show(1);
+        s.place(1, 4, Edge::Bottom);
+        let tab = s.tab_of(4).unwrap();
+        assert_eq!(s.layout(tab).leaf_ids(), [5, 4, 1]);
+        assert!(s.groups.is_empty());
+        // A pane of its own dropped beside its neighbour just moves.
+        s.place(1, 5, Edge::Left);
+        assert_eq!(s.layout(s.tab_of(4).unwrap()).leaf_ids(), [1, 5, 4]);
+    }
+    #[test]
+    fn split_detach_and_swap_keep_groups_coherent() {
+        let mut s = stacked();
+        // A hidden tab split beside the focused pane leaves its group.
+        s.split(5, SplitDir::Right);
+        assert_eq!(s.layout(1).leaf_ids(), [1, 5]);
+        assert_eq!(s.group_tabs(1), [1, 4]);
+        // A hidden tab dragged to the strip becomes its own title tab.
+        s.detach(4, 1);
+        assert_eq!(s.tabs, [1, 4]);
+        assert!(s.groups.is_empty());
+        // Swapping a visible tab hands its slot in the group to the new one.
+        s.add_to_group(6, 1, None, false);
+        s.swap_session(1, 7);
+        assert_eq!(s.group_tabs(7), [7, 6]);
+        assert!(s.tab_of(1).is_none());
+        s.swap_session(6, 8);
+        assert_eq!(s.group_tabs(7), [7, 8]);
+        // A Mono hidden in a group stays there.
+        let pane = s.next_pane_id();
+        s.mono_panes.insert(pane, mono("m"));
+        s.add_to_group(pane, 4, None, true);
+        assert!(s.settle_mono_panes().is_empty());
+        assert_eq!(s.group_tabs(4), [4, pane]);
+    }
+    #[test]
+    fn merging_a_title_tab_stacks_all_its_panes_in_the_target_group() {
+        let mut s = stacked();
+        s.open(2);
+        s.split(3, SplitDir::Down);
+        s.add_to_group(6, 3, None, false);
+        s.tab_workspaces.insert(2, "/w".into());
+        s.pinned_tabs.push(TitleTab::Session(2));
+        assert!(s.merge_tab_into(2, 5));
+        assert_eq!(s.tabs, [1]);
+        assert_eq!(s.title_order, [TitleTab::Session(1)]);
+        assert!(s.pinned_tabs.is_empty() && s.tab_workspaces.is_empty());
+        assert!(!s.layouts.contains_key(&2) && !s.focused.contains_key(&2));
+        assert_eq!(s.group_tabs(1), [1, 5, 4, 2, 3, 6]);
+        assert_eq!(s.layout(1).leaf_ids(), [1]);
+        assert_eq!(s.active, Some(1));
+        assert!(!s.merge_tab_into(1, 4), "a tab cannot fold into itself");
+    }
+    #[test]
+    fn groups_pins_and_previews_survive_a_restart() {
+        let mut s = stacked();
+        s.open(2);
+        s.split(3, SplitDir::Right);
+        s.add_to_group(-2, 3, None, false);
+        s.view_panes.insert(-2, TitleTab::App(AppView::Notes));
+        s.set_pinned(5, true);
+        s.set_preview(1, Some(4));
+        let json = s.saved_json();
+        let sessions: Vec<_> = (1..=5).map(|id| (id, "/w".into())).collect();
+        let r = Workspace::restore(Some(&json), &sessions, "/w");
+        let strip = |s: &Workspace| {
+            (s.groups.iter())
+                .map(|g| (g.tabs.clone(), g.pinned.clone(), g.preview))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&r), strip(&s));
+        assert_eq!(r.view_panes[&-2], TitleTab::App(AppView::Notes));
+        assert_eq!(r.tab_of(4), Some(1));
+        assert_eq!(r.next_pane_id(), -3);
+        // A file without groups or view panes writes neither.
+        let plain = serde_json::to_string(&Workspace::default()).unwrap();
+        assert!(!plain.contains("\"groups\"") && !plain.contains("view_panes"));
+    }
+    #[test]
+    fn restore_and_normalize_drop_dangling_group_tabs() {
+        let mut s = stacked();
+        s.groups[0].tabs.extend([-9, 4]);
+        s.groups[0].preview = Some(8);
+        s.groups.push(TabGroup {
+            tabs: vec![12, 13],
+            ..Default::default()
+        });
+        s.view_panes.insert(-3, TitleTab::Search);
+        s.normalize_groups();
+        assert_eq!(s.groups.len(), 1, "a group with nothing on screen goes");
+        assert_eq!(s.group_tabs(1), [1, 5, 4]);
+        assert_eq!(s.preview_of_group(1), None);
+        // A gone visible tab hands its leaf to a known hidden one.
+        let json = serde_json::to_string(&s).unwrap();
+        let sessions = vec![(4, "/w".into()), (5, "/w".into())];
+        let r = Workspace::restore(Some(&json), &sessions, "/w");
+        assert_eq!(r.tabs, [5]);
+        assert_eq!(r.group_tabs(4), [5, 4]);
+        assert!(
+            r.view_panes.is_empty(),
+            "a view pane no tab holds is dropped"
+        );
+        // Two visible tabs in one group split into two groups.
+        let mut s = Workspace::default();
+        s.open(1);
+        s.open(2);
+        s.groups.push(TabGroup {
+            tabs: vec![1, 3, 2],
+            ..Default::default()
+        });
+        s.normalize_groups();
+        assert_eq!(s.group_tabs(1), [1, 3]);
+        assert_eq!(s.group_tabs(2), [2]);
     }
     #[test]
     fn restore_keeps_split_tabs_and_prunes_their_missing_panes() {

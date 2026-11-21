@@ -84,6 +84,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
             MenuItem::action("Close Pane", CloseTab),
             MenuItem::action("Close Other Tabs", CloseOtherTabs),
             MenuItem::action("Close All Tabs", CloseAllTabs),
+            MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
             MenuItem::separator(),
             MenuItem::action("Previous Tab", PreviousTab),
             MenuItem::action("Next Tab", NextTab),

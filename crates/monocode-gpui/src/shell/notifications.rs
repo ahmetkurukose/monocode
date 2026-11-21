@@ -475,7 +475,7 @@ impl Shell {
 
     /// True when the user can actually see this session's chat right now.
     pub(super) fn notice_session_visible(&self, id: i64, cx: &App) -> bool {
-        if self.app_view_open() || self.settings.is_some() || self.search_page() {
+        if self.settings.is_some() {
             return false;
         }
         if self.mono_active(cx) {

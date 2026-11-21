@@ -164,11 +164,16 @@ impl Shell {
     /// Closes the project's panes and moves to another project if it was current.
     fn leave_project(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let sessions: HashSet<i64> = self.project_sessions(path).into_iter().collect();
+        // Its app view, Search and Mono tabs go with it.
+        let scope = format!("{}\0", monocode_core::files::path_key(path));
         let panes: Vec<i64> = self
             .workspace
             .open_sessions()
             .into_iter()
-            .filter(|pane| sessions.contains(&self.workspace.session_for_pane(*pane)))
+            .filter(|pane| {
+                sessions.contains(&self.workspace.session_for_pane(*pane))
+                    || (self.view_pane_scope(*pane)).is_some_and(|s| s.starts_with(&scope))
+            })
             .collect();
         for pane in panes {
             self.close_pane(pane, window, cx);

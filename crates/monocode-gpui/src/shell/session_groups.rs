@@ -11,6 +11,9 @@ use monocode_core::{
     store::Reminder,
 };
 
+#[path = "session_handover.rs"]
+mod session_handover;
+
 actions!(
     session_groups,
     [CancelRename, RenameSidebarItem, DeleteSidebarSelection]
@@ -432,7 +435,7 @@ impl Shell {
         } else {
             self.selected_sessions.clear();
             self.selection_anchor = Some(id);
-            self.open(id, window, cx);
+            self.open_in_workspace(id, OpenIn::default(), window, cx);
         }
         if modifiers.shift || additive {
             window.focus(&self.sidebar_focus, cx);
@@ -768,39 +771,15 @@ impl Shell {
     }
 
     pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.review_owners.iter().any(|(pane, owner)| {
-            *owner == id
-                && (self.workspace.tab_of(*pane).is_some()
-                    || self
-                        .reviews
-                        .get(pane)
-                        .is_some_and(|r| r.read(cx).unsaved_files(cx)))
-        }) {
-            self.error = Some("Close this session's detached file panes before deleting it".into());
-            cx.notify();
+        if !self.session_summaries.contains_key(&id) || self.deleting.contains(&id) {
             return;
         }
-        if self
-            .workspace
-            .terminal_panes
-            .iter()
-            .any(|(pane, t)| t.owner == id && self.workspace.tab_of(*pane).is_some())
-        {
-            self.error = Some("Close this session's terminal panes before deleting it".into());
-            cx.notify();
+        // The files, terminals and pages it opened stay open for another
+        // chat of the project, or close with it when none is left.
+        if !self.hand_over_panes(id, window, cx) {
             return;
         }
-        if self
-            .workspace
-            .browser_panes
-            .iter()
-            .any(|(pane, b)| b.owner == id && self.workspace.tab_of(*pane).is_some())
-        {
-            self.error = Some("Close this session's browser pages before deleting it".into());
-            cx.notify();
-            return;
-        }
-        if !self.session_summaries.contains_key(&id) || !self.deleting.insert(id) {
+        if !self.deleting.insert(id) {
             return;
         }
         self.close_preview(cx);
@@ -2376,14 +2355,14 @@ mod tests {
             .update(visual, |shell, w, cx| {
                 shell.open(a, w, cx);
                 let (_, items, _, _) =
-                    shell.menu_items(&MenuTarget::Tab(a), &mut Vec::new(), w, cx);
+                    shell.menu_items(&MenuTarget::GroupTab(a), &mut Vec::new(), w, cx);
                 assert!(
                     items.iter().any(
                         |item| matches!(item, MenuItem::Action(action) if action.id == "rename")
                     ),
                     "a chat's tab offers Rename"
                 );
-                shell.run_menu(MenuTarget::Tab(a), "rename", None, w, cx);
+                shell.run_menu(MenuTarget::GroupTab(a), "rename", None, w, cx);
                 let renaming = shell.renaming.as_ref().unwrap();
                 assert!(renaming.target == RenameTarget::Session(a));
                 assert_eq!(renaming.host, RenameHost::Tab);

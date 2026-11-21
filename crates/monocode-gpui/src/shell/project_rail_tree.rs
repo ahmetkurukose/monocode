@@ -185,26 +185,6 @@ impl Shell {
         self.project_rail_tree_on() && view != AppView::Automations
     }
 
-    /// The title tab an app view has here: the current project's own tab, or
-    /// the one global tab.
-    pub(super) fn app_tab(&self, view: AppView) -> TitleTab {
-        if self.project_app_scope(view) {
-            TitleTab::ProjectApp {
-                view,
-                project: self.workspace.project.clone(),
-            }
-        } else {
-            TitleTab::App(view)
-        }
-    }
-
-    /// An app view drawn as a Classic surface, with its own header and no
-    /// tab strip, rather than as a project tab.
-    pub(super) fn classic_app_surface(&self) -> bool {
-        self.active_app_view
-            .is_some_and(|view| !self.project_app_scope(view))
-    }
-
     /// Opens one of a project's apps, switching to the project first.
     pub(super) fn open_project_app(
         &mut self,
@@ -216,13 +196,7 @@ impl Shell {
         if self.workspace.project != project {
             self.select_project(project, window, cx);
         }
-        match view {
-            AppView::Inbox => self.open_inbox(window, cx),
-            AppView::Notes => self.open_notes(window, cx),
-            AppView::Database => self.open_database(window, cx),
-            AppView::Api => self.open_api(window, cx),
-            AppView::Automations => self.open_automations(window, cx),
-        }
+        self.open_app(view, window, cx);
     }
 
     /// The project's apps as small icons beside its name, in tree mode.
@@ -243,7 +217,7 @@ impl Shell {
             if !self.workspace.preferences.project_app_shown(app) {
                 continue;
             }
-            let selected = here && self.active_app_view == Some(view);
+            let selected = here && self.active_app_view() == Some(view);
             let unread = view == AppView::Inbox
                 && self
                     .inbox
@@ -294,7 +268,6 @@ impl Shell {
         // The browser is a pane, not an app view: its icon opens the
         // project's page, and is lit while one of them is in front.
         let browsing = here
-            && !self.app_view_open()
             && (self.workspace.active)
                 .is_some_and(|pane| self.workspace.browser_panes.contains_key(&pane));
         let target = project.clone();
@@ -565,8 +538,7 @@ impl Shell {
             && self.expanded_subagents.contains(&id)
             && (self.sessions.get(&id))
                 .is_some_and(|view| view.read(cx).open_subagent_id(cx).is_some());
-        let selected = !self.app_view_open()
-            && !showing_subagent
+        let selected = !showing_subagent
             && self
                 .workspace
                 .active
@@ -853,7 +825,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace.project != project || self.app_view_open() {
+        if self.workspace.project != project {
             self.select_project(project.to_owned(), window, cx);
         }
         if self.workspace.project != project {
@@ -1595,7 +1567,7 @@ mod tests {
             window
                 .update(visual, |shell, _, _| {
                     assert_eq!(shell.workspace.project, other);
-                    assert_eq!(shell.active_app_view, Some(view));
+                    assert_eq!(shell.active_app_view(), Some(view));
                 })
                 .unwrap();
         }
@@ -1615,11 +1587,9 @@ mod tests {
         visual.run_until_parked();
     }
 
-    fn app(view: AppView, project: &str) -> TitleTab {
-        TitleTab::ProjectApp {
-            view,
-            project: project.into(),
-        }
+    /// The app view tab `project`'s scope holds, if any.
+    fn app(shell: &Shell, view: AppView, project: &str) -> Option<i64> {
+        shell.scope_view_pane(&TitleTab::App(view), &shell.scope_key(project))
     }
 
     #[gpui::test]
@@ -1639,33 +1609,26 @@ mod tests {
         window
             .update(visual, |shell, _, cx| {
                 assert_eq!(shell.workspace.project, other);
-                assert!(shell.visible_tabs(cx).contains(&app(AppView::Notes, other)));
-                assert_eq!(shell.active_title_tab(cx), Some(app(AppView::Notes, other)));
+                let notes = app(shell, AppView::Notes, other).unwrap();
+                assert_eq!(shell.workspace.active, Some(notes));
                 assert!(!shell.classic_surface_open(cx));
             })
             .unwrap();
         visual.refresh().unwrap();
         visual.run_until_parked();
-        assert!(at(visual, "app-title-tab-Notes".into()).is_some());
-        assert!(at(visual, "title-tab-strip".into()).is_some());
-        assert!(at(visual, "classic-app-surface-header".into()).is_none());
 
-        // Another project's strip has its own app tabs, not this one's.
+        // Another project's groups have their own app tabs, not this one's.
         click_app(window, visual, "database", here);
         window
-            .update(visual, |shell, _, cx| {
+            .update(visual, |shell, _, _| {
                 assert_eq!(shell.workspace.project, here);
-                assert_eq!(shell.active_app_view, Some(AppView::Database));
-                let tabs = shell.visible_tabs(cx);
-                assert!(tabs.contains(&app(AppView::Database, here)));
-                assert!(!tabs.contains(&app(AppView::Notes, other)));
-                assert!(!tabs.iter().any(|tab| matches!(tab, TitleTab::App(_))));
+                assert_eq!(shell.active_app_view(), Some(AppView::Database));
+                assert!(app(shell, AppView::Database, here).is_some());
+                assert!(app(shell, AppView::Notes, here).is_none());
             })
             .unwrap();
         visual.refresh().unwrap();
         visual.run_until_parked();
-        assert!(at(visual, "app-title-tab-Database".into()).is_some());
-        assert!(at(visual, "app-title-tab-Notes".into()).is_none());
 
         // Going back to the project lands on the app tab it had open.
         window
@@ -1676,19 +1639,13 @@ mod tests {
         visual.run_until_parked();
         window
             .update(visual, |shell, window, cx| {
-                assert_eq!(shell.active_app_view, Some(AppView::Notes));
-                // Without the tree the view is a Classic surface again and
-                // the project tabs wait, hidden.
-                shell.workspace.preferences.project_rail_view = "list".into();
-                assert!(shell.classic_app_surface());
-                assert!(shell.visible_tabs(cx).iter().all(|t| t.session().is_some()));
-                shell.workspace.preferences.project_rail_view = "tree".into();
-                // Closing the tab leaves the view and drops the tab.
-                let tab = shell.app_tab(AppView::Notes);
-                shell.close_title_tabs(&[tab.clone()], None, window, cx);
-                assert_eq!(shell.active_app_view, None);
-                assert!(!shell.workspace.title_order.contains(&tab));
-                assert!((shell.workspace.title_order).contains(&app(AppView::Database, here)));
+                assert_eq!(shell.active_app_view(), Some(AppView::Notes));
+                // Closing the tab leaves the view; the group's chat takes over.
+                shell.close_app_view(window, cx);
+                assert_eq!(shell.active_app_view(), None);
+                assert!(shell.workspace.active.is_some());
+                assert!(app(shell, AppView::Notes, other).is_none());
+                assert!(app(shell, AppView::Database, here).is_some());
             })
             .unwrap();
     }
@@ -1709,13 +1666,12 @@ mod tests {
         click_app(window, visual, "notes", other);
         window
             .update(visual, |shell, window, cx| {
-                shell.toggle_pin_tab(app(AppView::Notes, other), cx);
-                assert!((shell.workspace.pinned_tabs).contains(&app(AppView::Notes, other)));
+                let notes = app(shell, AppView::Notes, other).unwrap();
+                shell.workspace.set_pinned(notes, true);
                 shell.archive_project(other, window, cx);
-                let gone = |tab: &TitleTab| *tab == app(AppView::Notes, other);
-                assert!(!shell.workspace.title_order.iter().any(gone));
-                assert!(!shell.workspace.pinned_tabs.iter().any(gone));
-                assert!(!shell.workspace.scope_focus.values().any(gone));
+                assert!(app(shell, AppView::Notes, other).is_none());
+                assert!(!shell.workspace.view_panes.contains_key(&notes));
+                assert!(shell.workspace.tab_of(notes).is_none());
             })
             .unwrap();
     }

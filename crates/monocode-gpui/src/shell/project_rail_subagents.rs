@@ -229,12 +229,11 @@ impl Shell {
         let now = monocode_core::time::now_ms();
         let row = &subagent.row;
         let (lead, trail) = row.lead_trail(subagent.clock.last_change, now);
-        let selected = !self.app_view_open()
-            && self
-                .workspace
-                .active
-                .map(|a| self.workspace.session_for_pane(a))
-                == Some(session)
+        let selected = self
+            .workspace
+            .active
+            .map(|a| self.workspace.session_for_pane(a))
+            == Some(session)
             && self
                 .sessions
                 .get(&session)

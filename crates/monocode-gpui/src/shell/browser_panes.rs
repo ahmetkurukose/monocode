@@ -1,11 +1,8 @@
 //! Browser pages share the session pane tree, like terminal panes: a page
-//! is its own title tab or sits beside a chat, and borrows its owner
+//! is a tab of a group or sits beside a chat, and borrows its owner
 //! session's project and worktree scope (docs/native/browser.md).
 use super::*;
-use crate::{
-    browser::{BrowserEvent, BrowserView},
-    workspace::BrowserPane,
-};
+use crate::browser::{BrowserEvent, BrowserView};
 
 impl Shell {
     /// The page of a browser pane. A pane restored with the workspace gets
@@ -243,8 +240,7 @@ impl Shell {
         window: &Window,
         cx: &App,
     ) -> Option<Entity<BrowserView>> {
-        if self.active_app_view.is_some()
-            || self.settings.is_some()
+        if self.settings.is_some()
             || self.review_focused
             || self.browser_covered(cx)
             || self.dock_focused(window, cx).is_some()
@@ -349,8 +345,8 @@ impl Shell {
         }
     }
 
-    /// A new page as its own title tab, at `url` or empty with the address
-    /// field focused. It borrows the scope of the focused session, else of
+    /// A new page as a tab of the focused group, at `url` or empty with the
+    /// address field focused. It borrows the scope of the focused session, else of
     /// one of the project's.
     pub(super) fn new_browser_pane(
         &mut self,
@@ -370,20 +366,8 @@ impl Shell {
         let url = url
             .map(|url| monocode_core::browser::address(&url))
             .unwrap_or_else(|| self.resolve_browser_start_url(owner, cx));
-        let pane = self.workspace.next_pane_id();
-        self.workspace.browser_panes.insert(
-            pane,
-            BrowserPane {
-                owner,
-                url: url.clone(),
-                ..Default::default()
-            },
-        );
-        // A page opened now loads now; only restored ones start asleep.
-        let view = cx.new(|cx| BrowserView::new(url, String::new(), None, false, cx));
-        self.watch_browser_pane(pane, &view, cx);
-        self.browser_views.insert(pane, view);
-        self.workspace.open(pane);
+        let pane = self.create_browser_pane(owner, url, cx);
+        self.place_or_open(pane, OpenIn::default(), cx);
         self.pane_motion = None;
         self.fit_sidebar(cx);
         self.open_browser_pane(pane, window, cx);
@@ -428,9 +412,9 @@ impl Shell {
         let Some(owner) = self.workspace.browser_panes.get(&pane).map(|b| b.owner) else {
             return;
         };
-        let Some(tab) = self.workspace.tab_of(pane) else {
+        if self.workspace.tab_of(pane).is_none() {
             return;
-        };
+        }
         if let Some(session) = self.ensure_session(owner, cx) {
             self.workspace.project = session.read(cx).summary.cwd.clone();
         }
@@ -447,7 +431,11 @@ impl Shell {
             .insert(self.workspace.project.clone(), pane);
         self.history.record(pane);
         self.review_focused = false;
-        self.remember_title_tab(TitleTab::Session(tab));
+        self.merge_scope_tabs(cx);
+        // Showing a hidden tab can rekey its title tab: look it up after.
+        if let Some(tab) = self.workspace.tab_of(pane) {
+            self.remember_title_tab(TitleTab::Session(tab));
+        }
         self.reveal_active_tab(cx);
         self.focus_browser_pane(window, cx);
         self.persist(cx);
@@ -520,7 +508,7 @@ impl Shell {
             || self.background_dialog.is_some()
             || self.session_preview.is_some()
             || self.pending_folder.is_some()
-            || self.tab_drag.is_some()
+            || self.strips.drag.as_ref().is_some_and(|drag| drag.active)
             || self.pane_drag.as_ref().is_some_and(|drag| drag.active)
             || self.app_search.as_ref().is_some_and(|search| search.panel)
             || self.notification_state.whats_new.is_some()
@@ -577,13 +565,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// A browser pane: its split header over the page.
-    pub(super) fn browser_pane_surface(
-        &mut self,
-        pane: i64,
-        split: Option<f32>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// A browser pane's page, under its group's strip.
+    pub(super) fn browser_pane_surface(&mut self, pane: i64, cx: &mut Context<Self>) -> AnyElement {
         let view = self.browser_pane_view(pane, cx);
         div()
             .id(("browser-pane", pane.unsigned_abs() as usize))
@@ -591,9 +574,6 @@ impl Shell {
             .size_full()
             .flex()
             .flex_col()
-            .when_some(split.filter(|p| *p > 0.), |d, p| {
-                d.child(self.split_header(pane, p, true, cx))
-            })
             .child(div().flex_1().min_h_0().min_w_0().children(view))
             .into_any_element()
     }
@@ -625,7 +605,10 @@ fn memory_is_short() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{shell::tests::window, workspace::Workspace};
+    use crate::{
+        shell::tests::window,
+        workspace::{BrowserPane, Workspace},
+    };
     use gpui::{TestAppContext, VisualTestContext};
 
     #[gpui::test]

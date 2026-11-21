@@ -156,7 +156,7 @@ fn detail_pages_slide_over_the_overview_and_back_without_recreating_content(
         let s = setup(cx);
         let session = s
             .window
-            .update(cx, |shell, _, _| shell.workspace.active.unwrap())
+            .update(cx, |shell, _, _| blank_session(shell))
             .unwrap();
         s.window
             .update(cx, |_, _, cx| {
@@ -306,6 +306,12 @@ fn detail_pages_slide_over_the_overview_and_back_without_recreating_content(
             stack.left()
         );
     }
+}
+/// The project's blank chat, open beside the Mono's tab.
+fn blank_session(shell: &Shell) -> i64 {
+    (shell.workspace.open_sessions().into_iter())
+        .find(|id| *id > 0)
+        .unwrap()
 }
 fn setup(cx: &mut TestAppContext) -> Setup {
     setup_with(cx, |path| Store::open(path).unwrap())
@@ -1310,7 +1316,7 @@ fn details_tabs_share_the_session_titlebar_in_both_layouts(cx: &mut TestAppConte
                 m.focus_active(w, cx);
                 cx.notify();
             });
-            shell.workspace.active.unwrap()
+            blank_session(shell)
         })
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
@@ -1325,8 +1331,10 @@ fn details_tabs_share_the_session_titlebar_in_both_layouts(cx: &mut TestAppConte
         let panel = visual.debug_bounds("right-panel-frame").unwrap();
         let tabs = visual.debug_bounds("mono-overview-tabs").unwrap();
         let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
-        let title_tabs = visual.debug_bounds("title-tab-strip").unwrap();
-        assert!((tabs.top() - title_tabs.top()).abs() <= px(0.5));
+        // The strips stay the title bar: the Mono's tabs share the window's
+        // top row with the navigation, over the details panel's header.
+        let navigation = visual.debug_bounds("toggle-sidebar").unwrap();
+        assert!((tabs.center().y - navigation.center().y).abs() <= px(0.5));
         assert_eq!(tabs.size.height, px(TITLE_BAR_HEIGHT));
         assert_eq!(
             tabs.left(),
@@ -1336,16 +1344,23 @@ fn details_tabs_share_the_session_titlebar_in_both_layouts(cx: &mut TestAppConte
         let search = visual.debug_bounds("titlebar-file-search").unwrap();
         assert_eq!(search.left() - activity.right(), px(6.));
         assert_eq!(toggle.left() - search.right(), px(4.));
-        assert!(tabs.bottom() <= panel.top() + px(if classic { TITLE_BAR_HEIGHT } else { 0. }));
+        // Boxy: the panel's own title-height inset. Inset: the strip room,
+        // the title bar less the card's 6px top gap and border.
+        let header = px(if classic {
+            TITLE_BAR_HEIGHT
+        } else {
+            TITLE_BAR_HEIGHT - 7.
+        });
+        assert!(tabs.bottom() <= panel.top() + header + px(0.5));
         assert_eq!(
             visual.debug_bounds("mono-dashboard").unwrap().top(),
-            panel.top() + px(if classic { TITLE_BAR_HEIGHT } else { 0. })
+            panel.top() + header
         );
         assert!(
             visual.debug_bounds("mono-overview-toggle").is_none(),
             "only the shell owns the panel toggle"
         );
-        assert!(title_tabs.right() <= tabs.left());
+        assert!(navigation.right() <= tabs.left());
         s.window
             .update(visual, |shell, w, cx| shell.open(session, w, cx))
             .unwrap();
@@ -1524,7 +1539,7 @@ fn opening_a_session_card_uses_the_shared_sidebar_state(cx: &mut TestAppContext)
                 m.settings = None;
                 cx.notify();
             });
-            shell.workspace.active.unwrap()
+            blank_session(shell)
         })
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
@@ -1567,7 +1582,7 @@ fn a_session_open_in_mono_details_keeps_its_history(cx: &mut TestAppContext) {
                 m.settings = None;
                 cx.notify();
             });
-            shell.workspace.active.unwrap()
+            blank_session(shell)
         })
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);

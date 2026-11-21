@@ -848,9 +848,7 @@ impl Shell {
     }
     /// The workspace shows an open session that has no messages yet.
     fn active_session_is_blank(&self, cx: &App) -> bool {
-        !self.app_view_open()
-            && self.app_search.is_none()
-            && !self.mono_active(cx)
+        self.app_search.is_none()
             && self.workspace.active.is_some_and(|id| {
                 self.session_summaries.contains_key(&id)
                     && !self.session_metadata(id, cx).summary.has_messages
@@ -987,7 +985,7 @@ mod tests {
         visual.run_until_parked();
         window
             .update(visual, |shell, _, cx| {
-                assert_eq!(shell.active_app_view, Some(AppView::Api));
+                assert_eq!(shell.active_app_view(), Some(AppView::Api));
                 let names = shell.api.as_ref().unwrap().read(cx).open_request_names();
                 assert_eq!(names, vec!["DELETE 3"]);
             })
@@ -1036,8 +1034,8 @@ mod tests {
             visual.run_until_parked();
             window
                 .update(visual, |shell, _, _| {
-                    assert_eq!(shell.active_app_view, Some(view), "{label}");
-                    assert!(shell.app_view_body().is_some(), "{label} has a body");
+                    assert_eq!(shell.active_app_view(), Some(view), "{label}");
+                    assert!(shell.app_view_element(view).is_some(), "{label} has a body");
                 })
                 .unwrap();
         }
@@ -1238,7 +1236,7 @@ mod tests {
         }
         window
             .update(visual, |shell, _, cx| {
-                assert_eq!(shell.active_app_view, Some(app_views::AppView::Notes));
+                assert_eq!(shell.active_app_view(), Some(app_views::AppView::Notes));
                 assert!(shell.notes.is_some());
                 assert!(
                     shell.workspace.preferences.notes,

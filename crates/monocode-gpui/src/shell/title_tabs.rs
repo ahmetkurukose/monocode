@@ -10,38 +10,9 @@ impl Shell {
         if from == to {
             return;
         }
-        let previous = TitleTab::Session(from);
-        let next = TitleTab::Session(to);
-        self.title_tab_motion.replace_key(&previous, next.clone());
-        for selected in [
-            &mut self.title_tab_selection.0,
-            &mut self.title_tab_selection.1,
-        ] {
-            if selected.as_ref() == Some(&previous) {
-                *selected = Some(next.clone());
-            }
-        }
-        let shift = self.tab_shifts.remove(&previous);
-        self.tab_shifts.remove(&next);
-        if let Some(shift) = shift {
-            self.tab_shifts.insert(next, shift);
-        }
-        self.pane_ticks.remove(&from);
-        self.pane_ticks.remove(&to);
-        if self.tab_hover == Some(from) {
-            self.tab_hover = Some(to);
-        }
-        if self.pin_card_hover.as_ref() == Some(&previous) {
-            self.pin_card_hover = Some(TitleTab::Session(to));
-        }
+        self.strips.replace_key(from, to);
     }
 
-    pub(crate) fn click_mono_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if std::mem::take(&mut self.skip_tab_click) {
-            return;
-        }
-        self.open_title_tab(&self.mono_tab(id.into()), window, cx);
-    }
     pub(super) fn tab_scope(&self) -> String {
         format!(
             "{}\0{}",
@@ -77,111 +48,47 @@ impl Shell {
             .collect()
     }
 
+    /// The current scope's title tabs. App views, Search and Monos are
+    /// tabs inside their groups, never title tabs of their own.
     fn scoped_tabs(&self, cx: &App) -> Vec<TitleTab> {
+        let scope = self.tab_scope();
         self.workspace
             .title_order
             .iter()
             .filter(|tab| match tab {
-                TitleTab::Search => !self.workspace.preferences.search_panel,
-                TitleTab::App(view) => {
-                    !self.workspace.classic_layout
-                        && (*view != app_views::AppView::Notes || self.workspace.preferences.notes)
-                }
-                TitleTab::ProjectApp { view, project } => {
-                    self.project_rail_tree_on()
-                        && *project == self.workspace.project
-                        && (*view != app_views::AppView::Notes || self.workspace.preferences.notes)
-                }
                 TitleTab::Session(tab) => {
                     self.workspace.tabs.contains(tab) && {
                         let id = self.workspace.scope_pane(*tab);
-                        self.session_summaries
-                            .contains_key(&self.workspace.session_for_pane(id))
-                            && self
-                                .session_metadata(self.workspace.session_for_pane(id), cx)
-                                .summary
-                                .cwd
-                                == self.workspace.project
-                            && self.in_worktree_scope(id, cx)
+                        match self.view_pane_scope(id) {
+                            Some(view_scope) => view_scope == scope,
+                            None => {
+                                let session = self.workspace.session_for_pane(id);
+                                self.session_summaries.contains_key(&session)
+                                    && self.session_metadata(session, cx).summary.cwd
+                                        == self.workspace.project
+                                    && self.in_worktree_scope(id, cx)
+                            }
+                        }
                     }
                 }
-                TitleTab::Mono {
-                    id,
-                    project,
-                    worktree,
-                } => {
-                    !self.workspace.classic_layout
-                        && *project == self.workspace.project
-                        && path_key(worktree) == path_key(self.working_copy())
-                        && self.workspace.preferences.monos
-                        && self
-                            .monos
-                            .as_ref()
-                            .is_some_and(|m| m.read(cx).roster.get(id).is_some())
-                }
+                _ => false,
             })
             .cloned()
             .collect()
     }
 
-    pub(super) fn active_title_tab(&self, cx: &App) -> Option<TitleTab> {
-        if let Some(view) = self.active_app_view {
-            return Some(self.app_tab(view));
-        }
-        if self.search_page() {
-            return Some(TitleTab::Search);
-        }
-        self.monos
-            .as_ref()
-            .and_then(|m| m.read(cx).active.clone())
-            .map(|id| self.mono_tab(id))
-            .or_else(|| self.workspace.active_tab().map(TitleTab::Session))
-    }
-
-    /// The active tab follows live focus; other tabs keep their last displayed
-    /// pane instead of borrowing the currently selected tab's preview focus.
-    pub(super) fn tab_review_focused(&self, tab: i64, cx: &App) -> bool {
-        if self.active_title_tab(cx) == Some(TitleTab::Session(tab)) {
-            self.review_focused
-        } else {
-            self.pane_ticks
-                .get(&tab)
-                .is_some_and(|tick| tick.shown == (self.workspace.tab_focus(tab), true))
-        }
+    pub(super) fn active_title_tab(&self, _: &App) -> Option<TitleTab> {
+        self.workspace.active_tab().map(TitleTab::Session)
     }
 
     pub(super) fn remember_title_tab(&mut self, tab: TitleTab) {
-        if self.workspace.classic_layout && matches!(tab, TitleTab::Mono { .. }) {
+        if !matches!(tab, TitleTab::Session(_)) {
             return;
         }
         if !self.workspace.title_order.contains(&tab) {
             self.workspace.title_order.push(tab.clone());
         }
         self.workspace.scope_focus.insert(self.tab_scope(), tab);
-    }
-
-    pub(super) fn mono_opened(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self
-            .monos
-            .as_ref()
-            .is_some_and(|m| m.read(cx).active.as_deref() == Some(&id))
-            || self.redirect_mono_to_pane(&id, cx)
-        {
-            return;
-        }
-        self.navigation_revision += 1;
-        self.selected_sessions.clear();
-        self.selection_anchor = None;
-        self.sidebar_target = None;
-        self.context_selection = false;
-        self.leave_app_views(cx);
-        self.leave_app_search(cx);
-        self.close_preview(cx);
-        self.review_focused = false;
-        self.remember_title_tab(self.mono_tab(id));
-        self.reveal_active_tab(cx);
-        self.persist(cx);
-        cx.notify();
     }
 
     pub(super) fn open_title_tab(
@@ -192,33 +99,15 @@ impl Shell {
     ) {
         match tab {
             TitleTab::Search => self.open_app_search(window, cx),
-            TitleTab::App(view) => match view {
-                app_views::AppView::Inbox => self.open_inbox(window, cx),
-                app_views::AppView::Notes => self.open_notes(window, cx),
-                app_views::AppView::Automations => self.open_automations(window, cx),
-                app_views::AppView::Database => self.open_database(window, cx),
-                app_views::AppView::Api => self.open_api(window, cx),
-            },
+            TitleTab::App(view) => self.open_app(*view, window, cx),
             TitleTab::ProjectApp { view, project } => {
                 self.open_project_app(*view, project.clone(), window, cx)
             }
             TitleTab::Session(id) => {
                 let focus = self.workspace.tab_focus(*id);
-                let review_focused = self.tab_review_focused(*id, cx);
                 self.open(focus, window, cx);
-                if review_focused
-                    && self.workspace.active == Some(focus)
-                    && let Some(review) = self.active_review(cx)
-                {
-                    self.review_focused = true;
-                    review.update(cx, |r, cx| r.focus_active(window, cx));
-                }
             }
-            TitleTab::Mono { id, .. } => {
-                if let Some(monos) = self.monos.clone() {
-                    monos.update(cx, |m, cx| m.open(id, window, cx));
-                }
-            }
+            TitleTab::Mono { id, .. } => self.open_mono_tab(id, window, cx),
         }
     }
 
@@ -229,29 +118,15 @@ impl Shell {
     ) -> bool {
         let tab = self.workspace.scope_focus.get(&self.tab_scope()).cloned();
         if let Some(tab) = tab.filter(|tab| self.visible_tabs(cx).contains(tab)) {
-            if matches!(tab, TitleTab::Mono { .. }) {
-                self.workspace.active = None;
-            }
             self.open_title_tab(&tab, window, cx);
             return true;
         }
         false
     }
 
-    pub(crate) fn close_mono_tab(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.classic_layout {
-            if self
-                .monos
-                .as_ref()
-                .is_some_and(|m| m.read(cx).active.as_deref() == Some(id))
-            {
-                self.classic_rail_back(window, cx);
-            }
-            return;
-        }
-        self.close_title_tabs(&[self.mono_tab(id.into())], None, window, cx);
-    }
-
+    /// The old title strip's tab menu, kept for the title-tab model until
+    /// app views, Search and Monos become group tabs (Stage 4).
+    #[cfg(test)]
     pub(super) fn run_title_tab_menu(
         &mut self,
         tab: TitleTab,
@@ -302,12 +177,13 @@ impl Shell {
         self.close_title_tabs_archiving(tabs, preferred, Vec::new(), window, cx);
     }
 
-    /// The panes inside the open ones of `tabs`.
+    /// The panes inside the open ones of `tabs`, hidden group tabs included.
     pub(super) fn title_tab_panes(&self, tabs: &[TitleTab]) -> Vec<i64> {
         tabs.iter()
             .filter(|tab| self.workspace.title_order.contains(tab))
             .filter_map(TitleTab::session)
             .flat_map(|id| self.workspace.layout(id).leaf_ids())
+            .flat_map(|id| self.workspace.group_tabs(id))
             .collect()
     }
 
@@ -373,23 +249,18 @@ impl Shell {
         };
         self.navigation_revision += 1;
         self.close_menu(cx);
-        self.tab_drag = None;
-        self.tab_shifts.clear();
-        self.tab_hover = None;
-        self.tab_scroll_task = None;
+        self.strips.drag = None;
+        self.strips.shifts.clear();
         self.cancel_pane_drag(cx);
         let session_active = self.workspace.active;
+        if replace {
+            self.leave_app_views(cx);
+        }
         for tab in &closing {
-            if matches!(tab, TitleTab::App(_) | TitleTab::ProjectApp { .. })
-                && active.as_ref() == Some(tab)
-            {
-                self.leave_app_views(cx);
-            }
-            if *tab == TitleTab::Search {
-                self.leave_app_search(cx);
-                self.saved_search = None;
-            }
             if let TitleTab::Session(id) = tab {
+                for pane in self.title_tab_panes(std::slice::from_ref(tab)) {
+                    self.remember_closed_tab(pane, cx);
+                }
                 self.workspace.close(*id);
             }
         }
@@ -406,7 +277,6 @@ impl Shell {
             }
             self.workspace.active = None;
             self.review_focused = false;
-            self.review_slide = None;
             self.pane_motion = None;
             if let Some(tab) = next {
                 self.open_title_tab(&tab, window, cx);
@@ -420,7 +290,7 @@ impl Shell {
         self.settle_mono_panes(window, cx);
         self.history
             .prune(&self.workspace.open_sessions(), self.workspace.active);
-        if self.workspace.active.is_none() && !self.mono_active(cx) && !self.app_view_open() {
+        if self.workspace.active.is_none() {
             self.focus_active(window, cx);
         }
         self.persist(cx);
@@ -428,6 +298,7 @@ impl Shell {
     }
 
     /// Moves `tab` to strip slot `to`; pinned tabs keep their places.
+    #[cfg(test)]
     pub(super) fn reorder_title_tab(&mut self, tab: &TitleTab, to: usize, cx: &App) {
         let mut visible = self.strip_tabs(cx);
         let Some(from) = visible.iter().position(|entry| entry == tab) else {
@@ -470,7 +341,8 @@ mod tests {
         id
     }
 
-    fn add_mono(window: WindowHandle<Shell>, cx: &mut TestAppContext) -> TitleTab {
+    /// A new Mono, opened as a tab of the current scope: its pane.
+    fn add_mono(window: WindowHandle<Shell>, cx: &mut TestAppContext) -> i64 {
         window
             .update(cx, |shell, w, cx| {
                 shell
@@ -480,12 +352,15 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         window
-            .update(cx, |shell, _, cx| shell.active_title_tab(cx).unwrap())
+            .update(cx, |shell, _, cx| {
+                assert!(shell.mono_active(cx));
+                shell.workspace.active.unwrap()
+            })
             .unwrap()
     }
 
     #[gpui::test]
-    fn mixed_tabs_open_in_order_and_close_to_the_visible_neighbor(cx: &mut TestAppContext) {
+    fn mixed_tabs_open_in_order_and_close_to_the_last_used(cx: &mut TestAppContext) {
         let (window, other_project, first) = window(cx);
         let mono = add_mono(window, cx);
         let second = window.update(cx, add_session).unwrap();
@@ -493,27 +368,22 @@ mod tests {
         let last = add_mono(window, cx);
         window
             .update(cx, |shell, w, cx| {
+                // Sessions and Monos share the scope's one group.
                 assert_eq!(
-                    shell.visible_tabs(cx),
-                    [
-                        TitleTab::Session(first),
-                        mono.clone(),
-                        TitleTab::Session(second),
-                        last.clone()
-                    ]
+                    shell.workspace.group_tabs(first),
+                    [first, mono, second, last]
                 );
-                shell.open_title_tab(&mono, w, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, w, cx| {
-                shell.close_title_tabs(std::slice::from_ref(&mono), None, w, cx);
-                assert_eq!(shell.active_title_tab(cx), Some(TitleTab::Session(second)));
-                shell.close_title_tabs(&[last], None, w, cx);
+                assert_eq!(shell.visible_tabs(cx).len(), 1);
+                shell.open(mono, w, cx);
+                assert!(shell.mono_active(cx));
+                shell.request_close_pane(mono, w, cx);
+                assert_eq!(shell.workspace.active, Some(last), "the last used tab");
+                shell.open(second, w, cx);
+                assert!(!shell.mono_active(cx));
+                shell.request_close_pane(last, w, cx);
                 assert_eq!(
-                    shell.active_title_tab(cx),
-                    Some(TitleTab::Session(second)),
+                    shell.workspace.active,
+                    Some(second),
                     "inactive close preserves focus"
                 );
                 assert!(
@@ -523,67 +393,12 @@ mod tests {
                         .focus_handle(cx)
                         .is_focused(w)
                 );
-                shell.close(second, w, cx);
+                assert!(shell.workspace.mono_panes.is_empty());
+                // Closing the session's tab hands its group to the other.
+                shell.request_close_pane(second, w, cx);
                 assert_eq!(shell.workspace.active, Some(first));
                 assert_eq!(shell.workspace.project, "/work/monocode");
                 assert!(shell.workspace.tabs.contains(&other_project));
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn mono_close_button_and_cmd_w_share_selection_and_focus(cx: &mut TestAppContext) {
-        let (window, _, first) = window(cx);
-        cx.update(|cx| {
-            bind_keys(cx);
-            input::bind(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mono = add_mono(window, cx);
-        let second = window.update(cx, add_session).unwrap();
-        window
-            .update(cx, |shell, w, cx| shell.open_title_tab(&mono, w, cx))
-            .unwrap();
-        cx.run_until_parked();
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        let close = visual.debug_bounds("close-mono-tab-button").unwrap();
-        visual.simulate_click(close.center(), Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, w, cx| {
-                assert_eq!(shell.workspace.active, Some(second));
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [TitleTab::Session(first), TitleTab::Session(second)]
-                );
-                assert!(
-                    shell.sessions[&second]
-                        .read(cx)
-                        .input
-                        .focus_handle(cx)
-                        .is_focused(w)
-                );
-            })
-            .unwrap();
-        let mono = add_mono(window, visual);
-        let modifier = if cfg!(target_os = "macos") {
-            "cmd"
-        } else {
-            "ctrl"
-        };
-        visual.simulate_keystrokes(&format!("{modifier}-w"));
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, w, cx| {
-                assert!(!shell.visible_tabs(cx).contains(&mono));
-                assert_eq!(shell.workspace.active, Some(second));
-                assert!(
-                    shell.sessions[&second]
-                        .read(cx)
-                        .input
-                        .focus_handle(cx)
-                        .is_focused(w)
-                );
             })
             .unwrap();
     }
@@ -613,46 +428,29 @@ mod tests {
         window
             .update(cx, |shell, w, cx| {
                 assert_eq!(
-                    shell.visible_tabs(cx),
-                    [TitleTab::Session(feature_session), mono_feature.clone()]
+                    shell.workspace.group_tabs(feature_session),
+                    [feature_session, mono_feature]
                 );
                 shell.cycle(1, w, cx);
                 assert_eq!(shell.workspace.active, Some(feature_session));
                 shell.activate_tab(-1, w, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, w, cx| {
-                assert_eq!(shell.active_title_tab(cx), Some(mono_feature.clone()));
-                let TitleTab::Mono { id, .. } = &mono_feature else {
-                    panic!("expected a Mono");
-                };
-                shell.run_menu(MenuTarget::MonoTab(id.clone()), "others", None, w, cx);
-                assert_eq!(
-                    shell.visible_tabs(cx).as_slice(),
-                    std::slice::from_ref(&mono_feature)
-                );
-                assert!(shell.workspace.tabs.contains(&main));
-                assert!(shell.workspace.tabs.contains(&other_project));
+                assert_eq!(shell.workspace.active, Some(mono_feature));
                 shell.select_worktree(None, w, cx);
             })
             .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
-                assert_eq!(shell.active_title_tab(cx), Some(mono_main.clone()));
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [TitleTab::Session(main), mono_main.clone()]
-                );
+                assert_eq!(shell.workspace.active, Some(mono_main));
+                assert_eq!(shell.workspace.group_tabs(main), [main, mono_main]);
+                assert!(shell.workspace.tabs.contains(&other_project));
                 shell.select_worktree(Some(feature), w, cx);
             })
             .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |shell, w, cx| {
-                assert_eq!(shell.active_title_tab(cx), Some(mono_feature));
+                assert_eq!(shell.workspace.active, Some(mono_feature));
                 shell.close_title_tabs(&shell.visible_tabs(cx), None, w, cx);
             })
             .unwrap();
@@ -663,7 +461,8 @@ mod tests {
                 assert_eq!(shell.working_copy(), "/work/feature");
                 // Everything of this copy is closed and stays closed.
                 assert_eq!(shell.visible_tabs(cx).len(), 0);
-                assert!(shell.workspace.title_order.contains(&mono_main));
+                assert!(shell.workspace.mono_panes.contains_key(&mono_main));
+                assert!(!shell.workspace.mono_panes.contains_key(&mono_feature));
                 assert!(shell.workspace.tabs.contains(&other_project));
             })
             .unwrap();
@@ -676,21 +475,14 @@ mod tests {
         let second = window.update(cx, add_session).unwrap();
         window
             .update(cx, |shell, w, cx| {
-                shell.reorder_title_tab(&mono, 0, cx);
-                shell.open_title_tab(&mono, w, cx);
+                shell.workspace.move_in_group(mono, 0);
+                shell.open(mono, w, cx);
             })
             .unwrap();
         cx.run_until_parked();
         let (store, summaries, saved) = window
-            .update(cx, |shell, _, cx| {
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [
-                        mono.clone(),
-                        TitleTab::Session(first),
-                        TitleTab::Session(second)
-                    ]
-                );
+            .update(cx, |shell, _, _| {
+                assert_eq!(shell.workspace.group_tabs(second), [mono, first, second]);
                 let db = locked(&shell.store).unwrap();
                 (
                     shell.store.clone(),
@@ -708,15 +500,9 @@ mod tests {
         cx.run_until_parked();
         restored
             .update(cx, |shell, _, cx| {
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [
-                        mono.clone(),
-                        TitleTab::Session(first),
-                        TitleTab::Session(second)
-                    ]
-                );
-                assert_eq!(shell.active_title_tab(cx), Some(mono));
+                assert_eq!(shell.workspace.group_tabs(second), [mono, first, second]);
+                assert_eq!(shell.workspace.active, Some(mono));
+                assert!(shell.mono_active(cx), "its page is back");
             })
             .unwrap();
     }
@@ -735,19 +521,15 @@ mod tests {
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
-                let tabs = shell.visible_tabs(cx);
+                // One title tab; the new sessions stack in its group in order.
+                assert_eq!(shell.visible_tabs(cx).len(), 1);
+                let tabs = shell.workspace.group_tabs(first);
                 assert_eq!(tabs.len(), 5);
-                assert_eq!(tabs[0], TitleTab::Session(first));
-                for (tab, provider) in tabs[1..].iter().zip(providers) {
-                    assert_eq!(
-                        shell.sessions[&tab.session().unwrap()]
-                            .read(cx)
-                            .summary
-                            .provider,
-                        provider.id()
-                    );
+                assert_eq!(tabs[0], first);
+                for (id, provider) in tabs[1..].iter().zip(providers) {
+                    assert_eq!(shell.sessions[id].read(cx).summary.provider, provider.id());
                 }
-                assert_eq!(shell.active_title_tab(cx).as_ref(), tabs.last());
+                assert_eq!(shell.workspace.active.as_ref(), tabs.last());
             })
             .unwrap();
     }
@@ -805,18 +587,18 @@ mod interaction_tests {
             })
             .unwrap();
         cx.run_until_parked();
-        let mono = window
+        let id = window
             .update(cx, |shell, w, cx| {
-                let mono = shell.active_title_tab(cx).unwrap();
+                let id = shell.mono_manager().read(cx).active.clone().unwrap();
                 shell.open(session, w, cx);
-                mono
+                id
             })
             .unwrap();
         cx.run_until_parked();
         cx.refresh().unwrap();
-        let TitleTab::Mono { id, .. } = &mono else {
-            panic!("expected a Mono");
-        };
+        let mono = window
+            .update(cx, |shell, _, _| shell.mono_tab(id.clone()))
+            .unwrap();
         let mono_row = format!("mono-rail-{id}");
         let session_row = format!("sidebar-session-{session}");
         assert!(sidebar_highlight(window, session_row.clone(), cx));
@@ -839,7 +621,8 @@ mod interaction_tests {
         );
         window
             .update(cx, |shell, _, _| {
-                assert_eq!(shell.workspace.active, Some(session));
+                let active = shell.workspace.active.unwrap();
+                assert_eq!(shell.mono_pane_id(active), Some(id.as_str()));
             })
             .unwrap();
         click(&session_row, cx);
@@ -879,101 +662,5 @@ mod interaction_tests {
             format!("sidebar-session-{other}"),
             cx
         ));
-    }
-
-    #[gpui::test]
-    fn closing_a_session_button_selects_the_adjacent_mono_and_restores_its_composer(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, _, first) = window(cx);
-        window
-            .update(cx, |shell, w, cx| {
-                shell
-                    .mono_manager()
-                    .update(cx, |m, cx| m.create(Vec::new(), w, cx));
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let mono = window
-            .update(cx, |shell, w, cx| {
-                let mono = shell.active_title_tab(cx).unwrap();
-                shell.open(first, w, cx);
-                mono
-            })
-            .unwrap();
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.run_until_parked();
-        let close = visual
-            .debug_bounds(Box::leak(
-                format!("close-title-tab-{first}").into_boxed_str(),
-            ))
-            .unwrap();
-        visual.simulate_click(close.center(), Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, w, cx| {
-                assert_eq!(shell.active_title_tab(cx), Some(mono));
-                let chat = shell.mono_manager().read(cx).chat().unwrap();
-                assert!(chat.read(cx).input.focus_handle(cx).is_focused(w));
-                assert_eq!(shell.workspace.project, "/work/monocode");
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn dragging_a_mono_uses_the_mixed_strip_slots_and_keeps_the_active_session(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, _, first) = window(cx);
-        window
-            .update(cx, |shell, w, cx| {
-                shell
-                    .mono_manager()
-                    .update(cx, |m, cx| m.create(Vec::new(), w, cx));
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let mono = window
-            .update(cx, |shell, w, cx| {
-                let mono = shell.active_title_tab(cx).unwrap();
-                shell.open(first, w, cx);
-                mono
-            })
-            .unwrap();
-        let TitleTab::Mono { id, .. } = &mono else {
-            panic!("expected a Mono");
-        };
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.run_until_parked();
-        let session_bounds = visual
-            .debug_bounds(Box::leak(format!("title-tab-{first}").into_boxed_str()))
-            .unwrap();
-        let mono_bounds = visual
-            .debug_bounds(Box::leak(format!("mono-title-tab-{id}").into_boxed_str()))
-            .unwrap();
-        visual.simulate_mouse_down(
-            mono_bounds.center(),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        visual.simulate_mouse_move(
-            point(session_bounds.center().x, mono_bounds.center().y),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        visual.run_until_parked();
-        visual.simulate_mouse_up(
-            point(session_bounds.center().x, mono_bounds.center().y),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, cx| {
-                assert_eq!(shell.visible_tabs(cx), [mono, TitleTab::Session(first)]);
-                assert_eq!(shell.workspace.active, Some(first));
-                assert!(!shell.mono_active(cx));
-            })
-            .unwrap();
     }
 }

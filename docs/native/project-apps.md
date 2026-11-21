@@ -4,14 +4,20 @@ Status: plan, revision 2 (stress-tested against the code, 2026-11-10). No code y
 `AK/monocode_enhancements`, on top of `native-v0.16.0-preview.14` (60 fork commits).
 Line numbers are from that tree.
 
+> **Superseded in part by `docs/native/tab-groups.md`.** The title strip, its pinned deck
+> and app tabs in it (§2.2, gate 3 of §3.3, the strip tests of §5) no longer exist: every
+> split region has its own group strip, and Inbox, Notes, Automations, Database, API and
+> Search open as view panes, one per scope, in a group of that scope (`shell/view_panes.rs`).
+> The rest is kept as the record of the plan.
+
 ## 1. Goal
 
 In **Classic + Tree** (Settings → Appearance → Project list: Tree):
 
 - Every expanded project in the rail tree gets a one-line row of small icons — **Inbox,
   Notes, Database** — as its last child. Each icon can be hidden in Settings.
-- Clicking one switches to that project and opens the app as a **tab in the title strip**,
-  the way Focused already shows app tabs.
+- Clicking one switches to that project and opens the app as a **tab** of the project
+  (today a view pane in one of its tab groups).
 - The tab **belongs to the project**: it shows in that project's strip only, one tab per
   (app, project).
 - Each app shows that project's slice: the project's Notes, the Inbox scoped to it, and the

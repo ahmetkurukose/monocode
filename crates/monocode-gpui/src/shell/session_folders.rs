@@ -282,10 +282,7 @@ impl Shell {
             self.open_folder_picker(id, anchor, window, cx);
         }
         let open = self.folder_picker.as_ref()?;
-        if self.workspace.active != Some(open.session)
-            || self.settings.is_some()
-            || self.app_view_open()
-        {
+        if self.workspace.active != Some(open.session) || self.settings.is_some() {
             self.folder_picker = None;
             return None;
         }

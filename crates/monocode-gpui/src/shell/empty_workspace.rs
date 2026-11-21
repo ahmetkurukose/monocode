@@ -50,11 +50,8 @@ pub(super) fn bound_shortcut(action: &dyn Action, cx: &App) -> Option<String> {
 
 impl Shell {
     /// Nothing is open in the project in front, and nothing else covers it.
-    pub(super) fn empty_workspace_showing(&self, cx: &App) -> bool {
-        self.workspace.active.is_none()
-            && !self.app_view_open()
-            && !self.mono_active(cx)
-            && !self.project_asleep(&self.workspace.project)
+    pub(super) fn empty_workspace_showing(&self, _: &App) -> bool {
+        self.workspace.active.is_none() && !self.project_asleep(&self.workspace.project)
     }
 
     /// The workspace area for an empty project, centred and quiet.
@@ -205,50 +202,6 @@ impl Shell {
                 .children(chats)
                 .into_any_element(),
         )
-    }
-
-    /// Opens `tab` as a pane of its own when no chat is in front to hold it.
-    pub(super) fn open_review_from_empty_workspace(
-        &mut self,
-        tab: crate::review::ReviewTab,
-        pin: Option<bool>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.empty_workspace_showing(cx) {
-            return;
-        }
-        let Some(owner) = self
-            .terminal_owner()
-            .or_else(|| self.project_session_for_terminal())
-        else {
-            self.with_pane_owner("a file", cx, move |this, window, cx| {
-                this.open_review_with_preview(tab, pin, window, cx)
-            });
-            return;
-        };
-        let pane = self.workspace.next_pane_id();
-        let state = crate::review::ReviewState {
-            chat_hidden: true,
-            ..Default::default()
-        };
-        let review = self.make_review(pane, state, cx);
-        review.update(cx, |r, cx| {
-            if let Some(pin) = pin {
-                r.open_file(tab, pin, cx);
-            } else {
-                r.open(tab, cx);
-            }
-            r.set_visible(true, cx);
-        });
-        self.workspace.review_owners.insert(pane, owner);
-        self.workspace
-            .reviews
-            .insert(pane, review.read(cx).state.clone());
-        self.workspace.open(pane);
-        self.open_file_pane(pane, window, cx);
-        self.fit_sidebar(cx);
-        cx.notify();
     }
 
     /// Runs `then` once the project has a session to own a pane: right away

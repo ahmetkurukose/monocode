@@ -263,6 +263,12 @@ impl Shell {
             });
         if beside_chat {
             self.workspace.place(pane, session, Edge::Right);
+        } else if let Some(tab) = tab {
+            // Out of the way: behind the tab's page, else behind the chat.
+            let beside = (self.workspace.layout(tab).leaf_ids().into_iter())
+                .find(|leaf| self.workspace.browser_panes.contains_key(leaf) && *leaf != pane)
+                .unwrap_or(session);
+            self.workspace.add_to_group(pane, beside, None, false);
         } else {
             self.workspace.open(pane);
         }
@@ -609,11 +615,15 @@ mod tests {
                     shell.workspace.tab_of(session)
                 );
                 assert_eq!(shell.workspace.session_for_pane(first), session);
-                // A second page is a tab of its own, still without taking focus.
+                // A second page stacks behind the first, still without taking focus.
                 let (second, _) = shell
                     .agent_open(session, "http://localhost:3000/b".into(), false, w, cx)
                     .unwrap();
-                assert_eq!(shell.workspace.tab_of(second), Some(second));
+                assert_eq!(shell.workspace.group_tabs(first), [first, second]);
+                assert_eq!(
+                    shell.workspace.tab_of(second),
+                    shell.workspace.tab_of(session)
+                );
                 assert_eq!(shell.workspace.active, Some(session));
                 assert_eq!(shell.agent_panes(session), vec![second, first]);
                 let listing = shell.agent_listing(session, cx);

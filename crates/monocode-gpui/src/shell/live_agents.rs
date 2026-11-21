@@ -100,9 +100,7 @@ impl Shell {
         // Two or more agents always make a card. A lone agent only does when it
         // is not the one on screen, whose chat already shows its progress: the
         // one working in another project, or while the Inbox covers the chat.
-        let viewing = if self.app_view_open() {
-            None
-        } else {
+        let viewing = {
             self.workspace
                 .active
                 .map(|pane| self.workspace.session_for_pane(pane))
@@ -278,8 +276,7 @@ impl Shell {
                 .started_at
                 .map(|at| live_elapsed(now.saturating_sub(at)))
         };
-        let selected = self.selected_sessions.contains(&id)
-            || (self.workspace.active == Some(id) && !self.mono_active(cx));
+        let selected = self.selected_sessions.contains(&id) || self.workspace.active == Some(id);
         let status: AnyElement = if agent.needs_approval {
             icon("alert-circle", 12.)
                 .text_color(rgb(AMBER))

@@ -1,82 +1,8 @@
-//! File panes share the session pane tree and title strip. Moving a pane
+//! File panes are tabs of the session pane tree's groups. Moving a pane
 //! transfers its entity, preserving dirty documents, selection and scroll.
 use super::*;
 
 impl Shell {
-    pub(super) fn independent_file_pane(&mut self, id: i64, cx: &mut Context<Self>) -> Option<i64> {
-        let pane = self.take_review_pane(id, cx)?;
-        self.workspace.open(pane);
-        Some(pane)
-    }
-
-    /// On a committed chat drop, leave its file surface in the original
-    /// layout slot and give the existing conversation its own movable pane.
-    pub(super) fn separate_session_review(
-        &mut self,
-        id: i64,
-        cx: &mut Context<Self>,
-    ) -> Option<i64> {
-        if self.workspace.reviews.get(&id)?.chat_hidden {
-            return None;
-        }
-        let pane = self.take_review_pane(id, cx)?;
-        self.workspace.swap_session(id, pane);
-        self.workspace.open(id);
-        Some(pane)
-    }
-
-    /// A chat can be dropped on its attached file, but never on itself.
-    pub(super) fn session_review_hit(&self, id: i64, position: Point<Pixels>) -> Option<Edge> {
-        let state = self.workspace.reviews.get(&id)?;
-        if state.chat_hidden {
-            return None;
-        }
-        let bounds = self.split_bounds.get(&id)?.get()?;
-        let width = bounds.size.width.as_f32();
-        let rect = Rect {
-            x: width * (1. - state.ratio),
-            y: 0.,
-            w: width * state.ratio,
-            h: bounds.size.height.as_f32(),
-        };
-        let x = (position.x - bounds.left()).as_f32();
-        let y = (position.y - bounds.top()).as_f32();
-        (bounds.contains(&position) && x >= rect.x)
-            .then(|| crate::pane_layout::edge_from_point(x, y, rect))
-    }
-
-    fn take_review_pane(&mut self, id: i64, cx: &mut Context<Self>) -> Option<i64> {
-        if self.workspace.review_owners.contains_key(&id)
-            || self
-                .workspace
-                .reviews
-                .get(&id)
-                .is_some_and(|r| r.chat_hidden)
-        {
-            return Some(id);
-        }
-        let review = self.reviews.remove(&id)?;
-        let pane = self.workspace.next_pane_id();
-        // The owner must be a session. A file opened from a terminal pane
-        // belongs to that terminal's session, not to the terminal itself: a
-        // terminal can close, and it is no chat to open or restore from.
-        let owner = self.workspace.session_for_pane(id);
-        self.workspace.review_owners.insert(pane, owner);
-        self.workspace.reviews.remove(&id);
-        self.reviews.insert(pane, review.clone());
-        self.review_slide = None;
-        review.update(cx, |r, cx| {
-            r.state.chat_hidden = true;
-            r.set_deferred(false, cx);
-            cx.emit(crate::review::ReviewEvent::Changed);
-            cx.notify();
-        });
-        self.workspace
-            .reviews
-            .insert(pane, review.read(cx).state.clone());
-        Some(pane)
-    }
-
     pub(super) fn open_file_pane(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let owner = self.workspace.session_for_pane(id);
         if self.deleting.contains(&owner) {
@@ -92,11 +18,15 @@ impl Shell {
         self.navigation_revision += 1;
         self.leave_app_views(cx);
         self.close_preview(cx);
+        if self.workspace.tab_of(id).is_none() {
+            self.place_new_tab(id, OpenIn::default(), cx);
+        }
         self.workspace.open(id);
         self.workspace
             .project_focus
             .insert(self.workspace.project.clone(), id);
         self.record_worktree_session(id, cx);
+        self.merge_scope_tabs(cx);
         self.history.record(id);
         self.review_focused = true;
         if let Some(review) = self.review_for(id, cx) {
@@ -219,7 +149,7 @@ mod tests {
         let (mono, chat) = window
             .update(cx, |shell, _, cx| {
                 assert!(shell.mono_active(cx));
-                let mono = shell.active_title_tab(cx).unwrap();
+                let mono = shell.workspace.active.unwrap();
                 let chat = shell.mono_manager().read(cx).chat().unwrap();
                 chat.read(cx).input.clone().update(cx, |input, cx| {
                     input.set_text("Keep my Mono draft".into(), cx)
@@ -243,18 +173,20 @@ mod tests {
             .unwrap();
         visual.run_until_parked();
         assert!(
-            visual.debug_bounds("review-tab-strip").is_some(),
+            visual.debug_bounds("review-frame").is_some(),
             "the file pane is rendered"
         );
-        assert!(visual.debug_bounds("mono-composer").is_none());
+        // The file opens beside the Mono, which stays on screen.
+        assert!(visual.debug_bounds("mono-composer").is_some());
         let (pane, editor) = window
             .update(visual, |shell, w, cx| {
                 assert!(!shell.mono_active(cx));
                 let pane = shell.workspace.active.unwrap();
                 assert_ne!(pane, session, "the file has its own title tab");
                 assert_eq!(shell.workspace.session_for_pane(pane), session);
-                assert!(shell.visible_tabs(cx).contains(&mono));
-                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(session)));
+                let tab = shell.workspace.tab_of(pane);
+                assert_eq!(shell.workspace.tab_of(mono), tab, "beside the Mono");
+                assert_eq!(shell.workspace.tab_of(session), tab);
                 let review = shell.active_review(cx).unwrap();
                 assert!(review.read(cx).state.chat_hidden);
                 let editor = review
@@ -274,7 +206,7 @@ mod tests {
                 editor.read(cx).input.clone().update(cx, |input, cx| {
                     input.replace_text_in_range(None, "unsaved", w, cx)
                 });
-                shell.open_title_tab(&mono, w, cx);
+                shell.open(mono, w, cx);
                 (pane, editor)
             })
             .unwrap();
@@ -282,7 +214,7 @@ mod tests {
         assert!(visual.debug_bounds("mono-composer").is_some());
         window
             .update(visual, |shell, w, cx| {
-                assert_eq!(shell.active_title_tab(cx), Some(mono.clone()));
+                assert_eq!(shell.workspace.active, Some(mono));
                 let restored = shell.mono_manager().read(cx).chat().unwrap();
                 assert_eq!(
                     restored, chat,
@@ -312,7 +244,7 @@ mod tests {
                 );
                 assert!(reopened.read(cx).dirty);
                 assert!(reopened.read(cx).focus_handle(cx).contains_focused(w, cx));
-                assert!(shell.visible_tabs(cx).contains(&mono));
+                assert!(shell.workspace.tab_of(mono).is_some());
             })
             .unwrap();
         std::fs::remove_dir_all(folder).unwrap();
@@ -321,7 +253,7 @@ mod tests {
     #[gpui::test]
     fn file_word_wrap_is_shared_and_persisted_across_restart(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, session) = window(cx);
+        let (window, _, _) = window(cx);
         let folder =
             std::env::temp_dir().join(format!("monocode-wrap-prefs-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
@@ -352,7 +284,7 @@ mod tests {
             .update(visual, |shell, w, cx| {
                 assert!(!shell.workspace.preferences.file_word_wrap);
                 assert!(
-                    !shell.reviews[&session]
+                    !shell.reviews[&shell.workspace.active.unwrap()]
                         .read(cx)
                         .active_editor()
                         .unwrap()
@@ -375,7 +307,7 @@ mod tests {
         let (store, summaries, saved, project) = window
             .update(visual, |shell, _, cx| {
                 assert!(
-                    !shell.reviews[&session]
+                    !shell.reviews[&shell.workspace.active.unwrap()]
                         .read(cx)
                         .active_editor()
                         .unwrap()
@@ -408,7 +340,10 @@ mod tests {
         restored
             .update(visual, |shell, _, cx| {
                 assert!(!shell.workspace.preferences.file_word_wrap);
-                let editor = shell.reviews[&session].read(cx).active_editor().unwrap();
+                let editor = shell.reviews[&shell.workspace.active.unwrap()]
+                    .read(cx)
+                    .active_editor()
+                    .unwrap();
                 assert!(
                     !editor.read(cx).input.read(cx).word_wrap(),
                     "restart restores the setting"
@@ -419,7 +354,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn numbered_shortcuts_return_from_file_only_tabs_to_sessions(cx: &mut TestAppContext) {
+    fn numbered_shortcuts_pick_the_tabs_of_the_focused_group(cx: &mut TestAppContext) {
         cx.update(|cx| {
             bind_keys(cx);
             cx.set_reduce_motion(true);
@@ -429,101 +364,68 @@ mod tests {
         } else {
             "ctrl"
         };
-        // File-only tabs can retain a hidden chat or be detached from it.
-        for detached in [false, true] {
-            let (window, first, session) = window(cx);
-            let file = window
-                .update(cx, |shell, w, cx| {
-                    shell.sessions[&first]
-                        .update(cx, |s, _| s.summary.cwd = shell.workspace.project.clone());
-                    shell.open(first, w, cx);
-                    shell.open_review(
-                        ReviewTab::File {
-                            cwd: shell.workspace.project.clone(),
-                            path: "/missing/shortcut-test.txt".into(),
-                        },
-                        w,
-                        cx,
-                    );
-                    shell.open_review(
-                        ReviewTab::Changes {
-                            cwd: shell.workspace.project.clone(),
-                            path: None,
-                            staged: None,
-                        },
-                        w,
-                        cx,
-                    );
-                    let file = if detached {
-                        let file = shell.independent_file_pane(first, cx).unwrap();
-                        shell.workspace.close(first);
-                        shell.reorder_title_tab(&TitleTab::Session(file), 0, cx);
-                        file
-                    } else {
-                        shell.reviews[&first].update(cx, |r, cx| {
-                            r.state.chat_hidden = true;
-                            cx.emit(crate::review::ReviewEvent::Changed);
-                        });
-                        first
-                    };
-                    shell.open(session, w, cx);
-                    assert_eq!(
-                        shell.visible_tabs(cx),
-                        [TitleTab::Session(file), TitleTab::Session(session)]
-                    );
-                    file
-                })
-                .unwrap();
-            let visual = &mut VisualTestContext::from_window(window.into(), cx);
-            visual.run_until_parked();
-            for (nested_tab, restored) in [(1, false), (0, false), (1, true)] {
-                if restored {
-                    window
-                        .update(visual, |shell, _, _| {
-                            // A restored tab has saved state before its pane is mounted.
-                            shell.reviews.remove(&file);
-                            shell.workspace.reviews.get_mut(&file).unwrap().active = nested_tab;
-                        })
-                        .unwrap();
-                }
-                visual.simulate_keystrokes(&format!("{modifier}-1"));
-                visual.run_until_parked();
+        let (window, _, session) = window(cx);
+        let file = window
+            .update(cx, |shell, w, cx| {
+                shell.open(session, w, cx);
+                shell.open_review(
+                    ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path: "/missing/shortcut-test.txt".into(),
+                    },
+                    w,
+                    cx,
+                );
+                let file = shell.workspace.active.unwrap();
+                // The file stacked behind the chat, in its group.
+                shell.workspace.add_to_group(file, session, None, false);
+                shell.open(session, w, cx);
+                assert_eq!(shell.workspace.group_tabs(session), [session, file]);
+                file
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        // A restored file pane has saved state before its review is made.
+        for restored in [false, true] {
+            if restored {
                 window
                     .update(visual, |shell, _, _| {
-                        assert_eq!(shell.workspace.active, Some(file));
-                    })
-                    .unwrap();
-                if nested_tab == 0 {
-                    let tab = visual.debug_bounds("file-tab-0").unwrap();
-                    visual.simulate_click(tab.center(), Default::default());
-                    visual.run_until_parked();
-                }
-                visual.simulate_keystrokes(&format!("{modifier}-2"));
-                visual.run_until_parked();
-                window
-                    .update(visual, |shell, w, cx| {
-                        assert_eq!(
-                            shell.workspace.active,
-                            Some(session),
-                            "Cmd+2 returns from nested tab {nested_tab} (detached={detached}, restored={restored})"
-                        );
-                        assert!(
-                            shell.sessions[&session]
-                                .read(cx)
-                                .input
-                                .focus_handle(cx)
-                                .is_focused(w)
-                        );
+                        shell.reviews.remove(&file);
                     })
                     .unwrap();
             }
+            visual.simulate_keystrokes(&format!("{modifier}-2"));
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, _, _| {
+                    assert_eq!(shell.workspace.active, Some(file));
+                    assert_eq!(shell.workspace.group_tabs(file), [session, file]);
+                })
+                .unwrap();
+            visual.simulate_keystrokes(&format!("{modifier}-1"));
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, w, cx| {
+                    assert_eq!(
+                        shell.workspace.active,
+                        Some(session),
+                        "Cmd+1 returns to the chat (restored={restored})"
+                    );
+                    assert!(
+                        shell.sessions[&session]
+                            .read(cx)
+                            .input
+                            .focus_handle(cx)
+                            .is_focused(w)
+                    );
+                })
+                .unwrap();
         }
     }
 
     #[gpui::test]
-    fn session_pane_grip_detaches_and_redocks_preserving_chat_and_dirty_files(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_chat_tab_dragged_beside_its_file_keeps_draft_and_dirty_edits(cx: &mut TestAppContext) {
         cx.update(|cx| {
             bind_keys(cx);
             cx.set_reduce_motion(true);
@@ -534,7 +436,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, "original\n").unwrap();
-        let (chat, review) = window
+        let (chat, file, review) = window
             .update(cx, |shell, w, cx| {
                 let chat = shell.sessions[&session].clone();
                 chat.read(cx).input.clone().update(cx, |input, cx| {
@@ -548,7 +450,8 @@ mod tests {
                     w,
                     cx,
                 );
-                (chat, shell.reviews[&session].clone())
+                let file = shell.workspace.active.unwrap();
+                (chat, file, shell.reviews[&file].clone())
             })
             .unwrap();
         cx.run_until_parked();
@@ -563,85 +466,40 @@ mod tests {
             .unwrap();
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        let grip_selector = Box::leak(format!("drag-session-pane-{session}").into_boxed_str());
+        let leaves = |visual: &mut VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    let tab = shell.workspace.tab_of(session).unwrap();
+                    shell.workspace.layout(tab).leaf_ids()
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            leaves(visual),
+            [session, file],
+            "the file opened beside the chat"
+        );
+        let grip_selector = Box::leak(format!("group-tab-{session}").into_boxed_str());
         let grip = visual.debug_bounds(grip_selector).unwrap().center();
-
-        // Clicks, tiny moves, self drops, outside drops and Escape do not
-        // split the attached file from its session.
-        for end in [
-            grip,
-            grip + point(px(2.), px(0.)),
-            grip + point(px(30.), px(0.)),
-            point(px(6.), px(100.)),
-        ] {
+        // Clicks, tiny moves and outside drops move nothing.
+        for end in [grip, grip + point(px(2.), px(0.)), point(px(6.), px(100.))] {
             visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
             visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
             visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
         }
-        let strip = visual
-            .debug_bounds(Box::leak(format!("title-tab-{session}").into_boxed_str()))
-            .unwrap();
-        let before = point(strip.left() + px(8.), strip.center().y);
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(before, MouseButton::Left, Default::default());
-        visual.simulate_keystrokes("escape");
-        visual.simulate_mouse_up(before, MouseButton::Left, Default::default());
-        window
-            .update(visual, |shell, _, _| {
-                assert!(shell.workspace.review_owners.is_empty());
-                assert_eq!(shell.reviews[&session], review);
-                assert!(shell.pane_drag.is_none());
-            })
-            .unwrap();
-
-        // Pulling the chat onto the title strip leaves the file in its tab.
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(before, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(before, MouseButton::Left, Default::default());
         visual.run_until_parked();
-        let file = window
-            .update(visual, |shell, w, cx| {
-                let file = *shell.workspace.review_owners.keys().next().unwrap();
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [TitleTab::Session(session), TitleTab::Session(file)]
-                );
-                assert_eq!(shell.workspace.active, Some(session));
-                assert!(!shell.reviews.contains_key(&session));
-                assert_eq!(shell.reviews[&file], review);
-                shell.open(file, w, cx);
-                file
-            })
-            .unwrap();
-        visual.run_until_parked();
-
-        // Redock the session next to the file, then reorder it with its grip.
-        let tab = visual
-            .debug_bounds(Box::leak(format!("title-tab-{session}").into_boxed_str()))
-            .unwrap()
-            .center();
+        assert_eq!(leaves(visual), [session, file]);
         let bounds = window
             .update(visual, |shell, _, _| shell.pane_bounds.get().unwrap())
             .unwrap();
         let right = point(bounds.right() - px(12.), bounds.center().y);
-        visual.simulate_mouse_down(tab, MouseButton::Left, Default::default());
+        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
         visual.simulate_mouse_move(right, MouseButton::Left, Default::default());
         visual.simulate_mouse_up(right, MouseButton::Left, Default::default());
         visual.run_until_parked();
-        window
-            .update(visual, |shell, _, _| {
-                assert_eq!(shell.workspace.layout(file).leaf_ids(), [file, session]);
-            })
-            .unwrap();
-        let grip = visual.debug_bounds(grip_selector).unwrap().center();
-        let left = point(bounds.left() + px(12.), bounds.center().y);
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(left, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(left, MouseButton::Left, Default::default());
-        visual.run_until_parked();
+        assert_eq!(leaves(visual), [file, session]);
         window
             .update(visual, |shell, _, cx| {
-                assert_eq!(shell.workspace.layout(file).leaf_ids(), [session, file]);
                 assert_eq!(shell.workspace.active, Some(session));
                 assert_eq!(shell.sessions[&session], chat);
                 assert_eq!(
@@ -659,7 +517,8 @@ mod tests {
                     .collect();
                 let restored =
                     Workspace::restore(Some(&saved), &sessions, &shell.workspace.project);
-                assert_eq!(restored.layout(file), shell.workspace.layout(file));
+                let tab = shell.workspace.tab_of(session).unwrap();
+                assert_eq!(restored.layout(tab), shell.workspace.layout(tab));
                 assert_eq!(restored.active, Some(session));
                 assert_eq!(restored.review_owners, shell.workspace.review_owners);
             })
@@ -668,11 +527,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn session_pane_grip_places_chat_on_each_edge_of_its_attached_file(cx: &mut TestAppContext) {
+    fn a_chat_tab_dropped_on_each_edge_of_its_file_splits_there(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
             let (window, _, session) = window(cx);
-            window
+            let file = window
                 .update(cx, |shell, w, cx| {
                     shell.open_review(
                         ReviewTab::File {
@@ -682,14 +541,13 @@ mod tests {
                         w,
                         cx,
                     );
+                    shell.workspace.active.unwrap()
                 })
                 .unwrap();
             let visual = &mut VisualTestContext::from_window(window.into(), cx);
             visual.run_until_parked();
             let grip = visual
-                .debug_bounds(Box::leak(
-                    format!("drag-session-pane-{session}").into_boxed_str(),
-                ))
+                .debug_bounds(Box::leak(format!("group-tab-{session}").into_boxed_str()))
                 .unwrap()
                 .center();
             let file_bounds = visual.debug_bounds("review-frame").unwrap();
@@ -703,17 +561,13 @@ mod tests {
             visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
             window
                 .update(visual, |shell, _, _| {
-                    assert_eq!(
-                        shell.pane_drag.as_ref().unwrap().over,
-                        Some((session, edge))
-                    );
+                    assert_eq!(shell.pane_drag.as_ref().unwrap().over, Some((file, edge)));
                 })
                 .unwrap();
             visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
             visual.run_until_parked();
             window
                 .update(visual, |shell, _, _| {
-                    let file = *shell.workspace.review_owners.keys().next().unwrap();
                     let tab = shell.workspace.tab_of(session).unwrap();
                     let leaves = shell.workspace.layout(tab).leaves();
                     let chat_rect = leaves.iter().find(|l| l.id == session).unwrap().rect;
@@ -773,82 +627,43 @@ mod tests {
             .unwrap();
     }
 
-    /// Settings > General > File tabs: "Top bar" opens a file as its own tab in
-    /// the title bar; "Beside chat" keeps it in the chat's file pane.
+    /// The old Settings > General > File tabs choice is read but no longer
+    /// decides anything: every file is a pane of its own beside the chat.
     #[gpui::test]
-    fn file_tabs_decide_where_a_file_opens(cx: &mut TestAppContext) {
+    fn every_file_is_its_own_pane_whatever_the_old_file_tabs_setting(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, session) = window(cx);
-        let dir = std::env::temp_dir().join(format!("monocode-file-tabs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = |name: &str| {
-            let path = dir.join(name);
-            std::fs::write(&path, "text\n").unwrap();
-            path.to_string_lossy().into_owned()
-        };
-        let (beside, top, second) = (path("beside.txt"), path("top.txt"), path("second.txt"));
-        // Beside chat: the file joins the chat's own pane.
-        window
-            .update(cx, |shell, w, cx| {
-                assert_eq!(shell.workspace.preferences.file_tabs, "pane");
-                shell.open_review(
-                    ReviewTab::File {
-                        cwd: shell.workspace.project.clone(),
-                        path: beside.clone(),
-                    },
-                    w,
-                    cx,
-                );
-                assert_eq!(shell.workspace.active, Some(session));
-                assert!(shell.workspace.review_owners.is_empty());
-                assert!(shell.reviews.contains_key(&session));
-            })
-            .unwrap();
-        cx.run_until_parked();
-        // Top bar: the next file opens as a tab of its own.
-        let pane = window
-            .update(cx, |shell, w, cx| {
-                shell.workspace.preferences.file_tabs = "workspace".into();
-                shell.open_review(
-                    ReviewTab::File {
-                        cwd: shell.workspace.project.clone(),
-                        path: top.clone(),
-                    },
-                    w,
-                    cx,
-                );
-                let pane = shell.workspace.active.unwrap();
-                assert_ne!(pane, session, "the file has its own pane");
-                assert_eq!(shell.workspace.review_owners.get(&pane), Some(&session));
-                assert!(
-                    shell.workspace.tab_of(pane).is_some(),
-                    "shown in the title bar"
-                );
-                assert!(shell.reviews[&pane].read(cx).state.chat_hidden);
-                pane
-            })
-            .unwrap();
-        cx.run_until_parked();
-        // And the one after joins that file tab instead of making another.
-        window
-            .update(cx, |shell, w, cx| {
-                let panes = shell.workspace.review_owners.len();
-                shell.open_review(
-                    ReviewTab::File {
-                        cwd: shell.workspace.project.clone(),
-                        path: second.clone(),
-                    },
-                    w,
-                    cx,
-                );
-                assert_eq!(shell.workspace.active, Some(pane));
-                assert_eq!(shell.workspace.review_owners.len(), panes);
-            })
-            .unwrap();
+        for (setting, name) in [("pane", "beside.txt"), ("workspace", "top.txt")] {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.workspace.preferences.file_tabs = setting.into();
+                    shell.open(session, w, cx);
+                    shell.open_review(
+                        ReviewTab::File {
+                            cwd: shell.workspace.project.clone(),
+                            path: format!("/tmp/{name}"),
+                        },
+                        w,
+                        cx,
+                    );
+                    let pane = shell.workspace.active.unwrap();
+                    assert_ne!(pane, session, "the file has its own pane");
+                    assert_eq!(shell.workspace.review_owners.get(&pane), Some(&session));
+                    assert!(!shell.workspace.reviews.contains_key(&session));
+                    assert!(shell.reviews[&pane].read(cx).state.chat_hidden);
+                    assert_eq!(
+                        shell.workspace.tab_of(pane),
+                        shell.workspace.tab_of(session),
+                        "in the chat's title tab, not one of its own"
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
     }
 
     #[gpui::test]
-    fn file_pane_grip_detaches_and_redocks_without_recreating_dirty_editors(
+    fn a_file_tab_dragged_out_and_closed_keeps_dirty_editors_for_reopening(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -857,7 +672,7 @@ mod tests {
             std::env::temp_dir().join(format!("monocode-pane-drag-{}.txt", std::process::id()));
         std::fs::write(&path, "original\n").unwrap();
         let file = path.to_string_lossy().into_owned();
-        let review = window
+        let (pane, review) = window
             .update(cx, |shell, w, cx| {
                 shell.open_review(
                     ReviewTab::File {
@@ -867,7 +682,8 @@ mod tests {
                     w,
                     cx,
                 );
-                shell.reviews[&session].clone()
+                let pane = shell.workspace.active.unwrap();
+                (pane, shell.reviews[&pane].clone())
             })
             .unwrap();
         cx.run_until_parked();
@@ -881,51 +697,30 @@ mod tests {
             .unwrap();
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        let grip = visual.debug_bounds("drag-file-pane").unwrap().center();
-        // A click and a drop outside the workspace leave the pane attached.
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        let outside = point(px(6.), px(100.));
-        visual.simulate_mouse_move(outside, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(outside, MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
+        let tab = window
             .update(visual, |shell, _, _| {
-                assert!(shell.workspace.review_owners.is_empty());
-                assert_eq!(shell.reviews[&session], review);
+                shell.workspace.tab_of(session).unwrap()
             })
             .unwrap();
-        let tab = visual
-            .debug_bounds(Box::leak(format!("title-tab-{session}").into_boxed_str()))
+        // Its grip reorders the panes of the split.
+        let grip = visual
+            .debug_bounds(Box::leak(format!("group-tab-{pane}").into_boxed_str()))
+            .unwrap()
+            .center();
+        let bounds = window
+            .update(visual, |shell, _, _| shell.pane_bounds.get().unwrap())
             .unwrap();
-        let drop = point(tab.left() + px(8.), tab.center().y);
+        let left = point(bounds.left() + px(12.), bounds.center().y);
         visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(drop, MouseButton::Left, Default::default());
-        window
-            .update(visual, |shell, _, _| {
-                assert_eq!(shell.pane_drag.as_ref().unwrap().insert, Some(0));
-            })
-            .unwrap();
-        visual.simulate_mouse_up(drop, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(left, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(left, MouseButton::Left, Default::default());
         visual.run_until_parked();
-        let pane = window
+        window
             .update(visual, |shell, _, cx| {
-                let pane = shell.workspace.active.unwrap();
-                assert!(pane < 0);
-                assert_eq!(shell.workspace.session_for_pane(pane), session);
-                assert!(!shell.reviews.contains_key(&session));
+                assert_eq!(shell.workspace.layout(tab).leaf_ids(), [pane, session]);
                 assert_eq!(shell.reviews[&pane], review);
                 assert_eq!(review.read(cx).active_editor().unwrap(), editor);
                 assert!(editor.read(cx).dirty);
-                assert_eq!(
-                    shell.visible_tabs(cx),
-                    [TitleTab::Session(pane), TitleTab::Session(session)]
-                );
-                assert_eq!(
-                    shell.tab_copy(pane, cx).headline,
-                    path.file_name().unwrap().to_string_lossy()
-                );
                 let saved = serde_json::to_string(&shell.workspace).unwrap();
                 let sessions: Vec<_> = shell
                     .sessions
@@ -934,21 +729,20 @@ mod tests {
                     .collect();
                 let restored =
                     Workspace::restore(Some(&saved), &sessions, &shell.workspace.project);
-                assert_eq!(restored.active, Some(pane));
-                assert_eq!(restored.tabs, shell.workspace.tabs);
+                assert_eq!(restored.layout(tab).leaf_ids(), [pane, session]);
                 assert_eq!(restored.review_owners, shell.workspace.review_owners);
-                pane
+                let remaining: Vec<_> = sessions
+                    .into_iter()
+                    .filter(|(id, _)| *id != session)
+                    .collect();
+                let pruned = Workspace::restore(Some(&saved), &remaining, &shell.workspace.project);
+                assert!(!pruned.review_owners.contains_key(&pane));
+                assert!(pruned.tab_of(pane).is_none());
             })
             .unwrap();
-        assert!(
-            visual
-                .debug_bounds(Box::leak(format!("title-tab-{pane}").into_boxed_str()))
-                .is_some()
-        );
-
         // A closed title tab retains its dirty documents for reopening.
         window
-            .update(visual, |shell, w, cx| shell.close(pane, w, cx))
+            .update(visual, |shell, w, cx| shell.close(session, w, cx))
             .unwrap();
         visual.run_until_parked();
         window
@@ -968,73 +762,14 @@ mod tests {
                 assert!(editor.read(cx).dirty);
             })
             .unwrap();
-        visual.run_until_parked();
-
-        // The independent file tab can be pulled back into a split.
-        window
-            .update(visual, |shell, w, cx| shell.open(session, w, cx))
-            .unwrap();
-        visual.run_until_parked();
-        let tab = visual
-            .debug_bounds(Box::leak(format!("title-tab-{pane}").into_boxed_str()))
-            .unwrap()
-            .center();
-        let bounds = window
-            .update(visual, |shell, _, _| shell.pane_bounds.get().unwrap())
-            .unwrap();
-        let left = point(bounds.left() + px(12.), bounds.center().y);
-        visual.simulate_mouse_down(tab, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(left, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(left, MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, cx| {
-                assert_eq!(shell.workspace.layout(session).leaf_ids(), [pane, session]);
-                assert_eq!(shell.reviews[&pane], review);
-                assert!(editor.read(cx).dirty);
-            })
-            .unwrap();
-
-        // Its grip also reorders panes within the split.
-        let grip = visual.debug_bounds("drag-file-pane").unwrap().center();
-        let right = point(bounds.right() - px(12.), bounds.center().y);
-        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(right, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(right, MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, cx| {
-                assert_eq!(shell.workspace.layout(session).leaf_ids(), [session, pane]);
-                assert_eq!(review.read(cx).active_editor().unwrap(), editor);
-                assert!(editor.read(cx).dirty);
-                let saved = serde_json::to_string(&shell.workspace).unwrap();
-                let sessions: Vec<_> = shell
-                    .sessions
-                    .iter()
-                    .map(|(id, s)| (*id, s.read(cx).summary.cwd.clone()))
-                    .collect();
-                let restored =
-                    Workspace::restore(Some(&saved), &sessions, &shell.workspace.project);
-                assert_eq!(restored.layout(session).leaf_ids(), [session, pane]);
-                assert_eq!(restored.active, Some(pane));
-                let remaining: Vec<_> = sessions
-                    .into_iter()
-                    .filter(|(id, _)| *id != session)
-                    .collect();
-                let pruned = Workspace::restore(Some(&saved), &remaining, &shell.workspace.project);
-                assert!(!pruned.review_owners.contains_key(&pane));
-                assert!(!pruned.reviews.contains_key(&pane));
-                assert!(pruned.tab_of(pane).is_none());
-            })
-            .unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
     #[gpui::test]
-    fn file_tab_drag_reorders_and_keeps_the_selected_editor(cx: &mut TestAppContext) {
+    fn files_stack_in_one_group_and_reorder_keeping_their_editors(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, session) = window(cx);
-        let review = window
+        let (window, _, _) = window(cx);
+        window
             .update(cx, |shell, w, cx| {
                 for name in ["a.rs", "b.rs", "c.rs"] {
                     shell.open_review(
@@ -1046,41 +781,31 @@ mod tests {
                         cx,
                     );
                 }
-                shell.reviews[&session].clone()
-            })
-            .unwrap();
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        visual.run_until_parked();
-        let first = visual.debug_bounds("file-tab-0").unwrap();
-        let last = visual.debug_bounds("file-tab-2").unwrap();
-        let start = point(first.left() + px(20.), first.center().y);
-        let end = start + point(last.left() - first.left(), px(0.));
-        visual.simulate_mouse_down(start, MouseButton::Left, Default::default());
-        let editor = window
-            .update(visual, |_, _, cx| review.read(cx).active_editor().unwrap())
-            .unwrap();
-        visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, cx| {
-                let state = &review.read(cx).state;
-                assert_eq!(
-                    state.tabs.iter().map(ReviewTab::label).collect::<Vec<_>>(),
-                    ["b.rs", "c.rs", "a.rs"]
-                );
-                assert_eq!(state.active, 2);
-                assert_eq!(shell.workspace.reviews[&session].active, 2);
-                assert_eq!(review.read(cx).active_editor().unwrap(), editor);
+                let tabs = shell.workspace.group_tabs(shell.workspace.active.unwrap());
+                let label = |shell: &Shell, pane: i64, cx: &App| {
+                    let state = &shell.reviews[&pane].read(cx).state;
+                    assert_eq!(state.tabs.len(), 1, "one file per pane");
+                    state.tabs[0].label()
+                };
+                let names = |shell: &Shell, cx: &App| {
+                    (shell.workspace.group_tabs(tabs[0]).iter())
+                        .map(|pane| label(shell, *pane, cx))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(names(shell, cx), ["a.rs", "b.rs", "c.rs"]);
+                let editor = shell.reviews[&tabs[0]].read(cx).active_editor();
+                assert!(shell.workspace.move_in_group(tabs[0], 2));
+                assert_eq!(names(shell, cx), ["b.rs", "c.rs", "a.rs"]);
+                assert_eq!(shell.reviews[&tabs[0]].read(cx).active_editor(), editor);
             })
             .unwrap();
     }
 
     #[gpui::test]
-    fn file_pane_grip_places_an_embedded_review_on_each_edge(cx: &mut TestAppContext) {
+    fn a_file_tab_dropped_on_each_edge_of_its_chat_splits_there(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, session) = window(cx);
-        let review = window
+        let (pane, review) = window
             .update(cx, |shell, w, cx| {
                 shell.open_review(
                     ReviewTab::File {
@@ -1090,24 +815,25 @@ mod tests {
                     w,
                     cx,
                 );
-                shell.reviews[&session].clone()
+                let pane = shell.workspace.active.unwrap();
+                (pane, shell.reviews[&pane].clone())
             })
             .unwrap();
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         for edge in [Edge::Left, Edge::Top, Edge::Bottom, Edge::Right] {
-            let grip = visual.debug_bounds("drag-file-pane").unwrap().center();
+            let grip = visual
+                .debug_bounds(Box::leak(format!("group-tab-{pane}").into_boxed_str()))
+                .unwrap()
+                .center();
             let target = visual
                 .debug_bounds(Box::leak(format!("pane-{session}").into_boxed_str()))
-                .unwrap_or_else(|| {
-                    window
-                        .update(visual, |shell, _, _| shell.pane_bounds.get().unwrap())
-                        .unwrap()
-                });
+                .unwrap();
             let end = match edge {
                 Edge::Left => point(target.left() + px(12.), target.center().y),
                 Edge::Right => point(target.right() - px(12.), target.center().y),
-                Edge::Top => point(target.center().x, target.top() + px(12.)),
+                // Below the chat's strip, which would take the file as a tab.
+                Edge::Top => point(target.center().x, target.top() + px(TITLE_BAR_HEIGHT + 12.)),
                 Edge::Bottom => point(target.center().x, target.bottom() - px(12.)),
             };
             visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
@@ -1116,11 +842,11 @@ mod tests {
             visual.run_until_parked();
             window
                 .update(visual, |shell, _, _| {
-                    let pane = shell.workspace.active.unwrap();
+                    assert_eq!(shell.workspace.active, Some(pane));
                     assert_eq!(shell.workspace.review_owners.len(), 1);
                     assert_eq!(shell.reviews[&pane], review);
-                    assert!(!shell.workspace.reviews.contains_key(&session));
-                    let leaves = shell.workspace.layout(session).leaves();
+                    let tab = shell.workspace.tab_of(session).unwrap();
+                    let leaves = shell.workspace.layout(tab).leaves();
                     let chat = leaves.iter().find(|l| l.id == session).unwrap().rect;
                     let file = leaves.iter().find(|l| l.id == pane).unwrap().rect;
                     assert!(match edge {
@@ -1146,7 +872,9 @@ mod tests {
         let pane = window
             .update(visual, |shell, w, cx| {
                 shell.open_file_at(cwd, path, None, w, cx);
-                let pane = shell.independent_file_pane(session, cx).unwrap();
+                let pane = shell.workspace.active.unwrap();
+                // Stacked over the chat in its group: the chat is hidden.
+                shell.workspace.add_to_group(pane, session, None, true);
                 shell.open_file_pane(pane, w, cx);
                 pane
             })
@@ -1154,9 +882,8 @@ mod tests {
         visual.run_until_parked();
         window
             .update(visual, |shell, _, cx| {
-                // The file has a tab to itself: the chat is not on screen.
                 assert_eq!(shell.workspace.active, Some(pane));
-                assert_ne!(pane, session);
+                assert_ne!(shell.workspace.visible_of(session), Some(session));
                 shell.reviews[&pane].update(cx, |_, cx| {
                     cx.emit(crate::review::ReviewEvent::Comment(
                         "@main.rs (lines 1-1)".into(),

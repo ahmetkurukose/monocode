@@ -381,12 +381,6 @@ impl Shell {
         crate::app_menu::install(&self.workspace.preferences, cx);
         cx.set_global(self.workspace.preferences.clone());
         self.apply_browser_agent_setting();
-        // Turning the tree on makes an open app view its project's tab.
-        if let Some(view) = self.active_app_view
-            && self.project_app_scope(view)
-        {
-            self.remember_title_tab(self.app_tab(view));
-        }
         // Terminals read their text size when they paint.
         for terminal in self
             .terminals

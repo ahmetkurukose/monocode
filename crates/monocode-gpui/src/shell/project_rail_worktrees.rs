@@ -310,7 +310,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace.project != project || self.app_view_open() {
+        if self.workspace.project != project {
             self.select_project(project.clone(), window, cx);
         }
         if self.workspace.project != project {
@@ -430,7 +430,6 @@ impl Shell {
             .project_rail_worktrees_expanded
             .contains(&path);
         let focused = self.workspace.project == project
-            && !self.app_view_open()
             && self
                 .worktree_focus
                 .get(&project)

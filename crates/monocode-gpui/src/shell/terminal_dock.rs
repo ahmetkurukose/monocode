@@ -204,7 +204,6 @@ impl Shell {
     }
     pub(super) fn panel_terminal_shown(&self, cx: &App) -> bool {
         self.workspace.right_panel_open
-            && !self.app_view_open()
             && self
                 .right_panel
                 .as_ref()
@@ -515,14 +514,14 @@ impl Shell {
             let (source, start) = (DragSource::DockTerminal(drag.from), drag.start);
             self.dock_drag = None;
             self.dock_skip_click = true;
-            self.tab_drag = None;
+            self.strips.drag = None;
             self.pane_drag = Some(PaneDrag {
                 source,
                 start,
                 position: event.position,
                 active: false,
                 over: None,
-                insert: None,
+                group: None,
             });
             cx.notify();
             return;
@@ -992,7 +991,7 @@ impl Shell {
     /// UsageFooter's right side: the running-terminal chip, else the
     /// Terminal button.
     pub(super) fn terminal_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.app_view_open() || self.workspace.project.is_empty() {
+        if self.workspace.project.is_empty() {
             self.live_mark = None;
             return None;
         }

@@ -229,7 +229,11 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-pub(crate) struct OpenFile(pub String);
+pub(crate) struct OpenFile {
+    pub path: String,
+    /// A single click previews; a double click or Enter keeps it open.
+    pub preview: bool,
+}
 impl EventEmitter<OpenFile> for Explorer {}
 /// A file chosen from the menu to go to a data source's console.
 pub(crate) struct SendFileToDatabase {
@@ -403,7 +407,12 @@ impl Explorer {
         self.rebuild(cx);
     }
     /// Opens the search panel with `query` typed, from Search Everywhere.
-    pub(crate) fn search_for(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn search_for(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_search(window, cx);
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_query(query, cx));
@@ -1306,7 +1315,10 @@ impl Explorer {
         if is_dir {
             self.toggle(&path, cx);
         } else {
-            cx.emit(OpenFile(path));
+            cx.emit(OpenFile {
+                path,
+                preview: false,
+            });
         }
     }
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1521,16 +1533,21 @@ impl Explorer {
                         })
                     })
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.keyboard = false;
-                        window.focus(&this.focus, cx);
-                        this.select(path.clone(), cx);
-                        if is_dir {
-                            this.toggle(&path, cx);
-                        } else {
-                            cx.emit(OpenFile(path.clone()));
-                        }
-                    }))
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            this.keyboard = false;
+                            window.focus(&this.focus, cx);
+                            this.select(path.clone(), cx);
+                            if is_dir {
+                                this.toggle(&path, cx);
+                            } else {
+                                cx.emit(OpenFile {
+                                    path: path.clone(),
+                                    preview: event.click_count() < 2,
+                                });
+                            }
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {

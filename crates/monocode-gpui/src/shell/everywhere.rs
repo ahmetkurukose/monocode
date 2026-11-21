@@ -188,6 +188,9 @@ impl Shell {
         add("Tab", "Close Tab", "x", || Box::new(CloseTab));
         add("Tab", "Close Other Tabs", "x", || Box::new(CloseOtherTabs));
         add("Tab", "Close All Tabs", "x", || Box::new(CloseAllTabs));
+        add("Tab", "Reopen Closed Tab", "rotate-ccw", || {
+            Box::new(ReopenClosedTab)
+        });
         add("Tab", "Next Tab", "arrow-right-2", || Box::new(NextTab));
         add("Tab", "Previous Tab", "arrow-left", || {
             Box::new(PreviousTab)
@@ -608,6 +611,7 @@ impl Shell {
     }
 
     /// Types into the open Search Everywhere.
+    #[cfg(test)]
     pub(super) fn set_everywhere_query(&mut self, text: String, cx: &mut Context<Self>) {
         if let Some(open) = &self.everywhere {
             let input = open.view.read(cx).input.clone();
@@ -1060,10 +1064,13 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let (window, _, _) = super::super::tests::window(cx);
+        let db = tempfile::tempdir().unwrap();
         for view in [AppView::Database, AppView::Inbox, AppView::Notes] {
             window
                 .update(cx, |shell, w, cx| {
-                    shell.active_app_view = Some(view);
+                    shell.database_dir = db.path().to_owned();
+                    shell.open_app(view, w, cx);
+                    assert_eq!(shell.active_app_view(), Some(view));
                     shell.open_file_at(cwd.clone(), path.clone(), None, w, cx);
                 })
                 .unwrap();
@@ -1072,7 +1079,7 @@ mod tests {
                 .update(cx, |shell, _, _| {
                     assert!(
                         !shell.app_view_open(),
-                        "{view:?} must not keep covering the file"
+                        "the file is in front of the {view:?} tab"
                     );
                     assert_eq!(shell.workspace.recent_files[&cwd][0], path);
                 })

@@ -331,12 +331,6 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "terminal placement dock bottom side right panel title bar tab shell focused layout",
     ),
     (
-        "file-tabs",
-        Section::General,
-        "File tabs",
-        "editor open top workspace normal session pane beside chat",
-    ),
-    (
         "file-word-wrap",
         Section::General,
         "Word wrap",

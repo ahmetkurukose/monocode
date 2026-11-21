@@ -12,9 +12,9 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Role, ScrollHandle,
-    SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
+    AnyElement, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Role, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px, rgb,
 };
 use monocode_core::{
     diff,
@@ -176,9 +176,10 @@ pub(crate) enum ReviewEvent {
         first_line: usize,
         last_line: usize,
     },
-    DragPane(Point<Pixels>),
     /// The last tab closed.
     Empty,
+    /// A preview was edited or double-clicked: it stays open.
+    Permanent,
     /// A file's tab asked for its row in the Explorer.
     ShowInExplorer(String),
     /// A file's tab asked for the file's versions.
@@ -318,7 +319,8 @@ pub(crate) struct ReviewPane {
     /// The deferred body fades from its first rendered frame.
     revealed: Option<PaneReveal>,
     hovered_tab: Option<usize>,
-    pub(crate) pane_draggable: bool,
+    /// The pane draws its own file tab row; a group strip stands in for it.
+    pub(crate) show_strip: bool,
     tab_scroll: ScrollHandle,
     /// Tab animations: opening and closing file tabs, with each tab's last look.
     tab_motion: crate::tab_motion::TabMotion<String, ReviewTab>,
@@ -437,7 +439,7 @@ impl ReviewPane {
             deferred: false,
             revealed: None,
             hovered_tab: None,
-            pane_draggable: false,
+            show_strip: true,
             tab_scroll: ScrollHandle::new(),
             tab_motion: Default::default(),
             tab_drag: None,
@@ -499,11 +501,13 @@ impl ReviewPane {
         };
         let editor_events = editor.as_ref().map(|editor| {
             cx.subscribe(editor, |this, editor, event: &FileEvent, cx| {
-                if matches!(event, FileEvent::Dirty) {
+                if matches!(event, FileEvent::Dirty) && editor.read(cx).dirty {
                     let editor = editor.read(cx);
-                    if editor.dirty && this.preview_path.as_ref() == Some(&editor.path) {
+                    if this.preview_path.as_ref() == Some(&editor.path) {
                         this.preview_path = None;
                     }
+                    // An edit keeps the pane: it is no group's preview now.
+                    cx.emit(ReviewEvent::Permanent);
                 }
                 if let FileEvent::AddToChat(text) = event {
                     cx.emit(ReviewEvent::Comment(text.clone()));
@@ -638,6 +642,29 @@ impl ReviewPane {
         }
         cx.notify();
     }
+    /// A preview file pane shows `tab` in place of what it showed, as its
+    /// one tab, still a preview. A closed diff keeps its cache.
+    pub(crate) fn replace_with(&mut self, tab: ReviewTab, cx: &mut Context<Self>) {
+        self.remember_body_focus(cx);
+        self.tab_drag = None;
+        for mut removed in self.sources.drain(..) {
+            removed.cancel();
+            self.git
+                .update(cx, |git, _| git.review_cache.remember(&removed));
+        }
+        self.hovered_tab = None;
+        self.state.active = 0;
+        let path = match &tab {
+            ReviewTab::File { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        self.open(tab, cx);
+        self.preview_path = path;
+    }
+    /// The shell made this pane permanent; its tab is no longer italic.
+    pub(crate) fn keep_preview(&mut self) {
+        self.preview_path = None;
+    }
     pub(crate) fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.tab_drag = None;
         self.close_prompted = false;
@@ -712,6 +739,13 @@ impl ReviewPane {
             .iter()
             .filter_map(|s| s.editor.as_ref())
             .any(|e| e.read(cx).dirty || e.read(cx).saving)
+    }
+    /// The editors with edits not yet on disk.
+    pub(crate) fn unsaved_editors(&self, cx: &gpui::App) -> Vec<Entity<FileEditor>> {
+        (self.sources.iter())
+            .filter_map(|s| s.editor.clone())
+            .filter(|e| e.read(cx).dirty || e.read(cx).saving)
+            .collect()
     }
     fn closing_editors(&self, cx: &gpui::App) -> Vec<Entity<FileEditor>> {
         let Some((target, others)) = self.pending_close else {
@@ -1671,34 +1705,6 @@ impl ReviewPane {
             .items_center()
             .border_b_1()
             .border_color(stroke())
-            .when(self.pane_draggable, |d| {
-                d.child(
-                    div()
-                        .id("drag-file-pane")
-                        .debug_selector(|| "drag-file-pane".into())
-                        .role(Role::Button)
-                        .aria_label("Drag to reorder pane")
-                        .w(px(20.))
-                        .h(px(TAB_PLATE_HEIGHT))
-                        .ml(px(6.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor(CursorStyle::OpenHand)
-                        .text_color(content(0.35))
-                        .hover(|s| s.bg(content(0.05)).text_color(content(0.7)))
-                        .child(icon("grip-vertical", 14.))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(ReviewEvent::DragPane(event.position));
-                            }),
-                        ),
-                )
-            })
             .child(
                 div()
                     .id("review-tabs")
@@ -1710,7 +1716,7 @@ impl ReviewPane {
                     .flex()
                     .items_center()
                     .gap(px(2.))
-                    .pl(px(if self.pane_draggable { 2. } else { 6. }))
+                    .pl(px(6.))
                     .pr(px(10.))
                     // Every tab fits, sharing the strip however many there are.
                     .overflow_hidden()
@@ -1817,6 +1823,7 @@ impl ReviewPane {
                                 }
                                 if preview && event.click_count() == 2 {
                                     this.preview_path = None;
+                                    cx.emit(ReviewEvent::Permanent);
                                     cx.notify();
                                 }
                                 this.select(ix, cx);
@@ -1978,7 +1985,7 @@ impl Render for ReviewPane {
                 cx.listener(|this, _, _, cx| this.finish_tab_drag(cx)),
             )
             .font_weight(FontWeight::NORMAL)
-            .child(self.tabs(window, cx))
+            .when(self.show_strip, |d| d.child(self.tabs(window, cx)))
             .child(
                 div()
                     .relative()

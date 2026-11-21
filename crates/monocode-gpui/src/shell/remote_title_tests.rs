@@ -213,12 +213,12 @@ fn refresh(ui: &Ui, cx: &mut TestAppContext) {
 /// Every title surface the shell derives from the live view.
 fn surfaces(ui: &Ui, cx: &mut TestAppContext) -> [String; 3] {
     read(ui, cx, |shell, cx| {
-        let tab = shell.workspace.tab_of(ui.chat).expect("open tab");
+        assert!(shell.workspace.tab_of(ui.chat).is_some(), "open tab");
         let metadata = shell.session_metadata(ui.chat, cx);
         [
             metadata.summary.title.to_string(),
             metadata.display_title(),
-            shell.tab_copy(tab, cx).headline,
+            shell.tab_face(ui.chat, cx).unwrap().title,
         ]
     })
 }

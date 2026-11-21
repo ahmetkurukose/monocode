@@ -16,11 +16,6 @@ fn ease(t: f32) -> f32 {
     1. - (1. - t) * (1. - t)
 }
 
-/// How far a motion that began at `start` has eased, 0 to 1.
-pub(crate) fn progress(start: Instant, now: Instant) -> f32 {
-    ease(now.duration_since(start).as_secs_f32() / DURATION.as_secs_f32())
-}
-
 /// A slot in the strip, in display order.
 pub(crate) enum Slot<K, G> {
     /// A live tab; `open` is its slot's share of its width, 1 once settled.
@@ -76,6 +71,12 @@ impl<K: Clone + Eq + Hash, G: Clone> TabMotion<K, G> {
         if let Some(closing) = self.closing.remove(from) {
             self.closing.insert(to, closing);
         }
+    }
+
+    /// Whether `key`'s slot is still growing in.
+    #[cfg(test)]
+    pub(crate) fn opening(&self, key: &K) -> bool {
+        self.opening.contains_key(key)
     }
 
     /// The strip to draw for `tabs`, each with what a closing copy would show.

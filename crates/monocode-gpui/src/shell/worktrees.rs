@@ -38,13 +38,30 @@ impl Shell {
                 path_key(self.session_working_copy(id, cx)) == path_key(&focus.path)
             })
     }
-    pub(super) fn record_worktree_session(&mut self, id: i64, _cx: &App) {
+    /// `id` opened in the checkout the view shows: it is a tab of that
+    /// scope from now on. Opening a saved chat must not silently narrow the
+    /// sidebar; only an explicit workspace selection changes that filter.
+    pub(super) fn record_worktree_session(&mut self, id: i64, cx: &mut Context<Self>) {
         let project = self.workspace.project.clone();
         let path = self.working_copy().to_owned();
-        // Opening a saved chat must not silently narrow the sidebar. Only an
-        // explicit workspace selection changes that project-wide filter.
         if let Some(tab) = self.workspace.tab_of(id) {
-            self.workspace.tab_workspaces.insert(tab, path.clone());
+            let here = self.pane_scope(id, cx);
+            let elsewhere = here.is_some() && self.title_tab_scope(tab, cx) != here;
+            // A tab of another worktree's layout (a sidebar click, history)
+            // moves into this scope's layout; the other layout keeps the
+            // rest. Relabelling its title tab would carry that whole layout
+            // over and fold it into this one.
+            if elsewhere && self.workspace.close_pane(id) {
+                self.place_or_open(id, OpenIn::default(), cx);
+                self.workspace.open(id);
+            }
+            if let Some(tab) = self.workspace.tab_of(id) {
+                self.workspace.tab_workspaces.insert(tab, path.clone());
+            }
+            // A layout of this one tab came over whole: it joins the scope's.
+            if elsewhere {
+                self.merge_scope_tabs(cx);
+            }
         }
         self.worktree_returns.insert((project, path), id);
     }
@@ -558,12 +575,16 @@ mod tests {
                 assert!(shell.worktree_focus.contains_key(project));
                 // A directly opened chat joins the selected workspace without
                 // changing either its checkout or the explicit sidebar filter.
+                // It leaves the main checkout's layout, which keeps the rest.
+                let other_chat = shell.workspace.active.unwrap();
                 shell.open(main_session, w, cx);
                 assert_eq!(shell.worktree_focus[project].path, other.path);
+                let tab = shell.workspace.tab_of(main_session).unwrap();
+                assert_eq!(shell.workspace.tab_of(other_chat), Some(tab));
+                assert_eq!(shell.visible_tabs(cx), [TitleTab::Session(tab)]);
                 assert!(
-                    shell
-                        .visible_tabs(cx)
-                        .contains(&TitleTab::Session(main_session))
+                    (shell.workspace.tab_of(feature_session)).is_some_and(|main| main != tab),
+                    "the main checkout's layout stays its own"
                 );
                 assert_eq!(shell.terminal_cwd(cx), project);
                 assert_eq!(

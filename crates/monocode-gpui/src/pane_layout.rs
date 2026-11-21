@@ -281,6 +281,18 @@ impl PaneNode {
     }
 
     /// The sash's current boundary and the range it rests in.
+    /// Every split shares its room equally again, at every depth.
+    pub fn equalize(&mut self) {
+        if let PaneNode::Split {
+            children, sizes, ..
+        } = self
+        {
+            *sizes = equal_sizes(children.len());
+            for child in children {
+                child.equalize();
+            }
+        }
+    }
     pub fn sash_range(&self, path: &[usize], index: usize) -> Option<(f32, f32, f32)> {
         let PaneNode::Split {
             children, sizes, ..

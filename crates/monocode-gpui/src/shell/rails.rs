@@ -301,18 +301,14 @@ impl Shell {
         };
         let session = self.session_metadata(id, cx);
         let selected = self.selected_sessions.contains(&id);
-        let active =
-            self.workspace.active == Some(id) && !self.mono_active(cx) && !self.app_view_open();
+        let active = self.workspace.active == Some(id);
         let draft = session.has_saved_draft();
         let approval = session.needs_approval();
         let orchestration = matches!(rail, Some((Rail::Agents(_), true)));
         let header = !compact || orchestration;
         let started_in_view = match rail {
             Some((Rail::Started(children), _)) => children.iter().any(|child| {
-                self.selected_sessions.contains(child)
-                    || (self.workspace.active == Some(*child)
-                        && !self.mono_active(cx)
-                        && !self.app_view_open())
+                self.selected_sessions.contains(child) || self.workspace.active == Some(*child)
             }),
             _ => false,
         };
@@ -570,14 +566,14 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, _| {
                     this.skip_session_click = false;
-                    this.tab_drag = None;
+                    this.strips.drag = None;
                     this.pane_drag = Some(PaneDrag {
                         source: DragSource::Session(id),
                         start: event.position,
                         position: event.position,
                         active: false,
                         over: None,
-                        insert: None,
+                        group: None,
                     });
                 }),
             )

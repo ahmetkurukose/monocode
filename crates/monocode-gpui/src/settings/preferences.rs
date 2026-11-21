@@ -12,6 +12,8 @@ pub(crate) struct Preferences {
     pub notifications: bool,
     pub project_notifications: serde_json::Value,
     pub notification_projects: serde_json::Value,
+    /// Where files opened before tab groups: still read and saved so older
+    /// builds keep their choice, but every file is its own pane now.
     pub file_tabs: String,
     pub file_word_wrap: bool,
     pub file_view_mode: String,

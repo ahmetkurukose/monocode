@@ -49,10 +49,13 @@ impl Shell {
     pub(crate) fn mono_quick_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_quick_composer(window, cx);
     }
+    /// A Mono's tab has focus and `Monos` shows its page.
     pub(super) fn mono_active(&self, cx: &App) -> bool {
-        self.monos
-            .as_ref()
-            .is_some_and(|m| m.read(cx).active.is_some())
+        (self.workspace.active).is_some_and(|pane| self.workspace.mono_panes.contains_key(&pane))
+            && self
+                .monos
+                .as_ref()
+                .is_some_and(|m| m.read(cx).active.is_some())
     }
     pub(crate) fn mono_session_views(&self, cx: &App) -> Vec<MonoSession> {
         // A Mono's launches are usually hidden from the sidebar, so they are

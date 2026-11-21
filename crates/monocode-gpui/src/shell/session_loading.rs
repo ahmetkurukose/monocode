@@ -342,9 +342,12 @@ mod tests {
                 assert_eq!(shell.session_marks.len(), 1);
                 assert_eq!(shell.tab_marks.len(), 1);
                 assert_eq!(shell.sidebar_session_ids(cx).len(), 1000);
-                assert_eq!(shell.visible_tabs(cx).len(), 2);
+                // Both saved tabs are of one scope: they fold into one, and
+                // the hidden chat stays metadata-only.
+                assert_eq!(shell.visible_tabs(cx).len(), 1);
+                assert_eq!(shell.workspace.group_tabs(oldest), [first, oldest]);
                 assert_eq!(
-                    shell.tab_copy(oldest, cx).headline,
+                    shell.tab_face(oldest, cx).unwrap().title,
                     "Saved conversation 999"
                 );
                 shell.query = "saved conversation 999".into();
