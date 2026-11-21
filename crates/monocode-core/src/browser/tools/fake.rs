@@ -212,6 +212,8 @@ pub struct FakePage {
     pub user_active: Cell<bool>,
     pub leases: Rc<Cell<usize>>,
     pub load_error: RefCell<Option<String>>,
+    /// The CDP client of a page not loaded yet: `ensure_loaded` gives it.
+    pub cold: RefCell<Option<Rc<CdpClient>>>,
 }
 
 impl FakePage {
@@ -272,6 +274,7 @@ impl FakePage {
             user_active: Cell::new(false),
             leases: Rc::default(),
             load_error: RefCell::default(),
+            cold: RefCell::default(),
         })
     }
 }
@@ -302,6 +305,11 @@ impl Page for FakePage {
             Some(error) => Err(error),
             None => Ok(()),
         };
+        if result.is_ok() {
+            if let Some(cdp) = self.cold.borrow_mut().take() {
+                *self.cdp.borrow_mut() = Some(cdp);
+            }
+        }
         Box::pin(async move { result })
     }
 

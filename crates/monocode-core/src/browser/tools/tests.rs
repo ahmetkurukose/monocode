@@ -166,6 +166,47 @@ fn tabs_open_show_close() {
 }
 
 #[test]
+fn a_tab_loaded_for_a_command_is_read_once_its_first_load_ends() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    // A restored tab: no browser yet, its first document on its way.
+    *page.cold.borrow_mut() = page.cdp.borrow_mut().take();
+    let steps = Rc::new(RefCell::new(Vec::<&str>::new()));
+    let looks = Rc::new(std::cell::Cell::new(0));
+    let (seen, count) = (steps.clone(), looks.clone());
+    page.script.on("Runtime.evaluate", move |p, _| {
+        let expression = p["expression"].as_str().unwrap_or("");
+        if !expression.starts_with("[location.href") {
+            return Ok(json!({"result": {"type": "undefined"}}));
+        }
+        count.set(count.get() + 1);
+        let at = match count.get() {
+            1 => json!(["about:blank", "", "complete"]),
+            2 => json!(["https://example.com/", "", "loading"]),
+            _ => {
+                seen.borrow_mut().push("loaded");
+                json!(["https://example.com/", "Example", "complete"])
+            }
+        };
+        Ok(json!({"result": {"type": "object", "value": at}}))
+    });
+    let seen = steps.clone();
+    page.script.on("Accessibility.getFullAXTree", move |_, _| {
+        seen.borrow_mut().push("snapshot");
+        Ok(login())
+    });
+    let mut driver = Driver::new(&host);
+    let snap = driver.run("browser_snapshot", json!({"page": 1}));
+    assert!(!snap.is_error, "{}", text(&snap));
+    assert_eq!(steps.borrow()[..2], ["loaded", "snapshot"]);
+    assert!(looks.get() >= 3);
+    // Loaded now: the next command does not wait for it again.
+    let before = looks.get();
+    driver.run("browser_snapshot", json!({"page": 1}));
+    assert!(looks.get() - before <= 1);
+}
+
+#[test]
 fn goto_waits_for_the_new_document() {
     let host = FakeHost::with_pages(&[1]);
     let page = host.page(1);

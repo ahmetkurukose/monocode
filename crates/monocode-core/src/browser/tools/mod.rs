@@ -204,6 +204,9 @@ async fn command(
     }
 }
 
+/// How long a command waits for a page it had to load first.
+const COLD_LOAD_MS: u64 = 10_000;
+
 /// A page ready for CDP, for one command.
 pub(crate) struct Ctx {
     pub host: Rc<dyn Host>,
@@ -217,6 +220,8 @@ pub(crate) struct Ctx {
 impl Ctx {
     async fn open(host: Rc<dyn Host>, scope: Scope, page: Rc<dyn Page>) -> Result<Ctx, ToolOutput> {
         let id = page.info().id;
+        // A tab not loaded yet (restored, K20) loads now, in the background.
+        let cold = page.cdp().is_none_or(|cdp| cdp.is_gone());
         page.ensure_loaded()
             .await
             .map_err(|e| ToolOutput::error("browser_not_started", e))?;
@@ -226,14 +231,21 @@ impl Ctx {
             .ok_or_else(|| page_gone(id))?;
         let state = state::page_state(id, &cdp);
         state.attach(&cdp).await.map_err(|_| page_gone(id))?;
-        Ok(Ctx {
+        let ctx = Ctx {
             host,
             scope,
             page,
             id,
             cdp,
             state,
-        })
+        };
+        if cold {
+            // The command is about the page, not its first moments: no
+            // snapshot of half a document.
+            let url = ctx.page.info().url;
+            nav::opened(&ctx, &url, COLD_LOAD_MS).await?;
+        }
+        Ok(ctx)
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, ToolOutput> {
