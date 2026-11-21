@@ -9,7 +9,9 @@
 //! painted last, hides the pages that did not (their tab is not in front) and
 //! moves away the ones a menu, a modal or a notification covers ([`cover`]),
 //! drawing their last frame in their place instead (K16). A page's docked
-//! DevTools (K18) is a second view, placed and swept the same way.
+//! DevTools (K18, K28) is a second view, placed and swept the same way: the
+//! DevTools frontend as a page of its own, speaking to the page through the
+//! app's CDP endpoint (`monocode_core::browser::proxy::devtools_base`).
 //!
 //! For the agent layer (context.md §6, `shell/browser_agent.rs`) each page
 //! with a view keeps a CDP client and a console and network log from its
@@ -27,12 +29,12 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, BackgroundExecutor, Bounds, Context, Corners, Entity,
-    EventEmitter, FocusHandle, Focusable, ForegroundExecutor, Global, Image, ImageFormat,
-    KeyBinding, KeyDownEvent, Pixels, RenderImage, Subscription, WeakEntity, Window, WindowId,
-    actions, canvas, div, prelude::*, px,
+    AnyElement, AnyWindowHandle, App, BackgroundExecutor, Bounds, Context, Corners, CursorStyle,
+    DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, ForegroundExecutor, Global, Image,
+    ImageFormat, KeyBinding, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
+    RenderImage, Subscription, WeakEntity, Window, WindowId, actions, canvas, div, prelude::*, px,
 };
-use monocode_core::browser::{CdpClient, DialogInfo, log::PageLog};
+use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
 use crate::{
     input::{self, Input},
@@ -44,10 +46,36 @@ use crate::{
 actions!(
     workspace,
     [
-        /// ⌥⌘I: the focused page's DevTools, in a window of its own.
+        /// ⌥⌘I: the focused page's DevTools, docked under it.
         ToggleBrowserDevTools
     ]
 );
+
+/// DevTools and the page above it each keep at least this many points.
+const DEVTOOLS_MIN: f32 = 120.;
+const PAGE_MIN: f32 = 80.;
+
+/// DevTools' height in a body `available` points tall: the wanted height
+/// (0: 40% of the body), kept clear of both minimums. Unmeasured (0), the
+/// body takes the wanted height as it is.
+pub(crate) fn devtools_height(wanted: u32, available: f32) -> f32 {
+    let wanted = if wanted == 0 {
+        (available * 0.4).max(DEVTOOLS_MIN)
+    } else {
+        wanted as f32
+    };
+    if available <= 0. {
+        return wanted;
+    }
+    let max = (available - PAGE_MIN).max(0.);
+    wanted.clamp(DEVTOOLS_MIN.min(max), max)
+}
+
+/// The DevTools frontend Chromium ships, for the page whose target is
+/// `target`, through the app's endpoint at `base` (`host:port/token`).
+fn devtools_frontend_url(base: &str, target: &str) -> String {
+    format!("devtools://devtools/bundled/devtools_app.html?ws={base}/devtools/page/{target}")
+}
 
 /// Whether Chromium runs, shared by every window.
 #[derive(Clone, Debug, PartialEq)]
@@ -362,6 +390,13 @@ fn find_status(text: &str, result: Option<(i32, i32)>) -> Option<String> {
 /// where Chromium is not available yet.
 pub(crate) type Profile = monocode_cef::Profile;
 
+/// A page's docked DevTools: the frontend's view, made once its address is
+/// known (the page's target id comes from Chromium).
+struct DockedDevTools {
+    host: Rc<Host<monocode_cef::BrowserView>>,
+    url: Option<String>,
+}
+
 /// What a page asks of the pane around it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PageRequest {
@@ -408,6 +443,17 @@ pub(crate) struct BrowserPage {
     engine: Entity<Engine>,
     profiles: PathBuf,
     host: Rc<Host<monocode_cef::BrowserView>>,
+    /// Whose pages this page's docked DevTools may reach through the app's
+    /// endpoint: its pane's owner session and project. The shell sets it.
+    pub(crate) devtools_scope: Option<Scope>,
+    /// The docked DevTools, while open.
+    devtools: Option<DockedDevTools>,
+    /// DevTools' height in points (0: 40% of the body), for the app's run.
+    devtools_height: u32,
+    /// The divider being dragged: where the drag started, and the height then.
+    devtools_drag: Option<(f32, f32)>,
+    /// The body under the toolbar, as last laid out.
+    body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     // Downloads and the dialogs the page asks for.
@@ -459,6 +505,9 @@ impl BrowserPage {
             // Snapshots sit in GPU atlases until given back.
             cx.on_release(|page, cx| {
                 page.host.release(cx);
+                if let Some(docked) = &page.devtools {
+                    docked.host.release(cx);
+                }
                 monocode_cef::forget_profile(&page.host.options.borrow().profile);
             }),
         ];
@@ -479,6 +528,11 @@ impl BrowserPage {
             engine,
             profiles,
             host: Host::with_shared(Rc::default()),
+            devtools_scope: None,
+            devtools: None,
+            devtools_height: 0,
+            devtools_drag: None,
+            body_bounds: Rc::default(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             downloads: Vec::new(),
@@ -887,21 +941,116 @@ impl BrowserPage {
             })
             .child(
                 icon_button_enabled("browser-devtools", "DevTools", "code", ready)
+                    .when(self.devtools.is_some(), |b| b.bg(content(0.1)))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
             )
             .children(self.downloads_button(cx))
     }
 
-    /// Opens the page's DevTools in a window of its own, or closes it.
+    /// Opens the page's DevTools docked under it, or closes them. Where
+    /// they cannot dock, they open in a window of their own.
     pub(crate) fn toggle_dev_tools(&mut self, cx: &mut Context<Self>) {
-        self.host.with_view(|view| {
-            if view.has_dev_tools() {
-                view.close_dev_tools()
-            } else {
-                view.show_dev_tools()
-            }
-        });
+        let detached = self
+            .host
+            .view
+            .borrow()
+            .as_ref()
+            .map(|h| h.view.has_dev_tools());
+        if detached == Some(true) {
+            self.host.with_view(|view| view.close_dev_tools());
+        } else if self.devtools.is_some() {
+            self.close_docked_dev_tools(cx);
+        } else if detached.is_some() {
+            self.open_docked_dev_tools(cx);
+        }
         cx.notify();
+    }
+
+    /// DevTools in a window of their own (CEF's, Chrome style), when they
+    /// cannot dock.
+    fn open_detached_dev_tools(&self) {
+        self.host.with_view(|view| view.show_dev_tools());
+    }
+
+    /// Docks the DevTools frontend under the page. Its address needs the
+    /// page's target id, which Chromium tells.
+    fn open_docked_dev_tools(&mut self, cx: &mut Context<Self>) {
+        let base = (self.devtools_scope.as_ref())
+            .ok_or_else(|| "the page has no project".to_owned())
+            .and_then(monocode_core::browser::proxy::devtools_base);
+        let (base, cdp) = match (base, self.cdp()) {
+            (Ok(base), Some(cdp)) => (base, cdp),
+            (base, _) => {
+                log::debug!("browser: DevTools open detached: {:?}", base.err());
+                self.open_detached_dev_tools();
+                return;
+            }
+        };
+        let host = Host::with_shared(Rc::default());
+        let opened = Rc::downgrade(&host);
+        self.devtools = Some(DockedDevTools { host, url: None });
+        let info = cdp.call("Target.getTargetInfo", serde_json::json!({}), None);
+        cx.spawn(async move |this, cx| {
+            let target = info
+                .await
+                .ok()
+                .and_then(|info| info["targetInfo"]["targetId"].as_str().map(str::to_owned));
+            let _ = this.update(cx, |page, cx| {
+                let Some(docked) = page
+                    .devtools
+                    .as_mut()
+                    .filter(|d| std::ptr::eq(opened.as_ptr(), Rc::as_ptr(&d.host)))
+                else {
+                    return;
+                };
+                match target {
+                    Some(target) => docked.url = Some(devtools_frontend_url(&base, &target)),
+                    None => {
+                        page.close_docked_dev_tools(cx);
+                        page.open_detached_dev_tools();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn close_docked_dev_tools(&mut self, cx: &mut Context<Self>) {
+        self.devtools_drag = None;
+        if let Some(docked) = self.devtools.take() {
+            docked.host.release(cx);
+            docked.host.close();
+        }
+        cx.notify();
+    }
+
+    /// The docked DevTools' own events: what concerns the page around them
+    /// (new pages, downloads, dialogs, the keyboard) is the page's.
+    fn on_dev_tools_event(
+        &mut self,
+        event: monocode_cef::BrowserEvent,
+        host: &Weak<Host<monocode_cef::BrowserView>>,
+        cx: &mut Context<Self>,
+    ) {
+        use monocode_cef::BrowserEvent;
+        let current = (self.devtools.as_ref())
+            .is_some_and(|d| std::ptr::eq(host.as_ptr(), Rc::as_ptr(&d.host)));
+        if !current {
+            return;
+        }
+        match event {
+            BrowserEvent::Focused => self.follow_page_focus(cx),
+            BrowserEvent::Closed
+            | BrowserEvent::CloseRequested
+            | BrowserEvent::RenderProcessGone => self.close_docked_dev_tools(cx),
+            event @ (BrowserEvent::PopupRequested { .. }
+            | BrowserEvent::PopupOpened { .. }
+            | BrowserEvent::Download(_)
+            | BrowserEvent::Auth(_)
+            | BrowserEvent::Dialog(_)) => self.on_page_event(event, cx),
+            _ => {}
+        }
     }
 
     /// A snapshot once a load has had a moment to paint, so an overlay has
@@ -1020,6 +1169,176 @@ impl BrowserPage {
         .size_full()
         .into_any_element()
     }
+
+    /// Where the docked DevTools draw, under the page.
+    fn devtools_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(docked) = &self.devtools else {
+            return div().into_any_element();
+        };
+        let Some(url) = docked.url.clone() else {
+            // Their address is on its way.
+            return div().size_full().into_any_element();
+        };
+        let host = docked.host.clone();
+        let options = self.host.options.borrow().clone();
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let weak = Rc::downgrade(&host);
+                host.paint(bounds, window, cx, |parent, frame, cx| {
+                    let made =
+                        monocode_cef::BrowserView::create_with(parent, frame, &url, &options);
+                    match made {
+                        Ok((view, events)) => {
+                            let page = page.clone();
+                            cx.spawn(async move |cx| {
+                                while let Ok(event) = events.recv().await {
+                                    let handled = page.update(cx, |page, cx| {
+                                        page.on_dev_tools_event(event, &weak, cx)
+                                    });
+                                    if handled.is_err() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
+                            Some(view)
+                        }
+                        Err(error) => {
+                            log::debug!("browser: docked DevTools did not open: {error}");
+                            None
+                        }
+                    }
+                })
+            },
+        )
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The page, with the docked DevTools under a draggable divider.
+    fn body(
+        &mut self,
+        page: gpui::AnyElement,
+        docked: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if !docked {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(page)
+                .into_any_element();
+        }
+        let available = (self.body_bounds.get()).map_or(0., |b| f32::from(b.size.height));
+        let height = devtools_height(self.devtools_height, available);
+        let slot = self.body_bounds.clone();
+        // The next render clamps to a new size, so a resize asks for it.
+        let probe = canvas(
+            move |bounds, window, _| {
+                if (slot.replace(Some(bounds))).is_none_or(|old| old.size != bounds.size) {
+                    window.on_next_frame(|window, _| window.refresh());
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let divider = div()
+            .id("browser-devtools-divider")
+            .role(gpui::Role::Splitter)
+            .aria_label("Resize DevTools")
+            // Real space, not an overlap: Chromium's views would take the
+            // pointer over any part of it they cover.
+            .h(px(5.))
+            .flex_shrink_0()
+            .cursor(CursorStyle::ResizeUpDown)
+            .flex()
+            .items_center()
+            .child(div().h(px(1.)).w_full().bg(content(0.12)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.devtools_drag = Some((f32::from(event.position.y), height));
+                    cx.stop_propagation();
+                }),
+            );
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(probe)
+            .child(div().flex_1().min_h_0().min_w_0().child(page))
+            .child(divider)
+            .child(
+                div()
+                    .h(px(height))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(self.devtools_surface(cx)),
+            )
+            .when(self.devtools_drag.is_some(), |d| {
+                d.child(self.drag_listener(cx))
+            })
+            .into_any_element()
+    }
+
+    /// While the divider drags: window-wide, since the pointer passes over
+    /// Chromium's views, whose drags AppKit still sends to GPUI's view.
+    fn drag_listener(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let moved = page.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = moved.update(cx, |page, cx| page.drag_divider(event, cx));
+                });
+                let released = page.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = released.update(cx, |page, cx| page.end_divider_drag(cx));
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    fn drag_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((start, height)) = self.devtools_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_divider_drag(cx);
+            return;
+        }
+        let available = (self.body_bounds.get()).map_or(0., |b| f32::from(b.size.height));
+        let wanted = (height + start - f32::from(event.position.y)).max(1.);
+        let height = devtools_height(wanted.round() as u32, available).round() as u32;
+        if height != self.devtools_height {
+            self.devtools_height = height;
+            cx.notify();
+        }
+    }
+
+    fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+        if self.devtools_drag.take().is_some() {
+            cx.notify();
+        }
+    }
 }
 
 impl Render for BrowserPage {
@@ -1035,9 +1354,9 @@ impl Render for BrowserPage {
             self.start_engine(cx);
         }
         self.focus_prompt_now(window, cx);
-        let body = match self.status(cx) {
-            Some(status) => status,
-            None => self.surface(cx),
+        let (body, docked) = match self.status(cx) {
+            Some(status) => (status, false),
+            None => (self.surface(cx), self.devtools.is_some()),
         };
         div()
             .id("browser-page")
@@ -1084,7 +1403,7 @@ impl Render for BrowserPage {
                     ),
                 )
             })
-            .child(div().flex_1().min_h_0().min_w_0().child(body))
+            .child(self.body(body, docked, cx))
             .relative()
             .children(self.downloads_popover(cx))
             .children(self.prompt_overlay(cx))
@@ -1501,6 +1820,8 @@ impl BrowserPage {
         }
         if self.host.view.borrow().is_some() {
             self.host = Host::with_shared(self.host.shared.clone());
+            // They inspect the page that goes.
+            self.close_docked_dev_tools(cx);
             cx.notify();
         }
         self.host.options.borrow_mut().profile = profile;
@@ -2144,6 +2465,15 @@ impl<V: NativeView> Host<V> {
 }
 
 impl Host<monocode_cef::BrowserView> {
+    /// Closes the view now, rather than when the last frame lets go of it.
+    fn close(&self) {
+        if let Some(hosted) = self.view.borrow_mut().take() {
+            hosted.view.close();
+            #[cfg(target_os = "macos")]
+            hosted.clip.removeFromSuperview();
+        }
+    }
+
     /// Gives the page's view a CDP client and starts its log (K36), unless
     /// it has a live one.
     fn attach_agent(self: &Rc<Self>) {
@@ -2929,6 +3259,31 @@ mod monocode_cef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devtools_keep_their_height_clear_of_both_minimums() {
+        // Unset: 40% of the body.
+        assert_eq!(devtools_height(0, 1000.), 400.);
+        assert_eq!(devtools_height(0, 250.), DEVTOOLS_MIN);
+        // Dragged: as wanted, within both minimums.
+        assert_eq!(devtools_height(300, 1000.), 300.);
+        assert_eq!(devtools_height(10, 1000.), DEVTOOLS_MIN);
+        assert_eq!(devtools_height(990, 1000.), 1000. - PAGE_MIN);
+        // Too small for both: the page keeps its minimum.
+        assert_eq!(devtools_height(300, 150.), 150. - PAGE_MIN);
+        assert_eq!(devtools_height(300, 50.), 0.);
+        // Not measured yet.
+        assert_eq!(devtools_height(300, 0.), 300.);
+        assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
+    }
+
+    #[test]
+    fn docked_devtools_load_chromiums_frontend_on_the_apps_endpoint() {
+        assert_eq!(
+            devtools_frontend_url("127.0.0.1:5000/abc", "F00D"),
+            "devtools://devtools/bundled/devtools_app.html?ws=127.0.0.1:5000/abc/devtools/page/F00D"
+        );
+    }
 
     #[test]
     fn typed_text_becomes_an_address_or_a_search() {

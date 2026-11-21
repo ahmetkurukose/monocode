@@ -26,9 +26,16 @@ impl Shell {
         let profiles = self.browser_profiles();
         let zoom = state.zoom.unwrap_or(100);
         let profile = self.browser_pane_profile(pane);
+        // The scope whose pages include this one (K21), for its DevTools.
+        let devtools_scope =
+            (self.session_summaries.get(&state.owner)).map(|owner| monocode_core::browser::Scope {
+                session: state.owner,
+                project: owner.cwd.clone(),
+            });
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
+            page.devtools_scope = devtools_scope;
             page
         });
         // Asked from inside a page's event: handled once that is over, with
@@ -159,7 +166,7 @@ impl Shell {
         true
     }
 
-    /// ⌥⌘I: the focused browser pane's DevTools window opens or closes.
+    /// ⌥⌘I: the focused browser pane's DevTools open docked or close.
     pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self
             .workspace
@@ -171,6 +178,31 @@ impl Shell {
         if let Some(page) = self.browser_page(pane, cx) {
             page.update(cx, |page, cx| page.toggle_dev_tools(cx));
         }
+    }
+
+    /// Development hook (`MONOCODE_BROWSER_OPEN_DEVTOOLS`): the focused
+    /// page's DevTools open once its page can be inspected.
+    pub(super) fn open_dev_tools_when_ready(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.workspace.active else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for _ in 0..300 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let opened = this.update(cx, |this, cx| {
+                    let page = this.browser_pages.get(&pane)?.0.clone();
+                    page.read(cx).cdp()?;
+                    page.update(cx, |page, cx| page.toggle_dev_tools(cx));
+                    Some(())
+                });
+                if !matches!(opened, Ok(None)) {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// A browser pane's page, under its group's strip.

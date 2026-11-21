@@ -70,8 +70,8 @@ impl Shell {
     /// bridge's environment for a synthetic session whose project is
     /// `MONOCODE_BROWSER_AGENT_DEV_PROJECT` or the window's project (the
     /// project `MONOCODE_BROWSER_OPEN`'s page belongs to), turns the external
-    /// CDP endpoint on, and writes `{bridge_env, cdp_endpoint, scope}` as
-    /// JSON to the file. A script then drives `browser-mcp` and the endpoint
+    /// CDP endpoint on, and writes `{bridge_env, cdp_endpoint, devtools_base,
+    /// scope}` as JSON to the file. A script then drives `browser-mcp` and the endpoint
     /// as an agent would.
     pub(super) fn start_browser_agent_dev_hook(&mut self, cx: &mut Context<Self>) {
         let Some(file) = std::env::var_os("MONOCODE_BROWSER_AGENT_DEV").filter(|f| !f.is_empty())
@@ -96,9 +96,11 @@ impl Shell {
                 project: project.clone(),
             };
             let cdp_endpoint = monocode_core::browser::proxy::endpoint(&scope)?;
+            let devtools_base = monocode_core::browser::proxy::devtools_base(&scope)?;
             let json = serde_json::json!({
                 "bridge_env": bridge_env,
                 "cdp_endpoint": cdp_endpoint,
+                "devtools_base": devtools_base,
                 "scope": {"session": DEV_HOOK_SESSION, "project": project},
             });
             std::fs::write(&file, json.to_string()).map_err(|e| e.to_string())
