@@ -6,6 +6,20 @@ use crate::review::{ReviewState, ReviewTab};
 use crate::workspace::{BrowserPane, TerminalPane};
 use monocode_core::files::path_key;
 
+/// The lowest browser pane id handed out in this run, in any window.
+static LOWEST_BROWSER_PANE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// A new browser pane's id: `next`, the workspace's next free pane id,
+/// unless a page that closed in this run had it or one below. Agents hold
+/// page ids, which are pane ids (K21): a closed page's id must not reach
+/// another page.
+fn browser_pane_id(next: i64) -> i64 {
+    use std::sync::atomic::Ordering;
+    let pane = next.min(LOWEST_BROWSER_PANE.load(Ordering::Relaxed) - 1);
+    LOWEST_BROWSER_PANE.fetch_min(pane, Ordering::Relaxed);
+    pane
+}
+
 /// How the router places a tab.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct OpenIn {
@@ -530,7 +544,7 @@ impl Shell {
     /// time its pane draws (`browser_page`); an empty `url` focuses the
     /// address field.
     pub(super) fn create_browser_pane(&mut self, owner: i64, url: String) -> i64 {
-        let pane = self.workspace.next_pane_id();
+        let pane = browser_pane_id(self.workspace.next_pane_id());
         self.workspace.browser_panes.insert(
             pane,
             BrowserPane {

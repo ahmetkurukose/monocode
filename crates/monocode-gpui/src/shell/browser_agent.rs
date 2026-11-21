@@ -3,9 +3,9 @@
 //! the external CDP endpoint drive, over the browser pages of every window,
 //! and the pump that runs their jobs on the main thread.
 //!
-//! A page's id is its pane id. Pages of a scope (K21) are the browser panes
-//! whose owner session works in the scope's project, and the ones the
-//! scope's session opened.
+//! A page's id is its pane id, never reused during the run. Pages of a
+//! scope (K21) are the browser panes whose owner session works in the
+//! scope's project, and the ones the scope's session opened.
 use super::*;
 use crate::workspace::BrowserPane;
 use gpui::{AsyncApp, WindowHandle};
@@ -634,6 +634,43 @@ mod tests {
         assert!(host.close(&ours, page));
         cx.run_until_parked();
         assert!(host.pages(&ours).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_closed_pages_id_never_reaches_another_page(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = super::super::tests::window(cx);
+        let host = AppHost::new(cx.to_async());
+        let ours = scope(session, "/work/monocode");
+        let open = |cx: &mut gpui::TestAppContext, url: &str| {
+            window
+                .update(cx, |shell, window, cx| {
+                    shell.open(session, window, cx);
+                    shell.open_agent_browser_page(session, url.into(), false, cx)
+                })
+                .unwrap()
+        };
+        let first = open(cx, "https://a.test/");
+        assert!(host.close(&ours, first));
+        cx.run_until_parked();
+        // The lowest pane id is free again, but an agent may still hold it.
+        let second = open(cx, "https://b.test/");
+        assert_ne!(second, first);
+        assert!(host.page(&ours, first).is_none());
+        // A user's page, and pages a page opens, follow the same rule.
+        assert!(host.close(&ours, second));
+        cx.run_until_parked();
+        let third = window
+            .update(cx, |shell, window, cx| {
+                shell.new_browser_pane(Some("https://c.test/".into()), window, cx);
+                shell.workspace.active.unwrap()
+            })
+            .unwrap();
+        assert!(![first, second].contains(&third));
+        assert_eq!(
+            host.page(&ours, third).unwrap().info().url,
+            "https://c.test/"
+        );
     }
 
     #[gpui::test]

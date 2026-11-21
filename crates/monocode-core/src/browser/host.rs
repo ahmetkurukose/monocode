@@ -11,8 +11,8 @@ use futures_util::future::LocalBoxFuture;
 
 use super::{cdp::CdpClient, log::PageLog};
 
-/// A page's id: the app's pane id, stable for the page's life (context.md
-/// §3.1 item 1).
+/// A page's id: the app's pane id, stable for the page's life and never
+/// given to another page during the app's run (context.md §3.1 item 1).
 pub type PageId = i64;
 
 /// Whose calls these are: an agent session and its project (K21).
