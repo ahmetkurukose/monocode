@@ -7,6 +7,7 @@ pub mod app_update;
 pub mod automations;
 pub mod catalog;
 pub mod checkpoint;
+pub mod browser;
 pub mod code;
 pub mod context;
 pub mod db;

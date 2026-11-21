@@ -3,6 +3,7 @@ mod actions;
 mod app_commands;
 mod app_views;
 mod automation_runs;
+pub(crate) mod browser_agent;
 pub(crate) mod browser_links;
 mod browser_panes;
 mod classic_sidebar;
@@ -7692,16 +7693,24 @@ impl Render for Shell {
             self.start_database_footer(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);
-            // For measuring the browser: a page at this address on launch.
+            // For measuring the browser: a page at this address on launch,
+            // with its docked DevTools if `MONOCODE_BROWSER_OPEN_DEVTOOLS=1`.
             if let Some(url) = std::env::var("MONOCODE_BROWSER_OPEN")
                 .ok()
                 .filter(|url| !url.is_empty())
             {
                 let this = cx.entity();
                 window.defer(cx, move |window, cx| {
-                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                    this.update(cx, |this, cx| {
+                        this.new_browser_pane(Some(url), window, cx);
+                        if std::env::var("MONOCODE_BROWSER_OPEN_DEVTOOLS").as_deref() == Ok("1") {
+                            this.open_dev_tools_when_ready(cx);
+                        }
+                    });
                 });
             }
+            // For testing the agent layer from outside (development only).
+            self.start_browser_agent_dev_hook(cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);

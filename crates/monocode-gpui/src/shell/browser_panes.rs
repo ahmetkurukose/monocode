@@ -14,17 +14,28 @@ impl Shell {
             .unwrap_or_else(|| std::env::temp_dir().join("monocode-browser"))
     }
 
-    fn browser_page(&mut self, pane: i64, cx: &mut Context<Self>) -> Option<Entity<BrowserPage>> {
+    pub(super) fn browser_page(
+        &mut self,
+        pane: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BrowserPage>> {
         if let Some((page, _)) = self.browser_pages.get(&pane) {
             return Some(page.clone());
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
         let zoom = state.zoom.unwrap_or(100);
-        let profile = self.browser_profile(state.owner);
+        let profile = self.browser_pane_profile(pane);
+        // The scope whose pages include this one (K21), for its DevTools.
+        let devtools_scope =
+            (self.session_summaries.get(&state.owner)).map(|owner| monocode_core::browser::Scope {
+                session: state.owner,
+                project: owner.cwd.clone(),
+            });
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
+            page.devtools_scope = devtools_scope;
             page
         });
         // Asked from inside a page's event: handled once that is over, with
@@ -155,7 +166,7 @@ impl Shell {
         true
     }
 
-    /// ⌥⌘I: the focused browser pane's DevTools window opens or closes.
+    /// ⌥⌘I: the focused browser pane's DevTools open docked or close.
     pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self
             .workspace
@@ -167,6 +178,31 @@ impl Shell {
         if let Some(page) = self.browser_page(pane, cx) {
             page.update(cx, |page, cx| page.toggle_dev_tools(cx));
         }
+    }
+
+    /// Development hook (`MONOCODE_BROWSER_OPEN_DEVTOOLS`): the focused
+    /// page's DevTools open once its page can be inspected.
+    pub(super) fn open_dev_tools_when_ready(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.workspace.active else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for _ in 0..300 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let opened = this.update(cx, |this, cx| {
+                    let page = this.browser_pages.get(&pane)?.0.clone();
+                    page.read(cx).cdp()?;
+                    page.update(cx, |page, cx| page.toggle_dev_tools(cx));
+                    Some(())
+                });
+                if !matches!(opened, Ok(None)) {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// A browser pane's page, under its group's strip.
@@ -202,6 +238,18 @@ impl Shell {
         }
     }
 
+    /// The profile pane `pane`'s page browses with: a throwaway one of its
+    /// own when an agent asked for that (K22), else its project's.
+    pub(super) fn browser_pane_profile(&self, pane: i64) -> crate::browser::Profile {
+        match self.workspace.browser_panes.get(&pane) {
+            Some(state) => match &state.ephemeral {
+                Some(name) => crate::browser::Profile::Ephemeral(name.clone()),
+                None => self.browser_profile(state.owner),
+            },
+            None => crate::browser::Profile::Default,
+        }
+    }
+
     fn browser_page_request(
         &mut self,
         pane: i64,
@@ -234,10 +282,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(owner) = self.workspace.browser_panes.get(&opener).map(|b| b.owner) else {
+        let Some(opener_state) = self.workspace.browser_panes.get(&opener).cloned() else {
             return;
         };
-        let pane = self.create_browser_pane(owner, url);
+        let pane = self.create_browser_pane(opener_state.owner, url);
+        // An agent's page opens agent pages, in its own profile.
+        if let Some(state) = self.workspace.browser_panes.get_mut(&pane) {
+            state.opened_by = opener_state.opened_by;
+            state.ephemeral = opener_state.ephemeral;
+        }
         let active = self.workspace.active;
         if self.workspace.tab_of(opener).is_some() {
             self.workspace.place_tab_after(pane, opener);
@@ -280,10 +333,8 @@ impl Shell {
             isolated.insert(key);
         }
         let pages: Vec<_> = (self.browser_pages.iter())
-            .filter_map(|(pane, (page, _))| {
-                let owner = self.workspace.browser_panes.get(pane)?.owner;
-                Some((page.clone(), self.browser_profile(owner)))
-            })
+            .filter(|(pane, _)| self.workspace.browser_panes.contains_key(pane))
+            .map(|(pane, (page, _))| (page.clone(), self.browser_pane_profile(*pane)))
             .collect();
         for (page, profile) in pages {
             page.update(cx, |page, cx| page.set_profile(profile, cx));
@@ -407,6 +458,41 @@ mod tests {
                     "http://localhost:5173/b"
                 );
                 assert_eq!(shell.workspace.browser_panes[&front].owner, session);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_popup_closed_before_its_tab_adopted_it_opens_at_its_address(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, session) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.open(session, window, cx);
+                shell.new_browser_pane(Some("http://localhost:5173/".into()), window, cx);
+                let opener = shell.workspace.active.unwrap();
+                // A `window.open` popup that waited too long, or whose opener
+                // closed: Chromium closed it, so there is nothing to adopt.
+                shell.open_browser_page_beside(
+                    opener,
+                    "http://localhost:5173/login".into(),
+                    false,
+                    Some(u64::MAX),
+                    window,
+                    cx,
+                );
+                let tabs = shell.workspace.group_tabs(opener);
+                let popup = *tabs.last().unwrap();
+                assert_eq!(tabs, [session, opener, popup]);
+                assert_eq!(shell.workspace.active, Some(opener));
+                assert_eq!(
+                    shell.workspace.browser_panes[&popup].url,
+                    "http://localhost:5173/login"
+                );
+                let page = shell.browser_pages[&popup].0.read(cx);
+                assert_eq!(page.url, "http://localhost:5173/login");
             })
             .unwrap();
     }

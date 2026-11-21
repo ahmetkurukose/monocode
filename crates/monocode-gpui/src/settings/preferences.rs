@@ -109,6 +109,9 @@ pub(crate) struct Preferences {
     /// pane. Off, only local addresses do and the rest go to the user's own
     /// browser.
     pub browser_all_links: bool,
+    /// Tools outside Monocode (Playwright, dev-browser) may connect to the
+    /// browser over CDP (docs/native/browser/context.md K27).
+    pub browser_external_cdp: bool,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -214,6 +217,7 @@ impl Default for Preferences {
             claude_chrome: false,
             code_agents: true,
             browser_all_links: false,
+            browser_external_cdp: false,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),

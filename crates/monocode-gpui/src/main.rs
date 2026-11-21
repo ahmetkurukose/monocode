@@ -260,6 +260,13 @@ fn main() {
         }
         return;
     }
+    if cli_args.first().is_some_and(|a| a == "browser-mcp") {
+        if let Err(error) = monocode_core::browser::bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if cli_args.first().is_some_and(|a| a == "app-mcp") {
         if let Err(error) = monocode_core::mono::bridge::mcp_stdio() {
             eprintln!("{error}");
@@ -596,6 +603,7 @@ fn main() {
                         )
                     });
                     code_agent::install(&shell, cx);
+                    shell::browser_agent::start(cx);
                     shell.update(cx, |shell, cx| shell.focus_active(window, cx));
                     #[cfg(target_os = "macos")]
                     {

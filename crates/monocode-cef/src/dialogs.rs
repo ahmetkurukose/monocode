@@ -51,6 +51,11 @@ impl AuthReply {
 impl Drop for AuthReply {
     fn drop(&mut self) {
         if let Some(callback) = self.take() {
+            if !crate::runtime::is_started() {
+                // CEF shut down: no call may follow, not even a release.
+                std::mem::forget(callback);
+                return;
+            }
             callback.cancel();
         }
     }
@@ -118,6 +123,10 @@ impl DialogReply {
 impl Drop for DialogReply {
     fn drop(&mut self) {
         if let Some(callback) = self.take() {
+            if !crate::runtime::is_started() {
+                std::mem::forget(callback);
+                return;
+            }
             callback.cont(0, None);
         }
     }
@@ -134,6 +143,19 @@ impl JsDialog {
     pub fn decline(&self) {
         if let Some(callback) = self.reply.take() {
             callback.cont(0, None);
+        }
+    }
+}
+
+impl JsDialog {
+    /// A dialog no page waits on, for the host's tests: answering it does
+    /// nothing.
+    pub fn detached(kind: DialogKind, origin: &str, message: &str) -> Self {
+        JsDialog {
+            kind,
+            origin: origin.to_owned(),
+            message: message.to_owned(),
+            reply: Arc::new(DialogReply(Mutex::new(None))),
         }
     }
 }
@@ -206,6 +228,16 @@ wrap_request_handler! {
             };
             self.state.send(BrowserEvent::Auth(request));
             1
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            _status: TerminationStatus,
+            _error_code: ::std::os::raw::c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            self.state.send(BrowserEvent::RenderProcessGone);
         }
     }
 }

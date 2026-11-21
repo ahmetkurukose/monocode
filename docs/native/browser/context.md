@@ -1,6 +1,6 @@
 # Browser: Chromium tabanlı tam browser — bağlam ve kararlar
 
-Durum: karar dokümanı, kod yok. Başlangıç: 2026-11-20. Branch: `browser/cef-spike`.
+Durum: karar dokümanı; Faz 0–2 bitti. Başlangıç: 2026-11-20. Branch: `browser/cef-spike`.
 Bu doküman işin **neden**ini, verilen **bütün kararları**, teknik **detayları** ve **faz planını**
 (§12) toplar. Faz bitişleri ve dokümanın güncel tutulma kuralı §13'te.
 Araştırma raporları `research/` altında (İngilizce):
@@ -50,9 +50,31 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K15 | Profil | **Varsayılan tek ortak profil**; isteyen proje ayarlardan **izole profil** açar (ayrı `CefRequestContext`, `Profiles/<proje>`). |
 | K16 | Overlay | Sayfayı örten menü/modal/bildirim varken sayfanın **son karesi** (CDP `Page.captureScreenshot`) GPUI'de çizilir; native view gizlenmez, pencerenin dışına taşınır (gizlenen view'da Chromium çizimi durdurur ve görüntü alınamaz). Kalıcı çözüm OSR ile Faz 3'te. |
 | K17 | Kısayollar | Sayfa odaktayken uygulamanın ⌘/⌃ kısayolları kazanır; **düzenleme kısayolları (⌘C/V/X/A/Z, ⇧⌘Z) sayfada kalır**. ⌘F bizim sayfada bul, ⌘R sayfa yenile, ⌘L adres çubuğu, ⌘+/−/0 sayfa zoom'u. |
-| K18 | DevTools | **Revize (Faz 1):** ayrı pencere. Yapışık hâli denendi; CEF macOS'ta DevTools'u Alloy style açamıyor ("Alloy style is not supported for this browser") ve Chrome style bir host view'un içine konamıyor: `ShowDevTools` child view ile CHECK'te durup uygulamayı kapattı. Yapışık DevTools için yol: kendi Alloy sayfamızda DevTools frontend'ini CDP üzerinden yüklemek (Faz 2'deki CDP uç noktasıyla birlikte). |
+| K18 | DevTools | **Revize (Faz 1):** ayrı pencere. Yapışık hâli denendi; CEF macOS'ta DevTools'u Alloy style açamıyor ("Alloy style is not supported for this browser") ve Chrome style bir host view'un içine konamıyor: `ShowDevTools` child view ile CHECK'te durup uygulamayı kapattı. **Revize (Faz 2):** yapışık DevTools geldi (K28); ayrı pencere yalnız yedek yol. |
 | K19 | Link yönlendirme | localhost ve proje portları Monocode browser'ında, diğerleri sistem tarayıcısında açılır; ayarla "her şey Monocode'da" seçilebilir; **⇧ ile tıklama diğer tarafı** açar. |
 | K20 | Restore | Önceki oturumun sekmeleri **görünür olunca** yüklenir (lazy). Discard sonraki faza. |
+| K21 | Agent kapsamı (Faz 2) | Agent **oturumun projesindeki** browser sekmelerini ve **kendi açtıklarını** görür ve sürer; başka projelerin sekmeleri görünmez. |
+| K22 | Agent profili | Agent'ın açtığı sekme varsayılan olarak **projenin profilini** kullanır (login'ler dahil); `isolated: true` ile **bellekte geçici profil** (boş `cache_path`, kapanınca silinir). |
+| K23 | Arka plan sekmesi | Agent'ın sürdüğü görünmeyen sekme, overlay'deki gibi **pencerenin dışına taşınmış görünür view**'da yaşar (çizim ve screenshot sürer). Gerçek headless Faz 3'te OSR ile. |
+| K24 | Faz 2 araç seti | tabs (list/open/close/show), goto/back/forward/reload, wait (text/url/selector/load), snapshot (interactive/selector/depth), click/fill/type/press/scroll, screenshot, eval, console, network, **dialog**. Geri kalanı Faz 3 (dış CDP uç noktasıyla Playwright zaten yapabilir). |
+| K25 | Onay | Allow list'te olmayan, kullanıcı onayı isteyen araç: **`browser_eval`** (ve ileride cookie/storage yazma). Gerisi serbest (`db_execute` modeli). |
+| K26 | Dış CDP uç noktası | **Profil başına, browser seviyesinde** uç nokta: birden çok target, `Target.createTarget` yeni sekme açar (Playwright `connectOverCDP`, dev-browser `browser.newPage()`). Her zaman bizim proxy'miz; CEF `remote_debugging_port` kapalı. Loopback, rastgele token, `Origin` başlıklı istek red, Host kontrolü. |
+| K27 | Uç noktanın dağıtımı | Ayarlardan açılır (varsayılan kapalı). Monocode'un başlattığı agent oturumlarına env (`MONOCODE_BROWSER_CDP`) ile verilir, argv'ye yazılmaz; ayrıca ayarlarda **kopyala** düğmesi. Sabit port (9222) yok. |
+| K28 | Yapışık DevTools | **Yapıldı (Faz 2):** DevTools frontend'i (`devtools://devtools/bundled/devtools_app.html?ws=…`) sayfanın altında kendi Alloy view'unda, proxy'nin sayfa uç noktasına **iç token** ile bağlı (yalnız `devtools://devtools` origin'i; dış CDP ayarı kapalıyken de çalışır). Ayrı pencere yedek. |
+| K29 | Faz 1 artıkları | Agent işiyle **paralel**, ayrı hatta: `cef::shutdown`, `window.opener`, sahipsiz popup, ölçüm. Diyaloğa odak agent hattında (dialog aracıyla birlikte). |
+| K30 | Test | Birim (snapshot fixture, proxy guard) + GPUI testleri + **gerçek CEF ile uçtan uca**: yerel test sayfası, MCP araçlarıyla senaryo, Playwright `connectOverCDP` smoke testi. |
+| K31 | Snapshot formatı | Girintili metin: `[@e3] button "Save"`, landmark'lar `[Main Content]`, satır sonunda durum ekleri (`checked`, `value="…"`, `focused`, `disabled`, `expanded`). JSON değil. |
+| K32 | Snapshot boyutu | Varsayılan `interactive` (etkileşimli öğeler, başlıklar, landmark'lar); `full` isteğe bağlı. İkisi de **30 KB**; kesilen yerde "`selector`/`depth` ile daralt" ipucu. |
+| K33 | Stale ref | Ref'ler belge kimliğine (main frame loader id) bağlı. Aynı belgede node kaybolduysa **role + name + nth** ile kurtarma; navigasyondan sonra `browser_stale_ref`. |
+| K34 | Kullanıcı ↔ agent | Kullanıcının bir sekmeye son 2 sn'de input'u varsa agent'ın input aksiyonu `browser_user_active` ile döner; çalışan aksiyon kesilmez. Kullanıcı input'u hiç engellenmez. |
+| K35 | Kuyruk | Sekme başına FIFO; CDP çağrıları main thread'de. Komut başına zaman aşımı 30 sn (`wait` en çok 120 sn). Sekme kapanır/çökerse bekleyen komutlar hemen `browser_page_gone`. |
+| K36 | Console/network | Her sayfada **açılıştan itibaren** ring buffer (console 500, network 300 girdi; gövde yok, `Network.getResponseBody` isteğe bağlı). |
+| K37 | Screenshot | MCP image content; varsayılan viewport, JPEG, en uzun kenar ≤1568 px; `full_page` ve `path` (dosyaya yaz) isteğe bağlı. |
+| K38 | Ortak CDP oturumu | **Revize (Faz 2):** sayfanın ham DevTools kanalı tek ve paylaşımlı (`CdpClient`), ama her dış istemci ve DevTools frontend'i kanal üzerinden sayfaya **kendi oturumunu** açar (`Target.attachToTarget` kendine, flatten). Sebep: V8 ikinci `Runtime.enable`'ı yok sayar, Playwright takılırdı. Ortak oturum yalnız yedek yol (o zaman `*.disable` yutulur). `Emulation.*` hâlâ sayfa geneli: istemcinin ayarları iç araçları ve kullanıcıyı da etkiler. İstemcinin `Target.setAutoAttach`'i `waitForDebuggerOnStart:false, flatten:true`'ya zorlanır, kapatılamaz. |
+| K39 | Agent sekmesinin yeri | Oturumun **chat'inin bulunduğu grup**, arka planda (odak çalmaz); chat görünmüyorsa odaktaki grup. |
+| K40 | URL politikası | **Revize (Faz 2):** izin listesi: http/https, `about:blank`, data, blob. Diğerleri (`file:`, `chrome:`, `devtools:`, `javascript:`, `view-source:`) `browser_url_refused`. |
+| K41 | MCP sunucusu | Adı `monocode_browser`, araçlar `browser_*`; `db`/`code` köprüleriyle aynı desen (loopback listener + oturum token'ı + `browser-mcp` stdio alt komutu), ama her çağrı **main thread'e** gider. Hata kodları sabit: `browser_no_page`, `browser_page_gone`, `browser_stale_ref`, `browser_no_ref`, `browser_user_active`, `browser_dialog_open`, `browser_timeout`, `browser_url_refused`, `browser_cdp_error`, `browser_not_started`. |
+| K42 | iframe | Faz 2: aynı origin iframe'leri snapshot'ta; OOPIF (cross-origin) `Target.setAutoAttach` flatten ile ayrı oturum, ref → `sessionId`. |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -362,9 +384,11 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 |---|---|
 | Eklentiler | Gömülü (Alloy) sekmelerde Chrome eklenti API'si yok; hibrit modelin çalışıp çalışmadığı belirsiz. En büyük risk. |
 | Overlay | Child view üstüne GPUI çizemez. Faz 1: son kare görüntüsü (K16); tooltip'ler ve ortak yardımcıları kullanmayan overlay'ler hâlâ sayfanın altında kalır. Kalıcı çözüm Faz 3 (OSR). |
-| Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır; Chromium'un gerçekten throttle ettiği ölçülmedi. |
-| DevTools yapışması | **Faz 1 bulgusu (K18):** CEF macOS'ta DevTools'u yalnız Chrome style açar ve Chrome style host view'a konamaz. Yapışık DevTools için CDP üzerinden kendi Alloy sayfamızda frontend (Faz 2). |
-| Bellek | Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
+| Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır. Faz 2: agent'ın sürdüğü sekme gizlenmez, pencere dışında çizer (K23); pencere ekran dışındayken Chromium'un görünen sekmeyi de gizlediği görüldü ve aynı yolla çözüldü. |
+| DevTools yapışması | **Çözüldü (Faz 2, K28):** frontend kendi Alloy view'umuzda, CDP proxy'si üzerinden. |
+| Battery Saver | **Faz 2 bulgusu:** pil %20 altındayken Chromium sayfaları 30 fps'e kilitler (Chrome'da da). Politika kararı bekliyor. |
+| Başlangıç kilitlenmesi | **Faz 2 bulgusu:** ~15 açılışta 2 kez `cef_initialize` içinde malloc kilidinde bekleme. İncelenecek. |
+| Bellek | Faz 2 ölçümü (`phase-2-done.md`): 1 sekmede helper'lar 482 MB, 5 sekmede 1077 MB (Chrome: 612 / 1063). Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
 | EDR | Framework artık uygulamayla ve bizim imzamızla geliyor; indirme kaynaklı risk kalktı. |
 | Sandbox ↔ dağıtım | **Çözüldü (K7 revizyonu):** sandbox yalnızca uygulama bundle'ından okumaya izin veriyor; framework gömüldü. |
 | Sürüm takibi | CEF ~4 haftada bir sürüm; güvenlik yamaları için yükseltme ritmi gerekir. |
@@ -396,7 +420,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   indirmeler.
 - Terminal/chat/markdown link yönlendirme, localhost dev server algılama (K19).
 
-### Faz 2 — Agent temelleri
+### Faz 2 — Agent temelleri (bitti, `phase-2-done.md`)
 - Süreç içi CDP katmanı, sekme başına komut kuyruğu (§6.1).
 - Yeni MCP araç seti (Orca komut setine göre) + Rust'a port edilmiş a11y snapshot motoru.
 - Güvenilir input (`isTrusted=true`), console, network, screenshot, eval.
@@ -406,6 +430,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   scroll fps / input gecikmesi ölçümü (`phase-1-done.md`).
 
 ### Faz 3 — Gelişmiş agent ve geliştirici özellikleri
+- Faz 2'den devralınan: Battery Saver politikası, programlı scroll'da uzun kareler, başlangıç kilitlenmesi, yapışık DevTools eksikleri, ana belgenin `GET` görünmesi (`phase-2-done.md`).
 - Delta snapshot, aksiyon etkileri, `expect_url` guard.
 - Agent varlık UI'ı (rozet, imleç animasyonu) ve kullanıcı odağı koruması.
 - Grab / Annotate / Draw ile agent'a geri bildirim.
@@ -454,7 +479,7 @@ Her faz bittiğinde:
 |---|---|---|
 | 0 | Bitti | `phase-0-done.md` |
 | 1 | Bitti | `phase-1-done.md` |
-| 2 | Başlamadı | — |
+| 2 | Bitti | `phase-2-done.md` |
 | 3 | Başlamadı | — |
 | 4 | Başlamadı | — |
 | 5 | Başlamadı | — |

@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod view;
 
 mod capture;
+mod devtools;
 
 mod dialogs;
 mod download;
@@ -18,10 +19,12 @@ mod mac;
 mod popup;
 mod profile;
 
+pub use devtools::{DevToolsAttachment, DevToolsSink};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{
     AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CreateError, CreateOptions, DialogKind,
-    Download, DownloadState, Frame, JsDialog, Profile, cancel_download, profile_id, take_popup,
+    Download, DownloadState, Frame, JsDialog, Profile, cancel_download, forget_profile, profile_id,
+    take_popup,
 };
 
 /// `OnScheduleMessagePumpWork`, from any CEF thread.

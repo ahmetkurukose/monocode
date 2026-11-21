@@ -9,7 +9,9 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     ffi::c_void,
+    mem::ManuallyDrop,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -22,7 +24,7 @@ pub use crate::{
     dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
     download::{Download, DownloadState, cancel_download},
     popup::take_popup,
-    profile::{Profile, profile_id},
+    profile::{Profile, forget_profile, profile_id},
 };
 
 /// What a page reports. Delivered on the main thread, in order.
@@ -44,16 +46,17 @@ pub enum BrowserEvent {
         code: i32,
         text: String,
     },
-    /// The page asked for a new window (`window.open`, `target=_blank`, a
-    /// middle click). No window was created; the host opens the URL as a new
+    /// The page asked for a new window without an opener to keep (a middle
+    /// or ⌘-click). No window was created; the host opens the URL as a new
     /// page, and shows it at once when `foreground` (crate::popup).
     PopupRequested {
         url: String,
         user_gesture: bool,
         foreground: bool,
     },
-    /// The page opened a popup that keeps `window.opener`; it is ready for a
-    /// new page to adopt with [`take_popup`].
+    /// The page opened a popup that keeps `window.opener` (`window.open`,
+    /// `target=_blank`); it is ready for a new page to adopt with
+    /// [`take_popup`]. Not adopted in time, it closes.
     PopupOpened {
         id: u64,
         url: String,
@@ -71,6 +74,9 @@ pub enum BrowserEvent {
     DialogsReset,
     /// The browser is gone; the view can be dropped.
     Closed,
+    /// The page's renderer process ended (a crash, or it was killed). The
+    /// page shows nothing until it loads again.
+    RenderProcessGone,
     /// A find-in-page result ([`BrowserView::find`]). `active_ordinal` counts
     /// from 1; several updates may arrive for one search, the last one final.
     FindResult {
@@ -153,6 +159,55 @@ impl PageState {
 
 fn string(value: Option<&CefString>) -> String {
     value.map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// A browser between `OnAfterCreated` and `OnBeforeClose`.
+struct Live {
+    browser: Browser,
+    closing: Arc<AtomicBool>,
+}
+
+thread_local! {
+    /// Every browser that exists, pages and popups, by id: what must close
+    /// before CEF shuts down.
+    static LIVE: RefCell<HashMap<i32, Live>> = RefCell::new(HashMap::new());
+}
+
+/// How many browsers exist ([`close_all`]).
+pub(crate) fn live() -> usize {
+    LIVE.with(|l| l.borrow().len())
+}
+
+/// Closes every browser, for CEF to shut down: `OnBeforeClose` follows for
+/// each as the message loop runs. A page's close waits for its view to go
+/// (`DoClose` keeps the host's window), so the view leaves its parent here.
+pub(crate) fn close_all() {
+    let all: Vec<(i32, Browser, bool)> = LIVE.with(|l| {
+        (l.borrow().iter())
+            .map(|(id, live)| {
+                let asked = live.closing.swap(true, Ordering::SeqCst);
+                (*id, live.browser.clone(), asked)
+            })
+            .collect()
+    });
+    #[cfg(target_os = "macos")]
+    objc2::rc::autoreleasepool(|_| {
+        for (id, browser, asked) in all {
+            crate::capture::forget(id);
+            let Some(host) = browser.host() else { continue };
+            if !asked {
+                host.close_browser(1);
+            }
+            crate::mac::view::detach(host.window_handle());
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
+    for (id, browser, asked) in all {
+        crate::capture::forget(id);
+        if let Some(host) = browser.host().filter(|_| !asked) {
+            host.close_browser(1);
+        }
+    }
 }
 
 wrap_display_handler! {
@@ -245,8 +300,9 @@ wrap_life_span_handler! {
             client: Option<&mut Option<cef::Client>>,
             _settings: Option<&mut cef::BrowserSettings>,
             _extra_info: Option<&mut Option<cef::DictionaryValue>>,
-            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+            no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
+            let scriptable = no_javascript_access.is_none_or(|no| *no == 0);
             // Never lets Alloy open a native window of its own.
             crate::popup::before_popup(
                 &self.state,
@@ -258,6 +314,7 @@ wrap_life_span_handler! {
                 popup_features,
                 window_info,
                 client,
+                scriptable,
             )
         }
 
@@ -271,7 +328,13 @@ wrap_life_span_handler! {
         }
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
-            if let (Some(key), Some(browser)) = (self.state.popup, browser) {
+            let Some(browser) = browser else { return };
+            let live = Live {
+                browser: browser.clone(),
+                closing: self.state.closing.clone(),
+            };
+            LIVE.with(|l| l.borrow_mut().insert(browser.identifier(), live));
+            if let Some(key) = self.state.popup {
                 crate::popup::created(key, browser.clone(), &self.state);
             }
         }
@@ -285,7 +348,14 @@ wrap_life_span_handler! {
             1
         }
 
-        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            if let Some(browser) = browser {
+                let id = browser.identifier();
+                // Dropped outside the borrow.
+                let live = LIVE.with(|l| l.borrow_mut().remove(&id));
+                drop(live);
+                crate::popup::opener_closed(id);
+            }
             self.state.send(BrowserEvent::Closed);
         }
     }
@@ -399,7 +469,8 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
 
 /// A page and its native view.
 pub struct BrowserView {
-    browser: Browser,
+    /// Let go of only while CEF runs ([`Drop`]).
+    browser: ManuallyDrop<Browser>,
     /// CEF's own view, a child of the parent given to [`BrowserView::create`].
     native: *mut c_void,
     frame: RefCell<Frame>,
@@ -474,7 +545,7 @@ impl BrowserView {
             .map(|host| host.window_handle() as *mut c_void)
             .unwrap_or(std::ptr::null_mut());
         Self {
-            browser,
+            browser: ManuallyDrop::new(browser),
             native,
             frame: RefCell::new(Frame::default()),
             closing: state.closing.clone(),
@@ -625,6 +696,22 @@ impl BrowserView {
         crate::capture::capture(&self.browser, Box::new(done));
     }
 
+    /// Chromium's id of the page's browser, unique for the app's run.
+    pub fn browser_id(&self) -> i32 {
+        self.browser.identifier()
+    }
+
+    /// Attaches `sink` to the page's raw DevTools messages (crate::devtools).
+    /// One attachment per page is expected; dropping it detaches.
+    pub fn devtools_attach(&self, sink: crate::DevToolsSink) -> Option<crate::DevToolsAttachment> {
+        crate::devtools::attach(&self.browser, sink)
+    }
+
+    /// Sends one raw CDP message to the page. False when Chromium refused it.
+    pub fn devtools_send(&self, message: &[u8]) -> bool {
+        crate::devtools::send(&self.browser, message)
+    }
+
     /// Closes the page. [`BrowserEvent::Closed`] follows.
     pub fn close(&self) {
         if self.closing.swap(true, Ordering::SeqCst) {
@@ -639,6 +726,13 @@ impl BrowserView {
 
 impl Drop for BrowserView {
     fn drop(&mut self) {
+        // After CEF shut down (the app quits) no CEF call may follow, not
+        // even a release: the reference is left to the exit.
+        if !crate::runtime::is_started() {
+            return;
+        }
         self.close();
+        // SAFETY: dropped once, here; the field is not used again.
+        unsafe { ManuallyDrop::drop(&mut self.browser) };
     }
 }

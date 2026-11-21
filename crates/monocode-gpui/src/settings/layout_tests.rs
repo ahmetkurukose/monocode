@@ -322,3 +322,50 @@ fn terminal_settings_are_in_the_rail_and_found_by_search(cx: &mut TestAppContext
     assert!(found("copy on select"));
     assert!(found("clipboard"));
 }
+
+#[gpui::test]
+fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &mut TestAppContext) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let window = window(Section::General, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            view.ctx.browser_scope = Some(monocode_core::browser::Scope {
+                session: 1,
+                project: "/work/monocode".into(),
+            });
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-toggle-browser-external-cdp")
+            .is_some(),
+        "the switch is on General"
+    );
+    let changed = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen = changed.clone();
+    window
+        .update(visual, |_, _, cx| {
+            cx.subscribe_self(move |_, event: &SettingsEvent, _| {
+                if let SettingsEvent::Changed(prefs) = event {
+                    seen.borrow_mut().push(prefs.browser_external_cdp);
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+    window
+        .update(visual, |view, _, cx| {
+            view.update(cx, |p| p.browser_external_cdp = true);
+            // No shell turned the endpoint on here: the reason shows.
+            view.copy_cdp_endpoint(cx);
+            assert!(matches!(&view.browser_endpoint, Some(Err(e)) if !e.is_empty()));
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert_eq!(*changed.borrow(), [true]);
+}

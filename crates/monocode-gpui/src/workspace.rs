@@ -186,7 +186,11 @@ pub(crate) struct Workspace {
     pub terminal_panes: HashMap<i64, TerminalPane>,
     /// Browser pages (Chromium), by their negative pane IDs. Like terminal
     /// panes, each borrows its owner session's project scope.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "saved_browser_panes"
+    )]
     pub browser_panes: HashMap<i64, BrowserPane>,
     /// App views, Search and Monos as panes, by their negative pane IDs.
     /// They have no owner session. `TitleTab::ProjectApp` never goes here:
@@ -350,6 +354,22 @@ pub(crate) struct BrowserPane {
     /// Page zoom in percent; `None` is 100%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<u16>,
+    /// The agent session that opened it (context.md K21); not saved.
+    #[serde(skip)]
+    pub opened_by: Option<i64>,
+    /// The throwaway profile it browses with (K22), shared with the pages it
+    /// opens. Such a page is never saved: it goes with the app.
+    #[serde(skip)]
+    pub ephemeral: Option<String>,
+}
+
+/// `browser_panes` as saved: without the pages of throwaway profiles, whose
+/// panes then drop out of the layout at restore.
+fn saved_browser_panes<S: serde::Serializer>(
+    panes: &HashMap<i64, BrowserPane>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(panes.iter().filter(|(_, pane)| pane.ephemeral.is_none()))
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
