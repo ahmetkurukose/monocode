@@ -212,6 +212,9 @@ impl PageLog {
             }
             "Page.frameNavigated" => {
                 let frame = &p["frame"];
+                if frame.get("parentId").is_none() {
+                    self.settle_before(frame["loaderId"].as_str().unwrap_or(""));
+                }
                 if frame.get("parentId").is_none()
                     && p["type"].as_str() != Some("BackForwardCacheRestore")
                 {
@@ -286,6 +289,20 @@ impl PageLog {
         console.push_back(entry);
     }
 
+    /// The main frame moved to another document, whose request is
+    /// `loader`: what the old one still waited for will not end in its log,
+    /// so it is over (canceled, if it had no answer yet).
+    fn settle_before(&self, loader: &str) {
+        for entry in self.network.borrow_mut().iter_mut() {
+            if !entry.finished && entry.request_id != loader {
+                entry.finished = true;
+                if entry.status.is_none() && entry.failed.is_none() {
+                    entry.failed = Some("canceled".into());
+                }
+            }
+        }
+    }
+
     /// Changes the newest entry of `request_id`.
     fn update(&self, request_id: &str, change: impl FnOnce(&mut NetworkEntry)) {
         if let Some(entry) = self
@@ -340,6 +357,11 @@ impl PageLog {
             .borrow()
             .iter()
             .filter(|e| !e.finished && e.kind != "EventSource")
+            // An answered document streams into its frame. An iframe in
+            // another process finishes it in that frame's session, which
+            // the log does not hear, and a new page's renderer may not be
+            // listening yet when its first document ends.
+            .filter(|e| !(e.kind == "Document" && e.status.is_some()))
             .count()
     }
 
@@ -473,6 +495,59 @@ mod tests {
             sent(&format!("x{i}"), "https://example.com/x", "Image");
         }
         assert_eq!(log.network(1000, None).len(), NETWORK_ENTRIES);
+    }
+
+    #[test]
+    fn answered_documents_and_an_old_documents_requests_do_not_keep_the_page_busy() {
+        let (cdp, script) = Script::client();
+        let log = PageLog::start(&cdp);
+        let sent = |id: &str, kind: &str| {
+            script.emit(
+                "Network.requestWillBeSent",
+                json!({"requestId": id, "type": kind, "loaderId": "L1",
+                    "request": {"url": "http://localhost/", "method": "GET"}}),
+            );
+        };
+        let answered = |id: &str| {
+            script.emit(
+                "Network.responseReceived",
+                json!({"requestId": id, "response": {"status": 200}}),
+            );
+        };
+        // The page's document, and an iframe's from another origin: both
+        // answered, neither's end is heard on the page's session.
+        sent("L1", "Document");
+        answered("L1");
+        sent("X", "Document");
+        answered("X");
+        assert_eq!(log.in_flight(), 0);
+        sent("F", "Fetch");
+        sent("G", "Fetch");
+        answered("G");
+        assert_eq!(log.in_flight(), 2);
+        // A frame navigating is not the page moving on.
+        script.emit(
+            "Page.frameNavigated",
+            json!({"frame": {"id": "C", "parentId": "M", "loaderId": "L9", "url": "x"}}),
+        );
+        assert_eq!(log.in_flight(), 2);
+        // The main frame moves to the document of request L2.
+        sent("L2", "Document");
+        script.emit(
+            "Page.frameNavigated",
+            json!({"frame": {"id": "M", "loaderId": "L2", "url": "http://localhost/b"}}),
+        );
+        assert_eq!(log.in_flight(), 1);
+        answered("L2");
+        assert_eq!(log.in_flight(), 0);
+        let all = log.network(10, None);
+        let of = |id: &str| all.iter().find(|e| e.request_id == id).unwrap();
+        assert_eq!(of("F").failed.as_deref(), Some("canceled"));
+        assert_eq!(
+            (of("G").failed.as_deref(), of("G").status),
+            (None, Some(200))
+        );
+        assert!(!of("L2").finished);
     }
 
     #[test]
