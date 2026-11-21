@@ -50,7 +50,7 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K15 | Profil | **Varsayılan tek ortak profil**; isteyen proje ayarlardan **izole profil** açar (ayrı `CefRequestContext`, `Profiles/<proje>`). |
 | K16 | Overlay | Sayfayı örten menü/modal/bildirim varken native view gizlenir, yerine **son karenin görüntüsü** (CDP `Page.captureScreenshot`) GPUI'de çizilir. |
 | K17 | Kısayollar | Sayfa odaktayken uygulamanın ⌘/⌃ kısayolları kazanır; **düzenleme kısayolları (⌘C/V/X/A/Z, ⇧⌘Z) sayfada kalır**. ⌘F bizim sayfada bul, ⌘R sayfa yenile, ⌘L adres çubuğu, ⌘+/−/0 sayfa zoom'u. |
-| K18 | DevTools | Pane'e **yapışık** (ikinci child view), ayrı pencere değil. |
+| K18 | DevTools | **Revize (Faz 1):** ayrı pencere. Yapışık hâli denendi; CEF macOS'ta DevTools'u Alloy style açamıyor ("Alloy style is not supported for this browser") ve Chrome style bir host view'un içine konamıyor: `ShowDevTools` child view ile CHECK'te durup uygulamayı kapattı. Yapışık DevTools için yol: kendi Alloy sayfamızda DevTools frontend'ini CDP üzerinden yüklemek (Faz 2'deki CDP uç noktasıyla birlikte). |
 | K19 | Link yönlendirme | localhost ve proje portları Monocode browser'ında, diğerleri sistem tarayıcısında açılır; ayarla "her şey Monocode'da" seçilebilir; **⇧ ile tıklama diğer tarafı** açar. |
 | K20 | Restore | Önceki oturumun sekmeleri **görünür olunca** yüklenir (lazy). Discard sonraki faza. |
 
