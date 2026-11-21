@@ -473,8 +473,12 @@ impl BrowserPage {
     }
 
     /// The address field takes the keyboard while there is nothing to show;
-    /// otherwise the page does.
+    /// otherwise the page does. A field of the page that has it (the
+    /// address, find, a prompt) keeps it.
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if self.focus.contains_focused(window, cx) && !self.focus.is_focused(window) {
+            return;
+        }
         if self.url.is_empty() {
             window.focus(&self.address.focus_handle(cx), cx);
         } else {

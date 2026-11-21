@@ -490,5 +490,20 @@ mod tests {
         // From the address field, the page's shortcuts still apply.
         keys(cx, &format!("{m}-="));
         assert_eq!(state(cx).0, 110);
+
+        // A click in the field also reaches the pane around it, which must
+        // not hand the focus back to the page: typing went to Chromium.
+        window
+            .update(cx, |shell, window, cx| shell.focus_pane(pane, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx).3, (false, true, false));
+        window
+            .update(cx, |shell, window, cx| {
+                shell.focus_browser_pane(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx).3, (false, true, false));
     }
 }
