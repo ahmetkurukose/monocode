@@ -346,6 +346,12 @@ impl Hub {
         self.history.jump(from, to);
         cx.emit(HubEvent::History);
     }
+    /// Records where the caret of the focused editor is; see `History::visit`.
+    pub(crate) fn visit(&mut self, place: Location, cx: &mut Context<Self>) {
+        if self.history.visit(place) {
+            cx.emit(HubEvent::History);
+        }
+    }
     pub(crate) fn back(
         &mut self,
         current: Option<Location>,

@@ -381,16 +381,21 @@ fn a_feature_tab_joins_the_right_panel_where_it_was_left_and_goes_when_removed(
             assert_eq!(panel.read(cx).tab(), outline);
             assert_eq!(
                 panel.read(cx).tabs(),
-                [outline, RightTab::Files, RightTab::Graph]
+                [
+                    outline,
+                    RightTab::Files,
+                    RightTab::Graph,
+                    RightTab::Worktrees
+                ]
             );
-            assert_eq!(shell.right_tab_count(cx), 3);
+            assert_eq!(shell.right_tab_count(cx), 4);
             // A restart finds no such tab, so Explorer is what is saved.
             let saved: serde_json::Value =
                 serde_json::from_str(&shell.workspace.saved_json()).unwrap();
             assert_eq!(saved["right_panel_tab"], "files");
             assert_eq!(
                 saved["right_panel_tabs"],
-                serde_json::json!(["files", "graph"])
+                serde_json::json!(["files", "graph", "worktrees"])
             );
         })
         .unwrap();
@@ -404,7 +409,10 @@ fn a_feature_tab_joins_the_right_panel_where_it_was_left_and_goes_when_removed(
         .update(visual, |shell, _, cx| {
             let panel = shell.right_panel.clone().unwrap();
             assert_eq!(panel.read(cx).tab(), RightTab::Files);
-            assert_eq!(panel.read(cx).tabs(), [RightTab::Files, RightTab::Graph]);
+            assert_eq!(
+                panel.read(cx).tabs(),
+                [RightTab::Files, RightTab::Graph, RightTab::Worktrees]
+            );
         })
         .unwrap();
     assert!(visual.debug_bounds("fake-outline-view").is_none());
@@ -810,7 +818,7 @@ fn escape_closes_a_settings_page_with_a_field_focused(cx: &mut TestAppContext) {
                 title: "Run configurations",
                 icon: "play",
                 build: Rc::new(|_, window, cx| {
-                    let field = cx.new(|cx| crate::input::Input::new(cx));
+                    let field = cx.new(crate::input::Input::new);
                     window.focus(&field.focus_handle(cx), cx);
                     field.into()
                 }),

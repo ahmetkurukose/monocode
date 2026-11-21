@@ -1092,7 +1092,13 @@ impl Changes {
         let has_open_pr = self.pr.as_ref().is_some_and(|p| p.state == "open");
         let on_default = Self::on_default(Some(index));
         let diverged = ahead > 0 && behind > 0;
-        let files = index.files.len();
+        // Unversioned files never reach a pull request, so only tracked
+        // uncommitted changes keep Create PR off.
+        let tracked = index
+            .files
+            .iter()
+            .filter(|f| !crate::commit_form::is_untracked(f))
+            .count();
         let can_publish = index.upstream.is_none();
         let can_sync = index.upstream.is_some() && (ahead > 0 || behind > 0);
         let can_create_pr = index.branch.is_some()
@@ -1100,7 +1106,7 @@ impl Changes {
             && !has_open_pr
             && !on_default
             && !diverged
-            && files == 0
+            && tracked == 0
             && index.ahead_of_default > 0
             && behind == 0;
         let can_view_pr = has_open_pr && self.pr.as_ref().is_some_and(|p| !p.url.is_empty());
@@ -1205,8 +1211,9 @@ impl Changes {
             })
             .when(show_create, |d| {
                 let title = index
-                    .default_branch
+                    .pr_base
                     .as_ref()
+                    .or(index.default_branch.as_ref())
                     .map_or("Create pull request".to_owned(), |b| {
                         format!("Create a pull request into {b}")
                     });
@@ -1511,19 +1518,6 @@ pub(crate) fn checkouts_overlap(project: &str, cwd: &str) -> bool {
 impl Changes {
     /// The windows this panel opens. The shell draws them, so they appear
     /// from the menu bar even where the panel itself is not on screen.
-    /// Whether a dialog or picker of this panel is open over the window.
-    pub(crate) fn has_overlay(&self, cx: &App) -> bool {
-        self.form
-            .read(cx)
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.surface == Surface::Panel)
-            || self.commit_dialog.is_some()
-            || self.update_dialog.is_some()
-            || self.stash_dialog.is_some()
-            || self.branch_picker.is_some()
-    }
-
     pub(crate) fn overlays(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
         if let Some(confirm) = CommitForm::pending_overlay(&self.form, Surface::Panel, window, cx) {

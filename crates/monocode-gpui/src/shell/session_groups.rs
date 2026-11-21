@@ -770,6 +770,24 @@ impl Shell {
         self.invalidate_chrome(cx);
     }
 
+    /// Why a batch delete of `id` that cannot stop to ask (a worktree's
+    /// removal) would lose work: a file it opened has unsaved edits. Its
+    /// other panes go to an heir or close with it, as [`Self::delete_session`]
+    /// does.
+    pub(super) fn session_delete_blocker(&self, id: i64, cx: &App) -> Option<&'static str> {
+        self.workspace
+            .review_owners
+            .iter()
+            .any(|(pane, owner)| {
+                *owner == id
+                    && self
+                        .reviews
+                        .get(pane)
+                        .is_some_and(|r| r.read(cx).unsaved_files(cx))
+            })
+            .then_some("Save or close this session's edited files before deleting it")
+    }
+
     pub(super) fn delete_session(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         if !self.session_summaries.contains_key(&id) || self.deleting.contains(&id) {
             return;

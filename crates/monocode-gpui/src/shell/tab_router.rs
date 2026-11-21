@@ -516,7 +516,7 @@ impl Shell {
                     if !known(self, owner) {
                         continue;
                     }
-                    let pane = self.create_browser_pane(owner, url, cx);
+                    let pane = self.create_browser_pane(owner, url);
                     self.place_or_open(pane, how, cx);
                     self.fit_sidebar(cx);
                     self.open_browser_pane(pane, window, cx);
@@ -526,27 +526,19 @@ impl Shell {
         }
     }
 
-    /// A new browser page, not yet in any tab.
-    pub(super) fn create_browser_pane(
-        &mut self,
-        owner: i64,
-        url: String,
-        cx: &mut Context<Self>,
-    ) -> i64 {
+    /// A new browser page, not yet in any tab. Its page starts the first
+    /// time its pane draws (`browser_page`); an empty `url` focuses the
+    /// address field.
+    pub(super) fn create_browser_pane(&mut self, owner: i64, url: String) -> i64 {
         let pane = self.workspace.next_pane_id();
         self.workspace.browser_panes.insert(
             pane,
             BrowserPane {
                 owner,
-                url: url.clone(),
+                url,
                 ..Default::default()
             },
         );
-        // A page opened now loads now; only restored ones start asleep.
-        let view =
-            cx.new(|cx| crate::browser::BrowserView::new(url, String::new(), None, false, cx));
-        self.watch_browser_pane(pane, &view, cx);
-        self.browser_views.insert(pane, view);
         pane
     }
 

@@ -70,8 +70,6 @@ pub(super) enum ProjectRailRow {
 pub(super) enum RailTerminal {
     Dock(usize),
     Pane(i64),
-    /// A browser page of the project, listed with its terminals.
-    Browser(i64),
 }
 pub(super) struct ProjectRailList {
     state: ListState,
@@ -1721,8 +1719,14 @@ impl Shell {
                     })
                     .child(bounds.probe())
                     .tooltip(move |_, cx| cx.new(|_| ProjectTooltip(tooltip.clone())).into())
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         if std::mem::take(&mut this.project_rail_list.skip_click) {
+                            return;
+                        }
+                        // The first click already selected the project; the
+                        // second opens a new chat in a new tab there.
+                        if e.click_count() == 2 {
+                            this.new_chat_from_rail(&path, window, cx);
                             return;
                         }
                         this.select_project(path.clone(), window, cx);
@@ -1758,6 +1762,27 @@ impl Shell {
         } else {
             row
         }
+    }
+    /// A double click on a project row: a new chat tab in that project's
+    /// scope, placed by the router in its focused group (an open view or
+    /// Mono stays a tab beside it).
+    fn new_chat_from_rail(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.project != path {
+            self.select_project(path.to_owned(), window, cx);
+        }
+        if self.workspace.project != path {
+            return;
+        }
+        // Selecting may already be placing a blank chat there; don't add a second.
+        let prefix = format!("{path}\0");
+        if self
+            .pending_project_blanks
+            .iter()
+            .any(|key| key.starts_with(&prefix))
+        {
+            return;
+        }
+        self.new_chat(cx);
     }
     pub(super) fn reveal_active_project_rail(&self) {
         if let Some(ix) = self.project_rail_list.rows.iter().position(

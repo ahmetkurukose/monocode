@@ -602,7 +602,7 @@ impl Shell {
     }
 
     /// Types into the open palette's search box.
-    #[cfg(any(test, feature = "selftest"))]
+    #[cfg(test)]
     pub(super) fn set_palette_query(&mut self, text: String, cx: &mut Context<Self>) {
         if let Some(open) = &self.palette {
             let search = open.picker.read(cx).search.clone();

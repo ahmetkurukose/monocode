@@ -375,8 +375,10 @@ mod tests {
 
     #[test]
     fn sql_inserts_quote_text_keep_numbers_and_name_columns_safely() {
-        let mut options = ExportOptions::default();
-        options.table = "public.orders".into();
+        let options = ExportOptions {
+            table: "public.orders".into(),
+            ..Default::default()
+        };
         let text = format_rows(
             ExportFormat::SqlInserts,
             &["id".into(), "Note".into()],
@@ -412,8 +414,10 @@ mod tests {
 
     #[test]
     fn the_header_can_be_left_out() {
-        let mut options = ExportOptions::default();
-        options.header = false;
+        let options = ExportOptions {
+            header: false,
+            ..Default::default()
+        };
         assert_eq!(
             format_rows(ExportFormat::Csv, &columns(), &rows()[1..], &options),
             "2,\n"
@@ -432,8 +436,10 @@ mod tests {
 
     #[test]
     fn transposing_writes_a_line_per_column() {
-        let mut options = ExportOptions::default();
-        options.transpose = true;
+        let options = ExportOptions {
+            transpose: true,
+            ..Default::default()
+        };
         assert_eq!(
             format_rows(
                 ExportFormat::Csv,

@@ -195,17 +195,6 @@ impl Shell {
         self.open_file_at(cwd, path, at, window, cx);
     }
 
-    pub(crate) fn code_open_url(
-        &mut self,
-        url: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let panes = self.workspace.browser_panes.len();
-        self.new_browser_pane(Some(url), window, cx);
-        self.workspace.browser_panes.len() > panes
-    }
-
     /// The running work dialog, where the features' processes are listed.
     pub(crate) fn open_running_work(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.resources

@@ -74,6 +74,15 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("escape", DismissSearch, Some("FileEditor")),
         KeyBinding::new("ctrl--", NavigateBack, Some("FileEditor")),
         KeyBinding::new("ctrl-shift--", NavigateForward, Some("FileEditor")),
+        // As in JetBrains IDEs: back and forward over the places the caret
+        // has been. Inside an editor these win over the workspace's pane
+        // focus moves, which keep the keys everywhere else.
+        KeyBinding::new(&format!("{m}-alt-left"), NavigateBack, Some("FileEditor")),
+        KeyBinding::new(
+            &format!("{m}-alt-right"),
+            NavigateForward,
+            Some("FileEditor"),
+        ),
     ]);
 }
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
@@ -190,6 +199,10 @@ pub(crate) struct FileEditor {
     markdown: Option<Entity<TranscriptView>>,
     markdown_source: SharedString,
     navigation: Option<(usize, usize)>,
+    /// The caret offset last reported to the navigation history, while the
+    /// editor has focus. Losing focus forgets it, so coming back reports the
+    /// place again and a return from another file is a step of its own.
+    reported_caret: Option<usize>,
     /// This pane's part in the editor's extension points (`code_editor`).
     extensions: extensions::Extensions,
     _subscriptions: Vec<Subscription>,
@@ -339,6 +352,7 @@ impl FileEditor {
             markdown: None,
             markdown_source: "".into(),
             navigation: None,
+            reported_caret: None,
             _subscriptions: subscriptions,
             _poll: poll,
         }
@@ -346,6 +360,27 @@ impl FileEditor {
     pub(crate) fn navigate(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
         self.navigation = Some((line, column));
         self.apply_navigation(cx);
+    }
+    /// Tells the navigation history where the caret is, so Back and Forward
+    /// (⌘⌥← and ⌘⌥→) return to the places the user has been.
+    fn report_caret(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let focused = self.document.is_some()
+            && !self.preview
+            && self.input.focus_handle(cx).is_focused(window);
+        if !focused {
+            self.reported_caret = None;
+            return;
+        }
+        let input = self.input.read(cx);
+        let caret = input.caret();
+        if self.reported_caret == Some(caret) || input.selection_dragging() {
+            return;
+        }
+        self.reported_caret = Some(caret);
+        let place =
+            crate::code_editor::Location::of(&self.extensions.doc.path, &input.content, caret);
+        let hub = crate::code_editor::hub(cx);
+        cx.defer(move |cx| hub.update(cx, |hub, cx| hub.visit(place, cx)));
     }
     fn apply_navigation(&mut self, cx: &mut Context<Self>) {
         if self.document.is_none() {
@@ -1047,6 +1082,7 @@ impl gpui::Render for FileEditor {
         if ready && !self.preview && self.focus.is_focused(window) {
             window.focus(&self.input.focus_handle(cx), cx);
         }
+        self.report_caret(window, cx);
         let preview_image: Option<ImageSource> = match &self.image {
             Some(image) => Some(image.clone().into()),
             None if self.preview && self.svg_failed => {

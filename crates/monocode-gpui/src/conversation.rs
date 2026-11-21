@@ -126,6 +126,11 @@ struct OpenMenu {
 }
 use response_menu::ResponseMenu;
 pub(crate) struct SessionChanged;
+/// The pill's Merge to <base> (and delete the worktree after): the shell does it.
+pub(crate) struct MergeWorktree {
+    pub(crate) path: String,
+    pub(crate) delete: bool,
+}
 pub(crate) struct ChooseFolder(pub(crate) AnchorSlot);
 /// The review card asked to open the session's recorded changes.
 pub(crate) struct OpenSessionChanges(pub(crate) crate::review::ReviewTab);
@@ -231,6 +236,9 @@ pub(crate) struct Conversation {
     session_git: monocode_core::git::SessionChanges,
     /// The session's latest action commit is on no remote yet: the pill offers Push.
     session_unpushed: bool,
+    /// Where this session's worktree branch stands against the branch it came from,
+    /// for the pill's Merge actions; `None` outside a worktree.
+    worktree_merge: Option<monocode_core::worktree::merge::Status>,
     session_edits_generation: u64,
     branch_anchor: AnchorSlot,
     context_anchor: AnchorSlot,
@@ -246,6 +254,9 @@ pub(crate) struct Conversation {
     cancel: Arc<AtomicBool>,
     title_cancel: Option<Arc<AtomicBool>>,
     worktree_name_cancel: Option<Arc<AtomicBool>>,
+    /// This session's worktree was named by the model before it was made (folder and
+    /// branch alike), so the first turn does not rename its branch again.
+    worktree_named: bool,
     _submission: Subscription,
     _alternate_submission: Subscription,
     response_events: Option<Subscription>,
@@ -687,6 +698,7 @@ impl Conversation {
             session_edits: Vec::new(),
             session_git: Default::default(),
             session_unpushed: false,
+            worktree_merge: None,
             session_edits_generation: 0,
             branch_anchor: AnchorSlot::default(),
             context_anchor: AnchorSlot::default(),
@@ -700,6 +712,7 @@ impl Conversation {
             cancel: Arc::new(AtomicBool::new(false)),
             title_cancel: None,
             worktree_name_cancel: None,
+            worktree_named: false,
             _submission: submission,
             _alternate_submission: alternate_submission,
             response_events: None,
@@ -1582,7 +1595,10 @@ impl Conversation {
     }
 }
 
+/// How long a new worktree waits for its generated name before using the prompt's words.
+const WORKTREE_NAMING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 impl EventEmitter<SessionChanged> for Conversation {}
+impl EventEmitter<MergeWorktree> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
@@ -1764,8 +1780,15 @@ impl Conversation {
         self.summary = summary;
         self.settings = settings;
         self.context = None;
-        self.status = "Worktree deleted".into();
+        self.worktree_merge = None;
+        // Moved to the checkout of the branch the worktree came from, it carries on there.
+        self.status = if self.settings.worktree_removed {
+            "Worktree deleted".into()
+        } else {
+            "Worktree deleted; this chat continues on the branch it came from".into()
+        };
         self.refresh_git(cx);
+        self.refresh_git_actions(cx);
         cx.emit(SessionChanged);
         cx.notify();
     }
@@ -1858,22 +1881,41 @@ impl Conversation {
             .unwrap_or_else(|| self.input.read(cx).content.to_string());
         let id = self.summary.id;
         let store = self.store.clone();
+        // Named before it is made, so the folder carries the same name as the branch;
+        // a slow or unavailable model falls back to the prompt's first words.
+        let text = (!self.is_remote() && !prompt.trim().is_empty())
+            .then(|| self.background_text_model(cx));
         let work = cx.background_executor().spawn(async move {
-            monocode_core::worktree_callers::for_session(
+            let name = text.and_then(|text| {
+                if cfg!(test) {
+                    return None;
+                }
+                monocode_core::git::naming::generate_within(
+                    text,
+                    Path::new(&cwd),
+                    &prompt,
+                    WORKTREE_NAMING_TIMEOUT,
+                )
+                .and_then(|generated| monocode_core::git::naming::generated_slug(&generated))
+            });
+            let made = monocode_core::worktree_callers::for_session_named(
                 Path::new(&cwd),
                 base.as_deref(),
                 &prompt,
+                name.as_deref(),
                 id,
                 origin,
                 &store,
-            )
+            )?;
+            Ok::<_, String>((made, name.is_some()))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.preparing_worktree = false;
                 match result {
-                    Ok(made) => {
+                    Ok((made, named)) => {
+                        this.worktree_named = named;
                         this.settings.worktree_cwd = Some(made.path.to_string_lossy().into_owned());
                         this.settings.new_worktree = false;
                         this.set_worktree_warnings(&made.warnings);
@@ -3322,7 +3364,10 @@ impl Conversation {
                                     this.context_hovered = *hovered;
                                     cx.notify();
                                 }))
-                                .child(crate::context_meter::ring(ratio.unwrap_or(0.)))
+                                .child(crate::context_meter::bar(
+                                    "context-skull",
+                                    ratio.unwrap_or(0.),
+                                ))
                                 .when(self.context_hovered, |d| {
                                     d.child(
                                         popover(
@@ -3348,7 +3393,23 @@ impl Conversation {
                                                             .text_color(content(0.5))
                                                             .child(detail),
                                                     )
-                                                }),
+                                                })
+                                                .when_some(
+                                                    ratio.and_then(crate::context_meter::advice),
+                                                    |d, advice| {
+                                                        d.child(
+                                                            div()
+                                                                .pt(px(4.))
+                                                                .text_size(px(11.))
+                                                                .text_color(
+                                                                    crate::context_meter::tint(
+                                                                        ratio.unwrap_or(0.),
+                                                                    ),
+                                                                )
+                                                                .child(advice),
+                                                        )
+                                                    },
+                                                ),
                                         ),
                                     )
                                 }),

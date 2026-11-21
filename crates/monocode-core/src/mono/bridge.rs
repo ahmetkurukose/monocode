@@ -27,6 +27,7 @@ sessions.draft {sessionId,prompt,project?}
 sessions.stop / sessions.archive / sessions.delete {sessionId,project?}
 worktrees.list {project?}
 worktrees.create {branch,base?,existing?,project?}
+worktrees.merge {path?,branch?,delete?,force?,project?}; worktrees.delete {path?,branch?,force?,deleteSessions?,project?}
 folders.list {project?}
 folders.move {sessionId,folderId?,newFolderName?,project?}
 notes.list {limit?,offset?}; notes.read {id}; notes.write {id?,title?,body?,tags?}
@@ -38,6 +39,7 @@ api.list {}; api.read {request,collection?}; api.run {request,collection?,enviro
 chat.card {type:"pr",repo?,number,note?} / {type:"session",sessionId,note?} / {type:"choices",options:[text]} / {type:"habit",name,instructions,schedule}
 API requests live in the project's Postman collections (.monocode/api). request is a name, a Folder/Name path or an index path from api.list; api.run applies variables, auth and the collection's scripts, saves variables its scripts set, and returns the response (body clipped), test results and console output. A lone environment is used when none is named.
 Ordinary Operator sessions are visible in project history. Mono launches follow its Show started sessions preference. reveal defaults to false and controls navigation, not history visibility. placement right/down explicitly opens a split beside besideSessionId (or the caller).
+worktrees.merge merges a worktree's branch into the branch it was started from (only commits; uncommitted changes refuse it; a conflict changes nothing). delete:true then deletes the worktree; its chats move to that branch. Name the worktree by path or branch; an Operator thread without either means its own worktree, whose delete waits until the current turn ends. force:true discards uncommitted or ignored local files on delete. These do what the user's Merge and Delete buttons do, so the app updates the same way.
 sessions.read returns up to three prose exchanges and nextBefore for older turns; pass that turn ID as before.
 notes.write requires body for a new note; existing notes accept title, body or tags independently.
 Artifacts, memory, soul, habits, cards and notifyOnComplete:true require a Mono.

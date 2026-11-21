@@ -184,7 +184,9 @@ pub(crate) struct Workspace {
     /// by their negative pane IDs. Like file panes, each borrows its owner
     /// session's project and worktree scope.
     pub terminal_panes: HashMap<i64, TerminalPane>,
-    /// Browser pages, by their negative pane IDs, like terminal panes.
+    /// Browser pages (Chromium), by their negative pane IDs. Like terminal
+    /// panes, each borrows its owner session's project scope.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub browser_panes: HashMap<i64, BrowserPane>,
     /// App views, Search and Monos as panes, by their negative pane IDs.
     /// They have no owner session. `TitleTab::ProjectApp` never goes here:
@@ -218,8 +220,9 @@ pub(crate) struct Workspace {
     pub project_rail_pinned: HashSet<String>,
     /// Projects opened in the rail's tree view.
     pub project_rail_expanded: HashSet<String>,
-    /// Worktrees opened under their project in the rail's tree view.
-    pub project_rail_worktrees_expanded: HashSet<String>,
+    /// Worktrees closed under their project in the rail's tree view; any other is open,
+    /// so a new worktree shows its chats straight away.
+    pub project_rail_worktrees_collapsed: HashSet<String>,
     /// Projects put to sleep, with when (ms). A sleeping project keeps its
     /// chats, tabs and terminal list but runs no shells, warm agents or pages
     /// until it is opened again.
@@ -235,10 +238,6 @@ pub(crate) struct Workspace {
     pub preferences: crate::settings::Preferences,
     pub session_filters: monocode_core::session_filters::Filters,
     pub project_appearance: HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
-    /// Remembered starting web address per project (`project_path -> url`),
-    /// chosen in Project settings or via a browser pane's page menu.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub project_browser_urls: HashMap<String, String>,
     /// What each project's terminals start with (`project_path -> setup`):
     /// variables, an environment file, a virtual environment, commands.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -252,6 +251,11 @@ pub(crate) struct Workspace {
     /// the project's settings (`code_shell::settings`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_code_settings: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Projects whose browser pages keep their own cookies and storage
+    /// instead of the profile all others share
+    /// (docs/native/browser/context.md K15).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub browser_isolated_projects: std::collections::BTreeSet<String>,
     /// The right panel's whole tab strip by tab key, feature tabs included,
     /// so one that comes back takes the place it was dragged to.
     /// `right_panel_tabs` keeps the built-in tabs alone.
@@ -335,28 +339,34 @@ pub(crate) struct TerminalPane {
     pub owner: i64,
     pub cwd: String,
 }
-
-/// A browser page in a pane (docs/native/browser.md). Only where it is and
-/// what it is called are saved; the page itself loads again when shown.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A browser page in the pane tree (docs/native/browser/context.md §4.5).
+/// Its address, title and zoom are saved; the page loads again when shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct BrowserPane {
-    /// The session whose project and worktree scope the page borrows.
     pub owner: i64,
     pub url: String,
     pub title: String,
-    /// `None` for the default (Safari's).
-    pub user_agent: Option<String>,
-    /// A fixed size the page is held at; `None` fits the pane.
-    pub viewport: Option<(u32, u32)>,
-    /// The user asked for this page to stay loaded while off screen.
-    pub keep_awake: bool,
-    /// Page zoom percentage (`None` means `100%`).
+    /// Page zoom in percent; `None` is 100%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zoom_percent: Option<u16>,
-    /// Reload the page automatically when files in its project change.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reload_on_save: bool,
+    pub zoom: Option<u16>,
+    #[serde(default, skip_serializing_if = "DevToolsDock::is_default")]
+    pub devtools: DevToolsDock,
+}
+
+/// A page's DevTools docked under it (context.md K18): whether it was open,
+/// and its height in points (0 until the divider is first moved).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DevToolsDock {
+    pub open: bool,
+    pub height: u32,
+}
+
+impl DevToolsDock {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -542,7 +552,7 @@ impl Default for Workspace {
             project_rail_width: 220.,
             project_rail_pinned: HashSet::new(),
             project_rail_expanded: HashSet::new(),
-            project_rail_worktrees_expanded: HashSet::new(),
+            project_rail_worktrees_collapsed: HashSet::new(),
             slept_projects: HashMap::new(),
             project_rail_groups: Vec::new(),
             project_rail_assignments: HashMap::new(),
@@ -553,10 +563,10 @@ impl Default for Workspace {
             preferences: crate::settings::Preferences::default(),
             session_filters: Default::default(),
             project_appearance: Default::default(),
-            project_browser_urls: Default::default(),
             project_terminal_setups: Default::default(),
             project_runs: Default::default(),
             project_code_settings: Default::default(),
+            browser_isolated_projects: Default::default(),
             right_panel_strip: Vec::new(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
@@ -886,14 +896,6 @@ impl Workspace {
         state
             .slept_projects
             .retain(|project, _| projects.contains(project) && !project.starts_with("remote://"));
-        state.project_browser_urls.retain(|project, url| {
-            let trimmed = url.trim();
-            if project.trim().is_empty() || trimmed.is_empty() {
-                return false;
-            }
-            *url = monocode_core::browser::address(trimmed);
-            true
-        });
         state.project_terminal_setups.retain(|project, setup| {
             *setup = std::mem::take(setup).normalized();
             !project.trim().is_empty() && !setup.is_empty()
@@ -1121,7 +1123,7 @@ impl Workspace {
             .or_else(|| self.browser_panes.get(&id).map(|b| b.owner))
             .unwrap_or(id)
     }
-    /// A file or terminal pane standing in for its owner session.
+    /// A file, terminal or browser pane standing in for its owner session.
     pub fn is_detached_pane(&self, id: i64) -> bool {
         self.review_owners.contains_key(&id)
             || self.terminal_panes.contains_key(&id)
@@ -1183,6 +1185,25 @@ impl Workspace {
             }
         }
         self.active = Some(id);
+    }
+    /// Stacks `tab` in `after`'s group right after it, as a page opened
+    /// from another sits beside its opener (docs/native/tab-groups.md). It
+    /// stays on screen when it was.
+    pub fn place_tab_after(&mut self, tab: i64, after: i64) {
+        if tab == after || self.tab_of(after).is_none() {
+            return;
+        }
+        let group = self.group_tabs(after);
+        let Some(at) = group.iter().position(|t| *t == after) else {
+            return;
+        };
+        let before = group
+            .iter()
+            .position(|t| *t == tab)
+            .is_some_and(|ix| ix < at);
+        let to = if before { at } else { at + 1 };
+        let show = self.active == Some(tab);
+        self.add_to_group(tab, after, Some(to), show);
     }
     /// Close the whole title tab holding `id`; its sessions keep running.
     pub fn close(&mut self, id: i64) {
@@ -1437,7 +1458,8 @@ impl Workspace {
             self.focused.insert(tab, pane);
         }
     }
-    /// Browser panes no tab holds any more, forgotten with their pages.
+    /// Browser panes no tab holds any more, forgotten. Their pages close
+    /// with them, so the caller drops their views.
     pub fn prune_browser_panes(&mut self) -> Vec<i64> {
         let open: HashSet<_> = self.open_sessions().into_iter().collect();
         let gone: Vec<_> = (self.browser_panes.keys().copied())
@@ -2725,6 +2747,41 @@ mod tests {
     }
 
     #[test]
+    fn a_projects_isolated_browser_profile_round_trips() {
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        state.browser_isolated_projects.insert("/p".into());
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        assert!(restored.browser_isolated_projects.contains("/p"));
+        // Nothing is written while every project shares the default profile.
+        let plain = serde_json::to_string(&Workspace::default()).unwrap();
+        assert!(!plain.contains("browser_isolated_projects"));
+    }
+
+    #[test]
+    fn a_page_opened_from_another_sits_right_after_its_tab() {
+        let mut state = Workspace::default();
+        state.open(1);
+        for id in [2, 3] {
+            assert!(state.add_to_group(id, 1, None, false));
+        }
+        state.show(1);
+        // Opened as a tab of its own, it joins its opener's group beside it.
+        state.open(-1);
+        state.place_tab_after(-1, 1);
+        assert_eq!(state.group_tabs(1), [1, -1, 3, 2]);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.active, Some(-1));
+        // Already in the group, it is only reordered; an unknown opener
+        // moves nothing.
+        state.place_tab_after(-1, 3);
+        assert_eq!(state.group_tabs(1), [1, 3, -1, 2]);
+        state.place_tab_after(-1, 99);
+        assert_eq!(state.group_tabs(1), [1, 3, -1, 2]);
+    }
+
+    #[test]
     fn a_projects_terminal_setup_round_trips_and_an_empty_one_is_dropped() {
         use monocode_core::terminal_setup::{TerminalSetup, Venv};
         let mut state = Workspace::default();
@@ -2783,26 +2840,18 @@ mod tests {
     }
 
     #[test]
-    fn browser_zoom_reload_and_project_start_url_round_trip() {
+    fn a_page_saved_by_the_webkit_browser_reopens_in_chromium() {
+        // Workspaces saved while Monocode had its WebKit browser keep pages in
+        // `browser_panes`, with settings Chromium pages do not have, and start
+        // pages in `project_browser_urls`. The page keeps its place, address
+        // and title; the rest is dropped.
         let mut state = Workspace::default();
         state.add_project("/p");
-        state
-            .project_browser_urls
-            .insert("/p".into(), "localhost:5173".into());
-        state
-            .project_browser_urls
-            .insert("/empty".into(), "   ".into());
-        state.browser_panes.insert(
-            -4,
-            BrowserPane {
+        state.terminal_panes.insert(
+            -5,
+            TerminalPane {
                 owner: 1,
-                url: "http://localhost:5173".into(),
-                title: "Vite".into(),
-                user_agent: None,
-                viewport: None,
-                keep_awake: false,
-                zoom_percent: Some(125),
-                reload_on_save: true,
+                cwd: "/p".into(),
             },
         );
         state.tabs = vec![1];
@@ -2810,20 +2859,53 @@ mod tests {
             1,
             PaneNode::Split {
                 dir: SplitDir::Right,
-                children: vec![PaneNode::Leaf { id: 1 }, PaneNode::Leaf { id: -4 }],
-                sizes: vec![0.5, 0.5],
+                children: vec![
+                    PaneNode::Leaf { id: 1 },
+                    PaneNode::Leaf { id: -4 },
+                    PaneNode::Leaf { id: -5 },
+                ],
+                sizes: vec![0.4, 0.3, 0.3],
             },
         );
         state.focused.insert(1, -4);
-        let saved = serde_json::to_string(&state).unwrap();
-        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        state.active = Some(-4);
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["browser_panes"] = serde_json::json!({
+            "-4": {
+                "owner": 1,
+                "url": "http://localhost:5173",
+                "title": "Vite",
+                "user_agent": null,
+                "viewport": [390, 844],
+                "keep_awake": true,
+                "zoom_percent": 125,
+                "reload_on_save": true
+            }
+        });
+        saved["project_browser_urls"] = serde_json::json!({ "/p": "localhost:5173" });
+        let restored = Workspace::restore(Some(&saved.to_string()), &[(1, "/p".into())], "/p");
+        assert_eq!(restored.tabs, vec![1]);
+        assert_eq!(restored.layout(1).leaf_ids(), vec![1, -4, -5]);
+        assert!(restored.terminal_panes.contains_key(&-5));
         assert_eq!(
-            restored.project_browser_urls.get("/p").map(String::as_str),
-            Some("http://localhost:5173")
+            restored.browser_panes[&-4],
+            BrowserPane {
+                owner: 1,
+                url: "http://localhost:5173".into(),
+                title: "Vite".into(),
+                ..Default::default()
+            }
         );
-        assert!(!restored.project_browser_urls.contains_key("/empty"));
-        let pane = &restored.browser_panes[&-4];
-        assert_eq!(pane.zoom_percent, Some(125));
-        assert!(pane.reload_on_save);
+        assert_eq!(restored.focused.get(&1), Some(&-4));
+        assert!(restored.projects.contains(&"/p".to_string()));
+        let again = serde_json::to_string(&restored).unwrap();
+        for gone in [
+            "project_browser_urls",
+            "keep_awake",
+            "zoom_percent",
+            "user_agent",
+        ] {
+            assert!(!again.contains(gone), "{gone}: {again}");
+        }
     }
 }

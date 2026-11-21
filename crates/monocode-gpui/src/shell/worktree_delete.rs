@@ -59,21 +59,54 @@ fn inspect(cwd: &Path, path: &Path, store: &Database) -> Result<DeleteInfo, Stri
     })
 }
 
-/// Tests make the sessions' detach fail after a successful removal.
+// Tests make the sessions' detach fail after a successful removal.
+// Per thread: the test dispatcher runs background work on the test's own thread, and
+// other tests running in parallel must not see it.
 #[cfg(test)]
-static FAIL_DETACH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_DETACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Move the sessions using `path` (removed) to the main checkout, marked removed.
+/// Move the sessions using `path` (removed) to `to`, the checkout of the branch the
+/// worktree came from; without one, to the main checkout marked removed.
 fn detach_sessions(
     store: &Database,
     path: &str,
     main: &Path,
+    to: Option<&str>,
 ) -> Result<Vec<(Session, monocode_core::agent::Settings)>, String> {
     #[cfg(test)]
-    if FAIL_DETACH.load(std::sync::atomic::Ordering::Relaxed) {
+    if FAIL_DETACH.get() {
         return Err("database is locked".into());
     }
-    locked(store)?.detach_worktree(path, &main.to_string_lossy())
+    locked(store)?.detach_worktree(path, &main.to_string_lossy(), to)
+}
+
+/// What a finished removal tells whoever asked for it (a merge, an agent's call).
+#[derive(Clone, Debug)]
+pub(crate) struct RemovalReport {
+    pub removed: Removed,
+    /// The checkout its sessions now use.
+    pub moved_to: String,
+    /// Sessions moved there (deleted ones not counted).
+    pub moved: usize,
+}
+
+pub(crate) type RemovalDone =
+    Box<dyn FnOnce(&mut Shell, Result<RemovalReport, String>, &mut Window, &mut Context<Shell>)>;
+
+/// One removal: [`Shell::remove_worktree_with`].
+pub(crate) struct RemoveRequest {
+    /// The project (any checkout of the repository).
+    pub cwd: String,
+    pub path: String,
+    pub delete_sessions: bool,
+    pub opts: RemoveOptions,
+    /// The worktree's branch was just merged into this branch: delete it even when
+    /// `git branch -d` judges it unmerged against another checkout's HEAD.
+    pub merged_into: Option<String>,
+    /// Told the outcome; errors then go to it alone, not to the window.
+    pub done: Option<RemovalDone>,
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -228,9 +261,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// Remove a worktree and, when asked, the sessions using it; sessions kept are
-    /// marked `worktree_removed`. Refuses while a terminal is open there or one of its
-    /// sessions is busy. Reports to [`Self::finish_worktree_removal`].
+    /// Remove a worktree and, when asked, the sessions using it; see
+    /// [`Self::remove_worktree_with`].
     pub(super) fn remove_worktree(
         &mut self,
         cwd: String,
@@ -240,9 +272,41 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remove_worktree_with(
+            RemoveRequest {
+                cwd,
+                path,
+                delete_sessions,
+                opts,
+                merged_into: None,
+                done: None,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Remove a worktree and, when asked, the sessions using it. Sessions kept move to
+    /// the checkout of the branch the worktree came from (or, without one, to the main
+    /// checkout marked `worktree_removed`). Refuses while a terminal is open there or
+    /// one of its sessions is busy. Reports to [`Self::finish_worktree_removal`].
+    pub(crate) fn remove_worktree_with(
+        &mut self,
+        request: RemoveRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let RemoveRequest {
+            cwd,
+            path,
+            delete_sessions,
+            opts,
+            merged_into,
+            done,
+        } = request;
         let ids = self.sessions_in_worktree(&path, cx);
         if let Some(error) = self.worktree_in_use(&path, &ids, cx) {
-            self.finish_worktree_removal(&path, Err(error), cx);
+            self.finish_worktree_removal(&path, Err(error), done, window, cx);
             return;
         }
         let (check_cwd, check_path) = (cwd.clone(), path.clone());
@@ -258,34 +322,37 @@ impl Shell {
             Ok(())
         });
         cx.spawn_in(window, async move |this, cx| {
+            let mut done = done;
             if let Err(error) = check.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.finish_worktree_removal(&path, Err(error), cx)
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.finish_worktree_removal(&path, Err(error), done.take(), window, cx)
                 });
                 return;
             }
-            // Recheck after the worker, then delete the conversations first.
-            let pending = this.update_in(cx, |this, window, cx| {
+            // Recheck after the worker. Sessions are deleted only after Git removed the
+            // worktree, so a failed removal never costs them; check now that they can be.
+            let pending = this.update(cx, |this, cx| {
                 if let Some(error) = this.worktree_in_use(&path, &ids, cx) {
                     return Err(format!("This worktree is now in use. {error}"));
+                }
+                if delete_sessions
+                    && let Some(blocker) =
+                        ids.iter().find_map(|id| this.session_delete_blocker(*id, cx))
+                {
+                    return Err(format!("{blocker}, or keep its sessions."));
                 }
                 // From here until it finishes, nothing new may start there.
                 this.removing_worktrees.insert(
                     path.clone(),
                     worktree::remove::mark_removing(Path::new(&path)),
                 );
-                if delete_sessions {
-                    for id in &ids {
-                        this.delete_session(*id, window, cx);
-                    }
-                }
                 Ok((this.group_writes.take(), this.store.clone()))
             });
             let (writes, store) = match pending {
                 Ok(Ok(pending)) => pending,
                 Ok(Err(error)) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.finish_worktree_removal(&path, Err(error), cx)
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.finish_worktree_removal(&path, Err(error), done.take(), window, cx)
                     });
                     return;
                 }
@@ -296,34 +363,29 @@ impl Shell {
             }
             let (worker_cwd, worker_path) = (cwd.clone(), path.clone());
             let work = cx.background_executor().spawn(async move {
-                if delete_sessions {
-                    let db = locked(&store)?;
-                    let paths = db.session_worktrees()?;
-                    if db.sessions()?.iter().any(|s| {
-                        is_equal_or_inside(
-                            paths
-                                .get(&s.id)
-                                .and_then(|p| p.as_deref())
-                                .unwrap_or(&s.cwd),
-                            &worker_path,
-                        )
-                    }) {
-                        return Err(
-                            "Some sessions could not be deleted, so the worktree was kept.".into(),
-                        );
-                    }
-                }
                 let main = worktree::layout::main_checkout(Path::new(&worker_cwd))?;
-                let removed = worktree::remove::remove(
+                // Read before removal: deleting the branch also drops `branch.<b>.base`.
+                let base = worktree::merge::base_of(&main, Path::new(&worker_path));
+                let mut removed = worktree::remove::remove(
                     Path::new(&worker_cwd),
                     Path::new(&worker_path),
                     &opts,
                     &store,
                 )?;
-                let mut removed = removed;
+                if let (Some(base), Some(branch)) = (&merged_into, removed.preserved_branch.clone())
+                    && worktree::merge::delete_merged_branch(&main, &branch, base)
+                {
+                    removed.preserved_branch = None;
+                    removed.branch_deleted = true;
+                }
+                let to = base
+                    .and_then(|base| worktree::merge::checkout_of(&main, &base))
+                    .map(|p| p.to_string_lossy().into_owned());
                 // The worktree is gone either way; failing to move its sessions off it
-                // is reported, not a failed removal.
-                let detached = match detach_sessions(&store, &worker_path, &main) {
+                // is reported, not a failed removal. Sessions about to be deleted are
+                // moved too, so one whose deletion fails still points at a real folder.
+                let detached = match detach_sessions(&store, &worker_path, &main, to.as_deref())
+                {
                     Ok(detached) => detached,
                     Err(error) => {
                         removed.warnings.push(format!(
@@ -332,11 +394,17 @@ impl Shell {
                         Vec::new()
                     }
                 };
-                Ok::<_, String>((removed, detached, main))
+                let moved_to = to.unwrap_or_else(|| main.to_string_lossy().into_owned());
+                Ok::<_, String>((removed, detached, main, moved_to))
             });
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                let result = result.map(|(removed, detached, main)| {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let removed_ok = result.is_ok();
+                let result = result.map(|(removed, detached, main, moved_to)| {
+                    let moved = detached
+                        .iter()
+                        .filter(|(s, _)| !(delete_sessions && ids.contains(&s.id)))
+                        .count();
                     for (summary, settings) in detached {
                         this.session_summaries.insert(summary.id, summary.clone());
                         this.session_worktrees
@@ -347,9 +415,29 @@ impl Shell {
                     }
                     this.worktree_focus
                         .retain(|_, focus| !is_equal_or_inside(&focus.path, &path));
-                    (removed, main)
+                    // Its layout follows its chats to the base's checkout and
+                    // folds into that scope's tab (docs/native/tab-groups.md).
+                    this.workspace
+                        .tab_workspaces
+                        .retain(|_, worktree| !is_equal_or_inside(worktree, &path));
+                    this.merge_scope_tabs(cx);
+                    (
+                        RemovalReport {
+                            removed,
+                            moved_to,
+                            moved,
+                        },
+                        main,
+                    )
                 });
-                this.finish_worktree_removal(&path, result, cx);
+                this.finish_worktree_removal(&path, result, done.take(), window, cx);
+                // Only now that the worktree is gone; one that fails to delete stays,
+                // moved to the main checkout, and reports why.
+                if removed_ok && delete_sessions {
+                    for id in &ids {
+                        this.delete_session(*id, window, cx);
+                    }
+                }
             });
         })
         .detach();
@@ -358,31 +446,30 @@ impl Shell {
     fn finish_worktree_removal(
         &mut self,
         path: &str,
-        result: Result<(Removed, std::path::PathBuf), String>,
+        result: Result<(RemovalReport, std::path::PathBuf), String>,
+        done: Option<RemovalDone>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.removing_worktrees.remove(path);
-        match result {
-            Ok((removed, main)) => {
-                self.worktree_ui.delete = None;
-                if let Some(branch) = removed.preserved_branch {
-                    self.worktree_ui.next_kept += 1;
-                    self.worktree_ui.kept.push(KeptBranch {
-                        id: self.worktree_ui.next_kept,
-                        cwd: main.to_string_lossy().into_owned(),
-                        branch,
-                        busy: false,
-                        error: None,
-                    });
-                }
-                if !removed.warnings.is_empty() {
-                    self.error = Some(removed.warnings.join("\n"));
-                }
-                if let Some(view) = self.settings.clone() {
-                    view.update(cx, |view, cx| view.worktree_removed(path, cx));
-                }
-                self.invalidate_rail_worktrees(cx);
+        if let Some(done) = done {
+            // The asker reports errors; success changes the app as a dialog's would.
+            let report = result
+                .as_ref()
+                .map(|(report, _)| report.clone())
+                .map_err(Clone::clone);
+            if let Ok((report, main)) = result {
+                self.removal_succeeded(path, report.removed, main, cx);
             }
+            self.sync_git(cx);
+            self.sync_settings(cx);
+            self.invalidate_chrome(cx);
+            done(self, report, window, cx);
+            cx.notify();
+            return;
+        }
+        match result {
+            Ok((report, main)) => self.removal_succeeded(path, report.removed, main, cx),
             Err(error) => match &mut self.worktree_ui.delete {
                 Some(dialog) => {
                     dialog.busy = false;
@@ -404,6 +491,41 @@ impl Shell {
         self.sync_settings(cx);
         self.invalidate_chrome(cx);
         cx.notify();
+    }
+
+    /// A removal went through: the kept-branch card, warnings, Settings and the rail.
+    fn removal_succeeded(
+        &mut self,
+        path: &str,
+        removed: Removed,
+        main: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .worktree_ui
+            .delete
+            .as_ref()
+            .is_some_and(|d| d.path == path)
+        {
+            self.worktree_ui.delete = None;
+        }
+        if let Some(branch) = removed.preserved_branch {
+            self.worktree_ui.next_kept += 1;
+            self.worktree_ui.kept.push(KeptBranch {
+                id: self.worktree_ui.next_kept,
+                cwd: main.to_string_lossy().into_owned(),
+                branch,
+                busy: false,
+                error: None,
+            });
+        }
+        if !removed.warnings.is_empty() {
+            self.error = Some(removed.warnings.join("\n"));
+        }
+        if let Some(view) = self.settings.clone() {
+            view.update(cx, |view, cx| view.worktree_removed(path, cx));
+        }
+        self.invalidate_rail_worktrees(cx);
     }
 
     /// The kept card's "Delete branch": `git branch -D`.
@@ -1096,26 +1218,41 @@ mod tests {
     }
 
     #[gpui::test]
-    fn kept_sessions_are_marked_removed(cx: &mut TestAppContext) {
+    fn kept_sessions_carry_on_in_the_checkout_of_their_base(cx: &mut TestAppContext) {
         let (_temp, main, root) = repo();
-        let (window, paths, sessions) = shell(cx, &main, &root, &["kept"], &[0]);
+        let (window, paths, sessions) = shell(cx, &main, &root, &["kept", "orphan"], &[0, 1]);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let settings = |window: WindowHandle<Shell>, visual: &mut VisualTestContext, id| {
+            window
+                .update(visual, |shell, _, _| {
+                    let summary = shell.session_summaries[&id].clone();
+                    let settings = locked(&shell.store)
+                        .unwrap()
+                        .agent_settings(id)
+                        .unwrap()
+                        .unwrap();
+                    (summary, settings, shell.session_worktrees.get(&id).cloned())
+                })
+                .unwrap()
+        };
+        // Its base (the branch the main checkout is on) is checked out: it goes there.
         open(window, visual, &main, &paths[0]);
         assert!(visual.debug_bounds("worktree-delete-sessions").is_some());
         click(visual, "worktree-delete-confirm");
         assert!(!paths[0].exists());
-        window
-            .update(visual, |shell, _, _| {
-                let summary = &shell.session_summaries[&sessions[0].id];
-                assert_eq!(summary.cwd, main, "the session moves to the main checkout");
-                let settings = locked(&shell.store)
-                    .unwrap()
-                    .agent_settings(sessions[0].id)
-                    .unwrap()
-                    .unwrap();
-                assert!(settings.worktree_removed);
-            })
-            .unwrap();
+        let (summary, saved, rail) = settings(window, visual, sessions[0].id);
+        assert_eq!(summary.cwd, main, "the session moves to the main checkout");
+        assert!(!saved.worktree_removed, "and carries on there");
+        assert_eq!(saved.worktree_cwd, None);
+        assert_eq!(rail, Some(None), "the rail lists it under the project");
+        // A base checked out nowhere: the main checkout, marked removed (pick one).
+        git(&paths[1], &["config", "branch.orphan.base", "nowhere"]);
+        open(window, visual, &main, &paths[1]);
+        click(visual, "worktree-delete-confirm");
+        assert!(!paths[1].exists());
+        let (summary, saved, _) = settings(window, visual, sessions[1].id);
+        assert_eq!(summary.cwd, main);
+        assert!(saved.worktree_removed);
     }
 
     #[gpui::test]
@@ -1178,7 +1315,7 @@ mod tests {
                     Some(worktree::remove::BEING_REMOVED)
                 );
                 // A failed removal lets them start again.
-                shell.finish_worktree_removal(&path, Err("refused".into()), cx);
+                shell.finish_worktree_removal(&path, Err("refused".into()), None, w, cx);
                 assert!(shell.removing_worktrees.is_empty());
                 assert!(!shell.worktree_being_removed(&inside));
                 assert!(!worktree::remove::is_being_removed(&inside));
@@ -1197,15 +1334,97 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_failed_removal_keeps_the_sessions_it_was_asked_to_delete(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, main, root) = repo();
+        let (window, paths, sessions) = shell(cx, &main, &root, &["stuck"], &[0]);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        open(window, visual, &main, &paths[0]);
+        click(visual, "worktree-delete-sessions");
+        // Git cannot remove the folder from a read-only parent.
+        let parent = paths[0].parent().unwrap().to_path_buf();
+        let mode = |m| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        click(visual, "worktree-delete-confirm");
+        mode(0o755).unwrap();
+        assert!(paths[0].is_dir(), "the removal failed");
+        assert!(open_dialog(window, visual));
+        assert!(visual.debug_bounds("worktree-delete-failed").is_some());
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.session_summaries.contains_key(&sessions[0].id));
+                let db = locked(&shell.store).unwrap();
+                assert!(
+                    db.sessions()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s.id == sessions[0].id)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_worktrees_tab_shows_what_is_unmerged_and_merges_it(cx: &mut TestAppContext) {
+        let (_temp, main, root) = repo();
+        let (window, paths, _) = shell(cx, &main, &root, &["tabbed"], &[0]);
+        let wt = &paths[0];
+        std::fs::write(wt.join("tab.txt"), "tab\n").unwrap();
+        git(wt, &["add", "tab.txt"]);
+        git(wt, &["commit", "-q", "-m", "Tab work"]);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |shell, window, cx| {
+                shell.workspace.right_panel_open = true;
+                shell.ensure_right_panel(window, cx);
+                let panel = shell.right_panel.clone().unwrap();
+                panel.update(cx, |panel, cx| {
+                    panel.set_shown(true, cx);
+                    panel.select(crate::right_panel::RightTab::Worktrees, cx);
+                });
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let rows = |window: WindowHandle<Shell>, visual: &mut VisualTestContext| {
+            window
+                .update(visual, |shell, _, cx| {
+                    let panel = shell.right_panel.clone().unwrap();
+                    let pane = panel.read(cx).worktrees.clone();
+                    pane.read(cx).rows().map(<[_]>::to_vec).unwrap_or_default()
+                })
+                .unwrap()
+        };
+        let listed = rows(window, visual);
+        assert_eq!(listed.len(), 2, "the project folder and its worktree");
+        let row = &listed[1];
+        let status = row.status.clone().expect("its state against its base");
+        assert_eq!((status.ahead, status.dirty), (1, 0));
+        assert_eq!(row.sessions, 1);
+        assert!(visual.debug_bounds("worktree-pane-unmerged-1").is_some());
+        click(visual, "worktree-pane-merge-1");
+        assert!(std::path::Path::new(&main).join("tab.txt").is_file());
+        assert!(wt.exists(), "Merge alone keeps the worktree");
+        let row = rows(window, visual)[1].clone();
+        assert_eq!(row.status.unwrap().ahead, 0);
+        assert!(visual.debug_bounds("worktree-pane-merged-1").is_some());
+        assert!(
+            visual.debug_bounds("worktree-merged").is_some(),
+            "the merged toast"
+        );
+    }
+
     #[gpui::test]
     fn sessions_that_cannot_be_detached_after_removal_are_a_warning(cx: &mut TestAppContext) {
         let (_temp, main, root) = repo();
         let (window, paths, _) = shell(cx, &main, &root, &["gone"], &[0]);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         open(window, visual, &main, &paths[0]);
-        FAIL_DETACH.store(true, std::sync::atomic::Ordering::Relaxed);
+        FAIL_DETACH.set(true);
         click(visual, "worktree-delete-confirm");
-        FAIL_DETACH.store(false, std::sync::atomic::Ordering::Relaxed);
+        FAIL_DETACH.set(false);
         assert!(!paths[0].exists());
         assert!(!open_dialog(window, visual), "the removal still finishes");
         window

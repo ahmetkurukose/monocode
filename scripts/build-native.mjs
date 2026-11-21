@@ -10,6 +10,10 @@ const env = {
   // through this script, so it keeps the upstream name.
   MONOCODE_NATIVE_APP_NAME: process.env.MONOCODE_NATIVE_APP_NAME || "SOCode",
 };
+// One Chromium SDK for every checkout instead of one per worktree.
+if (process.platform === "darwin" && !env.CEF_PATH && env.HOME) {
+  env.CEF_PATH = join(env.HOME, "Library/Caches/Monocode/cef-sdk");
+}
 
 function run(command, args, capture = false) {
   const result = spawnSync(command, args, {
@@ -32,7 +36,9 @@ const metadata = JSON.parse(
 const app = metadata.packages.find((pkg) => pkg.name === "monocode-gpui");
 if (!app) throw new Error("The monocode-gpui package was not found.");
 
-run("cargo", ["build", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "-p", app.name, "--release"]);
+// On macOS the bundle carries Chromium's helper processes beside the app.
+const helper = process.platform === "darwin" ? ["-p", "monocode-cef"] : [];
+run("cargo", ["build", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "-p", app.name, ...helper, "--release"]);
 const target = process.env.CARGO_BUILD_TARGET
   ? join(metadata.target_directory, process.env.CARGO_BUILD_TARGET)
   : metadata.target_directory;

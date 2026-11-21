@@ -772,3 +772,198 @@ fn a_repeated_start_request_waits_for_the_first_to_finish() {
         .expect("the retry proceeds once the first finished");
     waiter.join().unwrap();
 }
+
+#[gpui::test]
+fn operator_merges_and_deletes_worktrees_as_the_ui_does(cx: &mut TestAppContext) {
+    let root =
+        std::env::temp_dir().join(format!("operator-merge-{}", monocode_core::mono::new_id()));
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Operator Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&project, &["init", "-q"]);
+    std::fs::write(project.join("README.md"), "Fixture\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-qm", "Fixture"]);
+    let store = Arc::new(Mutex::new(Store::open(&root.join("native.db")).unwrap()));
+    monocode_core::worktree::meta::save_prefs(
+        &locked(&store).unwrap(),
+        &monocode_core::worktree::Prefs {
+            root: Some(root.join("workspaces")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let made = |name: &str| {
+        monocode_core::worktree_callers::named(
+            &project,
+            name,
+            None,
+            false,
+            monocode_core::worktree::CreatedBy::Api,
+            &store,
+        )
+        .unwrap()
+        .path
+    };
+    let feature = made("feature");
+    let solo = made("solo");
+    std::fs::write(std::path::Path::new(&feature).join("work.txt"), "work\n").unwrap();
+    git(std::path::Path::new(&feature), &["add", "work.txt"]);
+    git(std::path::Path::new(&feature), &["commit", "-qm", "Work"]);
+    let project = project.to_string_lossy().into_owned();
+    let operator = |worktree: Option<&str>| Settings {
+        operator_enabled: true,
+        worktree_cwd: worktree.map(str::to_owned),
+        ..Default::default()
+    };
+    // A thread in the main checkout, one working in `feature`, one in `solo`.
+    let (caller, in_feature, in_solo) = {
+        let db = locked(&store).unwrap();
+        let caller = db.create("codex", &project).unwrap();
+        let in_feature = db.create("codex", &project).unwrap();
+        let in_solo = db.create("codex", &project).unwrap();
+        db.save_agent_settings(in_feature.id, &operator(Some(&feature)))
+            .unwrap();
+        db.save_agent_settings(in_solo.id, &operator(Some(&solo)))
+            .unwrap();
+        (caller, in_feature, in_solo)
+    };
+    let (id, feature_id, solo_id) = (caller.id, in_feature.id, in_solo.id);
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| {
+                Shell::new(
+                    store.clone(),
+                    vec![caller, in_feature, in_solo],
+                    project.clone(),
+                    None,
+                    cx,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            for session in [id, feature_id, solo_id] {
+                let worktree = locked(&shell.store)
+                    .unwrap()
+                    .agent_settings(session)
+                    .unwrap()
+                    .and_then(|s| s.worktree_cwd);
+                shell
+                    .ensure_session(session, cx)
+                    .unwrap()
+                    .update(cx, |v, cx| {
+                        v.install_transfer(operator(worktree.as_deref()), None, cx);
+                    })
+            }
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Not a worktree, and nothing named: refused without changes.
+    assert!(
+        call(window, id, "m0", "worktrees.merge", json!({}), cx)
+            .unwrap_err()
+            .contains("Name the worktree")
+    );
+    assert!(
+        call(
+            window,
+            id,
+            "m1",
+            "worktrees.merge",
+            json!({"path": project}),
+            cx
+        )
+        .unwrap_err()
+        .contains("main checkout")
+    );
+
+    // Merge and delete `feature` from the main checkout's thread.
+    let merged = call(
+        window,
+        id,
+        "m2",
+        "worktrees.merge",
+        json!({"branch": "feature", "delete": true}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(merged["commits"], 1);
+    assert_eq!(merged["deleted"], true);
+    assert_eq!(merged["branchDeleted"], true);
+    assert!(std::path::Path::new(&project).join("work.txt").is_file());
+    assert!(!std::path::Path::new(&feature).exists());
+    window
+        .update(cx, |shell, _, cx| {
+            // The chat that worked there carries on in the main checkout.
+            let view = shell.sessions[&feature_id].read(cx);
+            assert!(!view.settings.worktree_removed);
+            assert_eq!(view.settings.worktree_cwd, None);
+            assert_eq!(shell.session_worktrees.get(&feature_id), Some(&None));
+            assert!(shell.worktree_ui.merged.is_some(), "the merged toast shows");
+        })
+        .unwrap();
+
+    // `solo`'s own thread deletes its worktree while its turn runs: after the turn.
+    let busy = |busy: bool, cx: &mut TestAppContext| {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&solo_id].update(cx, |v, cx| {
+                    v.busy = busy;
+                    cx.notify();
+                });
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    busy(true, cx);
+    let deferred = call(window, solo_id, "d1", "worktrees.delete", json!({}), cx).unwrap();
+    assert_eq!(deferred["deleteAfterTurn"], true);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_worktree_deletes_after_turns(window, cx);
+            assert_eq!(shell.worktree_ui.after_turn.len(), 1, "still waiting");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(std::path::Path::new(&solo).exists());
+    busy(false, cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.run_worktree_deletes_after_turns(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(!std::path::Path::new(&solo).exists());
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.worktree_ui.after_turn.is_empty());
+            assert!(!shell.sessions[&solo_id].read(cx).settings.worktree_removed);
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}

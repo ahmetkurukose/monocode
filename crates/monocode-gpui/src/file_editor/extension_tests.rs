@@ -440,7 +440,7 @@ fn a_registered_feature_attaches_itself_and_jumps_walk_back_and_forward_across_f
     // Go to definition lands in another file, through the file route.
     cx.simulate_keystrokes("f12");
     let lib_link = format!("{}:2:5", lib.display());
-    assert_eq!(*opened.borrow(), [lib_link.clone()]);
+    assert_eq!(*opened.borrow(), std::slice::from_ref(&lib_link));
     window
         .update(cx, |view, w, cx| {
             assert!(view.header_parts(cx).leading.is_some(), "the arrows appear");
@@ -474,4 +474,69 @@ fn a_registered_feature_attaches_itself_and_jumps_walk_back_and_forward_across_f
             assert_eq!(view.input.read(cx).caret(), call + 1);
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn cmd_alt_arrows_walk_the_places_the_caret_has_been_across_files(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.py");
+    let other = dir.path().join("other.py");
+    let text: String = (1..=60).map(|n| format!("value_{n} = {n}\n")).collect();
+    std::fs::write(&app, &text).unwrap();
+    // The user was in another file before opening this one.
+    cx.update(|cx| {
+        let place = code_editor::Location {
+            path: other.clone(),
+            line: 3,
+            column: 1,
+        };
+        code_editor::hub(cx).update(cx, |hub, cx| hub.visit(place, cx));
+    });
+    let opened: Rc<RefCell<Vec<String>>> = Rc::default();
+    cx.update(|cx| {
+        let opened = opened.clone();
+        cx.on_action(move |action: &OpenPath, _| opened.borrow_mut().push(action.0.clone()));
+    });
+    let window = open(&app, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    settle(cx, 200);
+    let line_start = |line: usize| -> usize {
+        text.split_inclusive('\n')
+            .take(line - 1)
+            .map(str::len)
+            .sum()
+    };
+    let caret_line = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |view, _, cx| {
+                let input = view.input.read(cx);
+                code_editor::row_of(&input.content, input.caret()) + 1
+            })
+            .unwrap()
+    };
+    // A nudge leaves no trail; a click far down the file does.
+    for line in [4, 40] {
+        let at = line_start(line);
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.select_range(at..at, cx))
+            })
+            .unwrap();
+        settle(cx, 50);
+    }
+    cx.simulate_keystrokes("cmd-alt-left");
+    settle(cx, 50);
+    assert_eq!(caret_line(cx), 4, "back to where the nudge left the caret");
+    cx.simulate_keystrokes("cmd-alt-right");
+    settle(cx, 50);
+    assert_eq!(caret_line(cx), 40);
+    cx.simulate_keystrokes("cmd-alt-left");
+    settle(cx, 50);
+    assert_eq!(caret_line(cx), 4);
+    assert!(opened.borrow().is_empty());
+    // One more step back leaves the file for the one before it.
+    cx.simulate_keystrokes("cmd-alt-left");
+    settle(cx, 50);
+    assert_eq!(*opened.borrow(), [format!("{}:3:1", other.display())]);
 }

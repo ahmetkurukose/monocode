@@ -256,6 +256,7 @@ impl SettingsView {
                     | "quick-composer"
                     | "working-agents"
                     | "action-opens-terminal"
+                    | "browser-all-links"
                     | "close-to-tray"
                     | "terminal-copy-on-select"
                     | "main-pane-glass"

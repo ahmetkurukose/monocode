@@ -1,5 +1,5 @@
 //! Finds the address a dev server says it is listening on, so the UI can
-//! offer to open it in the browser pane. Only this machine's addresses
+//! offer to open it in a browser. Only this machine's addresses
 //! count: a run's output is never a reason to open a remote page.
 use regex::Regex;
 use std::sync::OnceLock;
@@ -152,6 +152,18 @@ pub fn first_local_url(text: &str) -> Option<String> {
     local_urls(text).into_iter().next()
 }
 
+/// This machine's own addresses on its networks, so that a dev server
+/// reached through one of them counts as local. Read anew on each call: they
+/// change when the machine joins another network.
+pub fn machine_ips() -> Vec<std::net::IpAddr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|interface| interface.ip())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +251,12 @@ mod tests {
             Some("http://localhost:5173/")
         );
         assert_eq!(first_local_url("nothing here"), None);
+    }
+
+    #[test]
+    fn the_machines_addresses_leave_out_loopback_and_every_interface() {
+        for ip in machine_ips() {
+            assert!(!ip.is_loopback() && !ip.is_unspecified(), "{ip}");
+        }
     }
 }

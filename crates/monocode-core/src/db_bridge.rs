@@ -1,13 +1,12 @@
 //! Agents use the user's saved Database-view data sources (PostgreSQL and
 //! MongoDB) through an MCP server of Monocode's own, `monocode_db`. A Rust
 //! take on dbports' MCP server (LocalDBPortManager `internal/mcpserver`),
-//! built like `browser_bridge`: a process-wide listener on the loopback, a
-//! capability per session, and a stdio subcommand (`db-mcp`) of the Monocode
-//! binary that the provider starts and that forwards each tool call here. No
-//! user MCP settings are changed.
+//! built as a process-wide listener on the loopback, a capability per
+//! session, and a stdio subcommand (`db-mcp`) of the Monocode binary that the
+//! provider starts and that forwards each tool call here. No user MCP
+//! settings are changed.
 //!
-//! What differs from the browser: nothing here needs the UI thread. The
-//! listener's thread runs each call itself with the Database view's own
+//! Nothing here needs the UI thread. The listener's thread runs each call itself with the Database view's own
 //! layer ([`crate::db`]) on the database runtime, and publishes what it did
 //! ([`activity`], [`stats`]) for the UI to show.
 //!

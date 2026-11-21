@@ -314,7 +314,7 @@ LocalDBPortManager (dbports) ile SOCket'in veritabanı tarafı Rust ile içeri a
 - Durum yoklanır: bir şey açılırken 1 sn, tünel varken 3 sn, yoksa 10 sn; footer yalnızca gösterdiği şey değişince çizilir.
 
 ### Ajanlar (`monocode-core/src/db_bridge.rs`)
-- `monocode_browser` gibi oturuma kendiliğinden eklenen yerleşik MCP: `db-mcp` stdio alt komutu, oturum başına token.
+- `monocode_code` gibi oturuma kendiliğinden eklenen yerleşik MCP: `db-mcp` stdio alt komutu, oturum başına token.
   Çağrılar uygulamanın içinde, mevcut `Connection` katmanıyla çalışır.
 - Tool'lar: `db_list_sources`, `db_list_databases`, `db_list_schemas`, `db_list_tables`, `db_describe_table`,
   `db_search`, `db_query`, `db_explain`, `db_execute`. PostgreSQL ve MongoDB (Mongo konsolunun shell sözdizimi).

@@ -3,9 +3,8 @@ mod actions;
 mod app_commands;
 mod app_views;
 mod automation_runs;
-mod browser_agent;
+pub(crate) mod browser_links;
 mod browser_panes;
-mod browser_selftest;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -76,8 +75,11 @@ mod view_panes;
 mod window_chrome;
 mod worktree_create;
 pub(crate) use worktree_create::SetupChoice;
+mod worktree_app;
 mod worktree_delete;
 mod worktree_dialog;
+pub(crate) use worktree_app::{AppReply, WorktreeCall};
+mod worktree_merge;
 mod worktrees;
 
 use crate::{
@@ -239,6 +241,7 @@ pub(crate) struct ActivateTab(pub isize);
 pub(crate) fn bind_keys(cx: &mut App) {
     session_groups::bind(cx);
     session_folders::bind(cx);
+    crate::browser::bind(cx);
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
     } else {
@@ -310,6 +313,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}--"), ZoomOut, context),
         KeyBinding::new(&format!("{modifier}-0"), ResetZoom, context),
         KeyBinding::new(&format!("{modifier}-shift-r"), Reload, context),
+        KeyBinding::new(
+            &format!("{modifier}-alt-i"),
+            crate::browser::ToggleBrowserDevTools,
+            context,
+        ),
         KeyBinding::new(&format!("{modifier}-alt-left"), FocusPaneLeft, context),
         KeyBinding::new(&format!("{modifier}-alt-right"), FocusPaneRight, context),
         KeyBinding::new(&format!("{modifier}-alt-up"), FocusPaneUp, context),
@@ -862,18 +870,11 @@ pub(crate) struct Shell {
     /// Live shells of `workspace.terminal_panes`, spawned when first shown.
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Pages of `workspace.browser_panes`, made when first shown.
-    browser_views: HashMap<i64, Entity<crate::browser::BrowserView>>,
-    /// Active checkout file watchers keyed by project path for browser reload-on-save.
-    browser_file_watches: HashMap<String, gpui::Task<()>>,
-    browser_selftest_started: bool,
-    /// Sessions the user stopped from using the browser, until allowed again.
-    browser_agent_stopped: HashSet<i64>,
-    /// The page each session's agent used last.
-    browser_agent_last: HashMap<i64, i64>,
+    browser_pages: HashMap<i64, (Entity<crate::browser::BrowserPage>, Subscription)>,
+    /// The window's one-time services (database footer, selftests) started.
+    window_services_started: bool,
     /// What sleeping projects gave back, and the pages to reopen on waking.
     project_sleep: project_sleep::ProjectSleep,
-    /// Addresses pages asked to open in windows of their own.
-    pending_browser_pages: Vec<String>,
     /// A project's dock sliding open (toward 1) or shut (toward 0).
     dock_slide: Option<(String, PaneSlide)>,
     dock_resize: Option<(f32, f32)>,
@@ -1262,13 +1263,9 @@ impl Shell {
             sidebar_fitted_room: None,
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
-            browser_views: HashMap::new(),
-            browser_file_watches: HashMap::new(),
-            browser_selftest_started: false,
-            browser_agent_stopped: HashSet::new(),
-            browser_agent_last: HashMap::new(),
+            browser_pages: HashMap::new(),
+            window_services_started: false,
             project_sleep: Default::default(),
-            pending_browser_pages: Vec::new(),
             dock_slide: None,
             dock_resize: None,
             dock_hover: None,
@@ -1543,6 +1540,17 @@ impl Shell {
             .push(cx.subscribe(&view, |this, _, transfer: &Transfer, cx| {
                 this.transfer_response(transfer.clone(), cx)
             }));
+        self.observations.push(cx.subscribe(
+            &view,
+            |this, view, event: &crate::conversation::MergeWorktree, cx| {
+                // Merged on the next frame, which has the window the removal needs.
+                let project = view.read(cx).summary.cwd.clone();
+                this.worktree_ui
+                    .pending_merges
+                    .push((project, event.path.clone(), event.delete));
+                cx.notify();
+            },
+        ));
         self.observations.push(cx.subscribe(
             &view,
             move |this, _, event: &crate::conversation::OpenSessionChanges, cx| {
@@ -2181,6 +2189,55 @@ impl Shell {
                             cx,
                         )
                     });
+                }
+            },
+        ));
+        let worktrees = panel.read(cx).worktrees.clone();
+        let store = self.store.clone();
+        worktrees.update(cx, |pane, _| pane.set_store(store));
+        self.observations.push(cx.subscribe_in(
+            &worktrees,
+            window,
+            |this, _, event: &crate::worktrees_pane::WorktreesPaneEvent, window, cx| {
+                use crate::worktrees_pane::WorktreesPaneEvent as E;
+                // The rail's project, not the checkout the panel happens to show.
+                let rail_project = this.workspace.project.clone();
+                match event {
+                    E::Open { path, .. } => {
+                        if monocode_core::files::path_key(path)
+                            == monocode_core::files::path_key(&rail_project)
+                        {
+                            this.select_worktree(None, window, cx);
+                        } else {
+                            this.select_rail_worktree(rail_project, path.clone(), window, cx);
+                        }
+                    }
+                    E::Merge {
+                        project,
+                        path,
+                        delete,
+                    } => this.merge_worktree(
+                        worktree_merge::MergeRequest {
+                            project: project.clone(),
+                            path: path.clone(),
+                            delete: *delete,
+                            force: false,
+                            done: None,
+                            caller: None,
+                        },
+                        window,
+                        cx,
+                    ),
+                    E::Delete { project, path } => {
+                        this.open_delete_worktree_dialog(project.clone(), path.clone(), window, cx)
+                    }
+                    E::Create => this.open_create_worktree_dialog(
+                        rail_project,
+                        String::new(),
+                        worktree_create::WorktreeOrigin::Rail,
+                        window,
+                        cx,
+                    ),
                 }
             },
         ));
@@ -3788,8 +3845,8 @@ impl Shell {
         if let Some(view) = self.terminal_pane_views.get(&id) {
             return Some(view.clone().into());
         }
-        if let Some(view) = self.browser_views.get(&id) {
-            return Some(view.clone().into());
+        if let Some((page, _)) = self.browser_pages.get(&id) {
+            return Some(page.clone().into());
         }
         if let Some(review) = self.reviews.get(&id) {
             return Some(review.clone().into());
@@ -4049,15 +4106,14 @@ impl Shell {
         for pane in self.workspace.prune_terminal_panes() {
             self.terminal_pane_views.remove(&pane);
         }
-        // A browser pane closed with its tab or pane frees its page.
+        // A browser pane closed with its tab or pane closes its page.
         for pane in self.workspace.prune_browser_panes() {
-            self.browser_views.remove(&pane);
+            self.browser_pages.remove(&pane);
         }
         // A closed view pane's view lets go of it; the Monos page follows
         // the focused Mono tab.
         self.forget_closed_view_panes(cx);
         self.sync_mono_focus(cx);
-        self.sync_browser_file_watchers(cx);
         if let Some(id) = self.workspace.active {
             self.refresh_session_mark(id, cx);
         }
@@ -5436,10 +5492,10 @@ impl Shell {
                 crate::right_panel::tabs_width(self.right_tab_count(cx)),
             )
     }
-    /// Explorer and History, and Terminal when it lives in the panel. Changes
-    /// opens from the diff stat instead.
+    /// Explorer, History and Worktrees, and Terminal when it lives in the panel.
+    /// Changes opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        2 + usize::from(self.terminal_in_panel(cx))
+        3 + usize::from(self.terminal_in_panel(cx))
             + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
@@ -5866,9 +5922,6 @@ impl Shell {
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
                         .into(),
-                    MenuAction::new("browser-start-url", "Browser start page…")
-                        .icon("globe")
-                        .into(),
                     MenuAction::new("terminal-setup", "Terminal setup…")
                         .icon("terminal")
                         .into(),
@@ -5949,6 +6002,7 @@ impl Shell {
                     self.external_editor_menu(path).into(),
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
+                    self.browser_profile_menu(path).into(),
                     MenuItem::Separator,
                 ]);
                 items.extend(self.project_sleep_menu(path, cx));
@@ -6088,8 +6142,6 @@ impl Shell {
                     self.open_project_theme(path, window, cx);
                 } else if action == "background" {
                     self.open_background_dialog(path, window, cx);
-                } else if action == "browser-start-url" {
-                    self.open_browser_start_dialog(path, window, cx);
                 } else if action == "terminal-setup" {
                     self.open_terminal_setup_dialog(path, window, cx);
                 } else if let Some(page) = action.strip_prefix("code-settings:") {
@@ -6105,6 +6157,8 @@ impl Shell {
                     self.open_in_external_editor(editor, &path, cx);
                 } else if action.starts_with("mute:") {
                     self.run_project_notification_menu(&path, action, window, cx);
+                } else if action == "browser-isolated" {
+                    self.toggle_browser_isolation(&path, cx);
                 }
             }
         }
@@ -7361,9 +7415,6 @@ impl Shell {
         self.invalidate_chrome(cx);
     }
 
-    /// App.tsx's toTitleTab with TitleBar's tabCopy: a split tab, or a chat
-    /// with a file beside it, heads with the focused pane and names the rest
-    /// on a second line.
     /// A pane's mark: its provider, spinning while it works and checked when
     /// it finished unseen, or the file's icon.
     fn pane_mark(&self, mark: &PaneMark, active: bool) -> AnyElement {
@@ -7587,6 +7638,16 @@ impl Render for Shell {
                 this.update(cx, |this, cx| this.close_exited_terminals(window, cx));
             });
         }
+        // A link clicked in this window's views (a terminal, a reply) that
+        // opens in Monocode's browser.
+        if browser_links::pending(cx) {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                for url in browser_links::take_for(window.window_handle(), cx) {
+                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                }
+            });
+        }
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -7618,27 +7679,20 @@ impl Render for Shell {
             self.review_focused = false;
             window.focus(&view.read(cx).input.focus_handle(cx), cx);
         }
-        if let Some(links) = cx.try_global::<crate::browser::LinkQueue>()
-            && !links.0.is_empty()
-        {
-            let links = std::mem::take(&mut cx.global_mut::<crate::browser::LinkQueue>().0);
-            self.pending_browser_pages.extend(links);
-        }
-        for url in std::mem::take(&mut self.pending_browser_pages) {
-            // A page borrows a session's project; with none to borrow from,
-            // the link goes to the user's own browser rather than nowhere.
-            if self.terminal_owner().is_some() || self.project_session_for_terminal().is_some() {
-                self.new_browser_pane(Some(url), window, cx);
-            } else {
-                cx.open_url(&url);
-            }
-        }
-        if !std::mem::replace(&mut self.browser_selftest_started, true) {
-            self.start_browser_agent(window, cx);
+        if !std::mem::replace(&mut self.window_services_started, true) {
             self.start_database_footer(window, cx);
-            self.start_browser_selftest(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);
+            // For measuring the browser: a page at this address on launch.
+            if let Some(url) = std::env::var("MONOCODE_BROWSER_OPEN")
+                .ok()
+                .filter(|url| !url.is_empty())
+            {
+                let this = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                });
+            }
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
@@ -7650,6 +7704,21 @@ impl Render for Shell {
         {
             self.focus_pane(id, window, cx);
             self.open_review(tab, window, cx);
+        }
+        self.run_worktree_deletes_after_turns(window, cx);
+        for (project, path, delete) in std::mem::take(&mut self.worktree_ui.pending_merges) {
+            self.merge_worktree(
+                worktree_merge::MergeRequest {
+                    project,
+                    path,
+                    delete,
+                    force: false,
+                    done: None,
+                    caller: None,
+                },
+                window,
+                cx,
+            );
         }
         // Native fullscreen transitions resize the window, which redraws it.
         self.fullscreen = window.is_fullscreen();
@@ -8022,28 +8091,21 @@ impl Render for Shell {
                     .update(cx, |updater, cx| updater.check(true, cx));
             }))
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
-            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(1, cx));
-                } else {
-                    this.step_ui_scale(1, cx);
-                }
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+                this.step_ui_scale(1, cx);
             }))
-            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(-1, cx));
-                } else {
-                    this.step_ui_scale(-1, cx);
-                }
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+                this.step_ui_scale(-1, cx);
             }))
-            .on_action(cx.listener(|this, _: &ResetZoom, window, cx| {
-                if let Some(page) = this.active_browser_for_zoom(window, cx) {
-                    page.update(cx, |page, cx| page.step_zoom(0, cx));
-                } else {
-                    this.step_ui_scale(0, cx);
-                }
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| {
+                this.step_ui_scale(0, cx);
             }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| this.request_reload(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::browser::ToggleBrowserDevTools, _, cx| {
+                    this.toggle_browser_dev_tools(cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &SidebarAppearance, window, cx| {
                 this.open_settings(crate::settings::Section::Appearance, window, cx)
             }))
@@ -8444,7 +8506,6 @@ impl Render for Shell {
                         p.side(Side::Top).align(crate::popover::Align::End)
                     })
             }))
-            .child(self.browser_frame(cx))
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children((self.file_history.as_ref()).map(|(dialog, _)| {
@@ -8473,6 +8534,11 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(view, _)| crate::image_lightbox::overlay(view)),
             )
+            // Hides the browser pages not painted in this frame or under an
+            // overlay; Chromium's views sit above everything GPUI draws.
+            .when(!self.browser_pages.is_empty(), |root| {
+                root.child(crate::browser::sweep())
+            })
             .map(|root| {
                 #[cfg(target_os = "linux")]
                 let caption = self.client_decorations;
@@ -11887,7 +11953,7 @@ mod tests {
                         shell.workspace.active.unwrap()
                     }
                     ClosingKind::Browser => {
-                        let pane = shell.create_browser_pane(b, "about:blank".into(), cx);
+                        let pane = shell.create_browser_pane(b, "about:blank".into());
                         shell.workspace.place(pane, b, Edge::Right);
                         pane
                     }

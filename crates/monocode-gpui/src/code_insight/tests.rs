@@ -426,6 +426,9 @@ fn diagnostics_land_per_server_on_the_text_they_are_about_and_go_with_the_file(
     wait(cx, "the document to be closed", |_| {
         !rig.manager.is_open(&path)
     });
+    // The server hears of it on its own thread, a moment after the manager
+    // forgets the document.
+    pyright.wait_for("textDocument/didClose");
     assert_eq!(pyright.count("textDocument/didClose"), 1);
     cx.cx
         .update(|cx| assert!(diagnostics(&path, cx).is_empty()));

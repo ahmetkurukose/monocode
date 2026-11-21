@@ -10,6 +10,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.draft"=>"sessionId prompt project",
         "sessions.stop"|"sessions.archive"|"sessions.delete"=>"sessionId project",
         "worktrees.create"=>"branch base existing project",
+        "worktrees.merge"=>"path branch delete force project",
+        "worktrees.delete"=>"path branch force deleteSessions project",
         "folders.move"=>"sessionId folderId newFolderName project",
         "notes.list"=>"limit offset","notes.read"=>"id","notes.write"=>"id title body tags",
         "artifacts.list"=>"kind limit offset","artifacts.read"=>"id","artifacts.write"=>"id kind title body summary",
@@ -26,7 +28,17 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         if !fields.split_whitespace().any(|f| f == key) {
             return Err(format!("{action} does not take {key}"));
         }
-        if ["draft", "reveal", "notifyOnComplete", "existing", "enabled"].contains(&key.as_str())
+        if [
+            "draft",
+            "reveal",
+            "notifyOnComplete",
+            "existing",
+            "enabled",
+            "delete",
+            "force",
+            "deleteSessions",
+        ]
+        .contains(&key.as_str())
             && !value.is_boolean()
         {
             return Err(format!("{key} must be true or false"));
@@ -51,6 +63,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "notifyOnComplete",
             "existing",
             "enabled",
+            "delete",
+            "force",
+            "deleteSessions",
             "before",
             "limit",
             "offset",

@@ -1,10 +1,10 @@
 //! Agents run, inspect and debug a project's code through an MCP server of
-//! Monocode's own (docs/native/code.md §7). Built like `browser_bridge`: a
-//! process-wide listener on the loopback, a capability per session, and a
-//! stdio subcommand of the Monocode binary that the provider starts and
-//! that forwards each tool call here. No user MCP settings are changed.
+//! Monocode's own (docs/native/code.md §7). Built as a process-wide listener
+//! on the loopback, a capability per session, and a stdio subcommand of the
+//! Monocode binary that the provider starts and that forwards each tool call
+//! here. No user MCP settings are changed.
 //!
-//! What differs from the browser: nothing here needs the interface thread.
+//! Nothing here needs the interface thread.
 //! A call is answered on its connection's thread, straight from
 //! `code::services`, and may wait there for a program to stop or exit.
 use super::services::{services, Services};

@@ -205,7 +205,7 @@ impl Shell {
                 ws.terminal_panes.remove(&pane);
                 ws.browser_panes.remove(&pane);
                 this.terminal_pane_views.remove(&pane);
-                this.browser_views.remove(&pane);
+                this.browser_pages.remove(&pane);
             }
             this.fit_sidebar(cx);
             this.persist(cx);

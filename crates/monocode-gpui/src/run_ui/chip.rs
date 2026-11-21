@@ -193,14 +193,10 @@ pub(crate) fn pick(id: &str, window: &mut Window, cx: &mut App) {
             );
         }
         "open" => {
-            if let Some(url) = &info.url
-                && !context::open_url(url, window, cx)
-            {
-                start::notice(
-                    "Open a session in this project to show the page beside it.",
-                    window,
-                    cx,
-                );
+            // A dev server's address is local, so it opens in Monocode
+            // unless ⇧ is held or the run announced some other host.
+            if let Some(url) = &info.url {
+                crate::shell::browser_links::open_link(url, window.modifiers().shift, window, cx);
             }
         }
         "forget" => {

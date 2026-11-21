@@ -72,6 +72,9 @@ monocode-core = { path = "../monocode-core", features = ["test-support"] }
 
 # The vendored renderer's backdrop-blur marker for frosted popovers.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The browser's Chromium engine (docs/native/browser/context.md). macOS first;
+# Windows and Linux follow in phase 6.
+monocode-cef = { path = "../monocode-cef" }
 gpui_apple = { package = "gpui-pre-apple", version = "=0.3.9" }
 # Only named so that the self-test can turn on the window's render-to-image.
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.9", optional = true, features = ["test-support"] }
@@ -80,8 +83,8 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSApplication", "NSDockTile", "NSButton", "NSControl", "NSLayoutAnchor", "NSLayoutConstraint", "NSResponder", "NSView", "NSWindow", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSGraphicsContext", "NSBitmapImageRep", "NSImageRep", "NSAlert", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSTextField", "NSSecureTextField", "NSText"] }
 raw-window-handle = "0.6"
-objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKFrameInfo", "WKSnapshotConfiguration", "WKUIDelegate", "WKWindowFeatures", "WKOpenPanelParameters", "WKDownload", "WKDownloadDelegate", "WKNavigationResponse", "WKFindConfiguration", "WKFindResult", "WKContentWorld", "WKUserScript", "WKUserContentController", "WKScriptMessage", "WKScriptMessageHandler", "WKHTTPCookieStore", "WKWebsiteDataRecord", "WKSecurityOrigin", "block2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSData", "NSRange", "NSArray", "NSSet", "NSError", "NSBundle", "NSURL", "NSURLRequest", "NSObject", "NSDictionary", "NSURLAuthenticationChallenge", "NSURLCredential", "NSURLProtectionSpace", "NSURLResponse", "NSURLSession", "NSUUID", "NSDate", "NSHTTPCookie", "NSProgress", "NSValue"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKPreferences", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "block2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSData", "NSRange", "NSArray", "NSSet", "NSError", "NSBundle", "NSURL", "NSURLRequest", "NSObject"] }
 objc2-user-notifications = "0.3"
 # libmalloc keeps freed large spans dirty, so startup and image churn stayed
 # resident. mimalloc 3 retains churn the same way; the v2 feature pins 2.x.
@@ -94,7 +97,7 @@ parking_lot = "0.12"
 # Experimental native builds resolve separately from the production Tauri app.
 [workspace]
 resolver = "2"
-members = [".", "../monocode-core"]
+members = [".", "../monocode-core", "../monocode-cef"]
 
 [workspace.package]
 version = "0.16.0"

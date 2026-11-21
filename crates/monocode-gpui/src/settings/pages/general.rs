@@ -164,6 +164,23 @@ impl SettingsView {
                 |this, v, cx| this.update(cx, |p| p.set_terminal_placement(v)),
             )],
         ));
+        // Only macOS has the browser pane the links would open in.
+        if cfg!(target_os = "macos") {
+            workspace.push(self.row(
+                Some("browser-all-links"),
+                false,
+                "Open all links in Monocode",
+                Some("Web links in replies and terminals open in a browser tab. Off, only local addresses such as a dev server's do, and the rest open in your browser. ⇧-click a link to open it in the other one.".into()),
+                vec![self.toggle(
+                    "browser-all-links",
+                    "Open all links in Monocode",
+                    p.browser_all_links,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.browser_all_links = on),
+                )],
+            ));
+        }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(
                 Some("close-to-tray"),

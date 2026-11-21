@@ -14,7 +14,7 @@ mod variables;
 
 pub use config::{ProjectRuns, RunConfig, TestRunner, BUILTIN_PREFIX};
 pub use output::RunOutput;
-pub use ports::{first_local_url, local_urls};
+pub use ports::{first_local_url, local_urls, machine_ips};
 pub use registry::{registry, Registry, RunEvent, RunId, RunInfo, RunState, StartedBy};
 pub use resolve::{resolve, variables_used, Unresolved};
 pub use tasks::{

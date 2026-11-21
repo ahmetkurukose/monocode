@@ -1,1794 +1,2805 @@
-//! A browser page in a pane: the address row drawn by GPUI over a native
-//! web view (docs/native/browser.md). The page keeps its sign-ins between
-//! launches; closing or sleeping the pane frees what it used.
+//! The browser pane: a Chromium page (CEF, `monocode-cef`) shown as a native
+//! child view of the window (docs/native/browser/context.md §4).
+//!
+//! Chromium ships in the app bundle and starts in this process the first
+//! time a page is shown ([`Engine`]).
+//!
+//! A page's view sits above GPUI's own view, so GPUI cannot draw over it.
+//! Each frame every shown page records that it painted; the [`sweep`] element,
+//! painted last, hides the pages that did not (their tab is not in front) and
+//! moves away the ones a menu, a modal or a notification covers ([`cover`]),
+//! drawing their last frame in their place instead (K16). A page's docked
+//! DevTools (K18) is a second view, placed and swept the same way.
+
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    rc::{Rc, Weak},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use gpui::{
+    AnyElement, AnyWindowHandle, App, Bounds, Context, Corners, CursorStyle, DispatchPhase, Entity,
+    EventEmitter, FocusHandle, Focusable, Global, Image, ImageFormat, KeyBinding, KeyDownEvent,
+    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, RenderImage, Subscription, Window, WindowId,
+    actions, canvas, div, prelude::*, px,
+};
+
 use crate::{
     input::{self, Input},
-    popover::{
-        Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, menu_popover,
-    },
-    theme::*,
+    modal,
+    popover::{Align, Anchor, AnchorSlot, popover},
+    theme::{content, icon, icon_button, icon_button_enabled},
+    workspace::DevToolsDock,
 };
-use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Role, Subscription, Window,
-    canvas, div, prelude::*, px,
-};
-use std::{cell::RefCell, rc::Rc};
 
-pub(crate) mod agent;
-#[cfg(target_os = "macos")]
-mod host;
-#[cfg(target_os = "macos")]
-mod native_ui;
-
-gpui::actions!(
-    browser,
-    [FocusAddress, Reload, GoBack, GoForward, FindInPage, Inspect]
+actions!(
+    workspace,
+    [
+        /// ⌥⌘I: the focused page's docked DevTools.
+        ToggleBrowserDevTools
+    ]
 );
 
-/// The pane's keys. Copy, paste and the like are Monocode's actions bound
-/// per context; here they are bound for a page and passed on to it.
-pub(crate) fn bind(cx: &mut gpui::App) {
-    use gpui::KeyBinding;
+/// DevTools and the page above it each keep at least this many points.
+const DEVTOOLS_MIN: f32 = 120.;
+const PAGE_MIN: f32 = 80.;
+
+/// DevTools' height in a body `available` points tall: the saved height
+/// (0: 40% of the body), kept clear of both minimums. Unmeasured (0), the
+/// body takes the wanted height as it is.
+pub(crate) fn devtools_height(saved: u32, available: f32) -> f32 {
+    let wanted = if saved == 0 {
+        (available * 0.4).max(DEVTOOLS_MIN)
+    } else {
+        saved as f32
+    };
+    if available <= 0. {
+        return wanted;
+    }
+    let max = (available - PAGE_MIN).max(0.);
+    wanted.clamp(DEVTOOLS_MIN.min(max), max)
+}
+
+/// Whether Chromium runs, shared by every window.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EngineState {
+    /// No page asked for Chromium yet.
+    Idle,
+    Ready,
+    Failed(String),
+}
+
+/// The app's one Chromium runtime.
+pub(crate) struct Engine {
+    pub state: EngineState,
+    /// A start is queued for after the current frame.
+    queued: bool,
+}
+
+struct GlobalEngine(Entity<Engine>);
+impl Global for GlobalEngine {}
+
+impl Engine {
+    pub(crate) fn global(cx: &mut App) -> Entity<Engine> {
+        if let Some(engine) = cx.try_global::<GlobalEngine>() {
+            return engine.0.clone();
+        }
+        let engine = cx.new(|_| Engine {
+            state: EngineState::Idle,
+            queued: false,
+        });
+        cx.set_global(GlobalEngine(engine.clone()));
+        engine
+    }
+
+    /// Starts Chromium after the current frame, unless it runs. Starting
+    /// takes a few hundred milliseconds on the main thread (CEF's UI thread),
+    /// so the page shows that it is starting first. `profiles` is the root of
+    /// the browser profiles of this data mode.
+    pub(crate) fn ensure(&mut self, profiles: PathBuf, cx: &mut Context<Self>) {
+        if self.state == EngineState::Ready || std::mem::replace(&mut self.queued, true) {
+            return;
+        }
+        if matches!(self.state, EngineState::Failed(_)) {
+            self.state = EngineState::Idle;
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |engine, cx| engine.start_now(&profiles, cx));
+        })
+        .detach();
+    }
+
+    fn start_now(&mut self, profiles: &Path, cx: &mut Context<Self>) {
+        self.queued = false;
+        let started = std::time::Instant::now();
+        self.state = match start(profiles) {
+            Ok(()) => {
+                let took = started.elapsed();
+                if took > std::time::Duration::from_secs(1) {
+                    log::warn!("browser: Chromium took {took:?} to start");
+                }
+                EngineState::Ready
+            }
+            Err(e) => {
+                log::warn!("browser: Chromium is unavailable: {e}");
+                EngineState::Failed(e)
+            }
+        };
+        cx.notify();
+    }
+}
+
+/// The running app's `Contents/Frameworks`.
+fn bundle_frameworks() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let contents = exe
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("the app has no bundle")?;
+    Ok(contents.join("Frameworks"))
+}
+
+/// The one `* Helper.app` in `frameworks` (the GPU, Renderer, … variants
+/// carry a suffix after "Helper").
+fn find_helper(frameworks: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(frameworks).ok()?;
+    entries.flatten().find_map(|entry| {
+        let name = entry.file_name().into_string().ok()?;
+        let app = name.strip_suffix(" Helper.app")?;
+        let helper = format!("{app} Helper");
+        let path = entry.path().join("Contents/MacOS").join(&helper);
+        path.is_file().then_some(path)
+    })
+}
+
+fn start(profiles: &Path) -> Result<(), String> {
+    if monocode_cef::runtime::is_started() {
+        return Ok(());
+    }
+    let frameworks = bundle_frameworks()?;
+    let framework_dir = frameworks.join("Chromium Embedded Framework.framework");
+    let missing = "Chromium is missing from the app: run it from its bundle (npm run native:dev)";
+    if !framework_dir.is_dir() {
+        return Err(missing.into());
+    }
+    let config = monocode_cef::RuntimeConfig {
+        framework_dir,
+        helper: find_helper(&frameworks).ok_or(missing)?,
+        cache_root: profiles.to_path_buf(),
+        // A development build's signature changes with every build, which
+        // would ask for keychain access each time.
+        mock_keychain: cfg!(debug_assertions),
+        locale: String::new(),
+        log_file: Some(profiles.join("chromium.log")),
+    };
+    let _ = std::fs::create_dir_all(profiles);
+    monocode_cef::runtime::start(&config).map_err(|e| e.to_string())
+}
+
+/// What the user typed, as an address to load: a URL as it is, a host or a
+/// local address with a scheme added, anything else as a search.
+pub(crate) fn address(typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let lower = typed.to_ascii_lowercase();
+    if [
+        "http://",
+        "https://",
+        "file://",
+        "about:",
+        "chrome://",
+        "data:",
+    ]
+    .iter()
+    .any(|scheme| lower.starts_with(scheme))
+    {
+        return Some(typed.to_owned());
+    }
+    let host = lower.split(['/', '?', '#']).next().unwrap_or_default();
+    let name = host.rsplit_once(':').map_or(host, |(name, port)| {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            name
+        } else {
+            host
+        }
+    });
+    let local = name == "localhost"
+        || name.ends_with(".localhost")
+        || name.ends_with(".local")
+        || name.parse::<std::net::Ipv4Addr>().is_ok();
+    if !typed.contains(char::is_whitespace) {
+        if local {
+            return Some(format!("http://{typed}"));
+        }
+        if name.contains('.') && !name.starts_with('.') && !name.ends_with('.') {
+            return Some(format!("https://{typed}"));
+        }
+    }
+    let query: String = typed
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => "+".into(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    Some(format!("https://www.google.com/search?q={query}"))
+}
+
+/// A page's tab title: its own, else its host, else "Browser".
+pub(crate) fn page_title(url: &str, title: &str) -> String {
+    if !title.trim().is_empty() {
+        return title.to_owned();
+    }
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .filter(|host| !host.is_empty());
+    host.unwrap_or("Browser").to_owned()
+}
+
+/// A page's address, title or zoom changed; the pane saves them.
+pub(crate) struct PageChanged;
+
+// ---- Shortcuts (context.md K17) ----
+
+/// A browser page's key context. Its bindings outrank the workspace's, so
+/// ⌘+ zooms the page rather than the interface while a page is focused; the
+/// shell's shortcut forwarding adds it while Chromium has the keyboard.
+pub(crate) const KEY_CONTEXT: &str = "BrowserPage";
+const FIND_CONTEXT: &str = "BrowserFind";
+
+actions!(
+    browser,
+    [
+        FocusAddress,
+        Reload,
+        ReloadIgnoringCache,
+        Find,
+        FindNext,
+        FindPrevious,
+        CloseFind,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
+    ]
+);
+
+/// ⌘[ and ⌘] stay the workspace's Back and Forward (visited places), so
+/// page history has only the toolbar buttons.
+pub(crate) fn bind(cx: &mut App) {
     let m = if cfg!(target_os = "macos") {
         "cmd"
     } else {
         "ctrl"
     };
-    let key = |keys: &str| format!("{m}-{keys}");
+    let page = Some(KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new(&key("a"), input::SelectAll, Some("Browser")),
-        KeyBinding::new(&key("c"), input::Copy, Some("Browser")),
-        KeyBinding::new(&key("v"), input::Paste, Some("Browser")),
-        KeyBinding::new(&key("x"), input::Cut, Some("Browser")),
-        KeyBinding::new(&key("z"), input::Undo, Some("Browser")),
-        KeyBinding::new(&key("shift-z"), input::Redo, Some("Browser")),
-        KeyBinding::new(&key("l"), FocusAddress, Some("Browser")),
-        KeyBinding::new(&key("f"), FindInPage, Some("Browser")),
-        KeyBinding::new(&key("r"), Reload, Some("Browser")),
-        KeyBinding::new(&key("["), GoBack, Some("Browser")),
-        KeyBinding::new(&key("]"), GoForward, Some("Browser")),
-        KeyBinding::new(
-            if cfg!(target_os = "macos") {
-                "cmd-alt-i"
-            } else {
-                "ctrl-alt-i"
-            },
-            Inspect,
-            Some("Browser"),
-        ),
+        KeyBinding::new(&format!("{m}-l"), FocusAddress, page),
+        KeyBinding::new(&format!("{m}-r"), Reload, page),
+        // Over the workspace's ⇧⌘R (restart the app) while a page is focused.
+        KeyBinding::new(&format!("{m}-shift-r"), ReloadIgnoringCache, page),
+        KeyBinding::new(&format!("{m}-f"), Find, page),
+        KeyBinding::new(&format!("{m}-g"), FindNext, page),
+        KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, page),
+        KeyBinding::new(&format!("{m}-="), ZoomIn, page),
+        KeyBinding::new(&format!("{m}-+"), ZoomIn, page),
+        KeyBinding::new(&format!("{m}--"), ZoomOut, page),
+        KeyBinding::new(&format!("{m}-0"), ResetZoom, page),
+        // The find field is a Composer, whose ⇧Enter would add a newline.
+        KeyBinding::new("shift-enter", FindPrevious, Some("BrowserFind > Composer")),
+        KeyBinding::new("escape", CloseFind, Some(FIND_CONTEXT)),
     ]);
 }
 
-/// Web links clicked somewhere in the app (a reply, a terminal) that are to
-/// open in a browser pane. The Shell takes them on its next frame, where it
-/// has a window to open a pane in.
-#[derive(Default)]
-pub(crate) struct LinkQueue(pub Vec<String>);
-impl gpui::Global for LinkQueue {}
+// ---- Zoom ----
 
-/// Opens a web link where the setting says: in a browser pane of the
-/// project, or in the user's own browser.
-pub(crate) fn open_link(url: &str, cx: &mut gpui::App) {
-    let in_monocode = cfg!(target_os = "macos")
-        && (url.starts_with("http://") || url.starts_with("https://"))
-        && cx
-            .try_global::<crate::settings::Preferences>()
-            .is_some_and(|preferences| preferences.browser_links == "monocode");
-    if in_monocode {
-        cx.default_global::<LinkQueue>().0.push(url.to_owned());
-        cx.refresh_windows();
-    } else {
-        cx.open_url(url);
+/// Chrome's zoom steps, in percent.
+const ZOOM_PRESETS: [u16; 17] = [
+    25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500,
+];
+
+/// The next preset above `percent` (`step` > 0) or below it (< 0); 0 resets.
+fn zoom_step(percent: u16, step: i32) -> u16 {
+    match step.signum() {
+        0 => 100,
+        1 => ZOOM_PRESETS
+            .iter()
+            .copied()
+            .find(|p| *p > percent)
+            .unwrap_or(ZOOM_PRESETS[ZOOM_PRESETS.len() - 1]),
+        _ => ZOOM_PRESETS
+            .iter()
+            .rev()
+            .copied()
+            .find(|p| *p < percent)
+            .unwrap_or(ZOOM_PRESETS[0]),
     }
 }
 
-/// Clears what the browser stored: "cache", "site-data" (cookies and what
-/// sites kept) or anything else for both; only what changed in the last
-/// `seconds` when given.
-pub(crate) fn clear_data(what: &str, seconds: Option<f64>, done: impl FnOnce() + 'static) {
-    #[cfg(target_os = "macos")]
-    {
-        let kind = match what {
-            "cache" => host::data::Kind::Cache,
-            "site-data" => host::data::Kind::SiteData,
-            _ => host::data::Kind::Everything,
-        };
-        host::data::clear(kind, seconds, done);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (what, seconds);
-        done();
-    }
+/// Chromium's zoom level for a percentage: 0 is 100%, each level ×1.2.
+fn zoom_level(percent: u16) -> f64 {
+    (f64::from(percent) / 100.).ln() / 1.2f64.ln()
 }
 
-/// The sites that stored something, each with what kinds of data.
-pub(crate) fn data_sites(done: impl FnOnce(Vec<(String, Vec<String>)>) + 'static) {
-    #[cfg(target_os = "macos")]
-    host::data::sites(done);
-    #[cfg(not(target_os = "macos"))]
-    done(Vec::new());
+fn zoom_percent(level: f64) -> u16 {
+    (1.2f64.powf(level) * 100.)
+        .round()
+        .clamp(1., f64::from(u16::MAX)) as u16
 }
 
-/// Removes everything one site stored.
-pub(crate) fn clear_site(site: String, done: impl FnOnce(bool) + 'static) {
-    #[cfg(target_os = "macos")]
-    host::data::clear_site(site, done);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = site;
-        done(false);
+// ---- Find in page ----
+
+/// The find bar under the toolbar (⌘F).
+struct FindBar {
+    field: Entity<Input>,
+    /// Matches, and the selected one counting from 1; `None` until the page
+    /// answers.
+    result: Option<(i32, i32)>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// "3 of 12", or nothing to say yet.
+fn find_status(text: &str, result: Option<(i32, i32)>) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    match result? {
+        (0, _) => Some("No results".into()),
+        (count, active) => Some(format!("{} of {count}", active.clamp(1, count))),
     }
 }
 
-pub(crate) enum BrowserEvent {
-    /// The address or title changed: what is saved with the pane.
-    Changed,
-    /// The page took the keyboard, which makes its pane the focused one.
-    Focused,
-    /// The page asked for a new window at this address.
-    OpenNew(String),
-    /// Text for the chat of the session the page belongs to.
-    AddToChat(String),
-    /// The user stopped, or allowed again, a session's agent in the browser.
-    StopAgent(i64),
-    AllowAgent(i64),
-    /// Save this URL as the project's default browser start page.
-    SetProjectStartUrl(String),
-}
+/// The profile a page browses with; Chromium's own type, or its stand-in
+/// where Chromium is not available yet.
+pub(crate) type Profile = monocode_cef::Profile;
 
+/// What a page asks of the pane around it.
 #[derive(Clone, Debug, PartialEq)]
-struct AgentNote {
-    session: i64,
-    name: String,
-    stopped: bool,
+pub(crate) enum PageRequest {
+    /// A new page beside this one (a popup, `target=_blank`, a middle
+    /// click). `popup` is a created popup the new page adopts
+    /// ([`BrowserPage::adopt_popup`]); without it the page loads `url`.
+    Open {
+        url: String,
+        foreground: bool,
+        popup: Option<u64>,
+    },
+    /// The page closed itself (`window.close()`).
+    Close,
 }
 
-/// A line under the address row saying what just happened. It takes room
-/// of its own rather than floating: anything floating over the page would
-/// be under the native view.
-#[derive(Clone, Debug, PartialEq)]
-enum Banner {
-    Downloaded(std::path::PathBuf),
-    Problem(String),
-    Info(String),
+/// Something the page waits on the user for, shown as a modal over it.
+enum PagePrompt {
+    Auth(monocode_cef::AuthRequest),
+    Dialog(monocode_cef::JsDialog),
 }
 
-struct OpenMenu {
-    menu: Entity<Menu>,
-    _events: Subscription,
-}
-
-/// A row with one text field under the address row: finding in the page,
-/// or typing a user agent of one's own.
-struct Entry {
-    input: Entity<Input>,
-    _events: Vec<Subscription>,
-}
-
-pub(crate) struct BrowserView {
+/// One browser page in a pane: its toolbar, and the Chromium view below.
+pub(crate) struct BrowserPage {
     pub url: String,
     pub title: String,
-    pub user_agent: Option<String>,
-    /// A fixed size to hold the page at, as a device would; `None` fits the pane.
-    pub viewport: Option<(u32, u32)>,
-    /// Independent page zoom in percent (`100` is actual size).
-    pub zoom_percent: u16,
-    /// Reload this page automatically when files in its project change.
-    pub reload_on_save: bool,
-    /// The session whose agent last used the page, and its name.
-    agent: Option<AgentNote>,
-    /// The user asked for this page to stay loaded.
-    pub keep_awake: bool,
-    /// When the page was last on screen, or used by an agent.
-    last_used: Rc<std::cell::Cell<std::time::Instant>>,
     loading: bool,
-    can_back: bool,
-    can_forward: bool,
-    /// Why the last load failed, shown until the next one starts.
+    can_go_back: bool,
+    can_go_forward: bool,
+    progress: f64,
     failure: Option<String>,
-    /// No web view: the page was put to sleep, or never shown since launch.
-    asleep: bool,
     address: Entity<Input>,
-    address_focused: bool,
+    /// Page zoom in percent; Chromium keeps it per host ([`Self::sync_zoom`]).
+    pub zoom: u16,
+    /// The saved zoom has yet to reach Chromium: it applies to the host of
+    /// the first committed address.
+    zoom_pending: bool,
+    find: Option<FindBar>,
+    /// Where the page last drew, to take GPUI focus when Chromium gets it.
+    window: Option<AnyWindowHandle>,
+    engine: Entity<Engine>,
+    profiles: PathBuf,
+    host: Rc<Host<monocode_cef::BrowserView>>,
+    /// Saved with the pane; the shell sets it when it makes the page.
+    pub devtools_dock: DevToolsDock,
+    /// The docked DevTools' view, made when first painted while open.
+    devtools: Rc<Host<monocode_cef::DevToolsView>>,
+    /// The divider being dragged: where the drag started, and the height then.
+    devtools_drag: Option<(f32, f32)>,
+    /// The body under the toolbar, as last laid out.
+    body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
-    /// Set when the native page was clicked; the pane takes GPUI's focus on
-    /// its next frame, where there is a window to take it in.
-    take_focus: bool,
-    #[cfg(target_os = "macos")]
-    host: Rc<RefCell<Option<host::Hosted>>>,
-    /// Whether this frame's paint put the native view on screen.
-    placed: Rc<std::cell::Cell<bool>>,
-    /// What the last paint did with the native view, for the self-test.
-    paint_note: Rc<std::cell::Cell<&'static str>>,
-    banner: Option<Banner>,
-    menu: Option<OpenMenu>,
-    menu_anchor: AnchorSlot,
-    find: Option<Entry>,
-    /// The last search found nothing.
-    find_missed: bool,
-    custom_agent: Option<Entry>,
-    /// The Shell is drawing something over the panes (see `set_covered`).
-    shell_covered: bool,
-    /// Something GPUI draws (a menu, a dialog, a drag) may be over the pane.
-    /// The native view would hide it, so a picture of the page is shown in
-    /// its place for as long as that lasts.
-    covered: bool,
-    /// The picture, once it has been taken; the page stays up until then.
-    stand_in: Option<std::sync::Arc<gpui::Image>>,
-    /// The page had the keyboard when it was covered, and takes it back
-    /// when it is put on screen again.
-    refocus: Rc<std::cell::Cell<bool>>,
     _subscriptions: Vec<Subscription>,
-    _watch: gpui::Task<()>,
+    // Downloads and the dialogs the page asks for.
+    downloads: Vec<monocode_cef::Download>,
+    downloads_open: bool,
+    downloads_anchor: AnchorSlot,
+    /// The first one shows; the rest wait their turn.
+    prompts: VecDeque<PagePrompt>,
+    /// The shown prompt's fields: user name and password, or a prompt's text.
+    prompt_fields: Vec<Entity<Input>>,
+    prompt_focus: FocusHandle,
+    /// The shown prompt takes the keyboard on the next frame.
+    focus_prompt: bool,
+    _prompt_subscriptions: Vec<Subscription>,
 }
 
-/// One page's native view, as the Shell's frame sees it: taken off screen
-/// after a frame that did not paint it.
-///
-/// It is not hidden before the frame and shown again by the paint, as the
-/// Mono HTML view is: AppKit takes the keyboard away from a view that is
-/// hidden, so a page that was being typed in would lose it on every frame.
-pub(crate) struct PageFrame {
-    #[cfg(target_os = "macos")]
-    host: Rc<RefCell<Option<host::Hosted>>>,
-    placed: Rc<std::cell::Cell<bool>>,
-}
+impl EventEmitter<PageChanged> for BrowserPage {}
+impl EventEmitter<PageRequest> for BrowserPage {}
 
-impl PageFrame {
-    /// After the frame's panes have painted.
-    pub(crate) fn finish(&self) {
-        if !self.placed.get() {
-            #[cfg(target_os = "macos")]
-            if let Some(host) = self.host.borrow().as_ref() {
-                host.hide();
-            }
-        }
-    }
-}
-
-impl EventEmitter<BrowserEvent> for BrowserView {}
-impl Focusable for BrowserView {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+impl Focusable for BrowserPage {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-impl BrowserView {
-    /// `asleep`: a page restored with the workspace loads when first woken,
-    /// not at launch.
+impl BrowserPage {
     pub(crate) fn new(
         url: String,
         title: String,
-        user_agent: Option<String>,
-        asleep: bool,
+        zoom: u16,
+        profiles: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
-        let address = cx.new(|cx| {
-            let mut input = Input::field("Address", "Search or enter address", content(0.35), cx);
-            input.set_font_size(13.);
-            input.set_text(url.clone(), cx);
-            input
+        let engine = Engine::global(cx);
+        let field = cx.new(|cx| {
+            let mut field =
+                Input::field("Address", "Search or enter an address", content(0.35), cx);
+            field.set_text(url.clone(), cx);
+            field
         });
-        let subscriptions =
-            vec![
-                cx.subscribe(&address, |this, input, _: &input::Submitted, cx| {
-                    let text = input.read(cx).content.to_string();
-                    this.navigate(&text, cx);
-                }),
-            ];
+        let subscriptions = vec![
+            cx.observe(&engine, |_, _, cx| cx.notify()),
+            cx.subscribe(&field, |this, field, _: &input::Submitted, cx| {
+                let typed = field.read(cx).content.to_string();
+                if let Some(url) = address(&typed) {
+                    this.load(url, cx);
+                }
+            }),
+            // Snapshots sit in GPU atlases until given back.
+            cx.on_release(|page, cx| {
+                page.host.release(cx);
+                page.devtools.release(cx);
+            }),
+        ];
         Self {
             url,
             title,
-            user_agent,
-            viewport: None,
-            zoom_percent: 100,
-            reload_on_save: false,
-            agent: None,
-            keep_awake: false,
-            last_used: Rc::new(std::cell::Cell::new(std::time::Instant::now())),
             loading: false,
-            can_back: false,
-            can_forward: false,
+            can_go_back: false,
+            can_go_forward: false,
+            progress: 0.,
             failure: None,
-            asleep,
-            address,
-            address_focused: false,
-            focus: cx.focus_handle(),
-            take_focus: false,
-            #[cfg(target_os = "macos")]
-            host: Rc::new(RefCell::new(None)),
-            placed: Rc::new(std::cell::Cell::new(false)),
-            paint_note: Rc::new(std::cell::Cell::new("never painted")),
-            banner: None,
-            menu: None,
-            menu_anchor: AnchorSlot::default(),
+            address: field,
+            zoom,
+            zoom_pending: zoom != 100,
             find: None,
-            find_missed: false,
-            custom_agent: None,
-            shell_covered: false,
-            covered: false,
-            stand_in: None,
-            refocus: Rc::new(std::cell::Cell::new(false)),
+            window: None,
+            engine,
+            profiles,
+            host: Rc::new(Host::default()),
+            devtools_dock: DevToolsDock::default(),
+            devtools: Rc::new(Host::default()),
+            devtools_drag: None,
+            body_bounds: Rc::default(),
+            focus: cx.focus_handle(),
             _subscriptions: subscriptions,
-            _watch: cx.spawn(async move |this, cx| {
-                // WebKit reports loads as they happen, but a page can also
-                // retitle itself or move within itself with no load at all.
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(500))
-                        .await;
-                    #[cfg(target_os = "macos")]
-                    let alive = this.update(cx, |this, cx| this.page_changed(cx)).is_ok();
-                    #[cfg(not(target_os = "macos"))]
-                    let alive = this.update(cx, |_, _| ()).is_ok();
-                    if !alive {
-                        break;
-                    }
-                }
-            }),
+            downloads: Vec::new(),
+            downloads_open: false,
+            downloads_anchor: AnchorSlot::default(),
+            prompts: VecDeque::new(),
+            prompt_fields: Vec::new(),
+            prompt_focus: cx.focus_handle(),
+            focus_prompt: false,
+            _prompt_subscriptions: Vec::new(),
         }
     }
 
-    pub(crate) fn asleep(&self) -> bool {
-        self.asleep
+    pub(crate) fn display_title(&self) -> String {
+        page_title(&self.url, &self.title)
     }
 
-    /// The page's name for a tab or a row.
-    pub(crate) fn label(&self) -> String {
-        if self.title.trim().is_empty() {
-            monocode_core::browser::label(&self.url)
+    /// The address field takes the keyboard while there is nothing to show;
+    /// otherwise the page does.
+    pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if self.url.is_empty() {
+            window.focus(&self.address.focus_handle(cx), cx);
         } else {
-            self.title.clone()
+            window.focus(&self.focus, cx);
+            self.host.with_view(|view| view.set_focus(true));
         }
     }
 
-    /// Goes where the typed text says: an address, a host, or a search.
-    pub(crate) fn navigate(&mut self, text: &str, cx: &mut Context<Self>) {
-        let url = monocode_core::browser::address(text);
+    fn load(&mut self, url: String, cx: &mut Context<Self>) {
         self.url = url.clone();
         self.failure = None;
-        self.asleep = false;
-        self.address_focused = false;
-        self.address
-            .update(cx, |input, cx| input.set_text(url.clone(), cx));
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.load(&url);
-            host.focus();
+        if !self.host.with_view(|view| view.load_url(&url)) {
+            cx.notify();
         }
-        cx.emit(BrowserEvent::Changed);
+        cx.emit(PageChanged);
+    }
+
+    fn on_event(&mut self, event: monocode_cef::BrowserEvent, cx: &mut Context<Self>) {
+        use monocode_cef::BrowserEvent;
+        match event {
+            BrowserEvent::Address(url) => {
+                self.sync_zoom(cx);
+                if url != self.url {
+                    self.url = url.clone();
+                    self.address.update(cx, |field, cx| field.set_text(url, cx));
+                    cx.emit(PageChanged);
+                }
+            }
+            BrowserEvent::Title(title) => {
+                if title != self.title {
+                    self.title = title;
+                    cx.emit(PageChanged);
+                }
+            }
+            BrowserEvent::Loading {
+                loading,
+                can_go_back,
+                can_go_forward,
+            } => {
+                self.loading = loading;
+                self.can_go_back = can_go_back;
+                self.can_go_forward = can_go_forward;
+                if loading {
+                    self.failure = None;
+                } else {
+                    self.sync_zoom(cx);
+                    self.snapshot_when_settled(cx);
+                }
+            }
+            BrowserEvent::Progress(progress) => self.progress = progress,
+            BrowserEvent::LoadFailed { url, text, .. } => {
+                self.failure = Some(format!("{url} could not be loaded: {text}"));
+            }
+            BrowserEvent::Closed => {}
+            BrowserEvent::FindResult {
+                count,
+                active_ordinal,
+                final_update,
+            } => {
+                if let Some(find) = &mut self.find
+                    && (final_update || count > 0)
+                {
+                    find.result = Some((count, active_ordinal));
+                }
+            }
+            BrowserEvent::Focused => self.follow_page_focus(cx),
+            other => self.on_page_event(other, cx),
+        }
         cx.notify();
     }
 
-    fn back(&mut self, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.back();
-        }
-        cx.notify();
+    /// Whether the find bar is open, and whether the address field or the
+    /// find field has GPUI focus.
+    #[cfg(test)]
+    pub(crate) fn keyboard_state(&self, window: &Window, cx: &App) -> (bool, bool, bool) {
+        let find = self.find.as_ref();
+        (
+            find.is_some(),
+            self.address.focus_handle(cx).is_focused(window),
+            find.is_some_and(|f| f.field.focus_handle(cx).is_focused(window)),
+        )
     }
-    fn forward(&mut self, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.forward();
-        }
-        cx.notify();
+
+    /// A click in the page gives Chromium the keyboard without GPUI seeing
+    /// it; GPUI focus follows, so the page's shortcuts apply.
+    fn follow_page_focus(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else { return };
+        let focus = self.focus.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                if !focus.is_focused(window) {
+                    window.focus(&focus, cx);
+                }
+            });
+        });
     }
-    fn reload_or_stop(&mut self, cx: &mut Context<Self>) {
-        if self.asleep {
-            self.wake(cx);
+
+    /// Keeps [`Self::zoom`] in step with Chromium, which keeps one level per
+    /// host: shared by the pages of a profile on that host and kept across
+    /// navigations within it. Following it, rather than forcing a level per
+    /// page, avoids rewriting the host's level under every other page on it.
+    /// The saved zoom applies once, to the first host the page commits.
+    fn sync_zoom(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.zoom_pending);
+        let wanted = self.zoom;
+        let level = self.host.view.borrow().as_ref().map(|hosted| {
+            if pending {
+                hosted.view.set_zoom_level(zoom_level(wanted));
+            }
+            hosted.view.zoom_level()
+        });
+        let Some(level) = level else {
+            self.zoom_pending = pending;
+            return;
+        };
+        let percent = zoom_percent(level);
+        if !pending && percent != self.zoom {
+            self.zoom = percent;
+            cx.emit(PageChanged);
+            cx.notify();
+        }
+    }
+
+    fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
+        if percent == self.zoom {
             return;
         }
-        self.failure = None;
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            if self.loading {
-                host.stop();
+        self.zoom = percent;
+        // Before the page exists, its first address takes it.
+        if !self
+            .host
+            .with_view(|view| view.set_zoom_level(zoom_level(percent)))
+        {
+            self.zoom_pending = true;
+        }
+        cx.emit(PageChanged);
+        cx.notify();
+    }
+
+    fn reload(&mut self, ignore_cache: bool) {
+        self.host.with_view(|view| {
+            if ignore_cache {
+                view.reload_ignore_cache();
             } else {
-                host.reload();
+                view.reload();
             }
-        }
-        cx.notify();
+        });
     }
 
-    /// Frees the page: its web view and the process behind it go, the
-    /// address stays. Waking it loads the address again.
-    pub(crate) fn sleep(&mut self, cx: &mut Context<Self>) {
-        if self.asleep {
-            return;
-        }
-        self.asleep = true;
-        self.loading = false;
-        self.can_back = false;
-        self.can_forward = false;
-        #[cfg(target_os = "macos")]
-        self.host.borrow_mut().take();
-        if self.reload_on_save {
-            cx.emit(BrowserEvent::Changed);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn wake(&mut self, cx: &mut Context<Self>) {
-        if self.asleep {
-            self.asleep = false;
-            self.failure = None;
-            if self.reload_on_save {
-                cx.emit(BrowserEvent::Changed);
-            }
-            cx.notify();
-        }
-    }
-
-    /// Tells the pane whether GPUI is drawing something that may be over it.
-    pub(crate) fn set_covered(&mut self, covered: bool, cx: &mut Context<Self>) {
-        self.shell_covered = covered;
-        self.apply_cover(cx);
-    }
-
-    pub(crate) fn covered(&self) -> bool {
-        self.covered
-    }
-
-    /// The page gives way while the Shell or the pane's own menu is drawn
-    /// over it.
-    fn apply_cover(&mut self, cx: &mut Context<Self>) {
-        let covered = self.shell_covered || self.menu.is_some();
-        if self.covered == covered {
-            return;
-        }
-        self.covered = covered;
-        if !covered {
-            self.stand_in = None;
-            cx.notify();
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            self.refocus.set(host.has_keyboard());
-            let view = cx.weak_entity();
-            let app = cx.to_async();
-            host.snapshot(move |bytes| {
-                app.spawn(async move |cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        // Still covered: the picture takes the page's place.
-                        if this.covered
-                            && let Some(bytes) = bytes
-                        {
-                            this.stand_in = Some(std::sync::Arc::new(gpui::Image::from_bytes(
-                                gpui::ImageFormat::Jpeg,
-                                bytes,
-                            )));
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-            });
-        }
-    }
-
-    /// Starts a frame: the page counts as off screen until its pane paints.
-    pub(crate) fn begin_frame(&self) -> PageFrame {
-        self.placed.set(false);
-        PageFrame {
-            #[cfg(target_os = "macos")]
-            host: self.host.clone(),
-            placed: self.placed.clone(),
-        }
-    }
-
-    /// The keyboard goes to the page, or to the address of an empty one.
-    pub(crate) fn focus_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            window.focus(&self.focus, cx);
-            host.focus();
-            return;
-        }
+    /// ⌘L: the address field, all of it selected.
+    fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_keyboard(window);
         window.focus(&self.address.focus_handle(cx), cx);
+        self.address.update(cx, |field, cx| {
+            let len = field.content.len();
+            field.select_range(0..len, cx);
+        });
     }
 
-    /// Whether the page, drawn in the last frame, stands under something
-    /// floating: the Shell's (`shell_covered`) or its own menu.
-    pub(crate) fn under_overlay(&self, shell_covered: bool) -> bool {
-        // Once its picture stands in for it, the page is no longer placed.
-        let drawn = self.placed.get() || self.stand_in.is_some();
-        drawn && !self.asleep && (shell_covered || self.menu.is_some())
-    }
-
-    /// Whether the native page is in front of the user right now: real
-    /// mouse and key events can only be sent to one that is.
-    pub(crate) fn on_screen(&self) -> bool {
-        self.placed.get() && !self.covered && self.stand_in.is_none() && !self.asleep
-    }
-
-    /// Makes sure the page has a web view even though its pane is not being
-    /// drawn, so that an agent can use a page the user is not looking at.
-    /// It loads off screen; the pane puts it in place when it is shown.
-    pub(crate) fn ensure_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Takes the keyboard back from Chromium for a GPUI field.
+    fn take_keyboard(&self, window: &mut Window) {
+        self.host.with_view(|view| view.set_focus(false));
         #[cfg(target_os = "macos")]
-        {
-            use objc2_app_kit::NSView;
-            use objc2_foundation::{NSPoint, NSRect, NSSize};
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if self.asleep {
-                self.asleep = false;
-                self.failure = None;
-                if self.reload_on_save {
-                    cx.emit(BrowserEvent::Changed);
-                }
-                cx.notify();
-            }
-            if self.host.borrow().is_some() {
-                return true;
-            }
-            let Ok(handle) = HasWindowHandle::window_handle(window) else {
-                return false;
-            };
-            let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-                return false;
-            };
-            let Some(mtm) = objc2::MainThreadMarker::new() else {
-                return false;
-            };
-            let parent = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
-            let (width, height) = self.viewport.unwrap_or((1280, 800));
-            let frame = NSRect::new(
-                NSPoint::new(0., 0.),
-                NSSize::new(f64::from(width), f64::from(height)),
-            );
-            let link = host::Link {
-                app: cx.to_async(),
-                view: cx.weak_entity(),
-            };
-            let hosted = host::Hosted::new(
-                mtm,
-                link,
-                frame,
-                frame,
-                self.user_agent.as_deref(),
-                &self.url,
-            );
-            // Off screen the frame is the page's size in its own pixels, so
-            // only the page's own zoom applies; the pane adds the
-            // interface's when it puts the page in place.
-            hosted.place(parent, frame, frame, f64::from(self.zoom_percent) / 100.);
-            hosted.hide();
-            *self.host.borrow_mut() = Some(hosted);
-            true
-        }
+        mac::make_gpui_first_responder(window);
         #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (window, cx);
-            false
-        }
+        let _ = window;
     }
 
-    /// Back, forward or reload, by name.
-    pub(crate) fn go(&mut self, action: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        match action {
-            "back" => self.back(cx),
-            "forward" => self.forward(cx),
-            "reload" => {
-                self.failure = None;
-                #[cfg(target_os = "macos")]
-                if let Some(host) = self.host.borrow().as_ref() {
-                    host.reload();
-                }
-                cx.notify();
-            }
-            other => {
-                return Err(format!(
-                    "Unknown action {other}: use back, forward or reload"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Changes the user agent (`None`: the default) and loads the page
-    /// again, since a user agent only applies to loads made after it.
-    pub(crate) fn set_user_agent(&mut self, user_agent: Option<String>, cx: &mut Context<Self>) {
-        if self.user_agent == user_agent {
-            return;
-        }
-        self.user_agent = user_agent;
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.set_user_agent(self.user_agent.as_deref());
-            host.reload();
-        }
-        cx.emit(BrowserEvent::Changed);
-        cx.notify();
-    }
-
-    /// Holds the page at a size, or (`None`) lets it fit the pane.
-    pub(crate) fn set_viewport(&mut self, viewport: Option<(u32, u32)>, cx: &mut Context<Self>) {
-        let viewport = viewport
-            .filter(|(width, height)| *width > 0 && *height > 0)
-            .map(|(width, height)| (width.clamp(200, 4000), height.clamp(200, 4000)));
-        if self.viewport != viewport {
-            self.viewport = viewport;
-            cx.emit(BrowserEvent::Changed);
-            cx.notify();
-        }
-    }
-
-    /// Sets the independent zoom percentage (`25..=300`, `100` is actual size).
-    pub(crate) fn set_zoom_percent(&mut self, zoom: u16, cx: &mut Context<Self>) {
-        let zoom = monocode_core::browser::normalize_zoom(Some(zoom));
-        if self.zoom_percent != zoom {
-            self.zoom_percent = zoom;
-            cx.emit(BrowserEvent::Changed);
-            cx.notify();
-        }
-    }
-
-    /// Steps this page's zoom one stop up (`1`), down (`-1`), or resets it (`0`).
-    pub(crate) fn step_zoom(&mut self, step: i8, cx: &mut Context<Self>) {
-        let next = monocode_core::browser::step_zoom(self.zoom_percent, step);
-        self.set_zoom_percent(next, cx);
-    }
-
-    /// Toggles automatic reloads when files in this page's project change.
-    pub(crate) fn toggle_reload_on_save(&mut self, cx: &mut Context<Self>) {
-        self.reload_on_save = !self.reload_on_save;
-        cx.emit(BrowserEvent::Changed);
-        cx.notify();
-    }
-
-    /// Reloads an awake, non-blank page after a project file save.
-    pub(crate) fn reload_on_file_save(&mut self, cx: &mut Context<Self>) {
-        if self.asleep || self.url.is_empty() || self.url == "about:blank" {
-            return;
-        }
-        self.failure = None;
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.reload();
-        }
-        cx.notify();
-    }
-
-    /// A picture of the page as JPEG bytes, or `None` if it has no view.
-    pub(crate) fn snapshot(&self) -> async_channel::Receiver<Option<Vec<u8>>> {
-        let (send, receive) = async_channel::bounded(1);
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.snapshot(move |bytes| {
-                let _ = send.try_send(bytes);
-            });
-            return receive;
-        }
-        let _ = send.try_send(None);
-        receive
-    }
-
-    /// An agent of `session` is using the page: the pane says so, with a
-    /// way to stop it.
-    pub(crate) fn note_agent(&mut self, session: i64, name: String, cx: &mut Context<Self>) {
-        let note = AgentNote {
-            session,
-            name,
-            stopped: false,
-        };
-        self.last_used.set(std::time::Instant::now());
-        if self.agent.as_ref() != Some(&note) {
-            self.agent = Some(note);
-            cx.notify();
-        }
-    }
-
-    /// Shows the page's agent as stopped (or allowed again).
-    pub(crate) fn set_agent_stopped(
-        &mut self,
-        session: i64,
-        stopped: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(agent) = self.agent.as_mut().filter(|agent| agent.session == session)
-            && agent.stopped != stopped
-        {
-            agent.stopped = stopped;
-            cx.notify();
-        }
-    }
-
-    /// Runs an expression in the page; the receiver gets its value as JSON
-    /// text. A page with no web view answers with an error.
-    pub(crate) fn eval(&self, script: &str) -> async_channel::Receiver<Result<String, String>> {
-        let (send, receive) = async_channel::bounded(1);
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.eval(script, move |result| {
-                let _ = send.try_send(result);
-            });
-            return receive;
-        }
-        let _ = send.try_send(Err("The page is asleep".into()));
-        receive
-    }
-
-    pub(crate) fn loading(&self) -> bool {
-        self.loading
-    }
-
-    /// The page as the rules that free memory see it, if it is loaded.
-    pub(crate) fn load(&self, id: i64) -> Option<monocode_core::browser::PageLoad> {
-        self.has_page().then(|| monocode_core::browser::PageLoad {
-            id,
-            idle_secs: self.last_used.get().elapsed().as_secs(),
-            on_screen: self.placed.get(),
-            keep_awake: self.keep_awake,
-        })
-    }
-
-    /// Megabytes the page's process holds, when that can be told.
-    pub(crate) fn memory_mb(&self) -> Option<u64> {
-        #[cfg(target_os = "macos")]
-        return (self.host.borrow().as_ref()).and_then(|host| host.memory_mb());
-        #[cfg(not(target_os = "macos"))]
-        None
-    }
-
-    /// Whether the page has a web view (it is not asleep).
-    pub(crate) fn has_page(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        return self.host.borrow().is_some();
-        #[cfg(not(target_os = "macos"))]
-        false
-    }
-
-    /// Loading, as the web view says right now rather than as last heard.
-    pub(crate) fn busy(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.state().loading;
-        }
-        self.loading
-    }
-
-    pub(crate) fn failure(&self) -> Option<String> {
-        self.failure.clone()
-    }
-
-    /// Where the page stands, for the self-test's report.
-    pub(crate) fn diagnostics(&self) -> serde_json::Value {
-        #[cfg(target_os = "macos")]
-        let hosted = self.host.borrow().is_some();
-        #[cfg(not(target_os = "macos"))]
-        let hosted = false;
-        serde_json::json!({
-            "url": self.url,
-            "asleep": self.asleep,
-            "hosted": hosted,
-            "placed": self.placed.get(),
-            "covered": self.covered,
-            "stand_in": self.stand_in.is_some(),
-            "native": self.native_state(),
-            "calls": [
-                host::CALLS.load(std::sync::atomic::Ordering::Relaxed),
-                host::REACHED.load(std::sync::atomic::Ordering::Relaxed),
-                host::FAILED.load(std::sync::atomic::Ordering::Relaxed),
-            ],
-            "title": self.title,
-            "zoom_percent": self.zoom_percent,
-            "reload_on_save": self.reload_on_save,
-            "paint": self.paint_note.get(),
-            "loading": self.loading,
-            "failure": self.failure,
-        })
-    }
-
-    /// Whether the keyboard is the page's.
-    /// Keys go to the app's own view, not to the page and not to nobody.
-    pub(crate) fn keyboard_with_app(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.keyboard_with_app();
-        }
-        true
-    }
-
-    pub(crate) fn has_keyboard(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.has_keyboard();
-        }
-        false
-    }
-
-    /// A real click at a point of the page, in its own CSS pixels. The
-    /// event is returned to be sent once no GPUI update is running: AppKit
-    /// answers it by calling back into GPUI.
-    pub(crate) fn click_at(&self, x: f64, y: f64) -> Box<dyn FnOnce()> {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.click(x, y);
-        }
-        let _ = (x, y);
-        Box::new(|| {})
-    }
-
-    /// A real key press through the app's event path; sent as `click_at`.
-    pub(crate) fn press(&self, characters: &str, code: u16, command: bool) -> Box<dyn FnOnce()> {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.key(characters, code, command);
-        }
-        let _ = (characters, code, command);
-        Box::new(|| {})
-    }
-
-    pub(crate) fn probe(&self, x: f64, y: f64) -> serde_json::Value {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            return host.probe(x, y);
-        }
-        let _ = (x, y);
-        serde_json::Value::Null
-    }
-
-    /// What the web view itself reports, bypassing what the pane remembers.
-    pub(crate) fn native_state(&self) -> serde_json::Value {
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            let state = host.state();
-            return serde_json::json!({
-                "url": state.url, "title": state.title, "loading": state.loading,
+    /// ⌘F: opens the find bar, or selects its text when it is open.
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let field = cx.new(|cx| Input::field("Find in page", "Find", content(0.35), cx));
+            let subscriptions = vec![
+                cx.subscribe(&field, |this, _, _: &input::Changed, cx| {
+                    this.search(true, false, cx)
+                }),
+                cx.subscribe(&field, |this, _, _: &input::Submitted, cx| {
+                    this.search(true, true, cx)
+                }),
+            ];
+            self.find = Some(FindBar {
+                field,
+                result: None,
+                _subscriptions: subscriptions,
             });
         }
-        serde_json::Value::Null
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn page_changed(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.host.borrow().as_ref().map(|host| host.state()) else {
+        let Some(field) = self.find.as_ref().map(|find| find.field.clone()) else {
             return;
         };
-        let moved = !state.url.is_empty() && state.url != self.url;
-        let retitled = state.title != self.title;
-        if !moved
-            && !retitled
-            && (self.loading, self.can_back, self.can_forward)
-                == (state.loading, state.back, state.forward)
-        {
+        self.take_keyboard(window);
+        window.focus(&field.focus_handle(cx), cx);
+        field.update(cx, |field, cx| {
+            let len = field.content.len();
+            field.select_range(0..len, cx);
+        });
+        self.search(true, false, cx);
+    }
+
+    /// Searches the page for the find field's text: a new search while it
+    /// is typed, else the next or previous match.
+    fn search(&mut self, forward: bool, next: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else { return };
+        let text = find.field.read(cx).content.to_string();
+        if text.is_empty() {
+            find.result = None;
+            self.host.with_view(|view| view.stop_finding(true));
+        } else {
+            if !next {
+                find.result = None;
+            }
+            self.host
+                .with_view(|view| view.find(&text, forward, false, next));
+        }
+        cx.notify();
+    }
+
+    /// Esc: closes the find bar, clears its highlights and gives the page
+    /// the keyboard back.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_none() {
             return;
         }
-        self.loading = state.loading;
-        self.can_back = state.back;
-        self.can_forward = state.forward;
-        if state.loading {
-            self.failure = None;
-        }
-        if moved {
-            self.url = state.url.clone();
-            if !self.address_focused {
-                self.address
-                    .update(cx, |input, cx| input.set_text(state.url, cx));
-            }
-        }
-        if moved || retitled {
-            self.title = state.title;
-            cx.emit(BrowserEvent::Changed);
-        }
+        self.host.with_view(|view| view.stop_finding(true));
+        self.focus(window, cx);
         cx.notify();
     }
 
-    /// WebKit ended the page's process: it ran out of memory, or crashed.
-    #[cfg(target_os = "macos")]
-    pub(super) fn page_stopped(&mut self, cx: &mut Context<Self>) {
-        self.sleep(cx);
-        self.banner = Some(Banner::Problem(
-            "This page stopped (it crashed or was using too much memory) and was put to sleep."
-                .into(),
-        ));
-        cx.notify();
+    fn find_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let find = self.find.as_ref()?;
+        let text = find.field.read(cx).content.to_string();
+        let status = find_status(&text, find.result);
+        let can_step = find.result.is_some_and(|(count, _)| count > 0);
+        Some(
+            div()
+                .key_context(FIND_CONTEXT)
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .h(px(30.))
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(content(0.08))
+                .child(
+                    div()
+                        .w(px(260.))
+                        .min_w_0()
+                        .h(px(22.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(content(0.05))
+                        .child(find.field.clone()),
+                )
+                .child(
+                    div()
+                        .min_w(px(64.))
+                        .px_1()
+                        .text_size(px(11.))
+                        .text_color(content(0.5))
+                        .children(status),
+                )
+                .child(
+                    icon_button_enabled(
+                        "browser-find-previous",
+                        "Previous Match",
+                        "chevron-up",
+                        can_step,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.search(false, true, cx))),
+                )
+                .child(
+                    icon_button_enabled(
+                        "browser-find-next",
+                        "Next Match",
+                        "chevron-down",
+                        can_step,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.search(true, true, cx))),
+                )
+                .child(div().flex_1())
+                .child(
+                    icon_button_enabled("browser-find-close", "Close", "x", true)
+                        .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+                ),
+        )
     }
 
-    #[cfg(target_os = "macos")]
-    pub(super) fn open_new(&mut self, url: String, cx: &mut Context<Self>) {
-        cx.emit(BrowserEvent::OpenNew(url));
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn downloaded(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        self.banner = Some(Banner::Downloaded(path));
-        cx.notify();
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn download_failed(&mut self, message: String, cx: &mut Context<Self>) {
-        self.banner = Some(Banner::Problem(format!("The download failed: {message}")));
-        cx.notify();
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn page_failed(&mut self, message: String, cx: &mut Context<Self>) {
-        self.loading = false;
-        self.failure = Some(message);
-        cx.notify();
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn page_focused(&mut self, cx: &mut Context<Self>) {
-        self.take_focus = true;
-        cx.emit(BrowserEvent::Focused);
-        cx.notify();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn edit(&self, action: objc2::runtime::Sel) {
-        if let Some(host) = self.host.borrow().as_ref() {
-            host.edit(action);
-        }
-    }
-
-    fn tool(
-        id: &'static str,
-        label: &'static str,
-        glyph: &'static str,
-        enabled: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        icon_button(id, label, glyph)
-            .debug_selector(move || id.into())
-            .flex_shrink_0()
-            .when(!enabled, |d| d.opacity(0.3))
-    }
-
-    fn address_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let (back, forward) = (self.can_back, self.can_forward);
-        let url = self.url.clone();
+    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ready = self.host.view.borrow().is_some();
         div()
-            .debug_selector(|| "browser-address-row".into())
-            .h(px(36.))
-            .flex_shrink_0()
-            .px_2()
             .flex()
             .items_center()
             .gap_1()
+            .px_2()
+            .h(px(34.))
+            .flex_shrink_0()
             .border_b_1()
-            .border_color(content(0.07))
+            .border_color(content(0.08))
             .child(
-                Self::tool("browser-back", "Back", "chevron-left", back)
-                    .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
+                icon_button_enabled("browser-back", "Back", "arrow-left-2", self.can_go_back)
+                    .on_click(cx.listener(|this, _, _, _| {
+                        this.host.with_view(|view| view.go_back());
+                    })),
             )
             .child(
-                Self::tool("browser-forward", "Forward", "chevron-right", forward)
-                    .on_click(cx.listener(|this, _, _, cx| this.forward(cx))),
+                icon_button_enabled(
+                    "browser-forward",
+                    "Forward",
+                    "arrow-right-2",
+                    self.can_go_forward,
+                )
+                .on_click(cx.listener(|this, _, _, _| {
+                    this.host.with_view(|view| view.go_forward());
+                })),
             )
             .child(
-                Self::tool(
+                icon_button_enabled(
                     "browser-reload",
                     if self.loading { "Stop" } else { "Reload" },
-                    if self.loading { "close" } else { "refresh" },
-                    true,
+                    if self.loading { "x" } else { "refresh-cw" },
+                    ready,
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.reload_or_stop(cx))),
+                .on_click(cx.listener(|this, _, _, _| {
+                    let loading = this.loading;
+                    this.host
+                        .with_view(|view| if loading { view.stop() } else { view.reload() });
+                })),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h(px(26.))
+                    .h(px(24.))
                     .px_2()
                     .flex()
                     .items_center()
-                    .gap_2()
                     .rounded_md()
-                    .bg(content(0.06))
-                    .child(icon("globe", 12.).text_color(content(0.45)))
-                    .child(div().flex_1().min_w_0().child(self.address.clone()))
-                    .when(self.zoom_percent != 100, |d| {
-                        d.child(
-                            div()
-                                .id("browser-zoom-badge")
-                                .debug_selector(|| "browser-zoom-badge".into())
-                                .role(Role::Button)
-                                .aria_label("Reset zoom to 100%")
-                                .h(px(20.))
-                                .px(px(6.))
-                                .flex()
-                                .items_center()
-                                .flex_shrink_0()
-                                .rounded(px(4.))
-                                .bg(content(0.08))
-                                .hover(|s| s.bg(content(0.14)))
-                                .text_size(px(11.))
-                                .text_color(content(0.75))
-                                .child(format!("{}%", self.zoom_percent))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.set_zoom_percent(100, cx)),
-                                ),
-                        )
-                    }),
+                    .bg(content(0.05))
+                    .child(self.address.clone()),
             )
-            .child(
-                Self::tool(
-                    "browser-sleep",
-                    "Sleep: free this page's memory",
-                    "queue-pause",
-                    !self.asleep,
+            .when(self.zoom != 100, |d| {
+                d.child(
+                    div()
+                        .id("browser-zoom")
+                        .role(gpui::Role::Button)
+                        .aria_label("Reset Zoom")
+                        .flex_shrink_0()
+                        .px_2()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(content(0.6))
+                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .child(format!("{}%", self.zoom))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.sleep(cx))),
-            )
-            .child(
-                Self::tool(
-                    "browser-external",
-                    "Open in my browser",
-                    "external-link",
-                    true,
-                )
-                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
-            )
-            .child(
-                Self::tool("browser-menu", "Page options", "more-horizontal", true)
-                    .relative()
-                    .child(self.menu_anchor.probe())
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_menu(window, cx))),
-            )
-            .into_any_element()
-    }
-
-    fn toggle_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
-            self.apply_cover(cx);
-            cx.notify();
-            return;
-        }
-        let agents = monocode_core::browser::USER_AGENTS;
-        let current = monocode_core::browser::user_agent_name(self.user_agent.as_deref());
-        let mut items: Vec<MenuItem> = vec![
-            MenuAction::new("find", "Find in Page…")
-                .shortcut(if cfg!(target_os = "macos") {
-                    "⌘F"
-                } else {
-                    "Ctrl F"
-                })
-                .into(),
-            MenuAction::new("inspect", "Web Inspector")
-                .shortcut(if cfg!(target_os = "macos") {
-                    "⌘⌥I"
-                } else {
-                    "Ctrl Alt I"
-                })
-                .into(),
-            MenuAction::new("errors", "Add Console Errors to Chat").into(),
-            MenuAction::new("clear", "Clear This Site's Data").into(),
-            MenuAction::new("awake", "Keep This Page Awake")
-                .checked(self.keep_awake)
-                .into(),
-            MenuAction::new("reload-on-save", "Reload on Save")
-                .checked(self.reload_on_save)
-                .into(),
-        ];
-        if self.url.starts_with("http://") || self.url.starts_with("https://") {
-            items.push(
-                MenuAction::new("start-url", "Use Current Page as Project Start Page").into(),
-            );
-        }
-        items.extend([
-            MenuItem::Separator,
-            MenuItem::Header("Zoom".into()),
-            MenuAction::new("zoom:out", "Zoom Out")
-                .shortcut(if cfg!(target_os = "macos") {
-                    "⌘-"
-                } else {
-                    "Ctrl -"
-                })
-                .into(),
-            MenuAction::new(
-                "zoom:reset",
-                format!("Actual Size ({}%)", self.zoom_percent),
-            )
-            .shortcut(if cfg!(target_os = "macos") {
-                "⌘0"
-            } else {
-                "Ctrl 0"
             })
-            .checked(self.zoom_percent == 100)
-            .into(),
-            MenuAction::new("zoom:in", "Zoom In")
-                .shortcut(if cfg!(target_os = "macos") {
-                    "⌘+"
-                } else {
-                    "Ctrl +"
-                })
-                .into(),
-            MenuItem::Separator,
-            MenuItem::Header("User agent".into()),
-        ]);
-        for (ix, (name, _)) in agents.iter().enumerate() {
-            items.push(
-                MenuAction::new(format!("agent:{ix}"), *name)
-                    .checked(current == *name)
-                    .into(),
-            );
+            .child(
+                icon_button_enabled("browser-devtools", "DevTools", "code", ready)
+                    .when(self.devtools_dock.open, |b| b.bg(content(0.1)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
+            )
+            .children(self.downloads_button(cx))
+    }
+
+    /// Opens or closes the docked DevTools.
+    pub(crate) fn toggle_dev_tools(&mut self, cx: &mut Context<Self>) {
+        self.devtools_dock.open = !self.devtools_dock.open;
+        if !self.devtools_dock.open {
+            self.drop_dev_tools(cx);
         }
-        items.push(
-            MenuAction::new("agent:custom", "Custom…")
-                .checked(current == "Custom")
-                .into(),
-        );
-        items.push(MenuItem::Separator);
-        items.push(MenuItem::Header("Size".into()));
-        items.push(
-            MenuAction::new("size:fit", "Fit pane")
-                .checked(self.viewport.is_none())
-                .into(),
-        );
-        for (ix, (name, width, height)) in monocode_core::browser::DEVICE_SIZES.iter().enumerate() {
-            items.push(
-                MenuAction::new(format!("size:{ix}"), format!("{name}  {width} × {height}"))
-                    .checked(self.viewport == Some((*width, *height)))
-                    .into(),
-            );
-        }
-        items.push(MenuItem::Note(
-            "A user agent changes what servers and scripts are told. The engine stays WebKit."
-                .into(),
-        ));
-        if let Some(memory) = self.memory_mb() {
-            items.push(MenuItem::Note(
-                format!("This page is using {memory} MB.").into(),
-            ));
-        }
-        let menu = cx.new(|cx| {
-            Menu::new("Page options", items, window, cx)
-                .width(250.)
-                .style(MenuStyle::Explorer)
-        });
-        let events = cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
-            this.menu = None;
-            this.apply_cover(cx);
-            if let MenuEvent::Picked(id, _) = event {
-                this.pick(id.as_ref(), window, cx);
-            }
-            cx.notify();
-        });
-        self.menu = Some(OpenMenu {
-            menu,
-            _events: events,
-        });
-        self.apply_cover(cx);
+        cx.emit(PageChanged);
         cx.notify();
     }
 
-    fn pick(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match id {
-            "find" => self.open_find(window, cx),
-            "inspect" => self.inspect(cx),
-            "errors" => self.console_errors_to_chat(cx),
-            "clear" => self.clear_site_data(cx),
-            "agent:custom" => self.open_custom_agent(window, cx),
-            "size:fit" => self.set_viewport(None, cx),
-            "awake" => {
-                self.keep_awake = !self.keep_awake;
-                cx.emit(BrowserEvent::Changed);
-            }
-            "reload-on-save" => self.toggle_reload_on_save(cx),
-            "start-url" => {
-                if !self.url.is_empty() {
-                    cx.emit(BrowserEvent::SetProjectStartUrl(self.url.clone()));
-                }
-            }
-            "zoom:out" => self.step_zoom(-1, cx),
-            "zoom:reset" => self.set_zoom_percent(100, cx),
-            "zoom:in" => self.step_zoom(1, cx),
-            _ => {
-                let index = |prefix: &str| {
-                    id.strip_prefix(prefix)
-                        .and_then(|n| n.parse::<usize>().ok())
-                };
-                if let Some((_, agent)) =
-                    index("agent:").and_then(|ix| monocode_core::browser::USER_AGENTS.get(ix))
-                {
-                    self.custom_agent = None;
-                    self.set_user_agent((!agent.is_empty()).then(|| (*agent).to_owned()), cx);
-                } else if let Some((_, width, height)) =
-                    index("size:").and_then(|ix| monocode_core::browser::DEVICE_SIZES.get(ix))
-                {
-                    self.set_viewport(Some((*width, *height)), cx);
-                }
-            }
-        }
+    /// Closes DevTools' view; a new host makes the next one.
+    fn drop_dev_tools(&mut self, cx: &mut App) {
+        self.devtools_drag = None;
+        let old = std::mem::replace(&mut self.devtools, Rc::new(Host::default()));
+        old.release(cx);
+        old.close();
     }
 
-    fn entry(
-        label: &'static str,
-        text: String,
-        window: &mut Window,
+    /// DevTools closed on its own (its UI, or a crash).
+    fn dev_tools_closed(
+        &mut self,
+        host: &Weak<Host<monocode_cef::DevToolsView>>,
         cx: &mut Context<Self>,
-        submit: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
-        changed: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Entry {
-        let input = cx.new(|cx| {
-            let mut input = Input::field(label, label, content(0.35), cx);
-            input.set_font_size(13.);
-            input.set_text(text, cx);
-            input
-        });
-        let events = vec![
-            cx.subscribe(&input, move |this, input, _: &input::Submitted, cx| {
-                let text = input.read(cx).content.to_string();
-                submit(this, text, cx);
-            }),
-            cx.subscribe(&input, move |this, _, _: &input::Changed, cx| {
-                changed(this, cx);
-            }),
-        ];
-        window.focus(&input.focus_handle(cx), cx);
-        Entry {
-            input,
-            _events: events,
+    ) {
+        if std::ptr::eq(host.as_ptr(), Rc::as_ptr(&self.devtools)) {
+            self.devtools_dock.open = false;
+            self.drop_dev_tools(cx);
+            cx.emit(PageChanged);
         }
-    }
-
-    pub(crate) fn find_open(&self) -> bool {
-        self.find.is_some()
-    }
-
-    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.find {
-            Some(find) => window.focus(&find.input.focus_handle(cx), cx),
-            None => {
-                self.find_missed = false;
-                self.find = Some(Self::entry(
-                    "Find in page",
-                    String::new(),
-                    window,
-                    cx,
-                    |this, text, cx| this.find_next(&text, false, cx),
-                    |this, cx| {
-                        if this.find_missed {
-                            this.find_missed = false;
-                            cx.notify();
-                        }
-                    },
-                ));
-            }
-        }
+        // An earlier DevTools finishing its close lets a new one open.
         cx.notify();
     }
 
-    fn find_next(&mut self, text: &str, backwards: bool, cx: &mut Context<Self>) {
-        if text.is_empty() {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        if let Some(host) = self.host.borrow().as_ref() {
-            let (view, app) = (cx.weak_entity(), cx.to_async());
-            host.find(text, backwards, move |found| {
-                app.spawn(async move |cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        this.find_missed = !found;
-                        cx.notify();
-                    });
-                })
-                .detach();
-            });
-        }
-        let _ = backwards;
-    }
-
-    fn find_again(&mut self, backwards: bool, cx: &mut Context<Self>) {
-        if let Some(text) = (self.find.as_ref()).map(|find| find.input.read(cx).content.to_string())
-        {
-            self.find_next(&text, backwards, cx);
-        }
-    }
-
-    fn open_custom_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.user_agent.clone().unwrap_or_default();
-        self.custom_agent = Some(Self::entry(
-            "User agent",
-            current,
-            window,
-            cx,
-            |this, text, cx| {
-                this.custom_agent = None;
-                this.set_user_agent(monocode_core::browser::user_agent(&text), cx);
-            },
-            |_, _| {},
-        ));
-        cx.notify();
-    }
-
-    pub(crate) fn inspect(&mut self, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
-        let opened = (self.host.borrow().as_ref()).is_some_and(|host| host.inspect());
-        #[cfg(not(target_os = "macos"))]
-        let opened = false;
-        if !opened {
-            self.banner = Some(Banner::Problem(
-                "The inspector could not be opened from here. In Safari: Develop › this Mac › this page."
-                    .into(),
-            ));
-            cx.notify();
-        }
-    }
-
-    /// Puts what the page logged as errors and warnings into the chat of
-    /// the session it belongs to, as Add to Chat does for a selection.
-    fn console_errors_to_chat(&mut self, cx: &mut Context<Self>) {
-        let script = agent::call(
-            "M.console.filter((e) => e.level === 'error' || e.level === 'warn').slice(-40).map((e) => `[${e.level}] ${e.text}`)",
-        );
-        let receive = self.eval(&script);
-        let url = self.url.clone();
-        cx.spawn(async move |this, cx| {
-            let lines: Vec<String> = (receive.recv().await.ok())
-                .and_then(|result| result.ok())
-                .and_then(|text| serde_json::from_str(&text).ok())
-                .unwrap_or_default();
-            let _ = this.update(cx, |this, cx| {
-                if lines.is_empty() {
-                    this.banner = Some(Banner::Info(
-                        "The page has logged no errors or warnings.".into(),
-                    ));
-                    cx.notify();
-                    return;
+    /// A snapshot once a load has had a moment to paint, so an overlay has
+    /// a recent frame to show at once.
+    fn snapshot_when_settled(&self, cx: &mut Context<Self>) {
+        let host = Rc::downgrade(&self.host);
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            cx.update(|cx| {
+                if let Some(host) = host.upgrade()
+                    && host.shown.get() == Placement::Shown
+                {
+                    host.refresh_snapshot(cx);
                 }
-                let block = lines.join("\n").replace("```", "'''");
-                cx.emit(BrowserEvent::AddToChat(format!(
-                    "Console of {url}:\n```\n{block}\n```"
-                )));
             });
         })
         .detach();
     }
 
-    /// Signs out of the site on screen and forgets what it stored.
-    fn clear_site_data(&mut self, cx: &mut Context<Self>) {
-        let rest = (self.url.split_once("://")).map_or(self.url.as_str(), |(_, rest)| rest);
-        let host = monocode_core::browser::host_of(rest);
-        if host.is_empty() {
-            self.banner = Some(Banner::Info(
-                "Open a website first to clear its stored data.".into(),
-            ));
-            cx.notify();
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let site = host::site_of(host);
-            let (view, app) = (cx.weak_entity(), cx.to_async());
-            let name = site.clone();
-            host::data::clear_site(site, move |found| {
-                app.spawn(async move |cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        this.banner = Some(Banner::Info(if found {
-                            format!("Cleared what {name} stored. You are signed out of it.")
-                        } else {
-                            format!("{name} had nothing stored.")
-                        }));
-                        let _ = this.go("reload", cx);
-                    });
-                })
-                .detach();
-            });
-        }
-    }
-
-    /// The find bar, or the field for a user agent of one's own.
-    fn entry_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let row = |selector: &'static str| {
-            div()
-                .debug_selector(move || selector.into())
-                .h(px(32.))
-                .flex_shrink_0()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .border_b_1()
-                .border_color(content(0.07))
-                .text_size(px(12.))
-        };
-        let mut rows = Vec::new();
-        if let Some(find) = &self.find {
-            rows.push(
-                row("browser-find-row")
-                    .on_action(
-                        cx.listener(|this, _: &crate::shell::DismissMenu, window, cx| {
-                            cx.stop_propagation();
-                            this.find = None;
-                            this.find_missed = false;
-                            this.focus_page(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(icon("search", 12.).text_color(content(0.45)))
-                    .child(div().flex_1().min_w_0().child(find.input.clone()))
-                    .when(self.find_missed, |d| {
-                        d.child(div().text_color(content(0.5)).child("No matches"))
-                    })
-                    .child(
-                        Self::tool(
-                            "browser-find-previous",
-                            "Previous match",
-                            "chevron-up",
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.find_again(true, cx))),
-                    )
-                    .child(
-                        Self::tool("browser-find-next", "Next match", "chevron-down", true)
-                            .on_click(cx.listener(|this, _, _, cx| this.find_again(false, cx))),
-                    )
-                    .child(
-                        Self::tool("browser-find-close", "Close", "close", true).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.find = None;
-                                this.find_missed = false;
-                                this.focus_page(window, cx);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(agent) = &self.custom_agent {
-            rows.push(
-                row("browser-agent-entry")
-                    .on_action(
-                        cx.listener(|this, _: &crate::shell::DismissMenu, window, cx| {
-                            cx.stop_propagation();
-                            this.custom_agent = None;
-                            this.focus_page(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(div().text_color(content(0.5)).child("User agent"))
-                    .child(div().flex_1().min_w_0().child(agent.input.clone()))
-                    .child(
-                        Self::tool("browser-agent-entry-close", "Cancel", "close", true).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.custom_agent = None;
-                                this.focus_page(window, cx);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        rows
-    }
-
-    /// Who else is acting on the page, with the switch that stops them.
-    fn agent_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let agent = self.agent.clone()?;
-        let session = agent.session;
-        let stopped = agent.stopped;
-        Some(
-            div()
-                .debug_selector(|| "browser-agent-row".into())
-                .h(px(30.))
-                .flex_shrink_0()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .border_b_1()
-                .border_color(content(0.07))
-                .bg(content(0.04))
-                .text_size(px(12.))
-                .text_color(content(0.8))
-                .child(icon("bot", 13.).text_color(content(0.6)))
-                .child(div().flex_1().min_w_0().truncate().child(if stopped {
-                    format!("{} is stopped from using the browser", agent.name)
-                } else {
-                    format!("{} is using this page", agent.name)
-                }))
-                .child(
-                    crate::project_settings::button(
-                        "browser-agent-switch",
-                        if stopped { "Allow again" } else { "Stop" },
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(if stopped {
-                            BrowserEvent::AllowAgent(session)
-                        } else {
-                            BrowserEvent::StopAgent(session)
-                        });
-                    })),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn banner_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let banner = self.banner.clone()?;
-        let (text, path) = match &banner {
-            Banner::Downloaded(path) => (
-                format!(
-                    "Downloaded {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                Some(path.clone()),
-            ),
-            Banner::Problem(message) | Banner::Info(message) => (message.clone(), None),
+    /// Instead of the page while Chromium is not running yet.
+    fn status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (headline, detail, retry) = match &self.engine.read(cx).state {
+            EngineState::Ready => return None,
+            EngineState::Idle => ("Starting Chromium…".to_owned(), String::new(), false),
+            EngineState::Failed(error) => {
+                ("Chromium could not start".to_owned(), error.clone(), true)
+            }
         };
         Some(
             div()
-                .debug_selector(|| "browser-banner".into())
-                .h(px(30.))
-                .flex_shrink_0()
-                .px_3()
-                .flex()
-                .items_center()
-                .gap_2()
-                .border_b_1()
-                .border_color(content(0.07))
-                .bg(content(0.04))
-                .text_size(px(12.))
-                .text_color(content(0.8))
-                .child(div().flex_1().min_w_0().truncate().child(text))
-                .when_some(path, |d, path| {
-                    d.child(
-                        crate::project_settings::button("browser-banner-reveal", "Show in Finder")
-                            .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&path))),
-                    )
-                })
-                .child(
-                    Self::tool("browser-banner-close", "Dismiss", "close", true).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.banner = None;
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// What stands where the page would be while there is none.
-    fn card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (headline, detail, action) = if self.asleep {
-            (
-                "This page is asleep",
-                "It uses no memory. Its address is kept.".to_owned(),
-                "Wake",
-            )
-        } else if let Some(failure) = &self.failure {
-            ("This page did not load", failure.clone(), "Try again")
-        } else {
-            return None;
-        };
-        Some(
-            div()
-                .debug_selector(|| "browser-card".into())
-                .absolute()
-                .inset_0()
-                .bg(pane_fill())
+                .size_full()
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .text_size(px(13.))
-                .child(icon("globe", 24.).text_color(content(0.4)))
-                .child(div().text_color(content(0.9)).child(headline))
+                .child(icon("globe", 28.).text_color(content(0.3)))
                 .child(
                     div()
-                        .max_w(px(420.))
-                        .text_size(px(12.))
-                        .text_color(content(0.5))
-                        .child(detail),
+                        .text_size(px(14.))
+                        .text_color(content(0.8))
+                        .child(headline),
                 )
-                .child(
-                    crate::project_settings::button("browser-card-action", action)
-                        .on_click(cx.listener(|this, _, _, cx| this.reload_or_stop(cx))),
-                )
+                .when(!detail.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .max_w(px(420.))
+                            .text_size(px(12.))
+                            .text_color(content(0.5))
+                            .child(detail),
+                    )
+                })
+                .when(retry, |d| {
+                    d.child(
+                        div()
+                            .id("browser-retry")
+                            .mt_2()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(content(0.08))
+                            .hover(|s| s.bg(content(0.14)))
+                            .text_size(px(12.))
+                            .child("Try again")
+                            .on_click(cx.listener(|this, _, _, cx| this.start_engine(cx))),
+                    )
+                })
                 .into_any_element(),
         )
     }
 
-    #[cfg(target_os = "macos")]
-    fn page(&self, cx: &mut Context<Self>) -> AnyElement {
-        use objc2::MainThreadMarker;
-        use objc2_app_kit::NSView;
-        use objc2_foundation::{NSPoint, NSRect, NSSize};
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let hosted = self.host.clone();
-        let placed = self.placed.clone();
-        let note = self.paint_note.clone();
-        let refocus = self.refocus.clone();
-        let last_used = self.last_used.clone();
-        let covered = self.covered;
-        let link = host::Link {
-            app: cx.to_async(),
-            view: cx.weak_entity(),
+    fn start_engine(&mut self, cx: &mut Context<Self>) {
+        let profiles = self.profiles.clone();
+        self.engine
+            .update(cx, |engine, cx| engine.ensure(profiles, cx));
+    }
+
+    /// Where Chromium draws: a canvas that places the native view each frame.
+    fn surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let host = self.host.clone();
+        let url = if self.url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            self.url.clone()
         };
-        // A failed load shows its card over the page; a sleeping page has none.
-        let shown = !self.asleep && self.failure.is_none() && self.stand_in.is_none();
-        let asleep = self.asleep;
-        let (url, user_agent) = (self.url.clone(), self.user_agent.clone());
-        let viewport = self.viewport;
-        let page_zoom_factor = f64::from(self.zoom_percent) / 100.;
+        let page = cx.weak_entity();
         canvas(
             |_, _, _| {},
-            move |bounds, _, window, _| {
-                let mut hosted = hosted.borrow_mut();
-                if !shown {
-                    if let Some(host) = hosted.as_ref() {
-                        host.hide();
+            move |bounds, _, window, cx| {
+                let options = host.options.borrow().clone();
+                host.paint(bounds, window, cx, |parent, frame, cx| {
+                    match monocode_cef::BrowserView::create_with(parent, frame, &url, &options) {
+                        Ok((view, events)) => {
+                            let page = page.clone();
+                            cx.spawn(async move |cx| {
+                                while let Ok(event) = events.recv().await {
+                                    if page
+                                        .update(cx, |page, cx| page.on_event(event, cx))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            })
+                            .detach();
+                            Some(view)
+                        }
+                        Err(e) => {
+                            let error = e.to_string();
+                            let page = page.clone();
+                            cx.defer(move |cx| {
+                                let _ = page.update(cx, |page, cx| {
+                                    page.failure = Some(error);
+                                    cx.notify();
+                                });
+                            });
+                            None
+                        }
                     }
-                    if asleep {
-                        return;
-                    }
-                }
-                let Ok(handle) = HasWindowHandle::window_handle(window) else {
-                    note.set("no window handle");
-                    return;
-                };
-                let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-                    note.set("not an AppKit window");
-                    return;
-                };
-                // GPUI keeps its AppKit content view alive throughout paint.
-                let parent = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
-                // AppKit frames are in window points; GPUI's are divided by
-                // the interface zoom.
-                let zoom = window.content_zoom();
-                let pane = bounds;
-                // Held at a device's size, the page sits at the top of the
-                // pane, centred, and the pane clips what does not fit.
-                let bounds = match viewport {
-                    Some((width, height)) => {
-                        let (width, height) = (px(width as f32), px(height as f32));
-                        let left = pane.left() + ((pane.size.width - width) / 2.).max(px(0.));
-                        gpui::Bounds::new(gpui::point(left, pane.top()), gpui::size(width, height))
-                    }
-                    None => pane,
-                };
-                let clipped = bounds
-                    .intersect(&pane)
-                    .intersect(&window.content_mask().bounds)
-                    .map(|v| v * zoom);
-                let bounds = bounds.map(|v| v * zoom);
-                if clipped.size.width <= px(0.) || clipped.size.height <= px(0.) {
-                    if let Some(host) = hosted.as_ref() {
-                        host.hide();
-                    }
-                    note.set("clipped away");
-                    return;
-                }
-                let height = f64::from(clipped.size.height);
-                let y = f64::from(clipped.origin.y);
-                let y = if parent.isFlipped() {
-                    y
-                } else {
-                    parent.bounds().size.height - y - height
-                };
-                let frame = NSRect::new(
-                    NSPoint::new(f64::from(clipped.origin.x), y),
-                    NSSize::new(f64::from(clipped.size.width), height),
-                );
-                // The page keeps its full size while its clip follows
-                // GPUI's content mask.
-                let web_frame = NSRect::new(
-                    NSPoint::new(
-                        f64::from(bounds.left() - clipped.left()),
-                        f64::from(bounds.top() - clipped.top()),
-                    ),
-                    NSSize::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
-                );
-                if hosted.is_none() {
-                    let Some(mtm) = MainThreadMarker::new() else {
-                        return;
-                    };
-                    *hosted = Some(host::Hosted::new(
-                        mtm,
-                        link.clone(),
-                        frame,
-                        web_frame,
-                        user_agent.as_deref(),
-                        &url,
-                    ));
-                }
-                if let Some(host) = hosted.as_ref()
-                    && shown
-                {
-                    host.place(parent, frame, web_frame, f64::from(zoom) * page_zoom_factor);
-                    placed.set(true);
-                    last_used.set(std::time::Instant::now());
-                    note.set("placed");
-                    if !covered && refocus.take() {
-                        host.focus();
-                    }
-                }
+                })
             },
         )
         .size_full()
         .into_any_element()
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn page(&self, _: &mut Context<Self>) -> AnyElement {
-        div()
-            .size_full()
+    /// Where DevTools draws, under the page: made once the page is.
+    fn devtools_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let host = self.devtools.clone();
+        let page_host = self.host.clone();
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                let weak = Rc::downgrade(&host);
+                host.paint(bounds, window, cx, |parent, frame, cx| {
+                    let opened = page_host
+                        .view
+                        .borrow()
+                        .as_ref()
+                        .map(|hosted| hosted.view.show_dev_tools(parent, frame));
+                    match opened? {
+                        Ok((view, events)) => {
+                            let page = page.clone();
+                            cx.spawn(async move |cx| {
+                                if events.recv().await.is_ok() {
+                                    let _ = page
+                                        .update(cx, |page, cx| page.dev_tools_closed(&weak, cx));
+                                }
+                            })
+                            .detach();
+                            Some(view)
+                        }
+                        // An earlier DevTools is still closing; its close
+                        // repaints, and this tries again.
+                        Err(e) => {
+                            log::debug!("browser: DevTools did not open: {e}");
+                            None
+                        }
+                    }
+                })
+            },
+        )
+        .size_full()
+        .into_any_element()
+    }
+
+    /// The page, with DevTools under a draggable divider when it is open.
+    fn body(&mut self, page: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let open = self.devtools_dock.open && self.engine.read(cx).state == EngineState::Ready;
+        if !open {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(page)
+                .into_any_element();
+        }
+        let available = self
+            .body_bounds
+            .get()
+            .map_or(0., |b| f32::from(b.size.height));
+        let height = devtools_height(self.devtools_dock.height, available);
+        let slot = self.body_bounds.clone();
+        // The next render clamps to a new size, so a resize asks for it.
+        let probe = canvas(
+            move |bounds, window, _| {
+                if slot
+                    .replace(Some(bounds))
+                    .is_none_or(|old| old.size != bounds.size)
+                {
+                    window.on_next_frame(|window, _| window.refresh());
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let divider = div()
+            .id("browser-devtools-divider")
+            .role(gpui::Role::Splitter)
+            .aria_label("Resize DevTools")
+            // Real space, not an overlap: Chromium's views would take the
+            // pointer over any part of it they cover.
+            .h(px(5.))
+            .flex_shrink_0()
+            .cursor(CursorStyle::ResizeUpDown)
             .flex()
             .items_center()
-            .justify_center()
-            .text_size(px(13.))
-            .text_color(content(0.5))
-            .child("The browser pane needs macOS.")
+            .child(div().h(px(1.)).w_full().bg(content(0.12)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.devtools_drag = Some((f32::from(event.position.y), height));
+                    cx.stop_propagation();
+                }),
+            );
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(probe)
+            .child(div().flex_1().min_h_0().min_w_0().child(page))
+            .child(divider)
+            .child(
+                div()
+                    .h(px(height))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(self.devtools_surface(cx)),
+            )
+            .when(self.devtools_drag.is_some(), |d| {
+                d.child(self.drag_listener(cx))
+            })
             .into_any_element()
+    }
+
+    /// While the divider drags: window-wide, since the pointer passes over
+    /// Chromium's views, whose drags AppKit still sends to GPUI's view.
+    fn drag_listener(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = cx.weak_entity();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let moved = page.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = moved.update(cx, |page, cx| page.drag_divider(event, cx));
+                });
+                let released = page.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = released.update(cx, |page, cx| page.end_divider_drag(cx));
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    fn drag_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some((start, height)) = self.devtools_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_divider_drag(cx);
+            return;
+        }
+        let available = self
+            .body_bounds
+            .get()
+            .map_or(0., |b| f32::from(b.size.height));
+        let wanted = (height + start - f32::from(event.position.y)).max(1.);
+        let height = devtools_height(wanted.round() as u32, available).round() as u32;
+        if height != self.devtools_dock.height {
+            self.devtools_dock.height = height;
+            cx.notify();
+        }
+    }
+
+    fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+        if self.devtools_drag.take().is_some() {
+            // Saved once, when the drag ends.
+            cx.emit(PageChanged);
+            cx.notify();
+        }
     }
 }
 
-impl gpui::Render for BrowserView {
+impl Render for BrowserPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.address_focused = self.address.focus_handle(cx).is_focused(window);
-        if std::mem::take(&mut self.take_focus) {
-            window.focus(&self.focus, cx);
+        self.window = Some(window.window_handle());
+        if self.engine.read(cx).state == EngineState::Idle {
+            self.start_engine(cx);
         }
-        let pane = div()
-            .id("browser-pane")
-            .role(Role::Region)
-            .aria_label("Browser")
+        self.focus_prompt_now(window, cx);
+        let body = match self.status(cx) {
+            Some(status) => status,
+            None => self.surface(cx),
+        };
+        div()
+            .id("browser-page")
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(
+                cx.listener(|this, _: &FocusAddress, window, cx| this.focus_address(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &Reload, _, _| this.reload(false)))
+            .on_action(cx.listener(|this, _: &ReloadIgnoringCache, _, _| this.reload(true)))
+            .on_action(cx.listener(|this, _: &Find, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.search(true, true, cx)))
+            .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.search(false, true, cx)))
+            .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_find(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ZoomIn, _, cx| this.set_zoom(zoom_step(this.zoom, 1), cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(zoom_step(this.zoom, -1), cx)),
+            )
+            .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
             .size_full()
             .flex()
             .flex_col()
-            .bg(pane_fill())
-            .track_focus(&self.focus)
-            .key_context("Browser");
-        #[cfg(target_os = "macos")]
-        let pane = {
-            use objc2::sel;
-            pane.on_action(cx.listener(|this, _: &input::Copy, _, _| this.edit(sel!(copy:))))
-                .on_action(cx.listener(|this, _: &input::Cut, _, _| this.edit(sel!(cut:))))
-                .on_action(cx.listener(|this, _: &input::Paste, _, _| this.edit(sel!(paste:))))
-                .on_action(cx.listener(|this, _: &input::SelectAll, _, _| {
-                    this.edit(host::Hosted::select_all())
-                }))
-                .on_action(cx.listener(|this, _: &input::Undo, _, _| this.edit(sel!(undo:))))
-                .on_action(cx.listener(|this, _: &input::Redo, _, _| this.edit(sel!(redo:))))
-        };
-        let pane = pane
-            .on_action(cx.listener(|this, _: &FocusAddress, window, cx| {
-                window.focus(&this.address.focus_handle(cx), cx);
-                window.dispatch_action(Box::new(input::SelectAll), cx);
-            }))
-            .on_action(cx.listener(|this, _: &FindInPage, window, cx| this.open_find(window, cx)))
-            .on_action(cx.listener(|this, _: &Inspect, _, cx| this.inspect(cx)))
-            .on_action(cx.listener(|this, _: &Reload, _, cx| this.reload_or_stop(cx)))
-            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.back(cx)))
-            .on_action(cx.listener(|this, _: &GoForward, _, cx| this.forward(cx)));
-        pane.child(self.address_row(cx))
-            .children(self.entry_rows(cx))
-            .children(self.agent_row(cx))
-            .children(self.banner_row(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(self.page(cx))
-                    .children(self.stand_in.clone().map(|image| {
-                        gpui::img(image)
-                            .absolute()
-                            .inset_0()
-                            .size_full()
-                            .object_fit(gpui::ObjectFit::Fill)
-                    }))
-                    .children(self.card(cx)),
-            )
-            .children(self.menu.as_ref().map(|open| {
-                menu_popover(&open.menu, Anchor::Slot(self.menu_anchor.clone()), cx)
-                    .align(Align::End)
-            }))
+            .child(self.toolbar(cx))
+            .children(self.find_bar(cx))
+            .when_some(self.failure.clone(), |d, failure| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_size(px(12.))
+                        .text_color(content(0.6))
+                        .child(failure),
+                )
+            })
+            .when(self.loading && self.progress < 1., |d| {
+                d.child(
+                    div().h(px(2.)).w_full().child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(self.progress.clamp(0.05, 1.) as f32))
+                            .bg(crate::theme::accent_color()),
+                    ),
+                )
+            })
+            .child(self.body(body, cx))
+            .relative()
+            .children(self.downloads_popover(cx))
+            .children(self.prompt_overlay(cx))
     }
 }
 
-impl Drop for BrowserView {
-    fn drop(&mut self) {
+// ---- Popups, downloads, dialogs and profiles ----
+
+/// A size for people: `512 B`, `3.4 MB`.
+pub(crate) fn human_bytes(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    let units = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000. {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes / 1000.;
+    let mut unit = 0;
+    while value >= 1000. && unit + 1 < units.len() {
+        value /= 1000.;
+        unit += 1;
+    }
+    if value < 10. {
+        format!("{value:.1} {}", units[unit])
+    } else {
+        format!("{value:.0} {}", units[unit])
+    }
+}
+
+/// A download's line under its name.
+pub(crate) fn download_status(download: &monocode_cef::Download) -> String {
+    use monocode_cef::DownloadState;
+    match download.state {
+        DownloadState::InProgress => match download.total {
+            Some(total) => format!(
+                "{} of {}",
+                human_bytes(download.received),
+                human_bytes(total)
+            ),
+            None => human_bytes(download.received),
+        },
+        DownloadState::Complete => match download.total {
+            Some(total) => human_bytes(total),
+            None => human_bytes(download.received),
+        },
+        DownloadState::Canceled => "Canceled".into(),
+        DownloadState::Failed => "Failed".into(),
+    }
+}
+
+/// A host for a dialog's title: `example.com says`.
+fn origin_host(origin: &str) -> String {
+    let rest = origin.split("://").nth(1).unwrap_or(origin);
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+impl BrowserPage {
+    /// The events beyond the toolbar's: new pages, downloads and dialogs.
+    fn on_page_event(&mut self, event: monocode_cef::BrowserEvent, cx: &mut Context<Self>) {
+        use monocode_cef::BrowserEvent;
+        match event {
+            BrowserEvent::PopupRequested {
+                url, foreground, ..
+            } => cx.emit(PageRequest::Open {
+                url,
+                foreground,
+                popup: None,
+            }),
+            BrowserEvent::PopupOpened {
+                id,
+                url,
+                foreground,
+            } => cx.emit(PageRequest::Open {
+                url,
+                foreground,
+                popup: Some(id),
+            }),
+            BrowserEvent::CloseRequested => cx.emit(PageRequest::Close),
+            BrowserEvent::Download(download) => {
+                // The toolbar's indicator shows it; opening the list on its
+                // own would hide the page, which no overlay may cover.
+                match self.downloads.iter_mut().find(|d| d.id == download.id) {
+                    Some(known) => *known = download,
+                    None => self.downloads.push(download),
+                }
+            }
+            BrowserEvent::Auth(request) => self.push_prompt(PagePrompt::Auth(request), cx),
+            BrowserEvent::Dialog(dialog) => self.push_prompt(PagePrompt::Dialog(dialog), cx),
+            BrowserEvent::DialogsReset => {
+                let shown = matches!(self.prompts.front(), Some(PagePrompt::Dialog(_)));
+                self.prompts.retain(|p| matches!(p, PagePrompt::Auth(_)));
+                if shown {
+                    self.show_prompt(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The profile the page browses with. A page that exists already opens
+    /// again in the new profile, at the same address.
+    pub(crate) fn set_profile(&mut self, profile: monocode_cef::Profile, cx: &mut Context<Self>) {
+        if self.host.options.borrow().profile == profile {
+            return;
+        }
+        if self.host.view.borrow().is_some() {
+            self.host = Rc::new(Host::default());
+            cx.notify();
+        }
+        self.host.options.borrow_mut().profile = profile;
+    }
+
+    /// Takes over a popup this page's opener created (crate::popup in
+    /// monocode-cef), so that it keeps `window.opener`. False when it is gone;
+    /// the page then loads its address afresh.
+    pub(crate) fn adopt_popup(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
         #[cfg(target_os = "macos")]
-        self.host.borrow_mut().take();
+        {
+            use objc2::{MainThreadMarker, MainThreadOnly, msg_send, rc::Retained};
+            use objc2_app_kit::NSView;
+            use objc2_foundation::NSRect;
+
+            if self.host.view.borrow().is_some() {
+                return false;
+            }
+            let Some(mtm) = MainThreadMarker::new() else {
+                return false;
+            };
+            let Some((view, events)) = monocode_cef::take_popup(id) else {
+                return false;
+            };
+            let clip: Retained<mac::BrowserClip> = unsafe {
+                let clip = mac::BrowserClip::alloc(mtm).set_ivars(());
+                msg_send![super(clip), initWithFrame: NSRect::ZERO]
+            };
+            let clip: Retained<NSView> = Retained::into_super(clip);
+            clip.setWantsLayer(true);
+            clip.setClipsToBounds(true);
+            view.reparent(Retained::as_ptr(&clip) as *mut std::ffi::c_void);
+            // Hidden until its tab paints it.
+            view.set_visible(false);
+            *self.host.view.borrow_mut() = Some(Hosted { clip, view });
+            let page = cx.weak_entity();
+            cx.spawn(async move |_, cx| {
+                while let Ok(event) = events.recv().await {
+                    if page
+                        .update(cx, |page, cx| page.on_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (id, cx);
+            false
+        }
+    }
+
+    fn downloads_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_cef::DownloadState;
+        if self.downloads.is_empty() {
+            return None;
+        }
+        // Overall progress of what is still coming, when sizes are known.
+        let active: Vec<_> = self
+            .downloads
+            .iter()
+            .filter(|d| d.state == DownloadState::InProgress)
+            .collect();
+        let progress = (!active.is_empty()).then(|| {
+            let fractions: Vec<f64> = active.iter().filter_map(|d| d.fraction()).collect();
+            if fractions.is_empty() {
+                0.
+            } else {
+                fractions.iter().sum::<f64>() / fractions.len() as f64
+            }
+        });
+        Some(
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(self.downloads_anchor.probe())
+                .child(
+                    icon_button("browser-downloads", "Downloads", "arrow-down-circle").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.downloads_open = !this.downloads_open;
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .when_some(progress, |d, progress| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .bottom(px(1.))
+                            .left(px(5.))
+                            .right(px(5.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(content(0.12))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .w(gpui::relative(progress.clamp(0.08, 1.) as f32))
+                                    .bg(crate::theme::accent_color()),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn downloads_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.downloads_open || self.downloads.is_empty() {
+            return None;
+        }
+        let weak = cx.weak_entity();
+        let rows: Vec<AnyElement> = self
+            .downloads
+            .iter()
+            .rev()
+            .map(|download| self.download_row(download, cx))
+            .collect();
+        Some(
+            popover(
+                "browser-downloads-popover",
+                Anchor::Slot(self.downloads_anchor.clone()),
+            )
+            .align(Align::End)
+            .width(320.)
+            .max_height(360.)
+            .padding(6.)
+            .on_dismiss(move |_, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.downloads_open = false;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .id("browser-downloads-list")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn download_row(
+        &self,
+        download: &monocode_cef::Download,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use monocode_cef::DownloadState;
+        let id = download.id;
+        let running = download.state == DownloadState::InProgress;
+        let path = download.path.clone();
+        div()
+            .id(("browser-download", id as usize))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .hover(|s| s.bg(content(0.05)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(content(
+                                if download.state == DownloadState::Complete || running {
+                                    0.9
+                                } else {
+                                    0.5
+                                },
+                            ))
+                            .child(download.name()),
+                    )
+                    .when(running, |d| {
+                        d.child(
+                            div()
+                                .h(px(3.))
+                                .w_full()
+                                .rounded_full()
+                                .bg(content(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_full()
+                                        .w(gpui::relative(
+                                            download.fraction().unwrap_or(0.).clamp(0.03, 1.)
+                                                as f32,
+                                        ))
+                                        .bg(crate::theme::accent_color()),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.45))
+                            .child(download_status(download)),
+                    ),
+            )
+            .when(download.state != DownloadState::Canceled, |d| {
+                d.child(
+                    icon_button("browser-download-reveal", "Show in Finder", "folder-open")
+                        .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                )
+            })
+            .when(running, |d| {
+                d.child(
+                    icon_button("browser-download-cancel", "Cancel download", "x")
+                        .on_click(cx.listener(move |_, _, _, _| monocode_cef::cancel_download(id))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn push_prompt(&mut self, prompt: PagePrompt, cx: &mut Context<Self>) {
+        self.prompts.push_back(prompt);
+        if self.prompts.len() == 1 {
+            self.show_prompt(cx);
+        }
+    }
+
+    /// Makes the fields of the prompt in front, and gives it the keyboard.
+    fn show_prompt(&mut self, cx: &mut Context<Self>) {
+        let field = |label: &str, cx: &mut Context<Self>| {
+            let label = label.to_owned();
+            cx.new(|cx| {
+                let mut input = Input::field(label.clone(), label, content(0.35), cx);
+                input.set_font_size(13.);
+                input
+            })
+        };
+        let fields = match self.prompts.front() {
+            Some(PagePrompt::Auth(_)) => {
+                let user = field("User name", cx);
+                let password = field("Password", cx);
+                password.update(cx, |input, _| input.set_secret(true));
+                vec![user, password]
+            }
+            Some(PagePrompt::Dialog(dialog)) => match &dialog.kind {
+                monocode_cef::DialogKind::Prompt(text) => {
+                    let input = field("Answer", cx);
+                    let text = text.clone();
+                    input.update(cx, |input, cx| input.set_text(text, cx));
+                    vec![input]
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        self._prompt_subscriptions = fields
+            .iter()
+            .map(|field| {
+                cx.subscribe(field, |this, _, _: &input::Submitted, cx| {
+                    this.answer_prompt(true, cx)
+                })
+            })
+            .collect();
+        self.prompt_fields = fields;
+        self.focus_prompt = !self.prompts.is_empty();
+        if self.prompts.is_empty() {
+            // The page takes the keyboard back on the next click into it.
+            self.host.with_view(|view| view.set_focus(true));
+        }
+        cx.notify();
+    }
+
+    fn focus_prompt_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_prompt) {
+            return;
+        }
+        self.host.with_view(|view| view.set_focus(false));
+        match self.prompt_fields.first() {
+            Some(field) => window.focus(&field.focus_handle(cx), cx),
+            None => window.focus(&self.prompt_focus, cx),
+        }
+    }
+
+    /// Answers the prompt in front: OK / Sign In, or Cancel.
+    fn answer_prompt(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompts.pop_front() else {
+            return;
+        };
+        let text = |ix: usize, cx: &Context<Self>| {
+            self.prompt_fields
+                .get(ix)
+                .map(|f| f.read(cx).content.to_string())
+                .unwrap_or_default()
+        };
+        match &prompt {
+            PagePrompt::Auth(request) if accept => {
+                request.sign_in(text(0, cx).trim(), &text(1, cx));
+            }
+            PagePrompt::Auth(request) => request.cancel(),
+            PagePrompt::Dialog(dialog) if accept => {
+                let answer =
+                    matches!(dialog.kind, monocode_cef::DialogKind::Prompt(_)).then(|| text(0, cx));
+                dialog.accept(answer.as_deref());
+            }
+            PagePrompt::Dialog(dialog) => dialog.decline(),
+        }
+        self.show_prompt(cx);
+    }
+
+    fn prompt_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use monocode_cef::DialogKind;
+        let prompt = self.prompts.front()?;
+        let (title, detail, accept, cancel) = match prompt {
+            PagePrompt::Auth(request) => {
+                let c = &request.challenge;
+                let place = if c.port == 0 || c.port == 80 || c.port == 443 {
+                    c.host.clone()
+                } else {
+                    format!("{}:{}", c.host, c.port)
+                };
+                let what = if c.proxy { "The proxy" } else { "The site" };
+                let mut detail = format!("{what} {place} asks for a user name and password.");
+                if !c.realm.is_empty() {
+                    detail.push_str(&format!(" It says: “{}”", c.realm));
+                }
+                (
+                    format!("Sign in to {}", c.host),
+                    detail,
+                    "Sign In",
+                    Some("Cancel"),
+                )
+            }
+            PagePrompt::Dialog(dialog) => {
+                let says = match origin_host(&dialog.origin) {
+                    host if host.is_empty() => "This page says".to_owned(),
+                    host => format!("{host} says"),
+                };
+                match &dialog.kind {
+                    DialogKind::Alert => (says, dialog.message.clone(), "OK", None),
+                    DialogKind::Confirm | DialogKind::Prompt(_) => {
+                        (says, dialog.message.clone(), "OK", Some("Cancel"))
+                    }
+                    DialogKind::BeforeUnload { reload } => (
+                        if *reload {
+                            "Reload this page?"
+                        } else {
+                            "Leave this page?"
+                        }
+                        .to_owned(),
+                        "Changes you made may not be saved.".to_owned(),
+                        if *reload { "Reload" } else { "Leave" },
+                        Some("Stay"),
+                    ),
+                }
+            }
+        };
+        let labels: &[&str] = match prompt {
+            PagePrompt::Auth(_) => &["User name", "Password"],
+            PagePrompt::Dialog(_) => &[""],
+        };
+        let fields = self.prompt_fields.iter().zip(labels).map(|(field, label)| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .when(!label.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.5))
+                            .child(*label),
+                    )
+                })
+                .child(
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(content(0.12))
+                        .bg(content(0.04))
+                        .px_2()
+                        .py(px(6.))
+                        .child(field.clone()),
+                )
+        });
+        let card = modal::card().w(px(380.)).child(
+            modal::card_body()
+                .child(modal::title(title))
+                .when(!detail.is_empty(), |d| {
+                    d.child(
+                        modal::body(detail)
+                            .mt(px(6.))
+                            .max_h(px(240.))
+                            .overflow_hidden(),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(14.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .children(fields),
+                )
+                .child(
+                    modal::actions()
+                        .when_some(cancel, |d, cancel| {
+                            d.child(
+                                modal::ghost_button("browser-prompt-cancel", cancel)
+                                    .cursor_pointer()
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.answer_prompt(false, cx)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            modal::primary_button("browser-prompt-accept", accept)
+                                .cursor_pointer()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_prompt(true, cx)),
+                                ),
+                        ),
+                ),
+        );
+        let has_fields = !self.prompt_fields.is_empty();
+        let dismissible = cancel.is_some();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .track_focus(&self.prompt_focus)
+                .key_context("BrowserPrompt")
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    match event.keystroke.key.as_str() {
+                        "escape" => this.answer_prompt(!dismissible, cx),
+                        // Fields submit on Return themselves.
+                        "enter" if !has_fields => this.answer_prompt(true, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(modal::overlay("browser-prompt", card, {
+                    let weak = cx.weak_entity();
+                    move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| this.answer_prompt(!dismissible, cx));
+                    }
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
+// ---- The native view and its visibility ----
+
+thread_local! {
+    /// Every page's and DevTools' host, for [`sweep`].
+    static HOSTS: RefCell<Vec<Weak<dyn Swept>>> = const { RefCell::new(Vec::new()) };
+    /// Per window: the frame being painted, and what overlays covered in it.
+    static FRAMES: RefCell<HashMap<WindowId, Frame>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Default)]
+struct Frame {
+    epoch: u64,
+    covers: Vec<Bounds<Pixels>>,
+}
+
+/// A Chromium view a [`Host`] places: a page or its DevTools.
+trait NativeView: 'static {
+    fn set_frame(&self, frame: monocode_cef::Frame);
+    fn set_visible(&self, visible: bool);
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>);
+    fn close(&self);
+}
+
+impl NativeView for monocode_cef::BrowserView {
+    fn set_frame(&self, frame: monocode_cef::Frame) {
+        self.set_frame(frame);
+    }
+    fn set_visible(&self, visible: bool) {
+        self.set_visible(visible);
+    }
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        self.capture(done);
+    }
+    fn close(&self) {
+        self.close();
+    }
+}
+
+impl NativeView for monocode_cef::DevToolsView {
+    fn set_frame(&self, frame: monocode_cef::Frame) {
+        self.set_frame(frame);
+    }
+    fn set_visible(&self, visible: bool) {
+        self.set_visible(visible);
+    }
+    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
+        self.capture(done);
+    }
+    fn close(&self) {
+        self.close();
+    }
+}
+
+/// How a host's view shows, as the last sweep decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Placement {
+    /// Not painted (its tab is not in front): hidden from Chromium too, which
+    /// throttles it.
+    #[default]
+    Hidden,
+    /// Under an overlay: moved out of the window but still live for
+    /// Chromium, so it can be captured; its snapshot is drawn in its place.
+    Covered,
+    Shown,
+}
+
+/// What a host painted in this frame at `bounds` becomes, under `covers`.
+fn shown(painted: bool, bounds: Bounds<Pixels>, covers: &[Bounds<Pixels>]) -> Placement {
+    if !painted || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+        Placement::Hidden
+    } else if covers.iter().any(|cover| cover.intersects(&bounds)) {
+        Placement::Covered
+    } else {
+        Placement::Shown
+    }
+}
+
+/// A capture asked for longer ago than this is given up: a page Chromium
+/// does not draw may never answer.
+const CAPTURE_PATIENCE: Duration = Duration::from_secs(3);
+
+/// A Chromium view inside a clipping view of the window, and the last frame
+/// captured from it.
+struct Host<V> {
+    view: RefCell<Option<Hosted<V>>>,
+    /// The window and frame it was last painted in, and where.
+    painted: Cell<Option<(WindowId, u64, Bounds<Pixels>)>>,
+    shown: Cell<Placement>,
+    registered: Cell<bool>,
+    /// One recent frame, at the screen's scale. Given back to the GPU atlas
+    /// when replaced, when the view hides, and with the page.
+    snapshot: RefCell<Option<Arc<RenderImage>>>,
+    /// When the capture on its way was asked for.
+    capturing: Cell<Option<Instant>>,
+    /// The page is gone: captures still on their way are dropped.
+    released: Cell<bool>,
+    /// The profile the page is created in ([`BrowserPage::set_profile`]).
+    options: RefCell<monocode_cef::CreateOptions>,
+}
+
+impl<V> Default for Host<V> {
+    fn default() -> Self {
+        Self {
+            view: RefCell::default(),
+            options: RefCell::default(),
+            painted: Cell::default(),
+            shown: Cell::default(),
+            registered: Cell::default(),
+            snapshot: RefCell::default(),
+            capturing: Cell::default(),
+            released: Cell::default(),
+        }
+    }
+}
+
+struct Hosted<V> {
+    #[cfg(target_os = "macos")]
+    clip: objc2::rc::Retained<objc2_app_kit::NSView>,
+    view: V,
+}
+
+/// Covered views wait this far outside the window (points).
+#[cfg(target_os = "macos")]
+const AWAY: f64 = -100_000.;
+
+/// Painted last in a window, it settles each host painted there.
+trait Swept {
+    fn sweep(
+        self: Rc<Self>,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+        window: &mut Window,
+        cx: &mut App,
+    );
+}
+
+impl<V: NativeView> Swept for Host<V> {
+    fn sweep(
+        self: Rc<Self>,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((painted_in, painted, bounds)) = self.painted.get() else {
+            return;
+        };
+        if painted_in != window_id {
+            return;
+        }
+        let next = shown(painted == epoch, bounds, covers);
+        let prev = self.shown.replace(next);
+        self.apply(prev, next);
+        match next {
+            Placement::Hidden if prev != Placement::Hidden => {
+                self.set_snapshot(None, Some(window), cx)
+            }
+            Placement::Covered if prev != Placement::Covered => {
+                // Live while covered, so this capture is of the frame just
+                // left; until it comes, the last one shows, if any.
+                self.refresh_snapshot(cx);
+                if self.snapshot.borrow().is_some() {
+                    window.on_next_frame(|window, _| window.refresh());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<V: NativeView> Host<V> {
+    /// Runs `f` on the view, if it exists yet.
+    fn with_view(&self, f: impl FnOnce(&V)) -> bool {
+        match self.view.borrow().as_ref() {
+            Some(hosted) => {
+                f(&hosted.view);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Carries the sweep's decision to the native views.
+    fn apply(&self, prev: Placement, next: Placement) {
+        let slot = self.view.borrow();
+        let Some(hosted) = slot.as_ref() else { return };
+        match next {
+            Placement::Hidden => {
+                if prev != Placement::Hidden {
+                    #[cfg(target_os = "macos")]
+                    hosted.clip.setHidden(true);
+                    hosted.view.set_visible(false);
+                }
+            }
+            Placement::Covered | Placement::Shown => {
+                if prev == Placement::Hidden {
+                    #[cfg(target_os = "macos")]
+                    hosted.clip.setHidden(false);
+                    hosted.view.set_visible(true);
+                }
+                // Paint put the clip in place this frame; a covered one moves
+                // out of the window instead of hiding, which would stop
+                // Chromium drawing and so capturing it.
+                #[cfg(target_os = "macos")]
+                if next == Placement::Covered {
+                    hosted
+                        .clip
+                        .setFrameOrigin(objc2_foundation::NSPoint::new(AWAY, AWAY));
+                }
+            }
+        }
+    }
+
+    /// Replaces the snapshot, giving the old one's texture back.
+    fn set_snapshot(
+        &self,
+        image: Option<Arc<RenderImage>>,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        if self.released.get() && image.is_some() {
+            return;
+        }
+        if let Some(old) = self.snapshot.replace(image) {
+            cx.drop_image(old, window);
+        }
+    }
+
+    /// The page is gone: its snapshot goes, and no other comes.
+    fn release(&self, cx: &mut App) {
+        self.set_snapshot(None, None, cx);
+        self.released.set(true);
+    }
+
+    /// Asks Chromium for the view's current frame, unless a capture is on
+    /// its way. PNG decoding runs off the main thread.
+    fn refresh_snapshot(self: &Rc<Self>, cx: &mut App) {
+        if self.released.get()
+            || self
+                .capturing
+                .get()
+                .is_some_and(|asked| asked.elapsed() < CAPTURE_PATIENCE)
+        {
+            return;
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        let asked = self.with_view(|view| {
+            view.capture(Box::new(move |result| {
+                let _ = tx.try_send(result);
+            }))
+        });
+        if !asked {
+            return;
+        }
+        self.capturing.set(Some(Instant::now()));
+        let host = Rc::downgrade(self);
+        let renderer = cx.svg_renderer();
+        cx.spawn(async move |cx| {
+            // Closed without a result when the view closes first.
+            let png = match rx.recv().await {
+                Ok(Ok(png)) => Some(png),
+                Ok(Err(e)) => {
+                    log::debug!("browser: no snapshot: {e}");
+                    None
+                }
+                Err(_) => None,
+            };
+            let image = match png {
+                Some(png) => cx
+                    .background_spawn(async move {
+                        Image::from_bytes(ImageFormat::Png, png).to_image_data(renderer)
+                    })
+                    .await
+                    .map_err(|e| log::debug!("browser: snapshot did not decode: {e}"))
+                    .ok(),
+                None => None,
+            };
+            cx.update(|cx| {
+                let Some(host) = host.upgrade() else { return };
+                host.capturing.set(None);
+                // A hidden view keeps no snapshot: it would only hold memory.
+                let Some(image) = image.filter(|_| host.shown.get() != Placement::Hidden) else {
+                    return;
+                };
+                host.set_snapshot(Some(image), None, cx);
+                if host.shown.get() == Placement::Covered
+                    && let Some((window_id, ..)) = host.painted.get()
+                    && let Some(window) = cx
+                        .windows()
+                        .into_iter()
+                        .find(|w| w.window_id() == window_id)
+                {
+                    let _ = window.update(cx, |_, window, _| window.refresh());
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Closes the view now, rather than when the last frame lets go of it.
+    fn close(&self) {
+        if let Some(hosted) = self.view.borrow_mut().take() {
+            hosted.view.close();
+            #[cfg(target_os = "macos")]
+            hosted.clip.removeFromSuperview();
+        }
+    }
+
+    /// Under an overlay, the snapshot stands in for the view.
+    fn paint_snapshot(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        if self.shown.get() != Placement::Covered {
+            return;
+        }
+        if let Some(image) = self.snapshot.borrow().clone() {
+            let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn paint(
+        self: &Rc<Self>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut App,
+        _: impl FnOnce(*mut std::ffi::c_void, monocode_cef::Frame, &mut App) -> Option<V>,
+    ) {
+    }
+
+    /// Places the view at `bounds` this frame, making it with `create` (in
+    /// a parent view and at a frame) the first time.
+    #[cfg(target_os = "macos")]
+    fn paint(
+        self: &Rc<Self>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        create: impl FnOnce(*mut std::ffi::c_void, monocode_cef::Frame, &mut App) -> Option<V>,
+    ) {
+        use objc2::{MainThreadMarker, MainThreadOnly, msg_send, rc::Retained};
+        use objc2_app_kit::{NSView, NSWindowOrderingMode};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        if !self.registered.replace(true) {
+            let swept: Weak<dyn Swept> = Rc::downgrade(self) as Weak<dyn Swept>;
+            HOSTS.with(|hosts| hosts.borrow_mut().push(swept));
+        }
+        self.paint_snapshot(bounds, window);
+        let id = Window::window_handle(window).window_id();
+        let epoch = FRAMES.with(|f| f.borrow().get(&id).map_or(0, |f| f.epoch));
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // GPUI keeps its AppKit content view alive throughout paint.
+        let parent = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
+        let clipped = bounds.intersect(&window.content_mask().bounds);
+        // An empty place hides it in the sweep.
+        self.painted.set(Some((id, epoch, clipped)));
+        if clipped.size.width <= px(0.) || clipped.size.height <= px(0.) {
+            return;
+        }
+        // AppKit frames are in window points; GPUI's are divided by the
+        // interface zoom.
+        let zoom = window.content_zoom();
+        let (outer, inner) = (clipped.map(|v| v * zoom), bounds.map(|v| v * zoom));
+        let y = f64::from(outer.origin.y);
+        let (width, height) = (f64::from(outer.size.width), f64::from(outer.size.height));
+        let y = if parent.isFlipped() {
+            y
+        } else {
+            parent.bounds().size.height - y - height
+        };
+        let rect = NSRect::new(
+            NSPoint::new(f64::from(outer.origin.x), y),
+            NSSize::new(width, height),
+        );
+        // The page keeps its full size while the clip follows GPUI's mask.
+        let frame = monocode_cef::Frame {
+            x: f64::from(inner.left() - outer.left()),
+            y: f64::from(inner.top() - outer.top()),
+            width: f64::from(inner.size.width),
+            height: f64::from(inner.size.height),
+        };
+
+        let mut slot = self.view.borrow_mut();
+        if slot.is_none() {
+            let clip: Retained<mac::BrowserClip> = unsafe {
+                let clip = mac::BrowserClip::alloc(mtm).set_ivars(());
+                msg_send![super(clip), initWithFrame: rect]
+            };
+            let clip: Retained<NSView> = Retained::into_super(clip);
+            clip.setWantsLayer(true);
+            clip.setClipsToBounds(true);
+            parent.addSubview_positioned_relativeTo(&clip, NSWindowOrderingMode::Above, None);
+            let raw = Retained::as_ptr(&clip) as *mut std::ffi::c_void;
+            match create(raw, frame, cx) {
+                Some(view) => {
+                    *slot = Some(Hosted { clip, view });
+                    // Chromium makes its view shown.
+                    self.shown.set(Placement::Shown);
+                }
+                None => {
+                    clip.removeFromSuperview();
+                    return;
+                }
+            }
+        }
+        let Some(hosted) = slot.as_ref() else { return };
+        // SAFETY: main thread, during paint; the clip is ours.
+        let attached = unsafe { hosted.clip.superview() };
+        if !attached.is_some_and(|s| std::ptr::eq(&*s, parent)) {
+            parent.addSubview_positioned_relativeTo(
+                &hosted.clip,
+                NSWindowOrderingMode::Above,
+                None,
+            );
+        }
+        // Shown or not is the sweep's to say, after the overlays painted.
+        hosted.clip.setFrame(rect);
+        hosted.view.set_frame(frame);
+    }
+}
+
+impl<V> Drop for Host<V> {
+    fn drop(&mut self) {
+        // The snapshot's texture went back with the page (`release`).
+        if let Some(hosted) = self.view.get_mut().take() {
+            drop(hosted.view);
+            #[cfg(target_os = "macos")]
+            hosted.clip.removeFromSuperview();
+        }
+    }
+}
+
+/// Marks `bounds` (window coordinates) as drawn over by an overlay this
+/// frame: a page under it gives way to its snapshot, since GPUI cannot draw
+/// above the page.
+pub(crate) fn cover(bounds: Bounds<Pixels>, window: &Window) {
+    let id = window.window_handle().window_id();
+    FRAMES.with(|f| f.borrow_mut().entry(id).or_default().covers.push(bounds));
+}
+
+/// An invisible element that [`cover`]s its own bounds.
+pub(crate) fn cover_element() -> impl IntoElement {
+    canvas(|_, _, _| {}, |bounds, _, window, _| cover(bounds, window))
+        .absolute()
+        .inset_0()
+}
+
+/// Painted after everything else in a window: hides the views that were not
+/// painted in this frame, moves away the ones an overlay covers, and starts
+/// the next frame.
+pub(crate) fn sweep() -> impl IntoElement {
+    gpui::deferred(
+        canvas(
+            |_, _, _| {},
+            |_, _, window, cx| {
+                let id = window.window_handle().window_id();
+                let (epoch, covers) = FRAMES.with(|f| {
+                    let mut frames = f.borrow_mut();
+                    let frame = frames.entry(id).or_default();
+                    let covers = std::mem::take(&mut frame.covers);
+                    let epoch = frame.epoch;
+                    frame.epoch += 1;
+                    (epoch, covers)
+                });
+                let live: Vec<Rc<dyn Swept>> = HOSTS.with(|hosts| {
+                    let mut hosts = hosts.borrow_mut();
+                    hosts.retain(|host| host.strong_count() > 0);
+                    hosts.iter().filter_map(Weak::upgrade).collect()
+                });
+                for host in live {
+                    host.sweep(id, epoch, &covers, window, cx);
+                }
+            },
+        )
+        .size_0(),
+    )
+    .with_priority(usize::MAX)
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2::{MainThreadOnly, define_class, runtime::NSObjectProtocol};
+    use objc2_app_kit::NSView;
+
+    /// Makes GPUI's own view AppKit's first responder, so typed keys reach a
+    /// GPUI field instead of the Chromium page that had them.
+    pub(super) fn make_gpui_first_responder(window: &gpui::Window) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+        // SAFETY: GPUI keeps its content view alive with the window.
+        let view = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
+        if let Some(native) = view.window() {
+            native.makeFirstResponder(Some(view));
+        }
+    }
+
+    define_class!(
+        /// Clips a page to its pane. Flipped, so the page's frame is top-left
+        /// based like GPUI's.
+        #[unsafe(super(NSView))]
+        #[name = "MonocodeBrowserClip"]
+        #[thread_kind = MainThreadOnly]
+        pub(super) struct BrowserClip;
+        unsafe impl NSObjectProtocol for BrowserClip {}
+        impl BrowserClip {
+            #[unsafe(method(isFlipped))]
+            fn flipped(&self) -> bool {
+                true
+            }
+        }
+    );
+}
+
+/// Windows and Linux get Chromium in phase 6 (context.md §12); until then
+/// the pane says so instead of loading.
+#[cfg(not(target_os = "macos"))]
+mod monocode_cef {
+    pub mod runtime {
+        pub fn is_started() -> bool {
+            false
+        }
+        pub fn start(_: &super::RuntimeConfig) -> Result<(), &'static str> {
+            Err("the browser is not available on this platform yet")
+        }
+    }
+
+    pub struct RuntimeConfig {
+        pub framework_dir: std::path::PathBuf,
+        pub helper: std::path::PathBuf,
+        pub cache_root: std::path::PathBuf,
+        pub mock_keychain: bool,
+        pub locale: String,
+        pub log_file: Option<std::path::PathBuf>,
+    }
+
+    #[allow(dead_code)]
+    pub enum BrowserEvent {
+        Address(String),
+        Title(String),
+        Loading {
+            loading: bool,
+            can_go_back: bool,
+            can_go_forward: bool,
+        },
+        Progress(f64),
+        LoadFailed {
+            url: String,
+            code: i32,
+            text: String,
+        },
+        PopupRequested {
+            url: String,
+            user_gesture: bool,
+            foreground: bool,
+        },
+        PopupOpened {
+            id: u64,
+            url: String,
+            foreground: bool,
+        },
+        CloseRequested,
+        Download(Download),
+        Auth(AuthRequest),
+        Dialog(JsDialog),
+        DialogsReset,
+        Closed,
+        FindResult {
+            count: i32,
+            active_ordinal: i32,
+            final_update: bool,
+        },
+        Focused,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Frame {
+        pub x: f64,
+        pub y: f64,
+        pub width: f64,
+        pub height: f64,
+    }
+
+    const UNAVAILABLE: &str = "the browser is not available on this platform yet";
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub enum Profile {
+        #[default]
+        Default,
+        Isolated(String),
+    }
+    impl Profile {
+        pub fn for_project(path: &str) -> Self {
+            Profile::Isolated(path.to_owned())
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct CreateOptions {
+        pub profile: Profile,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DownloadState {
+        InProgress,
+        Complete,
+        Canceled,
+        Failed,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Download {
+        pub id: u32,
+        pub path: std::path::PathBuf,
+        pub received: i64,
+        pub total: Option<i64>,
+        pub state: DownloadState,
+    }
+    impl Download {
+        pub fn name(&self) -> String {
+            String::new()
+        }
+        pub fn fraction(&self) -> Option<f64> {
+            None
+        }
+    }
+    pub fn cancel_download(_: u32) {}
+
+    pub struct AuthChallenge {
+        pub host: String,
+        pub port: u16,
+        pub realm: String,
+        pub proxy: bool,
+    }
+    pub struct AuthRequest {
+        pub challenge: AuthChallenge,
+    }
+    impl AuthRequest {
+        pub fn sign_in(&self, _: &str, _: &str) {}
+        pub fn cancel(&self) {}
+    }
+
+    pub enum DialogKind {
+        Alert,
+        Confirm,
+        Prompt(String),
+        BeforeUnload { reload: bool },
+    }
+    pub struct JsDialog {
+        pub kind: DialogKind,
+        pub origin: String,
+        pub message: String,
+    }
+    impl JsDialog {
+        pub fn accept(&self, _: Option<&str>) {}
+        pub fn decline(&self) {}
+    }
+
+    /// Never created: [`runtime::start`] always fails here.
+    pub struct BrowserView;
+    impl BrowserView {
+        pub fn create(
+            _: *mut std::ffi::c_void,
+            _: Frame,
+            _: &str,
+        ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), &'static str> {
+            Err(UNAVAILABLE)
+        }
+        pub fn show_dev_tools(
+            &self,
+            _: *mut std::ffi::c_void,
+            _: Frame,
+        ) -> Result<(DevToolsView, async_channel::Receiver<DevToolsEvent>), &'static str> {
+            Err(UNAVAILABLE)
+        }
+        pub fn capture(&self, _: impl FnOnce(Result<Vec<u8>, String>) + 'static) {}
+        pub fn set_frame(&self, _: Frame) {}
+        pub fn set_visible(&self, _: bool) {}
+        pub fn load_url(&self, _: &str) {}
+        pub fn go_back(&self) {}
+        pub fn go_forward(&self) {}
+        pub fn reload(&self) {}
+        pub fn stop(&self) {}
+        pub fn set_focus(&self, _: bool) {}
+        pub fn reload_ignore_cache(&self) {}
+        pub fn find(&self, _: &str, _: bool, _: bool, _: bool) {}
+        pub fn stop_finding(&self, _: bool) {}
+        pub fn set_zoom_level(&self, _: f64) {}
+        pub fn zoom_level(&self) -> f64 {
+            0.
+        }
+        pub fn close(&self) {}
+    }
+
+    pub enum DevToolsEvent {
+        #[allow(dead_code)]
+        Closed,
+    }
+
+    pub struct DevToolsView;
+    impl DevToolsView {
+        pub fn set_frame(&self, _: Frame) {}
+        pub fn set_visible(&self, _: bool) {}
+        pub fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
+        pub fn close(&self) {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_text_becomes_an_address_or_a_search() {
+        let a = |s| address(s).unwrap();
+        assert_eq!(a("https://example.com/x"), "https://example.com/x");
+        assert_eq!(a("  example.com "), "https://example.com");
+        assert_eq!(a("docs.rs/gpui?x=1"), "https://docs.rs/gpui?x=1");
+        assert_eq!(a("localhost:5173"), "http://localhost:5173");
+        assert_eq!(a("127.0.0.1:8080/api"), "http://127.0.0.1:8080/api");
+        assert_eq!(a("app.localhost"), "http://app.localhost");
+        assert_eq!(a("about:blank"), "about:blank");
+        assert_eq!(a("rust gpui"), "https://www.google.com/search?q=rust+gpui");
+        assert_eq!(a("hello"), "https://www.google.com/search?q=hello");
+        assert_eq!(a("a&b"), "https://www.google.com/search?q=a%26b");
+        assert_eq!(address("   "), None);
+    }
+
+    #[test]
+    fn the_helper_is_the_bundle_without_a_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["X Helper (GPU)", "X Helper (Renderer)", "X Helper"] {
+            let macos = dir.path().join(format!("{name}.app/Contents/MacOS"));
+            std::fs::create_dir_all(&macos).unwrap();
+            std::fs::write(macos.join(name), "").unwrap();
+        }
+        assert_eq!(
+            find_helper(dir.path()),
+            Some(dir.path().join("X Helper.app/Contents/MacOS/X Helper"))
+        );
+        assert_eq!(find_helper(&dir.path().join("missing")), None);
+    }
+
+    #[gpui::test]
+    fn popups_ask_for_pages_and_downloads_are_listed_once(cx: &mut gpui::TestAppContext) {
+        use monocode_cef::{BrowserEvent, Download, DownloadState};
+        let page =
+            cx.new(|cx| BrowserPage::new(String::new(), String::new(), 100, "/tmp".into(), cx));
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let asked = asked.clone();
+            cx.subscribe(&page, move |_, request: &PageRequest, _| {
+                asked.borrow_mut().push(request.clone())
+            })
+            .detach();
+        });
+        let download = |received, state| Download {
+            id: 3,
+            path: "/d/a.zip".into(),
+            received,
+            total: Some(10),
+            state,
+        };
+        page.update(cx, |page, cx| {
+            page.on_event(
+                BrowserEvent::PopupRequested {
+                    url: "https://a.test/".into(),
+                    user_gesture: false,
+                    foreground: false,
+                },
+                cx,
+            );
+            page.on_event(BrowserEvent::CloseRequested, cx);
+            page.on_event(
+                BrowserEvent::Download(download(0, DownloadState::InProgress)),
+                cx,
+            );
+            page.on_event(
+                BrowserEvent::Download(download(10, DownloadState::Complete)),
+                cx,
+            );
+            assert_eq!(page.downloads, [download(10, DownloadState::Complete)]);
+            assert_eq!(download_status(&page.downloads[0]), "10 B");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *asked.borrow(),
+            [
+                PageRequest::Open {
+                    url: "https://a.test/".into(),
+                    foreground: false,
+                    popup: None,
+                },
+                PageRequest::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn download_sizes_read_like_a_browsers() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1_500), "1.5 KB");
+        assert_eq!(human_bytes(34_000_000), "34 MB");
+        assert_eq!(human_bytes(2_100_000_000), "2.1 GB");
+        assert_eq!(
+            origin_host("https://example.com:8080/a?b"),
+            "example.com:8080"
+        );
+        assert_eq!(origin_host(""), "");
+    }
+
+    #[test]
+    fn zoom_steps_through_chromes_presets() {
+        assert_eq!(zoom_step(100, 1), 110);
+        assert_eq!(zoom_step(100, -1), 90);
+        assert_eq!(zoom_step(150, 0), 100);
+        assert_eq!(zoom_step(500, 1), 500);
+        assert_eq!(zoom_step(25, -1), 25);
+        // Between presets: another page set the host's level some other way.
+        assert_eq!(zoom_step(120, 1), 125);
+        assert_eq!(zoom_step(120, -1), 110);
+        for percent in ZOOM_PRESETS {
+            assert_eq!(zoom_percent(zoom_level(percent)), percent);
+        }
+        assert_eq!(zoom_level(100), 0.);
+        assert!((zoom_level(120) - 1.).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_find_bar_counts_matches_once_the_page_answers() {
+        assert_eq!(find_status("", Some((3, 1))), None);
+        assert_eq!(find_status("rust", None), None);
+        assert_eq!(
+            find_status("rust", Some((0, 0))).as_deref(),
+            Some("No results")
+        );
+        assert_eq!(
+            find_status("rust", Some((12, 3))).as_deref(),
+            Some("3 of 12")
+        );
+        assert_eq!(
+            find_status("rust", Some((12, 0))).as_deref(),
+            Some("1 of 12")
+        );
+    }
+
+    #[test]
+    fn devtools_keeps_its_height_clear_of_both_minimums() {
+        // Unsaved: 40% of the body, never under the minimum.
+        assert_eq!(devtools_height(0, 1000.), 400.);
+        assert_eq!(devtools_height(0, 250.), DEVTOOLS_MIN);
+        // Saved: as it was, while it fits.
+        assert_eq!(devtools_height(300, 1000.), 300.);
+        assert_eq!(devtools_height(10, 1000.), DEVTOOLS_MIN);
+        assert_eq!(devtools_height(990, 1000.), 1000. - PAGE_MIN);
+        // A body too short for both: the page keeps its minimum.
+        assert_eq!(devtools_height(300, 150.), 150. - PAGE_MIN);
+        assert_eq!(devtools_height(300, 50.), 0.);
+        // Not measured yet: the wanted height.
+        assert_eq!(devtools_height(300, 0.), 300.);
+        assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
+    }
+
+    #[test]
+    fn a_view_hides_unpainted_and_gives_way_under_an_overlay() {
+        let at = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: gpui::point(px(x), px(y)),
+            size: gpui::size(px(w), px(h)),
+        };
+        let page = at(0., 40., 800., 600.);
+        let menu = at(700., 30., 200., 100.);
+        let elsewhere = at(900., 0., 50., 50.);
+        assert_eq!(shown(true, page, &[]), Placement::Shown);
+        assert_eq!(shown(true, page, &[elsewhere]), Placement::Shown);
+        assert_eq!(shown(true, page, &[elsewhere, menu]), Placement::Covered);
+        assert_eq!(shown(false, page, &[]), Placement::Hidden);
+        assert_eq!(shown(false, page, &[menu]), Placement::Hidden);
+        assert_eq!(shown(true, at(0., 0., 0., 100.), &[]), Placement::Hidden);
+    }
+
+    struct NoView;
+    impl NativeView for NoView {
+        fn set_frame(&self, _: monocode_cef::Frame) {}
+        fn set_visible(&self, _: bool) {}
+        fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
+        fn close(&self) {}
+    }
+
+    #[gpui::test]
+    fn a_snapshot_gives_its_texture_back_when_replaced_or_released(cx: &mut gpui::TestAppContext) {
+        let image = || {
+            let frame = image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([9; 4])));
+            Arc::new(RenderImage::new(vec![frame]))
+        };
+        let (first, second) = (image(), image());
+        let host = Rc::new(Host::<NoView>::default());
+        host.shown.set(Placement::Covered);
+        let window = cx.add_empty_window();
+        let draw = |window: &mut gpui::VisualTestContext| {
+            let host = host.clone();
+            window.draw(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(20.), px(20.)),
+                |_, _| {
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| host.paint_snapshot(bounds, window),
+                    )
+                    .size_full()
+                    .into_any_element()
+                },
+            );
+        };
+        // Outside any window's update, as captures land and pages go.
+        let app = |window: &mut gpui::VisualTestContext, f: &dyn Fn(&mut App)| {
+            let app: &gpui::TestAppContext = window;
+            app.update(f);
+        };
+        let in_atlas = |window: &mut gpui::VisualTestContext, image: &Arc<RenderImage>| {
+            window.update(|window, _| window.has_image_atlas_entry(image))
+        };
+
+        app(window, &|cx| {
+            host.set_snapshot(Some(first.clone()), None, cx)
+        });
+        draw(window);
+        assert!(in_atlas(window, &first));
+        // Painting it again reuses the texture.
+        draw(window);
+        assert!(in_atlas(window, &first));
+
+        app(window, &|cx| {
+            host.set_snapshot(Some(second.clone()), None, cx)
+        });
+        assert!(!in_atlas(window, &first));
+        draw(window);
+        assert!(in_atlas(window, &second));
+
+        app(window, &|cx| host.release(cx));
+        assert!(!in_atlas(window, &second));
+        // A capture that lands after the page went is dropped.
+        app(window, &|cx| host.set_snapshot(Some(image()), None, cx));
+        assert!(host.snapshot.borrow().is_none());
+    }
+
+    #[test]
+    fn a_page_is_titled_by_its_title_then_its_host() {
+        assert_eq!(page_title("https://example.com/a", "Example"), "Example");
+        assert_eq!(page_title("https://example.com/a", " "), "example.com");
+        assert_eq!(page_title("http://localhost:5173/", ""), "localhost:5173");
+        assert_eq!(page_title("", ""), "Browser");
     }
 }

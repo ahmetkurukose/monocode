@@ -682,6 +682,12 @@ impl Protocol {
         else {
             return;
         };
+        // Claude beats `<parent>-heartbeat-N` about every 30s while the Agent
+        // call itself runs; that is the parent's pulse, not a child tool, and
+        // as a step it would list one running "Agent" per beat.
+        if id == parent || id.starts_with(&format!("{parent}-")) {
+            return;
+        }
         // Progress is a child's step, never the parent Agent's final report.
         self.agent_step(
             parent,
@@ -1032,6 +1038,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tick(&mut p), Some(Vec::new()));
+    }
+    #[test]
+    fn the_agent_calls_own_heartbeats_are_not_child_steps() {
+        let mut p = protocol(Kind::Claude);
+        p.frame(json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Stage 2"}}]}}), &mut Vec::new()).unwrap();
+        for beat in 0..3 {
+            p.frame(json!({"type":"tool_progress","parent_tool_use_id":"agent-call","tool_use_id":format!("agent-call-heartbeat-{beat}"),"tool_name":"Agent"}), &mut Vec::new()).unwrap();
+        }
+        p.frame(json!({"type":"tool_progress","parent_tool_use_id":"agent-call","tool_use_id":"child-bash","tool_name":"Bash"}), &mut Vec::new()).unwrap();
+        let Some(Panel::Agent(run)) = p.tools["agent-call"].panel() else {
+            panic!()
+        };
+        let ids: Vec<_> = run.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["child-bash"]);
     }
     #[test]
     fn a_subagents_background_command_names_the_subagent_that_started_it() {

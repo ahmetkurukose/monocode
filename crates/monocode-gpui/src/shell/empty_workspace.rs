@@ -11,23 +11,47 @@
 use super::*;
 use gpui::Action;
 
-/// The rows, in order: id, name, and the action the shortcut runs. A click
-/// runs the same action, so a row can never do something its key does not.
-type Row = (&'static str, &'static str, fn() -> Box<dyn Action>);
-const ROWS: [Row; 8] = [
-    ("new-session", "New session", || Box::new(NewCodex)),
-    ("go-to-file", "Go to file", || Box::new(GoToFile)),
-    ("command-palette", "Command palette", || {
+/// The rows, in order: id, name, a fixed key label for a shortcut the keymap
+/// cannot hold, and the action the shortcut runs. A click runs the same
+/// action, so a row can never do something its key does not.
+type Row = (
+    &'static str,
+    &'static str,
+    Option<fn() -> &'static str>,
+    fn() -> Box<dyn Action>,
+);
+const ROWS: [Row; 7] = [
+    // ⇧⇧ is two taps the shell watches for, not a binding; ⌘K is its alias.
+    (
+        "search-everywhere",
+        "Search Everywhere",
+        Some(double_shift_label),
+        || Box::new(SearchEverywhere),
+    ),
+    ("command-palette", "Command palette", None, || {
         Box::new(OpenCommandPalette)
     }),
-    ("search", "Search", || Box::new(FocusSearch)),
-    ("find-in-files", "Find in files", || Box::new(SearchFiles)),
-    ("toggle-terminal", "Toggle terminal", || {
+    ("new-session", "New session", None, || Box::new(NewCodex)),
+    ("find-in-files", "Find in files", None, || {
+        Box::new(SearchFiles)
+    }),
+    ("toggle-terminal", "Toggle terminal", None, || {
         Box::new(ToggleTerminal)
     }),
-    ("open-project", "Open project", || Box::new(OpenProject)),
-    ("settings", "Settings", || Box::new(OpenSettings)),
+    ("open-project", "Open project", None, || {
+        Box::new(OpenProject)
+    }),
+    ("settings", "Settings", None, || Box::new(OpenSettings)),
 ];
+
+/// Search Everywhere's shortcut as the title bar writes it.
+fn double_shift_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⇧⇧"
+    } else {
+        "Shift Shift"
+    }
+}
 
 /// Width of the name column, which is right-aligned against the keys.
 const NAME_WIDTH: f32 = 168.;
@@ -35,11 +59,22 @@ const NAME_WIDTH: f32 = 168.;
 const KEY_WIDTH: f32 = 112.;
 
 /// The shortcut the live keymap gives `action`, written as the menus write it.
-/// The last binding is the one a second alias (⌘N beside ⌘T) is outranked by.
+/// The binding with the fewest modifiers wins, so ⌘P shows rather than its
+/// ⇧⌘P alias; among equals the last one does (⌘T over ⌘N).
 pub(super) fn bound_shortcut(action: &dyn Action, cx: &App) -> Option<String> {
     let keymap = cx.key_bindings();
     let keymap = keymap.borrow();
-    let binding = keymap.bindings_for_action(action).next_back()?;
+    let modifiers = |binding: &gpui::KeyBinding| -> usize {
+        binding
+            .keystrokes()
+            .iter()
+            .map(|stroke| usize::from(stroke.modifiers().number_of_modifiers()))
+            .sum()
+    };
+    let binding = keymap
+        .bindings_for_action(action)
+        .rev()
+        .min_by_key(|binding| modifiers(binding))?;
     let keys: Vec<String> = binding
         .keystrokes()
         .iter()
@@ -81,8 +116,11 @@ impl Shell {
         let rows = ROWS
             .into_iter()
             .enumerate()
-            .map(|(ix, (id, name, action))| {
-                let keys = bound_shortcut(action().as_ref(), cx);
+            .map(|(ix, (id, name, fixed, action))| {
+                let keys = match fixed {
+                    Some(label) => Some(label().to_owned()),
+                    None => bound_shortcut(action().as_ref(), cx),
+                };
                 div()
                     .id(("empty-workspace-row", ix))
                     .debug_selector(move || format!("empty-workspace-row-{id}"))

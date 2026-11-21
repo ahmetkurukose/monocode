@@ -126,8 +126,6 @@ pub(crate) enum SettingsEvent {
     WhatsNew,
     CheckAppUpdates,
     CheckHarnessUpdates,
-    /// The Browser page's "Sleep all" and "Close all".
-    BrowserPages(&'static str),
     ManageInboxProvider(String),
     Changed(Box<Preferences>),
     /// The Appearance page's Layout picker: true for Focused, false for Classic.
@@ -245,7 +243,6 @@ pub(crate) struct SettingsView {
     targets: RefCell<HashMap<&'static str, AnchorSlot>>,
     slider_tracks: RefCell<HashMap<SliderKind, AnchorSlot>>,
     slider_drag: Option<SliderKind>,
-    browser_data: pages::browser::BrowserData,
     select_open: Option<&'static str>,
     select_active: usize,
     select_focus: FocusHandle,
@@ -398,7 +395,6 @@ impl SettingsView {
             _reveal: None,
             targets: Default::default(),
             slider_tracks: Default::default(),
-            browser_data: Default::default(),
             slider_drag: None,
             select_open: None,
             select_active: 0,

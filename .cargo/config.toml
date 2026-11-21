@@ -1,0 +1,6 @@
+# The Chromium (CEF) SDK that `cef-dll-sys` builds against: headers and the
+# C++ wrapper, ~600 MB unpacked. Without CEF_PATH every target directory and
+# profile would download and unpack its own copy. An inherited CEF_PATH wins
+# (the native scripts point it at one cache shared by all checkouts).
+[env]
+CEF_PATH = { value = "crates/monocode-gpui/target/cef-sdk", relative = true, force = false }

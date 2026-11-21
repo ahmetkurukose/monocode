@@ -608,7 +608,7 @@ fn run_turn_using(
         if !raw_native_command && settings.operator_enabled {
             let cli = std::env::current_exe().map_err(|e| e.to_string())?;
             prompt = format!(
-                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
+                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}, worktrees.create {{branch,base?,existing?}}, worktrees.merge {{path?,branch?,delete?,force?}} (into the branch it came from; with delete:true the worktree is then deleted and its chats move there), worktrees.delete {{path?,branch?,force?,deleteSessions?}}. Without path or branch the merge/delete is this thread's own worktree; deleting it waits for this turn to end. Use these for merging or deleting worktrees instead of raw git, so the app's rail and chats follow. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
                 shlex_quote(&cli.to_string_lossy())
             );
         }
@@ -620,21 +620,10 @@ fn run_turn_using(
         } else {
             None
         };
-        // The browser pane's tools, unless agents are kept out of it. The
-        // capability is the session's; like the visual one it is transport
-        // only and never saved with the conversation.
-        if !settings.text_only && !raw_native_command && monocode_core::browser_bridge::enabled() {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            if let Ok(environment) =
-                monocode_core::browser_bridge::environment(summary.id, &executable)
-            {
-                settings.environment.extend(environment);
-            }
-        }
         // The user's Database-view data sources, scoped to the session's
         // project. Sources belong to projects, and a session's worktree is
         // usually not inside its project, so the project's path is the one
-        // given, not the worktree's. Transport only, like the browser's.
+        // given, not the worktree's. Transport only, like the visual one.
         if !settings.text_only && !raw_native_command {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             if let Ok(environment) =
