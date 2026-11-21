@@ -461,6 +461,9 @@ pub async fn screenshot(ctx: &Ctx, args: &Value) -> Reply {
     })
 }
 
+/// The object group of what `browser_eval` holds on to while it reads it.
+const EVAL_GROUP: &str = "monocode-eval";
+
 pub async fn eval(ctx: &Ctx, args: &Value) -> Reply {
     let Some(expression) = args.get("expression").and_then(Value::as_str) else {
         return Err(invalid("expression is required"));
@@ -469,14 +472,17 @@ pub async fn eval(ctx: &Ctx, args: &Value) -> Reply {
         .get("await_promise")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Run once, by reference: what cannot be returned as JSON (`window`,
+    // a DOM node, a cycle) is then described instead of failing, and the
+    // expression's side effects never happen twice.
     let answer = ctx
         .act(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
-                "returnByValue": true,
                 "awaitPromise": await_promise,
                 "userGesture": true,
+                "objectGroup": EVAL_GROUP,
             }),
         )
         .await?;
@@ -490,7 +496,37 @@ pub async fn eval(ctx: &Ctx, args: &Value) -> Reply {
             "the exception is long",
         )));
     }
-    let result = &answer["result"];
+    let mut result = answer["result"].clone();
+    if let Some(object) = result["objectId"].as_str() {
+        let json = ctx
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object,
+                    "functionDeclaration": "function () { return this; }",
+                    "returnByValue": true,
+                }),
+            )
+            .await;
+        // A node or a function comes back as `{}`: its description says more.
+        let opaque = result["subtype"] == "node"
+            || result["type"] == "function"
+            || (result["className"].as_str()).is_some_and(|class| class != "Object");
+        let by_value = json.ok().filter(|json| {
+            let value = &json["result"]["value"];
+            json.get("exceptionDetails").is_none()
+                && !value.is_null()
+                && !(opaque && value.as_object().is_some_and(|o| o.is_empty()))
+        });
+        if let Some(json) = by_value {
+            result = json["result"].clone();
+        }
+        drop(ctx.cdp.call(
+            "Runtime.releaseObjectGroup",
+            json!({"objectGroup": EVAL_GROUP}),
+            None,
+        ));
+    }
     let text = if let Some(value) = result["unserializableValue"].as_str() {
         value.to_owned()
     } else if result["type"] == "undefined" {

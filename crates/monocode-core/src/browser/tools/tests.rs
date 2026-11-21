@@ -844,9 +844,15 @@ fn eval_results_and_exceptions() {
     let host = FakeHost::with_pages(&[1]);
     let page = host.page(1);
     page.script.on("Runtime.evaluate", |p, _| {
-        assert_eq!(p["returnByValue"], true);
+        // By reference: an object is read separately, so the expression
+        // runs once whatever it returns.
+        assert_ne!(p["returnByValue"], true);
         Ok(match p["expression"].as_str().unwrap() {
-            "obj" => json!({"result": {"type": "object", "value": {"a": [1, 2]}}}),
+            "obj" => json!({"result": {"type": "object", "objectId": "o1"}}),
+            "window" => json!({"result": {"type": "object", "className": "Window",
+                "description": "Window", "objectId": "w1"}}),
+            "body" => json!({"result": {"type": "object", "subtype": "node",
+                "className": "HTMLBodyElement", "description": "body#main", "objectId": "n1"}}),
             "nan" => json!({"result": {"type": "number", "unserializableValue": "NaN"}}),
             "nothing" => json!({"result": {"type": "undefined"}}),
             "big" => json!({"result": {"type": "string", "value": "x".repeat(40_000)}}),
@@ -854,12 +860,30 @@ fn eval_results_and_exceptions() {
                 "exceptionDetails": {"text": "Uncaught", "exception": {"description": "ReferenceError: nope is not defined"}}}),
         })
     });
+    page.script.on("Runtime.callFunctionOn", |p, _| {
+        assert_eq!(p["returnByValue"], true);
+        match p["objectId"].as_str().unwrap() {
+            "o1" => Ok(json!({"result": {"type": "object", "value": {"a": [1, 2]}}})),
+            "n1" => Ok(json!({"result": {"type": "object", "value": {}}})),
+            _ => Err("Object reference chain is too long".into()),
+        }
+    });
     let mut driver = Driver::new(&host);
     let out = |driver: &mut Driver, e: &str| driver.run("browser_eval", json!({"expression": e}));
     assert_eq!(
         text(&out(&mut driver, "obj")),
         "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
     );
+    // Not JSON: described, not an error, and evaluated only once.
+    let window = out(&mut driver, "window");
+    assert!(!window.is_error);
+    assert_eq!(text(&window), "Window");
+    let windows = (page.script.calls("Runtime.evaluate").iter())
+        .filter(|p| p["expression"] == "window")
+        .count();
+    assert_eq!(windows, 1);
+    assert_eq!(text(&out(&mut driver, "body")), "body#main");
+    assert_eq!(page.script.calls("Runtime.releaseObjectGroup").len(), 3);
     assert_eq!(text(&out(&mut driver, "nan")), "NaN");
     assert_eq!(text(&out(&mut driver, "nothing")), "undefined");
     let big = out(&mut driver, "big");
