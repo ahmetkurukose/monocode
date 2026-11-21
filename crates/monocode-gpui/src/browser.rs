@@ -378,6 +378,10 @@ pub(crate) struct BrowserPage {
     /// the first committed address.
     zoom_pending: bool,
     find: Option<FindBar>,
+    /// Takes the keyboard from Chromium whenever the address field gets the
+    /// focus (a click, ⌘L, a new blank page); made at the first render,
+    /// which has the window.
+    address_keyboard: Option<Subscription>,
     /// Where the page last drew, to take GPUI focus when Chromium gets it.
     window: Option<AnyWindowHandle>,
     engine: Entity<Engine>,
@@ -446,6 +450,7 @@ impl BrowserPage {
             zoom,
             zoom_pending: zoom != 100,
             find: None,
+            address_keyboard: None,
             window: None,
             engine,
             profiles,
@@ -643,6 +648,10 @@ impl BrowserPage {
         if self.find.is_none() {
             let field = cx.new(|cx| Input::field("Find in page", "Find", content(0.35), cx));
             let subscriptions = vec![
+                // A click into the field after the page had the keyboard.
+                cx.on_focus_in(&field.focus_handle(cx), window, |this, window, _| {
+                    this.take_keyboard(window)
+                }),
                 cx.subscribe(&field, |this, _, _: &input::Changed, cx| {
                     this.search(true, false, cx)
                 }),
@@ -982,6 +991,12 @@ impl BrowserPage {
 impl Render for BrowserPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window = Some(window.window_handle());
+        if self.address_keyboard.is_none() {
+            let address = self.address.focus_handle(cx);
+            self.address_keyboard = Some(cx.on_focus_in(&address, window, |this, window, _| {
+                this.take_keyboard(window)
+            }));
+        }
         if self.engine.read(cx).state == EngineState::Idle {
             self.start_engine(cx);
         }
