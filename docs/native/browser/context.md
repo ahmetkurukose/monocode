@@ -48,9 +48,9 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K13 | Doğrulama testi | MDM/EDR (Iru, SentinelOne) için ayrı ön test **yapılmayacak**; geliştirme sırasında görülür. |
 | K14 | Sekmeler (Faz 1) | **Her browser sayfası bir sekme grubunun sekmesi** (`docs/native/tab-groups.md`; pane içinde ayrı sekme şeridi yok, ayrı başlık sekmesi de yok). Yeni sayfa router'ın seçtiği gruba (odaktaki grup) girer. Popup ve `target=_blank` açan sayfanın grubunda, hemen onun arkasına sekme olarak eklenir; arka planda açılan sayfa odağı çalmaz, gizli sekme olarak bekler. |
 | K15 | Profil | **Varsayılan tek ortak profil**; isteyen proje ayarlardan **izole profil** açar (ayrı `CefRequestContext`, `Profiles/<proje>`). |
-| K16 | Overlay | Sayfayı örten menü/modal/bildirim varken native view gizlenir, yerine **son karenin görüntüsü** (CDP `Page.captureScreenshot`) GPUI'de çizilir. |
+| K16 | Overlay | Sayfayı örten menü/modal/bildirim varken sayfanın **son karesi** (CDP `Page.captureScreenshot`) GPUI'de çizilir; native view gizlenmez, pencerenin dışına taşınır (gizlenen view'da Chromium çizimi durdurur ve görüntü alınamaz). Kalıcı çözüm OSR ile Faz 3'te. |
 | K17 | Kısayollar | Sayfa odaktayken uygulamanın ⌘/⌃ kısayolları kazanır; **düzenleme kısayolları (⌘C/V/X/A/Z, ⇧⌘Z) sayfada kalır**. ⌘F bizim sayfada bul, ⌘R sayfa yenile, ⌘L adres çubuğu, ⌘+/−/0 sayfa zoom'u. |
-| K18 | DevTools | Pane'e **yapışık** (ikinci child view), ayrı pencere değil. |
+| K18 | DevTools | **Revize (Faz 1):** ayrı pencere. Yapışık hâli denendi; CEF macOS'ta DevTools'u Alloy style açamıyor ("Alloy style is not supported for this browser") ve Chrome style bir host view'un içine konamıyor: `ShowDevTools` child view ile CHECK'te durup uygulamayı kapattı. Yapışık DevTools için yol: kendi Alloy sayfamızda DevTools frontend'ini CDP üzerinden yüklemek (Faz 2'deki CDP uç noktasıyla birlikte). |
 | K19 | Link yönlendirme | localhost ve proje portları Monocode browser'ında, diğerleri sistem tarayıcısında açılır; ayarla "her şey Monocode'da" seçilebilir; **⇧ ile tıklama diğer tarafı** açar. |
 | K20 | Restore | Önceki oturumun sekmeleri **görünür olunca** yüklenir (lazy). Discard sonraki faza. |
 
@@ -361,8 +361,9 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 | Konu | Not |
 |---|---|
 | Eklentiler | Gömülü (Alloy) sekmelerde Chrome eklenti API'si yok; hibrit modelin çalışıp çalışmadığı belirsiz. En büyük risk. |
-| Overlay | Child view üstüne GPUI çizemez; overlay çözümü UX kalitesini belirler. |
-| Gizli sekme throttling | macOS windowed Alloy'da NSView gizleme ile throttling doğrulanacak. |
+| Overlay | Child view üstüne GPUI çizemez. Faz 1: son kare görüntüsü (K16); tooltip'ler ve ortak yardımcıları kullanmayan overlay'ler hâlâ sayfanın altında kalır. Kalıcı çözüm Faz 3 (OSR). |
+| Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır; Chromium'un gerçekten throttle ettiği ölçülmedi. |
+| DevTools yapışması | **Faz 1 bulgusu (K18):** CEF macOS'ta DevTools'u yalnız Chrome style açar ve Chrome style host view'a konamaz. Yapışık DevTools için CDP üzerinden kendi Alloy sayfamızda frontend (Faz 2). |
 | Bellek | Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
 | EDR | Framework artık uygulamayla ve bizim imzamızla geliyor; indirme kaynaklı risk kalktı. |
 | Sandbox ↔ dağıtım | **Çözüldü (K7 revizyonu):** sandbox yalnızca uygulama bundle'ından okumaya izin veriyor; framework gömüldü. |
@@ -385,18 +386,24 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 - Pane içinde tek Chromium sekmesi (child NSView) + performans ölçümü (scroll fps, input
   gecikmesi, bellek).
 
-### Faz 1 — Dev browser çekirdeği
-- Çoklu sayfa = sekme grubunda çoklu sekme (K14), kalıcı `pageId`, adres çubuğu, geri/ileri/yenile/durdur.
+### Faz 1 — Dev browser çekirdeği (bitti, `phase-1-done.md`)
+- Çoklu sayfa = sekme grubunda çoklu sekme (K14), kalıcı `pageId` (pane id), adres çubuğu,
+  geri/ileri/yenile/durdur.
 - Ortak profil + proje başına izole profil seçeneği (K15), workspace kalıcılığı, lazy restore (K20).
-- Kısayol yönlendirme (`OnPreKeyEvent`), odak, IME; overlay ilk çözümü (view gizle + son kare).
-- DevTools, sayfada bul, zoom, popup politikası, JS/HTTP auth diyalogları, indirmeler.
-- Terminal/chat/markdown link yönlendirme, localhost dev server algılama.
+- Kısayol yönlendirme (K17; macOS'ta `OnPreKeyEvent` gerekmedi, NSEvent monitörü yetiyor), odak,
+  IME; overlay ilk çözümü (son kare, K16).
+- DevTools (ayrı pencere, K18), sayfada bul, zoom, popup politikası, JS/HTTP auth diyalogları,
+  indirmeler.
+- Terminal/chat/markdown link yönlendirme, localhost dev server algılama (K19).
 
 ### Faz 2 — Agent temelleri
 - Süreç içi CDP katmanı, sekme başına komut kuyruğu (§6.1).
 - Yeni MCP araç seti (Orca komut setine göre) + Rust'a port edilmiş a11y snapshot motoru.
 - Güvenilir input (`isTrusted=true`), console, network, screenshot, eval.
 - Dış araçlar için token korumalı CDP uç noktası (dev-browser `--connect`, Playwright) (§6.2).
+- Faz 1'den devralınan: yapışık DevTools (CDP frontend, K18), çıkışta düzgün `cef::shutdown`,
+  her popup'ta `window.opener`, sahiplenilmeyen popup sızıntısı, dönüşte diyaloğa odak,
+  scroll fps / input gecikmesi ölçümü (`phase-1-done.md`).
 
 ### Faz 3 — Gelişmiş agent ve geliştirici özellikleri
 - Delta snapshot, aksiyon etkileri, `expect_url` guard.
@@ -424,7 +431,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 
 ### Faz 7 — Opsiyonel
 - Uzak ve mobil browser (screencast protokolü, §3.1 madde 10).
-- Kendi CDN'imizden imzalı CEF dağıtımı (§5.1).
+- ~~Kendi CDN'imizden imzalı CEF dağıtımı~~ (geçersiz: CEF uygulamayla geliyor, K7).
 
 ## 13. Faz bitişi ve doküman bakımı
 
@@ -445,8 +452,8 @@ Her faz bittiğinde:
 ### Faz durumu
 | Faz | Durum | Bitiş dokümanı |
 |---|---|---|
-| 0 | Bitti, kullanıcı onayı bekliyor | `phase-0-done.md` |
-| 1 | Başlamadı | — |
+| 0 | Bitti | `phase-0-done.md` |
+| 1 | Bitti | `phase-1-done.md` |
 | 2 | Başlamadı | — |
 | 3 | Başlamadı | — |
 | 4 | Başlamadı | — |

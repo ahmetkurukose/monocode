@@ -3601,7 +3601,11 @@ impl Shell {
             return;
         }
         if self.workspace.browser_panes.contains_key(&id) {
-            self.open_browser_pane(id, window, cx);
+            // A click on the page's own toolbar (its address field, say)
+            // keeps the focus it gave; only another pane is opened.
+            if self.workspace.active != Some(id) {
+                self.open_browser_pane(id, window, cx);
+            }
             return;
         }
         if self.workspace.active == Some(id) {

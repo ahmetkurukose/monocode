@@ -21,10 +21,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Bounds, Context, Corners, CursorStyle, DispatchPhase, Entity,
-    EventEmitter, FocusHandle, Focusable, Global, Image, ImageFormat, KeyBinding, KeyDownEvent,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, RenderImage, Subscription, Window, WindowId,
-    actions, canvas, div, prelude::*, px,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, Corners, Entity, EventEmitter, FocusHandle,
+    Focusable, Global, Image, ImageFormat, KeyBinding, KeyDownEvent, Pixels, RenderImage,
+    Subscription, Window, WindowId, actions, canvas, div, prelude::*, px,
 };
 
 use crate::{
@@ -32,36 +31,15 @@ use crate::{
     modal,
     popover::{Align, Anchor, AnchorSlot, popover},
     theme::{content, icon, icon_button, icon_button_enabled},
-    workspace::DevToolsDock,
 };
 
 actions!(
     workspace,
     [
-        /// ⌥⌘I: the focused page's docked DevTools.
+        /// ⌥⌘I: the focused page's DevTools, in a window of its own.
         ToggleBrowserDevTools
     ]
 );
-
-/// DevTools and the page above it each keep at least this many points.
-const DEVTOOLS_MIN: f32 = 120.;
-const PAGE_MIN: f32 = 80.;
-
-/// DevTools' height in a body `available` points tall: the saved height
-/// (0: 40% of the body), kept clear of both minimums. Unmeasured (0), the
-/// body takes the wanted height as it is.
-pub(crate) fn devtools_height(saved: u32, available: f32) -> f32 {
-    let wanted = if saved == 0 {
-        (available * 0.4).max(DEVTOOLS_MIN)
-    } else {
-        saved as f32
-    };
-    if available <= 0. {
-        return wanted;
-    }
-    let max = (available - PAGE_MIN).max(0.);
-    wanted.clamp(DEVTOOLS_MIN.min(max), max)
-}
 
 /// Whether Chromium runs, shared by every window.
 #[derive(Clone, Debug, PartialEq)]
@@ -400,19 +378,15 @@ pub(crate) struct BrowserPage {
     /// the first committed address.
     zoom_pending: bool,
     find: Option<FindBar>,
+    /// Takes the keyboard from Chromium whenever the address field gets the
+    /// focus (a click, ⌘L, a new blank page); made at the first render,
+    /// which has the window.
+    address_keyboard: Option<Subscription>,
     /// Where the page last drew, to take GPUI focus when Chromium gets it.
     window: Option<AnyWindowHandle>,
     engine: Entity<Engine>,
     profiles: PathBuf,
     host: Rc<Host<monocode_cef::BrowserView>>,
-    /// Saved with the pane; the shell sets it when it makes the page.
-    pub devtools_dock: DevToolsDock,
-    /// The docked DevTools' view, made when first painted while open.
-    devtools: Rc<Host<monocode_cef::DevToolsView>>,
-    /// The divider being dragged: where the drag started, and the height then.
-    devtools_drag: Option<(f32, f32)>,
-    /// The body under the toolbar, as last laid out.
-    body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     // Downloads and the dialogs the page asks for.
@@ -462,10 +436,7 @@ impl BrowserPage {
                 }
             }),
             // Snapshots sit in GPU atlases until given back.
-            cx.on_release(|page, cx| {
-                page.host.release(cx);
-                page.devtools.release(cx);
-            }),
+            cx.on_release(|page, cx| page.host.release(cx)),
         ];
         Self {
             url,
@@ -479,14 +450,11 @@ impl BrowserPage {
             zoom,
             zoom_pending: zoom != 100,
             find: None,
+            address_keyboard: None,
             window: None,
             engine,
             profiles,
             host: Rc::new(Host::default()),
-            devtools_dock: DevToolsDock::default(),
-            devtools: Rc::new(Host::default()),
-            devtools_drag: None,
-            body_bounds: Rc::default(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             downloads: Vec::new(),
@@ -505,8 +473,12 @@ impl BrowserPage {
     }
 
     /// The address field takes the keyboard while there is nothing to show;
-    /// otherwise the page does.
+    /// otherwise the page does. A field of the page that has it (the
+    /// address, find, a prompt) keeps it.
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if self.focus.contains_focused(window, cx) && !self.focus.is_focused(window) {
+            return;
+        }
         if self.url.is_empty() {
             window.focus(&self.address.focus_handle(cx), cx);
         } else {
@@ -680,6 +652,10 @@ impl BrowserPage {
         if self.find.is_none() {
             let field = cx.new(|cx| Input::field("Find in page", "Find", content(0.35), cx));
             let subscriptions = vec![
+                // A click into the field after the page had the keyboard.
+                cx.on_focus_in(&field.focus_handle(cx), window, |this, window, _| {
+                    this.take_keyboard(window)
+                }),
                 cx.subscribe(&field, |this, _, _: &input::Changed, cx| {
                     this.search(true, false, cx)
                 }),
@@ -871,42 +847,20 @@ impl BrowserPage {
             })
             .child(
                 icon_button_enabled("browser-devtools", "DevTools", "code", ready)
-                    .when(self.devtools_dock.open, |b| b.bg(content(0.1)))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
             )
             .children(self.downloads_button(cx))
     }
 
-    /// Opens or closes the docked DevTools.
+    /// Opens the page's DevTools in a window of its own, or closes it.
     pub(crate) fn toggle_dev_tools(&mut self, cx: &mut Context<Self>) {
-        self.devtools_dock.open = !self.devtools_dock.open;
-        if !self.devtools_dock.open {
-            self.drop_dev_tools(cx);
-        }
-        cx.emit(PageChanged);
-        cx.notify();
-    }
-
-    /// Closes DevTools' view; a new host makes the next one.
-    fn drop_dev_tools(&mut self, cx: &mut App) {
-        self.devtools_drag = None;
-        let old = std::mem::replace(&mut self.devtools, Rc::new(Host::default()));
-        old.release(cx);
-        old.close();
-    }
-
-    /// DevTools closed on its own (its UI, or a crash).
-    fn dev_tools_closed(
-        &mut self,
-        host: &Weak<Host<monocode_cef::DevToolsView>>,
-        cx: &mut Context<Self>,
-    ) {
-        if std::ptr::eq(host.as_ptr(), Rc::as_ptr(&self.devtools)) {
-            self.devtools_dock.open = false;
-            self.drop_dev_tools(cx);
-            cx.emit(PageChanged);
-        }
-        // An earlier DevTools finishing its close lets a new one open.
+        self.host.with_view(|view| {
+            if view.has_dev_tools() {
+                view.close_dev_tools()
+            } else {
+                view.show_dev_tools()
+            }
+        });
         cx.notify();
     }
 
@@ -1036,182 +990,17 @@ impl BrowserPage {
         .size_full()
         .into_any_element()
     }
-
-    /// Where DevTools draws, under the page: made once the page is.
-    fn devtools_surface(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let host = self.devtools.clone();
-        let page_host = self.host.clone();
-        let page = cx.weak_entity();
-        canvas(
-            |_, _, _| {},
-            move |bounds, _, window, cx| {
-                let weak = Rc::downgrade(&host);
-                host.paint(bounds, window, cx, |parent, frame, cx| {
-                    let opened = page_host
-                        .view
-                        .borrow()
-                        .as_ref()
-                        .map(|hosted| hosted.view.show_dev_tools(parent, frame));
-                    match opened? {
-                        Ok((view, events)) => {
-                            let page = page.clone();
-                            cx.spawn(async move |cx| {
-                                if events.recv().await.is_ok() {
-                                    let _ = page
-                                        .update(cx, |page, cx| page.dev_tools_closed(&weak, cx));
-                                }
-                            })
-                            .detach();
-                            Some(view)
-                        }
-                        // An earlier DevTools is still closing; its close
-                        // repaints, and this tries again.
-                        Err(e) => {
-                            log::debug!("browser: DevTools did not open: {e}");
-                            None
-                        }
-                    }
-                })
-            },
-        )
-        .size_full()
-        .into_any_element()
-    }
-
-    /// The page, with DevTools under a draggable divider when it is open.
-    fn body(&mut self, page: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let open = self.devtools_dock.open && self.engine.read(cx).state == EngineState::Ready;
-        if !open {
-            return div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .child(page)
-                .into_any_element();
-        }
-        let available = self
-            .body_bounds
-            .get()
-            .map_or(0., |b| f32::from(b.size.height));
-        let height = devtools_height(self.devtools_dock.height, available);
-        let slot = self.body_bounds.clone();
-        // The next render clamps to a new size, so a resize asks for it.
-        let probe = canvas(
-            move |bounds, window, _| {
-                if slot
-                    .replace(Some(bounds))
-                    .is_none_or(|old| old.size != bounds.size)
-                {
-                    window.on_next_frame(|window, _| window.refresh());
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full();
-        let divider = div()
-            .id("browser-devtools-divider")
-            .role(gpui::Role::Splitter)
-            .aria_label("Resize DevTools")
-            // Real space, not an overlap: Chromium's views would take the
-            // pointer over any part of it they cover.
-            .h(px(5.))
-            .flex_shrink_0()
-            .cursor(CursorStyle::ResizeUpDown)
-            .flex()
-            .items_center()
-            .child(div().h(px(1.)).w_full().bg(content(0.12)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.devtools_drag = Some((f32::from(event.position.y), height));
-                    cx.stop_propagation();
-                }),
-            );
-        div()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(probe)
-            .child(div().flex_1().min_h_0().min_w_0().child(page))
-            .child(divider)
-            .child(
-                div()
-                    .h(px(height))
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .child(self.devtools_surface(cx)),
-            )
-            .when(self.devtools_drag.is_some(), |d| {
-                d.child(self.drag_listener(cx))
-            })
-            .into_any_element()
-    }
-
-    /// While the divider drags: window-wide, since the pointer passes over
-    /// Chromium's views, whose drags AppKit still sends to GPUI's view.
-    fn drag_listener(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let page = cx.weak_entity();
-        canvas(
-            |_, _, _| {},
-            move |_, _, window, _| {
-                let moved = page.clone();
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                    if phase != DispatchPhase::Bubble {
-                        return;
-                    }
-                    let _ = moved.update(cx, |page, cx| page.drag_divider(event, cx));
-                });
-                let released = page.clone();
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-                    if phase != DispatchPhase::Bubble {
-                        return;
-                    }
-                    let _ = released.update(cx, |page, cx| page.end_divider_drag(cx));
-                });
-            },
-        )
-        .absolute()
-        .size_0()
-    }
-
-    fn drag_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some((start, height)) = self.devtools_drag else {
-            return;
-        };
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.end_divider_drag(cx);
-            return;
-        }
-        let available = self
-            .body_bounds
-            .get()
-            .map_or(0., |b| f32::from(b.size.height));
-        let wanted = (height + start - f32::from(event.position.y)).max(1.);
-        let height = devtools_height(wanted.round() as u32, available).round() as u32;
-        if height != self.devtools_dock.height {
-            self.devtools_dock.height = height;
-            cx.notify();
-        }
-    }
-
-    fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
-        if self.devtools_drag.take().is_some() {
-            // Saved once, when the drag ends.
-            cx.emit(PageChanged);
-            cx.notify();
-        }
-    }
 }
 
 impl Render for BrowserPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window = Some(window.window_handle());
+        if self.address_keyboard.is_none() {
+            let address = self.address.focus_handle(cx);
+            self.address_keyboard = Some(cx.on_focus_in(&address, window, |this, window, _| {
+                this.take_keyboard(window)
+            }));
+        }
         if self.engine.read(cx).state == EngineState::Idle {
             self.start_engine(cx);
         }
@@ -1265,7 +1054,7 @@ impl Render for BrowserPage {
                     ),
                 )
             })
-            .child(self.body(body, cx))
+            .child(div().flex_1().min_h_0().min_w_0().child(body))
             .relative()
             .children(self.downloads_popover(cx))
             .children(self.prompt_overlay(cx))
@@ -1861,12 +1650,11 @@ struct Frame {
     covers: Vec<Bounds<Pixels>>,
 }
 
-/// A Chromium view a [`Host`] places: a page or its DevTools.
+/// A Chromium view a [`Host`] places.
 trait NativeView: 'static {
     fn set_frame(&self, frame: monocode_cef::Frame);
     fn set_visible(&self, visible: bool);
     fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>);
-    fn close(&self);
 }
 
 impl NativeView for monocode_cef::BrowserView {
@@ -1878,24 +1666,6 @@ impl NativeView for monocode_cef::BrowserView {
     }
     fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
         self.capture(done);
-    }
-    fn close(&self) {
-        self.close();
-    }
-}
-
-impl NativeView for monocode_cef::DevToolsView {
-    fn set_frame(&self, frame: monocode_cef::Frame) {
-        self.set_frame(frame);
-    }
-    fn set_visible(&self, visible: bool) {
-        self.set_visible(visible);
-    }
-    fn capture(&self, done: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {
-        self.capture(done);
-    }
-    fn close(&self) {
-        self.close();
     }
 }
 
@@ -2145,15 +1915,6 @@ impl<V: NativeView> Host<V> {
             });
         })
         .detach();
-    }
-
-    /// Closes the view now, rather than when the last frame lets go of it.
-    fn close(&self) {
-        if let Some(hosted) = self.view.borrow_mut().take() {
-            hosted.view.close();
-            #[cfg(target_os = "macos")]
-            hosted.clip.removeFromSuperview();
-        }
     }
 
     /// Under an overlay, the snapshot stands in for the view.
@@ -2533,12 +2294,10 @@ mod monocode_cef {
         ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), &'static str> {
             Err(UNAVAILABLE)
         }
-        pub fn show_dev_tools(
-            &self,
-            _: *mut std::ffi::c_void,
-            _: Frame,
-        ) -> Result<(DevToolsView, async_channel::Receiver<DevToolsEvent>), &'static str> {
-            Err(UNAVAILABLE)
+        pub fn show_dev_tools(&self) {}
+        pub fn close_dev_tools(&self) {}
+        pub fn has_dev_tools(&self) -> bool {
+            false
         }
         pub fn capture(&self, _: impl FnOnce(Result<Vec<u8>, String>) + 'static) {}
         pub fn set_frame(&self, _: Frame) {}
@@ -2556,19 +2315,6 @@ mod monocode_cef {
         pub fn zoom_level(&self) -> f64 {
             0.
         }
-        pub fn close(&self) {}
-    }
-
-    pub enum DevToolsEvent {
-        #[allow(dead_code)]
-        Closed,
-    }
-
-    pub struct DevToolsView;
-    impl DevToolsView {
-        pub fn set_frame(&self, _: Frame) {}
-        pub fn set_visible(&self, _: bool) {}
-        pub fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
         pub fn close(&self) {}
     }
 }
@@ -2713,23 +2459,6 @@ mod tests {
     }
 
     #[test]
-    fn devtools_keeps_its_height_clear_of_both_minimums() {
-        // Unsaved: 40% of the body, never under the minimum.
-        assert_eq!(devtools_height(0, 1000.), 400.);
-        assert_eq!(devtools_height(0, 250.), DEVTOOLS_MIN);
-        // Saved: as it was, while it fits.
-        assert_eq!(devtools_height(300, 1000.), 300.);
-        assert_eq!(devtools_height(10, 1000.), DEVTOOLS_MIN);
-        assert_eq!(devtools_height(990, 1000.), 1000. - PAGE_MIN);
-        // A body too short for both: the page keeps its minimum.
-        assert_eq!(devtools_height(300, 150.), 150. - PAGE_MIN);
-        assert_eq!(devtools_height(300, 50.), 0.);
-        // Not measured yet: the wanted height.
-        assert_eq!(devtools_height(300, 0.), 300.);
-        assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
-    }
-
-    #[test]
     fn a_view_hides_unpainted_and_gives_way_under_an_overlay() {
         let at = |x: f32, y: f32, w: f32, h: f32| Bounds {
             origin: gpui::point(px(x), px(y)),
@@ -2751,7 +2480,6 @@ mod tests {
         fn set_frame(&self, _: monocode_cef::Frame) {}
         fn set_visible(&self, _: bool) {}
         fn capture(&self, _: Box<dyn FnOnce(Result<Vec<u8>, String>)>) {}
-        fn close(&self) {}
     }
 
     #[gpui::test]

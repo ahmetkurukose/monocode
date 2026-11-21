@@ -27,7 +27,6 @@ impl Shell {
             page.set_profile(profile, cx);
             page
         });
-        page.update(cx, |page, _| page.devtools_dock = state.devtools);
         // Asked from inside a page's event: handled once that is over, with
         // the window at hand.
         cx.subscribe(&page, move |_, _, request: &PageRequest, cx| {
@@ -41,13 +40,6 @@ impl Shell {
         })
         .detach();
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let dock = page.read(cx).devtools_dock;
-            if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
-                && state.devtools != dock
-            {
-                state.devtools = dock;
-                this.persist(cx);
-            }
             let (url, title, zoom) = {
                 let page = page.read(cx);
                 let zoom = (page.zoom != 100).then_some(page.zoom);
@@ -163,7 +155,7 @@ impl Shell {
         true
     }
 
-    /// ⌥⌘I: the focused browser pane's docked DevTools opens or closes.
+    /// ⌥⌘I: the focused browser pane's DevTools window opens or closes.
     pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self
             .workspace
@@ -309,39 +301,15 @@ mod tests {
     };
 
     #[test]
-    fn a_page_remembers_its_docked_devtools() {
-        use crate::workspace::DevToolsDock;
-        let docked = BrowserPane {
-            owner: 1,
-            url: "http://localhost:5173/".into(),
-            devtools: DevToolsDock {
-                open: true,
-                height: 320,
-            },
-            ..BrowserPane::default()
-        };
-        let saved = serde_json::to_string(&docked).unwrap();
-        assert_eq!(serde_json::from_str::<BrowserPane>(&saved).unwrap(), docked);
-        // Closed and never resized: nothing saved, and older saves read so.
-        let plain = BrowserPane {
-            devtools: DevToolsDock::default(),
-            ..docked
-        };
-        let saved = serde_json::to_string(&plain).unwrap();
-        assert!(!saved.contains("devtools"), "{saved}");
-        let older = r#"{"owner":1,"url":"http://localhost:5173/","title":""}"#;
-        assert_eq!(serde_json::from_str::<BrowserPane>(older).unwrap(), plain);
-        // Closed after a resize keeps the height for next time.
-        let resized = r#"{"owner":1,"devtools":{"height":250}}"#;
-        assert_eq!(
-            serde_json::from_str::<BrowserPane>(resized)
-                .unwrap()
-                .devtools,
-            DevToolsDock {
-                open: false,
-                height: 250
-            }
-        );
+    fn a_page_saved_with_docked_devtools_loads_without_it() {
+        // Pages saved while DevTools docked under them reopened it at launch,
+        // which CEF cannot do on macOS: it stopped the app.
+        let saved =
+            r#"{"owner":1,"url":"https://www.google.com/","devtools":{"open":true,"height":0}}"#;
+        let page = serde_json::from_str::<BrowserPane>(saved).unwrap();
+        assert_eq!(page.url, "https://www.google.com/");
+        let again = serde_json::to_string(&page).unwrap();
+        assert!(!again.contains("devtools"), "{again}");
     }
 
     #[test]
@@ -522,5 +490,20 @@ mod tests {
         // From the address field, the page's shortcuts still apply.
         keys(cx, &format!("{m}-="));
         assert_eq!(state(cx).0, 110);
+
+        // A click in the field also reaches the pane around it, which must
+        // not hand the focus back to the page: typing went to Chromium.
+        window
+            .update(cx, |shell, window, cx| shell.focus_pane(pane, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx).3, (false, true, false));
+        window
+            .update(cx, |shell, window, cx| {
+                shell.focus_browser_pane(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx).3, (false, true, false));
     }
 }
