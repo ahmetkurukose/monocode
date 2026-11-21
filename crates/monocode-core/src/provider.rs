@@ -1431,6 +1431,7 @@ fn run_operation(
             crate::visual_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::db_bridge::configure_codex(&mut command, &request.settings.environment);
             crate::code::bridge::configure_codex(&mut command, &request.settings.environment);
+            crate::browser::bridge::configure_codex(&mut command, &request.settings.environment);
             crate::mono::bridge::configure_codex(
                 &mut command,
                 request.settings.mono.as_ref(),
@@ -1524,6 +1525,18 @@ fn run_operation(
             {
                 servers.insert(crate::code::bridge::SERVER_NAME.into(), server);
                 allowed.push(crate::code::bridge::claude_allowed_tools());
+            }
+            // The app's browser. Everything is allowed up front but
+            // browser_eval, which Claude asks the user about every time (K25).
+            if let Some(server) = (!settings.text_only)
+                .then(|| crate::browser::bridge::mcp_server(&settings.environment))
+                .flatten()
+            {
+                servers.insert(crate::browser::bridge::SERVER_NAME.into(), server);
+                let tools = crate::browser::bridge::claude_allowed_tools();
+                if !tools.is_empty() {
+                    allowed.push(tools);
+                }
             }
             if !system.is_empty() {
                 command.args(["--append-system-prompt", &system.join("\n\n")]);

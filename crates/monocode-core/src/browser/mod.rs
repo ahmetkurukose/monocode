@@ -13,6 +13,7 @@
 //! piece of work reaches the app's main thread as a [`Job`] through
 //! [`submit`], and the app runs each with its [`Host`] (see [`jobs`]).
 
+pub mod bridge;
 pub mod cdp;
 pub mod host;
 pub mod log;

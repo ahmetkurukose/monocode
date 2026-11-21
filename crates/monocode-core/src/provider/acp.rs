@@ -129,6 +129,12 @@ impl Protocol {
         ) {
             list.push(code);
         }
+        if let (Some(list), Some(browser)) = (
+            servers.as_array_mut(),
+            crate::browser::bridge::acp_server(&settings.environment),
+        ) {
+            list.push(browser);
+        }
         servers
     }
     pub(super) fn acp_cancel(&mut self, stdin: &mut impl Write) -> Result<(), String> {
@@ -1857,5 +1863,31 @@ mod tests {
             assert!(events.is_empty());
             assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "no");
         }
+    }
+
+    #[test]
+    fn acp_sessions_are_handed_the_browser_tools() {
+        let mut p = protocol(Kind::ALL.into_iter().find(|k| k.is_acp()).unwrap());
+        p.request.settings.environment = [
+            ("MONOCODE_BROWSER_ENDPOINT", "127.0.0.1:9"),
+            ("MONOCODE_BROWSER_TOKEN", "secret"),
+            ("MONOCODE_BROWSER_SESSION", "7"),
+            ("MONOCODE_BROWSER_EXECUTABLE", "/Apps/Monocode"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let servers = p.mcp_servers();
+        let browser = servers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == crate::browser::bridge::SERVER_NAME)
+            .unwrap();
+        assert_eq!(browser["command"], "/Apps/Monocode");
+        assert_eq!(browser["args"], json!(["browser-mcp"]));
+        // Without a capability there is no server.
+        p.request.settings.environment.clear();
+        assert!(!p.mcp_servers().to_string().contains("monocode_browser"));
     }
 }

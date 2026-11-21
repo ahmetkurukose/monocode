@@ -651,6 +651,35 @@ fn run_turn_using(
                 settings.environment.extend(environment);
             }
         }
+        // The app's browser, for a local session: the capability holds its
+        // project, whose pages it sees with those it opens (K21). With the
+        // external CDP endpoint on, its address goes in the environment too,
+        // never on a command line (K27).
+        if !settings.text_only
+            && !raw_native_command
+            && cwd != "~"
+            && monocode_core::remote::parse_remote_path(cwd).is_none()
+        {
+            use monocode_core::browser::{Scope, bridge, proxy};
+            let project = std::path::Path::new(&summary.cwd);
+            if bridge::enabled() {
+                let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+                if let Ok(environment) = bridge::environment(summary.id, project, &executable) {
+                    settings.environment.extend(environment);
+                }
+            }
+            if proxy::enabled() {
+                let scope = Scope {
+                    session: summary.id,
+                    project: project.to_string_lossy().into_owned(),
+                };
+                if let Ok(endpoint) = proxy::endpoint(&scope) {
+                    settings
+                        .environment
+                        .insert(bridge::ENV_CDP.into(), endpoint);
+                }
+            }
+        }
         if let Some(visual_bridge) = &visual_bridge {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             settings
