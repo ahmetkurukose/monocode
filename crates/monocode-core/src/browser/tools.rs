@@ -9,6 +9,9 @@ use serde_json::Value;
 
 use super::{Call, Host, ToolOutput};
 
+/// Said to the agent once, with the server.
+pub const INSTRUCTIONS: &str = "Monocode's browser tools (stub).";
+
 /// MCP tool definitions (`{"name","description","inputSchema"}`), in order.
 pub fn definitions() -> Vec<Value> {
     Vec::new()

@@ -10,11 +10,13 @@
 //! - [`proxy`]: the external, Chrome-compatible CDP endpoint (K26, K27).
 //!
 //! Threads: the bridge and the proxy listen on threads of their own; every
-//! call reaches the app's main thread as a [`Call`] and is run there.
+//! piece of work reaches the app's main thread as a [`Job`] through
+//! [`submit`], and the app runs each with its [`Host`] (see [`jobs`]).
 
 pub mod cdp;
 pub mod host;
 pub mod log;
+pub mod proxy;
 pub mod tools;
 
 pub use cdp::{CdpClient, CdpError, CdpEvent, Subscription};
@@ -61,4 +63,29 @@ pub struct Call {
     pub arguments: serde_json::Value,
     /// Answers the call; may be called from the main thread only once.
     pub reply: Box<dyn FnOnce(ToolOutput) + Send>,
+}
+
+/// Work for the main thread: given the app's host, it returns a future the
+/// app runs on its foreground executor.
+pub type Job = Box<
+    dyn FnOnce(std::rc::Rc<dyn Host>) -> futures_util::future::LocalBoxFuture<'static, ()> + Send,
+>;
+
+fn job_channel() -> &'static (async_channel::Sender<Job>, async_channel::Receiver<Job>) {
+    static JOBS: std::sync::OnceLock<(async_channel::Sender<Job>, async_channel::Receiver<Job>)> =
+        std::sync::OnceLock::new();
+    JOBS.get_or_init(async_channel::unbounded)
+}
+
+/// Hands `job` to the main thread, from any thread. False only if the app
+/// stopped taking work.
+pub fn submit(job: Job) -> bool {
+    job_channel().0.try_send(job).is_ok()
+}
+
+/// The jobs [`submit`] queued. The app takes it once at start and runs, on
+/// its main thread, `job(host.clone())` for each, without waiting for one to
+/// end before starting the next.
+pub fn jobs() -> async_channel::Receiver<Job> {
+    job_channel().1.clone()
 }
