@@ -3,7 +3,7 @@
 //! opened from the title strip's New tab menu.
 use super::*;
 use crate::{
-    browser::{BrowserPage, PageChanged},
+    browser::{BrowserPage, PageChanged, PageRequest},
     workspace::BrowserPane,
 };
 
@@ -22,17 +22,45 @@ impl Shell {
         }
         let state = self.workspace.browser_panes.get(&pane)?.clone();
         let profiles = self.browser_profiles();
-        let page = cx.new(|cx| BrowserPage::new(state.url, state.title, profiles, cx));
+        let zoom = state.zoom.unwrap_or(100);
+        let profile = self.browser_profile(state.owner);
+        let page = cx.new(|cx| {
+            let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
+            page.set_profile(profile, cx);
+            page
+        });
+        page.update(cx, |page, _| page.devtools_dock = state.devtools);
+        // Asked from inside a page's event: handled once that is over, with
+        // the window at hand.
+        cx.subscribe(&page, move |_, _, request: &PageRequest, cx| {
+            let request = request.clone();
+            cx.spawn(async move |this, cx| {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.browser_page_request(pane, request, window, cx)
+                });
+            })
+            .detach();
+        })
+        .detach();
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let (url, title) = {
+            let dock = page.read(cx).devtools_dock;
+            if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
+                && state.devtools != dock
+            {
+                state.devtools = dock;
+                this.persist(cx);
+            }
+            let (url, title, zoom) = {
                 let page = page.read(cx);
-                (page.url.clone(), page.title.clone())
+                let zoom = (page.zoom != 100).then_some(page.zoom);
+                (page.url.clone(), page.title.clone(), zoom)
             };
             if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
-                && (state.url != url || state.title != title)
+                && (state.url != url || state.title != title || state.zoom != zoom)
             {
                 state.url = url;
                 state.title = title;
+                state.zoom = zoom;
                 this.persist(cx);
             }
             this.invalidate_chrome(cx);
@@ -73,7 +101,7 @@ impl Shell {
             BrowserPane {
                 owner,
                 url: url.unwrap_or_default(),
-                title: String::new(),
+                ..Default::default()
             },
         );
         self.workspace.open(pane);
@@ -139,6 +167,20 @@ impl Shell {
         true
     }
 
+    /// ⌥⌘I: the focused browser pane's docked DevTools opens or closes.
+    pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self
+            .workspace
+            .active
+            .filter(|id| self.workspace.browser_panes.contains_key(id))
+        else {
+            return;
+        };
+        if let Some(page) = self.browser_page(pane, cx) {
+            page.update(cx, |page, cx| page.toggle_dev_tools(cx));
+        }
+    }
+
     /// A browser pane: its split header over the page.
     pub(super) fn browser_pane_surface(
         &mut self,
@@ -163,12 +205,161 @@ impl Shell {
     }
 }
 
+// ---- Pages opened by pages, and profiles ----
+
+impl Shell {
+    /// The profile `owner`'s project browses with (K15): the shared default
+    /// one, or the project's own.
+    fn browser_profile(&self, owner: i64) -> crate::browser::Profile {
+        let Some(cwd) = self.session_summaries.get(&owner).map(|s| s.cwd.as_str()) else {
+            return crate::browser::Profile::Default;
+        };
+        let key = monocode_core::files::path_key(cwd);
+        if self.workspace.browser_isolated_projects.contains(&key) {
+            crate::browser::Profile::for_project(&key)
+        } else {
+            crate::browser::Profile::Default
+        }
+    }
+
+    fn browser_page_request(
+        &mut self,
+        pane: i64,
+        request: PageRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace.browser_panes.contains_key(&pane) {
+            return;
+        }
+        match request {
+            PageRequest::Open {
+                url,
+                foreground,
+                popup,
+            } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
+            PageRequest::Close => self.close_pane(pane, window, cx),
+        }
+    }
+
+    /// A page `opener` opened: its own title tab right after the opener's,
+    /// for the same owner. It takes focus only when `foreground`.
+    fn open_browser_page_beside(
+        &mut self,
+        opener: i64,
+        url: String,
+        foreground: bool,
+        popup: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.workspace.browser_panes.get(&opener).map(|b| b.owner) else {
+            return;
+        };
+        let pane = self.workspace.next_pane_id();
+        self.workspace.browser_panes.insert(
+            pane,
+            BrowserPane {
+                owner,
+                url,
+                ..Default::default()
+            },
+        );
+        let active = self.workspace.active;
+        self.workspace.open(pane);
+        if let Some(after) = self.workspace.tab_of(opener) {
+            self.workspace.place_tab_after(pane, after);
+        }
+        if let Some(id) = popup
+            && let Some(page) = self.browser_page(pane, cx)
+        {
+            page.update(cx, |page, cx| page.adopt_popup(id, cx));
+        }
+        if foreground {
+            self.pane_motion = None;
+            self.fit_sidebar(cx);
+            self.open_browser_pane(pane, window, cx);
+        } else {
+            self.workspace.active = active;
+            self.persist(cx);
+            cx.notify();
+        }
+    }
+
+    /// The project menu's "Isolated browser profile" switch.
+    pub(super) fn browser_profile_menu(&self, path: &str) -> MenuAction {
+        let on = (self.workspace.browser_isolated_projects)
+            .contains(&monocode_core::files::path_key(path));
+        MenuAction::new("browser-isolated", "Isolated browser profile")
+            .description("Own cookies and storage for this project's pages. Open pages reload.")
+            .icon("globe")
+            .toggle(on)
+    }
+
+    /// Turns the project's own browser profile on or off; its open pages
+    /// open again in the profile they now use.
+    pub(super) fn toggle_browser_isolation(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = monocode_core::files::path_key(path);
+        let isolated = &mut self.workspace.browser_isolated_projects;
+        if !isolated.remove(&key) {
+            isolated.insert(key);
+        }
+        let pages: Vec<_> = (self.browser_pages.iter())
+            .filter_map(|(pane, (page, _))| {
+                let owner = self.workspace.browser_panes.get(pane)?.owner;
+                Some((page.clone(), self.browser_profile(owner)))
+            })
+            .collect();
+        for (page, profile) in pages {
+            page.update(cx, |page, cx| page.set_profile(profile, cx));
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         pane_layout::{SplitDir, leaf},
         workspace::{BrowserPane, TitleTab, Workspace},
     };
+
+    #[test]
+    fn a_page_remembers_its_docked_devtools() {
+        use crate::workspace::DevToolsDock;
+        let docked = BrowserPane {
+            owner: 1,
+            url: "http://localhost:5173/".into(),
+            devtools: DevToolsDock {
+                open: true,
+                height: 320,
+            },
+            ..BrowserPane::default()
+        };
+        let saved = serde_json::to_string(&docked).unwrap();
+        assert_eq!(serde_json::from_str::<BrowserPane>(&saved).unwrap(), docked);
+        // Closed and never resized: nothing saved, and older saves read so.
+        let plain = BrowserPane {
+            devtools: DevToolsDock::default(),
+            ..docked
+        };
+        let saved = serde_json::to_string(&plain).unwrap();
+        assert!(!saved.contains("devtools"), "{saved}");
+        let older = r#"{"owner":1,"url":"http://localhost:5173/","title":""}"#;
+        assert_eq!(serde_json::from_str::<BrowserPane>(older).unwrap(), plain);
+        // Closed after a resize keeps the height for next time.
+        let resized = r#"{"owner":1,"devtools":{"height":250}}"#;
+        assert_eq!(
+            serde_json::from_str::<BrowserPane>(resized)
+                .unwrap()
+                .devtools,
+            DevToolsDock {
+                open: false,
+                height: 250
+            }
+        );
+    }
 
     #[test]
     fn restore_keeps_browser_pages_of_known_sessions_in_open_tabs() {
@@ -184,6 +375,7 @@ mod tests {
             owner,
             url: "http://localhost:5173/".into(),
             title: "Vite".into(),
+            ..Default::default()
         };
         state.browser_panes.insert(-1, page(1));
         // Its own tab, but its owner is gone.
@@ -202,5 +394,86 @@ mod tests {
         assert_eq!(restored.next_pane_id(), -2);
         assert_eq!(restored.session_for_pane(-1), 1);
         assert!(restored.is_detached_pane(-1));
+    }
+
+    #[test]
+    fn a_page_saves_its_zoom_only_when_it_is_not_100_percent() {
+        let page = BrowserPane {
+            owner: 1,
+            url: "http://localhost:5173/".into(),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&page).unwrap().contains("zoom"));
+        let zoomed = BrowserPane {
+            zoom: Some(125),
+            ..page
+        };
+        let saved = serde_json::to_string(&zoomed).unwrap();
+        assert_eq!(serde_json::from_str::<BrowserPane>(&saved).unwrap(), zoomed);
+    }
+
+    #[gpui::test]
+    fn a_focused_page_zooms_finds_and_takes_the_address_over_the_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.new_browser_pane(Some("http://localhost:5173/".into()), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let (pane, page, scale) = window
+            .update(cx, |shell, _, _| {
+                let (pane, (page, _)) = shell.browser_pages.iter().next().unwrap();
+                (*pane, page.clone(), shell.workspace.preferences.ui_scale)
+            })
+            .unwrap();
+        let m = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        let keys = |cx: &mut gpui::TestAppContext, keys: &str| {
+            cx.simulate_keystrokes(window.into(), keys);
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |shell, window, cx| {
+                    let page = page.read(cx);
+                    (
+                        page.zoom,
+                        shell.workspace.browser_panes[&pane].zoom,
+                        shell.workspace.preferences.ui_scale,
+                        page.keyboard_state(window, cx),
+                    )
+                })
+                .unwrap()
+        };
+
+        keys(cx, &format!("{m}-= {m}-="));
+        assert_eq!(state(cx), (125, Some(125), scale, (false, false, false)));
+        keys(cx, &format!("{m}--"));
+        assert_eq!(state(cx).0, 110);
+        keys(cx, &format!("{m}-0"));
+        assert_eq!(state(cx), (100, None, scale, (false, false, false)));
+
+        keys(cx, &format!("{m}-f"));
+        assert_eq!(state(cx).3, (true, false, true));
+        keys(cx, "escape");
+        assert_eq!(state(cx).3, (false, false, false));
+
+        keys(cx, &format!("{m}-l"));
+        assert_eq!(state(cx).3, (false, true, false));
+        // From the address field, the page's shortcuts still apply.
+        keys(cx, &format!("{m}-="));
+        assert_eq!(state(cx).0, 110);
     }
 }

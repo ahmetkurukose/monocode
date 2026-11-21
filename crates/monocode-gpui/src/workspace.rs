@@ -215,6 +215,11 @@ pub(crate) struct Workspace {
     /// the project's settings (`code_shell::settings`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_code_settings: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Projects whose browser pages keep their own cookies and storage
+    /// instead of the profile all others share
+    /// (docs/native/browser/context.md K15).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub browser_isolated_projects: std::collections::BTreeSet<String>,
     /// The right panel's whole tab strip by tab key, feature tabs included,
     /// so one that comes back takes the place it was dragged to.
     /// `right_panel_tabs` keeps the built-in tabs alone.
@@ -299,13 +304,33 @@ pub(crate) struct TerminalPane {
     pub cwd: String,
 }
 /// A browser page in the pane tree (docs/native/browser/context.md §4.5).
-/// Only its address and title are saved; the page loads again when shown.
+/// Its address, title and zoom are saved; the page loads again when shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct BrowserPane {
     pub owner: i64,
     pub url: String,
     pub title: String,
+    /// Page zoom in percent; `None` is 100%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<u16>,
+    #[serde(default, skip_serializing_if = "DevToolsDock::is_default")]
+    pub devtools: DevToolsDock,
+}
+
+/// A page's DevTools docked under it (context.md K18): whether it was open,
+/// and its height in points (0 until the divider is first moved).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DevToolsDock {
+    pub open: bool,
+    pub height: u32,
+}
+
+impl DevToolsDock {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A project's dock: its place, size and the terminals it holds. Shells are
@@ -502,6 +527,7 @@ impl Default for Workspace {
             project_terminal_setups: Default::default(),
             project_runs: Default::default(),
             project_code_settings: Default::default(),
+            browser_isolated_projects: Default::default(),
             right_panel_strip: Vec::new(),
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
@@ -1063,6 +1089,30 @@ impl Workspace {
             }
         }
         self.active = Some(id);
+    }
+    /// Moves title tab `tab` right after `after`, as a page opened from
+    /// another sits beside its opener.
+    pub fn place_tab_after(&mut self, tab: i64, after: i64) {
+        if tab == after || !self.tabs.contains(&after) {
+            return;
+        }
+        if let Some(from) = self.tabs.iter().position(|t| *t == tab) {
+            self.tabs.remove(from);
+            let to = self
+                .tabs
+                .iter()
+                .position(|t| *t == after)
+                .map_or(0, |ix| ix + 1);
+            self.tabs.insert(to, tab);
+        }
+        let (moved, anchor) = (TitleTab::Session(tab), TitleTab::Session(after));
+        if let Some(from) = self.title_order.iter().position(|t| *t == moved) {
+            self.title_order.remove(from);
+            match self.title_order.iter().position(|t| *t == anchor) {
+                Some(ix) => self.title_order.insert(ix + 1, moved),
+                None => self.title_order.push(moved),
+            }
+        }
     }
     /// Close the whole title tab holding `id`; its sessions keep running.
     pub fn close(&mut self, id: i64) {
@@ -2064,6 +2114,44 @@ mod tests {
     }
 
     #[test]
+    fn a_projects_isolated_browser_profile_round_trips() {
+        let mut state = Workspace::default();
+        state.add_project("/p");
+        state.browser_isolated_projects.insert("/p".into());
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored = Workspace::restore(Some(&saved), &[(1, "/p".into())], "/p");
+        assert!(restored.browser_isolated_projects.contains("/p"));
+        // Nothing is written while every project shares the default profile.
+        let plain = serde_json::to_string(&Workspace::default()).unwrap();
+        assert!(!plain.contains("browser_isolated_projects"));
+    }
+
+    #[test]
+    fn a_page_opened_from_another_sits_right_after_its_tab() {
+        let mut state = Workspace {
+            tabs: vec![1, 2, 3],
+            title_order: vec![
+                TitleTab::Session(1),
+                TitleTab::Session(2),
+                TitleTab::Session(3),
+            ],
+            ..Workspace::default()
+        };
+        state.open(-1);
+        state.place_tab_after(-1, 1);
+        assert_eq!(state.tabs, [1, -1, 2, 3]);
+        assert_eq!(
+            state.title_order,
+            [1, -1, 2, 3].map(TitleTab::Session).to_vec()
+        );
+        // The last tab's page goes last; an unknown opener moves nothing.
+        state.open(-2);
+        state.place_tab_after(-2, 3);
+        state.place_tab_after(-2, 99);
+        assert_eq!(state.tabs, [1, -1, 2, 3, -2]);
+    }
+
+    #[test]
     fn a_projects_terminal_setup_round_trips_and_an_empty_one_is_dropped() {
         use monocode_core::terminal_setup::{TerminalSetup, Venv};
         let mut state = Workspace::default();
@@ -2175,6 +2263,7 @@ mod tests {
                 owner: 1,
                 url: "http://localhost:5173".into(),
                 title: "Vite".into(),
+                ..Default::default()
             }
         );
         assert_eq!(restored.focused.get(&1), Some(&-4));

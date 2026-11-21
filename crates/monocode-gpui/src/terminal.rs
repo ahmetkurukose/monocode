@@ -166,7 +166,7 @@ pub(crate) struct Terminal {
     url_regex: Option<RegexSearch>,
     /// The pointer over the grid, for underlining the link beneath it.
     hover: Option<gpui::Point<gpui::Pixels>>,
-    /// The link a plain click pressed; releasing on it opens it.
+    /// The link a plain or ⇧ click pressed; releasing on it opens it.
     pressed_link: Option<Link>,
     pub(crate) visible: bool,
     /// The process this terminal runs in place of a shell (`run.rs`).
@@ -783,15 +783,21 @@ impl Terminal {
     }
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        self.pressed_link = (event.click_count == 1 && !event.modifiers.shift)
+        let link = (event.click_count == 1)
             .then(|| self.link_at(event.position))
             .flatten();
+        // ⇧ extends a selection, except on a link with nothing selected,
+        // where it opens the link in the other browser.
+        let selected =
+            (self.term.lock().selection.as_ref()).is_some_and(|selection| !selection.is_empty());
+        let extend = event.modifiers.shift && (selected || link.is_none());
+        self.pressed_link = link.filter(|_| !extend);
         let Some((at, side)) = self.grid_point(event.position) else {
             return;
         };
         let mut term = self.term.lock();
         match term.selection.as_mut() {
-            Some(selection) if event.modifiers.shift => selection.update(at, side),
+            Some(selection) if extend => selection.update(at, side),
             _ => {
                 let ty = match event.click_count {
                     2 => SelectionType::Semantic,
@@ -828,7 +834,7 @@ impl Terminal {
     }
     /// A click that pressed and released on the same link, without
     /// dragging out a selection, opens it as the web build's xterm does.
-    fn mouse_up(&mut self, event: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+    fn mouse_up(&mut self, event: &gpui::MouseUpEvent, window: &Window, cx: &mut Context<Self>) {
         let was_selecting = self.selecting;
         self.stop_selection();
         if was_selecting
@@ -848,7 +854,7 @@ impl Terminal {
             .as_ref()
             .is_some_and(|selection| !selection.is_empty());
         if !selected && self.link_at(event.position).as_ref() == Some(&link) {
-            cx.open_url(&link.uri);
+            crate::shell::browser_links::open_link(&link.uri, event.modifiers.shift, window, cx);
         }
     }
     fn stop_selection(&mut self) {
@@ -1413,9 +1419,9 @@ impl Element for Grid {
             }
         });
         let terminal = self.terminal.downgrade();
-        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
             if phase == gpui::DispatchPhase::Capture && event.button == MouseButton::Left {
-                let _ = terminal.update(cx, |terminal, cx| terminal.mouse_up(event, cx));
+                let _ = terminal.update(cx, |terminal, cx| terminal.mouse_up(event, window, cx));
             }
         });
         // Dead keys and input methods compose text before it is typed; the
@@ -1978,6 +1984,108 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_link_click_opens_a_local_page_in_monocode_and_shift_click_in_the_system(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        // Not the window's root, so no frame lays it out over the test's grid.
+        let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
+        let cx = cx.add_empty_window();
+        let at = |line: usize, column: usize| {
+            point(px(column as f32 * 8. + 1.), px(line as f32 * 16. + 1.))
+        };
+        let click = |position, shift: bool, cx: &mut gpui::VisualTestContext| {
+            let modifiers = Modifiers {
+                shift,
+                ..Default::default()
+            };
+            cx.update(|window, cx| {
+                view.update(cx, |terminal, cx| {
+                    terminal.mouse_down(
+                        &MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count: 1,
+                            first_mouse: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    terminal.mouse_up(
+                        &gpui::MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers,
+                            click_count: 1,
+                        },
+                        window,
+                        cx,
+                    );
+                })
+            });
+        };
+        let queued = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| crate::shell::browser_links::queued(cx))
+        };
+        view.update(cx, |terminal, _| {
+            let cell = size(px(8.), px(16.));
+            terminal.resize(40, 4, cell);
+            terminal.geometry.set(Some(Geometry {
+                origin: point(px(0.), px(0.)),
+                cell,
+            }));
+            write_note(
+                &terminal.term,
+                "http://localhost:3000/\r\nhttps://example.com/",
+            );
+        });
+        let pane = cfg!(target_os = "macos");
+
+        click(at(0, 3), false, cx);
+        let local = vec!["http://localhost:3000/".to_owned()];
+        assert_eq!(queued(cx), if pane { local.clone() } else { Vec::new() });
+        click(at(1, 3), false, cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/"));
+
+        // ⇧ sends each to the other browser.
+        click(at(0, 3), true, cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("http://localhost:3000/"));
+        click(at(1, 3), true, cx);
+        let both = vec![
+            "http://localhost:3000/".to_owned(),
+            "https://example.com/".to_owned(),
+        ];
+        assert_eq!(queued(cx), if pane { both } else { Vec::new() });
+
+        // With text selected, ⇧-click extends the selection and opens nothing.
+        view.update(cx, |terminal, _| {
+            let mut term = terminal.term.lock();
+            let mut selection = Selection::new(
+                SelectionType::Simple,
+                GridPoint::new(Line(0), Column(0)),
+                Side::Left,
+            );
+            selection.update(GridPoint::new(Line(0), Column(2)), Side::Right);
+            term.selection = Some(selection);
+        });
+        let before = queued(cx).len();
+        click(at(1, 3), true, cx);
+        assert_eq!(queued(cx).len(), before);
+        assert_eq!(cx.opened_url().as_deref(), Some("http://localhost:3000/"));
+        view.update(cx, |terminal, _| {
+            assert!(
+                terminal
+                    .term
+                    .lock()
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty())
+            );
+        });
+    }
+
+    #[gpui::test]
     fn a_projects_setup_is_typed_once_the_shell_is_quiet_and_an_action_runs_behind_it(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2144,39 +2252,43 @@ mod tests {
     #[gpui::test]
     fn selecting_copies_only_when_copy_on_select_is_on(cx: &mut gpui::TestAppContext) {
         let view = cx.new(|cx| Terminal::new("/tmp".into(), cx));
-        let release = |cx: &mut gpui::TestAppContext| {
-            view.update(cx, |terminal, cx| {
-                write_note(&terminal.term, "copy-me please");
-                terminal.term.lock().selection = Some({
-                    let mut selection = Selection::new(
-                        SelectionType::Simple,
-                        GridPoint::new(Line(0), Column(0)),
-                        Side::Left,
+        let cx = cx.add_empty_window();
+        let release = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                view.update(cx, |terminal, cx| {
+                    write_note(&terminal.term, "copy-me please");
+                    terminal.term.lock().selection = Some({
+                        let mut selection = Selection::new(
+                            SelectionType::Simple,
+                            GridPoint::new(Line(0), Column(0)),
+                            Side::Left,
+                        );
+                        selection.update(GridPoint::new(Line(0), Column(6)), Side::Right);
+                        selection
+                    });
+                    terminal.selecting = true;
+                    terminal.mouse_up(
+                        &gpui::MouseUpEvent {
+                            position: point(px(0.), px(0.)),
+                            modifiers: Default::default(),
+                            button: MouseButton::Left,
+                            click_count: 1,
+                        },
+                        window,
+                        cx,
                     );
-                    selection.update(GridPoint::new(Line(0), Column(6)), Side::Right);
-                    selection
-                });
-                terminal.selecting = true;
-                terminal.mouse_up(
-                    &gpui::MouseUpEvent {
-                        position: point(px(0.), px(0.)),
-                        modifiers: Default::default(),
-                        button: MouseButton::Left,
-                        click_count: 1,
-                    },
-                    cx,
-                );
+                })
             });
         };
         cx.write_to_clipboard(ClipboardItem::new_string("untouched".into()));
-        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        cx.update(|_, cx| cx.set_global(crate::settings::Preferences::default()));
         release(cx);
         assert_eq!(
             cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
             Some("untouched"),
             "off by default"
         );
-        cx.update(|cx| {
+        cx.update(|_, cx| {
             cx.set_global(crate::settings::Preferences {
                 terminal_copy_on_select: true,
                 ..Default::default()

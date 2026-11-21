@@ -33,9 +33,19 @@ pub(crate) fn link_menu(url: &str, position: Point<Pixels>, window: &mut Window,
 }
 
 fn activate_link(event: &ClickEvent, selection: Option<&TextSelection>) -> bool {
-    event.click_count() == 1
-        && !event.modifiers().shift
-        && !selection.is_some_and(TextSelection::has_selection)
+    event.click_count() == 1 && !selection.is_some_and(TextSelection::has_selection)
+}
+
+/// ⇧ on a link with nothing selected opens it in the other browser, so the
+/// press must not extend the selection from where the last click left it.
+fn shift_press_on_link(event: &gpui::MouseDownEvent, selection: Option<&TextSelection>) {
+    if event.button == MouseButton::Left
+        && event.modifiers.shift
+        && let Some(selection) = selection
+        && !selection.has_selection()
+    {
+        selection.forget_anchor();
+    }
 }
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
@@ -451,9 +461,19 @@ fn inline_selected(
     let menu_links = links.clone();
     let clicked_urls = urls.clone();
     let text_id: SharedString = format!("{id}-text").into();
+    let pressed_layout = layout.clone();
+    let pressed_links = links.clone();
+    let pressed_selection = selection.clone();
     let child = div()
         .id(id)
         .child(InteractiveText::new(text_id, styled).on_click(links, |_, _, _| {}))
+        .capture_any_mouse_down(move |event, _, _| {
+            if let Ok(byte) = pressed_layout.index_for_position(event.position)
+                && pressed_links.iter().any(|range| range.contains(&byte))
+            {
+                shift_press_on_link(event, pressed_selection.as_ref());
+            }
+        })
         .on_click(move |event, window, cx| {
             if !activate_link(event, clicked_selection.as_ref()) {
                 return;
@@ -471,7 +491,7 @@ fn inline_selected(
                         return;
                     }
                 }
-                open_link(&clicked_urls[ix], window, cx);
+                open_link(&clicked_urls[ix], event.modifiers().shift, window, cx);
             }
         })
         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -549,7 +569,7 @@ fn rich_inline(
                             .hover(|s| s.bg(content(0.13)))
                             .on_click(move |event, window, cx| {
                                 if activate_link(event, clicked_selection.as_ref()) {
-                                    open_link(&path, window, cx)
+                                    open_link(&path, event.modifiers().shift, window, cx)
                                 }
                             })
                             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -626,11 +646,17 @@ fn rich_inline(
                             d.cursor(gpui::CursorStyle::PointingHand)
                         })
                         .child(child)
+                        .when(link.is_some(), |d| {
+                            let selection = clicked_selection.clone();
+                            d.capture_any_mouse_down(move |event, _, _| {
+                                shift_press_on_link(event, selection.as_ref())
+                            })
+                        })
                         .on_click(move |event, window, cx| {
                             if let Some(url) = &link
                                 && activate_link(event, clicked_selection.as_ref())
                             {
-                                open_link(url, window, cx);
+                                open_link(url, event.modifiers().shift, window, cx);
                             }
                         })
                         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -728,9 +754,10 @@ pub(crate) fn resolve_file_links(row: &mut MarkdownRow, base: &str) {
     }
 }
 
-fn open_link(url: &str, window: &mut Window, cx: &mut App) {
+/// `invert`: the click held ⇧, which opens a web link in the other browser.
+fn open_link(url: &str, invert: bool, window: &mut Window, cx: &mut App) {
     if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
-        cx.open_url(url);
+        crate::shell::browser_links::open_link(url, invert, window, cx);
     } else if !url.starts_with('#') && (!url.contains("://") || url.starts_with("file://")) {
         window.dispatch_action(Box::new(crate::file_editor::OpenPath(url.into())), cx);
     }

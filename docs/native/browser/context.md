@@ -46,6 +46,13 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K11 | WebKit | **Tamamen kaldırılır**, yedek olarak tutulmaz. |
 | K12 | Platform | **macOS, Windows, Linux** desteklenecek. Uygulama sırası: **önce macOS**, diğerleri sonra. Mimari baştan üç platforma uygun kurulur. |
 | K13 | Doğrulama testi | MDM/EDR (Iru, SentinelOne) için ayrı ön test **yapılmayacak**; geliştirme sırasında görülür. |
+| K14 | Sekmeler (Faz 1) | **Her browser sayfası Monocode'un kendi başlık sekmesi** (pane içinde ayrı sekme şeridi yok). Sekme mantığı `tab-unified-window-management` çalışmasında değişiyor; browser ona uyar. Popup ve `target=_blank` yeni başlık sekmesi açar. |
+| K15 | Profil | **Varsayılan tek ortak profil**; isteyen proje ayarlardan **izole profil** açar (ayrı `CefRequestContext`, `Profiles/<proje>`). |
+| K16 | Overlay | Sayfayı örten menü/modal/bildirim varken native view gizlenir, yerine **son karenin görüntüsü** (CDP `Page.captureScreenshot`) GPUI'de çizilir. |
+| K17 | Kısayollar | Sayfa odaktayken uygulamanın ⌘/⌃ kısayolları kazanır; **düzenleme kısayolları (⌘C/V/X/A/Z, ⇧⌘Z) sayfada kalır**. ⌘F bizim sayfada bul, ⌘R sayfa yenile, ⌘L adres çubuğu, ⌘+/−/0 sayfa zoom'u. |
+| K18 | DevTools | Pane'e **yapışık** (ikinci child view), ayrı pencere değil. |
+| K19 | Link yönlendirme | localhost ve proje portları Monocode browser'ında, diğerleri sistem tarayıcısında açılır; ayarla "her şey Monocode'da" seçilebilir; **⇧ ile tıklama diğer tarafı** açar. |
+| K20 | Restore | Önceki oturumun sekmeleri **görünür olunca** yüklenir (lazy). Discard sonraki faza. |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -379,8 +386,8 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   gecikmesi, bellek).
 
 ### Faz 1 — Dev browser çekirdeği
-- Pane içinde çoklu sekme, kalıcı `pageId`, adres çubuğu, geri/ileri/yenile/durdur.
-- Proje başına profil (`CefRequestContext`), workspace kalıcılığı, uyuyan sekme restore'u.
+- Çoklu sayfa = çoklu başlık sekmesi (K14), kalıcı `pageId`, adres çubuğu, geri/ileri/yenile/durdur.
+- Ortak profil + proje başına izole profil seçeneği (K15), workspace kalıcılığı, lazy restore (K20).
 - Kısayol yönlendirme (`OnPreKeyEvent`), odak, IME; overlay ilk çözümü (view gizle + son kare).
 - DevTools, sayfada bul, zoom, popup politikası, JS/HTTP auth diyalogları, indirmeler.
 - Terminal/chat/markdown link yönlendirme, localhost dev server algılama.

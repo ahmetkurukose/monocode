@@ -78,6 +78,12 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleIconName</key><string>AppIcon</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSBluetoothAlwaysUsageDescription</key><string>Websites in the browser can use Bluetooth, for example to sign in with a passkey on your phone.</string>
+<key>NSBluetoothPeripheralUsageDescription</key><string>Websites in the browser can use Bluetooth, for example to sign in with a passkey on your phone.</string>
+<key>NSCameraUsageDescription</key><string>Websites in the browser can ask to use your camera.</string>
+<key>NSMicrophoneUsageDescription</key><string>Websites in the browser can ask to use your microphone.</string>
+<key>NSLocationUsageDescription</key><string>Websites in the browser can ask for your location.</string>
+<key>NSLocationWhenInUseUsageDescription</key><string>Websites in the browser can ask for your location.</string>
 </dict></plist>
 PLIST
 native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"

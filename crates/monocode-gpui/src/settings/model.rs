@@ -319,6 +319,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "terminal placement dock bottom side right panel title bar tab shell focused layout",
     ),
     (
+        "browser-all-links",
+        Section::General,
+        "Open all links in Monocode",
+        "browser web links localhost dev server system default chromium shift click",
+    ),
+    (
         "file-tabs",
         Section::General,
         "File tabs",

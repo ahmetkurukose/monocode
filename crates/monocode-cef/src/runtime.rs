@@ -45,7 +45,13 @@ impl RuntimeConfig {
 
     /// The default profile's folder, inside `cache_root`.
     pub fn default_profile(&self) -> PathBuf {
-        self.cache_root.join("Profiles").join("default")
+        self.profiles().join("default")
+    }
+
+    /// Where every profile lives: the default one and the projects'
+    /// isolated ones ([`crate::Profile`]).
+    pub fn profiles(&self) -> PathBuf {
+        self.cache_root.join("Profiles")
     }
 }
 
@@ -220,6 +226,7 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
         return Err(StartError::Initialize);
     }
     crate::mac::pump::install();
+    crate::profile::set_root(config.profiles());
     APP.with(|slot| *slot.borrow_mut() = Some(app));
     Ok(())
 }

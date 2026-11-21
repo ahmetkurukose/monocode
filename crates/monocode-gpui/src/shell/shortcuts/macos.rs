@@ -1,6 +1,11 @@
 use super::Forwarding;
 use gpui::Window;
-use objc2::{MainThreadMarker, msg_send, rc::Retained, runtime::AnyObject};
+use objc2::{
+    MainThreadMarker, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, NSObjectProtocol},
+    sel,
+};
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSResponder, NSView};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
@@ -11,6 +16,8 @@ use std::{
 /// A window-local monitor reaches GPUI even when WKWebView or AVPlayerView is
 /// AppKit's first responder. GPUI still translates the original NSEvent, so
 /// keyboard layouts and configured shortcuts use its normal matching rules.
+/// Chromium pages need no `OnPreKeyEvent`: the monitor sees each key-down
+/// before AppKit hands it to the page. `native_keeps` lists what the page keeps.
 pub(super) struct NativeKeys {
     monitor: Retained<AnyObject>,
 }
@@ -56,6 +63,13 @@ impl NativeKeys {
             }) {
                 return original;
             }
+            // An input method composing in the page (Chromium's view is an
+            // NSTextInputClient) keeps every key; `native_keeps` decides.
+            let composing = responder.as_ref().is_some_and(|r| {
+                r.respondsToSelector(sel!(hasMarkedText))
+                    && unsafe { msg_send![&**r, hasMarkedText] }
+            });
+            forwarding.composing.set(composing);
             forwarding.handled.set(false);
             forwarding.native.set(true);
             // Keep the native first responder: forwarding does not select or

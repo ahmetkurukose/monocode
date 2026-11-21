@@ -194,6 +194,15 @@ impl TextSelection {
         let state = self.state.0.borrow();
         state.anchor != state.head || state.drag.as_ref().is_some_and(|drag| drag.moved)
     }
+    /// Drops an empty selection's anchor, so that the next ⇧-press starts a
+    /// selection where it lands instead of extending one from the last click.
+    pub(crate) fn forget_anchor(&self) {
+        if !self.has_selection() {
+            let mut state = self.state.0.borrow_mut();
+            state.anchor = None;
+            state.head = None;
+        }
+    }
     pub(crate) fn wrap(
         &self,
         text: SharedString,
@@ -797,6 +806,99 @@ mod tests {
             })
             .unwrap();
         assert!(visual.debug_bounds("selection-copy").is_none());
+    }
+
+    #[gpui::test]
+    fn a_reply_link_opens_by_its_address_and_shift_click_opens_it_in_the_other_browser(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{
+            Bounds, Modifiers, VisualTestContext, WindowBounds, WindowOptions, point, size,
+        };
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let window = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(900.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TranscriptView::new()),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |view, _, cx| {
+                // Mono's look names each prose row, so the test can find it.
+                view.mono_mode("", 0, "Mono");
+                view.patch(
+                    0,
+                    vec![Row {
+                        role: "assistant".into(),
+                        text:
+                            "[localhost](http://localhost:3000/)\n\n[example](https://example.com/)"
+                                .into(),
+                        first: true,
+                        sent_at: None,
+                    }],
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let keys: Vec<(usize, usize)> = window
+            .update(cx, |view, _, _| {
+                (view.rows.iter())
+                    .filter(|row| matches!(&row.body, Body::Markdown(_)))
+                    .map(|row| row.key)
+                    .collect()
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let link = |visual: &mut VisualTestContext, ix: usize| {
+            let (a, b) = keys[ix];
+            let name: &'static str = format!("mono-prose-{a}-{b}").leak();
+            let row = (visual.debug_bounds(name)).expect("the link's row is drawn");
+            // The middle of its one line, below whatever space is above it.
+            row.bottom_left() + point(px(6.), px(-12.))
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let queued = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| crate::shell::browser_links::queued(cx))
+        };
+        let pane = cfg!(target_os = "macos");
+
+        let local = link(visual, 0);
+        visual.simulate_click(local, Default::default());
+        visual.run_until_parked();
+        let page = vec!["http://localhost:3000/".to_owned()];
+        assert_eq!(queued(visual), if pane { page.clone() } else { Vec::new() });
+        let web = link(visual, 1);
+        visual.simulate_click(web, Default::default());
+        visual.run_until_parked();
+        assert_eq!(visual.opened_url().as_deref(), Some("https://example.com/"));
+
+        // ⇧ right after a click opens the link rather than selecting up to it.
+        visual.simulate_click(local, shift);
+        visual.run_until_parked();
+        assert_eq!(
+            visual.opened_url().as_deref(),
+            Some("http://localhost:3000/")
+        );
+        visual.simulate_click(web, shift);
+        visual.run_until_parked();
+        assert_eq!(queued(visual).len(), 2 * usize::from(pane));
+        window
+            .update(visual, |view, _, _| {
+                assert!(view.selected_text().is_none(), "nothing got selected");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

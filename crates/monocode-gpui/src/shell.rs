@@ -2,6 +2,7 @@ mod accounts;
 mod actions;
 mod app_commands;
 mod app_views;
+pub(crate) mod browser_links;
 mod browser_panes;
 mod automation_runs;
 mod classic_sidebar;
@@ -236,6 +237,7 @@ pub(crate) struct ActivateTab(pub isize);
 pub(crate) fn bind_keys(cx: &mut App) {
     session_groups::bind(cx);
     session_folders::bind(cx);
+    crate::browser::bind(cx);
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
     } else {
@@ -306,6 +308,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}--"), ZoomOut, context),
         KeyBinding::new(&format!("{modifier}-0"), ResetZoom, context),
         KeyBinding::new(&format!("{modifier}-shift-r"), Reload, context),
+        KeyBinding::new(
+            &format!("{modifier}-alt-i"),
+            crate::browser::ToggleBrowserDevTools,
+            context,
+        ),
         KeyBinding::new(&format!("{modifier}-alt-left"), FocusPaneLeft, context),
         KeyBinding::new(&format!("{modifier}-alt-right"), FocusPaneRight, context),
         KeyBinding::new(&format!("{modifier}-alt-up"), FocusPaneUp, context),
@@ -6631,6 +6638,7 @@ impl Shell {
                     self.external_editor_menu(path).into(),
                     MenuItem::Separator,
                     self.project_notification_menu(path).into(),
+                    self.browser_profile_menu(path).into(),
                     MenuItem::Separator,
                 ]);
                 items.extend(self.project_sleep_menu(path, cx));
@@ -6822,6 +6830,8 @@ impl Shell {
                     self.open_in_external_editor(editor, &path, cx);
                 } else if action.starts_with("mute:") {
                     self.run_project_notification_menu(&path, action, window, cx);
+                } else if action == "browser-isolated" {
+                    self.toggle_browser_isolation(&path, cx);
                 }
             }
         }
@@ -9421,6 +9431,16 @@ impl Render for Shell {
                 this.update(cx, |this, cx| this.close_exited_terminals(window, cx));
             });
         }
+        // A link clicked in this window's views (a terminal, a reply) that
+        // opens in Monocode's browser.
+        if browser_links::pending(cx) {
+            let this = cx.entity();
+            window.defer(cx, move |window, cx| {
+                for url in browser_links::take_for(window.window_handle(), cx) {
+                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                }
+            });
+        }
         if self.mono_panes_unsettled(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -9877,6 +9897,9 @@ impl Render for Shell {
                 this.step_ui_scale(0, cx);
             }))
             .on_action(cx.listener(|this, _: &Reload, window, cx| this.request_reload(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::browser::ToggleBrowserDevTools, _, cx| {
+                this.toggle_browser_dev_tools(cx)
+            }))
             .on_action(cx.listener(|this, _: &SidebarAppearance, window, cx| {
                 this.open_settings(crate::settings::Section::Appearance, window, cx)
             }))
