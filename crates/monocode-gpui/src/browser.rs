@@ -2041,10 +2041,15 @@ fn shown(
 
 /// Where a page out of sight goes when an agent starts (`kept`) or stops
 /// keeping it drawn, between sweeps; `None` leaves it be. A page its tab
-/// shows is the sweep's business.
-fn kept_placement(now: Placement, kept: bool) -> Option<Placement> {
+/// shows is the sweep's business while its window is on screen (`seen`).
+/// In a window that is not (minimized, on another Space, behind others)
+/// Chromium stops drawing the shown page and pauses its animation frames,
+/// which agents wait on; out of the window it keeps drawing, and the next
+/// sweep puts it back.
+fn kept_placement(now: Placement, kept: bool, seen: bool) -> Option<Placement> {
     match (now, kept) {
         (Placement::Hidden, true) => Some(Placement::Away),
+        (Placement::Shown, true) if !seen => Some(Placement::Away),
         (Placement::Away, false) => Some(Placement::Hidden),
         _ => None,
     }
@@ -2221,7 +2226,7 @@ trait Swept {
 impl<V: NativeView> Swept for Host<V> {
     fn keep(&self, kept: bool) {
         let prev = self.shown.get();
-        let Some(next) = kept_placement(prev, kept) else {
+        let Some(next) = kept_placement(prev, kept, self.window_seen()) else {
             return;
         };
         if self.view.borrow().is_none() {
@@ -2303,6 +2308,22 @@ impl<V: NativeView> Swept for Host<V> {
 }
 
 impl<V: NativeView> Host<V> {
+    /// Whether the window holding the page's view is on screen, at least in
+    /// part. True when it cannot tell.
+    fn window_seen(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::NSWindowOcclusionState;
+            let slot = self.view.borrow();
+            if let Some(window) = slot.as_ref().and_then(|hosted| hosted.clip.window()) {
+                return window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::Visible);
+            }
+        }
+        true
+    }
+
     /// Runs `f` on the view, if it exists yet.
     fn with_view(&self, f: impl FnOnce(&V)) -> bool {
         match self.view.borrow().as_ref() {
@@ -3084,15 +3105,20 @@ mod tests {
     #[test]
     fn keeping_a_page_drawn_moves_only_a_hidden_one_and_lets_go_of_it() {
         use Placement::*;
-        assert_eq!(kept_placement(Hidden, true), Some(Away));
-        assert_eq!(kept_placement(Away, false), Some(Hidden));
-        // A page its tab shows stays where the tab draws it.
-        for placement in [Shown, Covered] {
-            assert_eq!(kept_placement(placement, true), None);
-            assert_eq!(kept_placement(placement, false), None);
+        for seen in [true, false] {
+            assert_eq!(kept_placement(Hidden, true, seen), Some(Away));
+            assert_eq!(kept_placement(Away, false, seen), Some(Hidden));
+            assert_eq!(kept_placement(Covered, true, seen), None);
+            assert_eq!(kept_placement(Away, true, seen), None);
+            assert_eq!(kept_placement(Hidden, false, seen), None);
+            for placement in [Shown, Covered] {
+                assert_eq!(kept_placement(placement, false, seen), None);
+            }
         }
-        assert_eq!(kept_placement(Away, true), None);
-        assert_eq!(kept_placement(Hidden, false), None);
+        // A page its tab shows stays where the tab draws it, unless its
+        // window is off screen: Chromium would pause it there.
+        assert_eq!(kept_placement(Shown, true, true), None);
+        assert_eq!(kept_placement(Shown, true, false), Some(Away));
         // Without a view there is nothing to move.
         let host = Host::<NoView>::with_shared(Rc::default());
         host.keep(true);
