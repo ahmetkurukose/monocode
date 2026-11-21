@@ -669,9 +669,10 @@ pub async fn network(page: &dyn Page, args: &Value) -> Reply {
             e.method,
             status,
             e.kind.to_lowercase(),
-            e.url
+            short_url(&e.url)
         ));
-        if let Some(size) = e.size {
+        // A failed request's size is that of Chromium's error page.
+        if let Some(size) = e.size.filter(|_| e.failed.is_none()) {
             out.push_str(&format!(" {} B", size as u64));
         }
         out.push('\n');
@@ -680,6 +681,23 @@ pub async fn network(page: &dyn Page, args: &Value) -> Reply {
         out.trim_end().to_owned(),
         "ask for fewer with limit or filter",
     )))
+}
+
+/// A URL as the network list shows it: `data:` URLs by their type and
+/// length (their payload is often hundreds of KB of base64), others cut at
+/// 300 characters.
+fn short_url(url: &str) -> String {
+    const MAX: usize = 300;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let kind = rest.split([',', ';']).next().unwrap_or_default();
+        let kind = if kind.is_empty() { "text/plain" } else { kind };
+        return format!("data:{kind},… ({} characters)", url.chars().count());
+    }
+    if url.chars().count() <= MAX {
+        return url.to_owned();
+    }
+    let cut: String = url.chars().take(MAX).collect();
+    format!("{cut}… ({} characters)", url.chars().count())
 }
 
 pub fn dialog(page: &dyn Page, args: &Value) -> Reply {

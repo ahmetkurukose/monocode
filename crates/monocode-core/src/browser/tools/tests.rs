@@ -252,6 +252,65 @@ fn goto_that_does_not_finish_loading_says_so() {
 }
 
 #[test]
+fn goto_to_a_server_that_never_answers_says_so_before_the_timeout() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    // A host whose name does not resolve: Chromium keeps Page.navigate open.
+    page.script.hold("Page.navigate");
+    let mut driver = Driver::new(&host);
+    let out = driver.run("browser_goto", json!({"url": "https://unresolvable.test"}));
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("has not answered in 20 s"));
+    assert!(host.clock.now() < 30_000);
+}
+
+#[test]
+fn chromiums_error_page_is_reported_as_a_failed_load() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    page.script
+        .reply("Page.navigate", json!({"frameId": "F", "loaderId": "L9"}));
+    page.script.reply(
+        "Page.getFrameTree",
+        json!({"frameTree": {"frame": {"id": "F", "loaderId": "L9"}}}),
+    );
+    page.script.on("Runtime.evaluate", |params, _| {
+        let expression = params["expression"].as_str().unwrap_or_default();
+        Ok(if expression.contains("error-code") {
+            json!({"result": {"value": "DNS_PROBE_FINISHED_NXDOMAIN"}})
+        } else {
+            json!({"result": {"value": ["chrome-error://chromewebdata/", "nowhere.test", "complete"]}})
+        })
+    });
+    let mut driver = Driver::new(&host);
+    let out = driver.run("browser_goto", json!({"url": "https://nowhere.test"}));
+    let said = text(&out);
+    assert!(said.contains("could not load"), "{said}");
+    assert!(said.contains("DNS_PROBE_FINISHED_NXDOMAIN"), "{said}");
+}
+
+#[test]
+fn the_network_list_shortens_data_urls() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_tabs", json!({}));
+    let payload = "A".repeat(50_000);
+    page.script.emit(
+        "Network.requestWillBeSent",
+        json!({"requestId": "R1", "loaderId": "L", "type": "Image",
+               "request": {"url": format!("data:image/png;base64,{payload}"), "method": "GET"}}),
+    );
+    let out = driver.run("browser_network", json!({"page": 1}));
+    let said = text(&out);
+    assert!(
+        said.contains("data:image/png,… (50022 characters)"),
+        "{said}"
+    );
+    assert!(!said.contains(&payload[..100]));
+}
+
+#[test]
 fn history_steps() {
     let host = FakeHost::with_pages(&[1]);
     let page = host.page(1);
