@@ -625,6 +625,22 @@ impl BrowserView {
         crate::capture::capture(&self.browser, Box::new(done));
     }
 
+    /// Chromium's id of the page's browser, unique for the app's run.
+    pub fn browser_id(&self) -> i32 {
+        self.browser.identifier()
+    }
+
+    /// Attaches `sink` to the page's raw DevTools messages (crate::devtools).
+    /// One attachment per page is expected; dropping it detaches.
+    pub fn devtools_attach(&self, sink: crate::DevToolsSink) -> Option<crate::DevToolsAttachment> {
+        crate::devtools::attach(&self.browser, sink)
+    }
+
+    /// Sends one raw CDP message to the page. False when Chromium refused it.
+    pub fn devtools_send(&self, message: &[u8]) -> bool {
+        crate::devtools::send(&self.browser, message)
+    }
+
     /// Closes the page. [`BrowserEvent::Closed`] follows.
     pub fn close(&self) {
         if self.closing.swap(true, Ordering::SeqCst) {

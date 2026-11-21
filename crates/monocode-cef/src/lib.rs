@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod view;
 
 mod capture;
+mod devtools;
 
 mod dialogs;
 mod download;
@@ -18,6 +19,7 @@ mod mac;
 mod popup;
 mod profile;
 
+pub use devtools::{DevToolsAttachment, DevToolsSink};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{
     AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CreateError, CreateOptions, DialogKind,

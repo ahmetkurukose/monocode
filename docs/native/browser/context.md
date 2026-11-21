@@ -53,6 +53,28 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K18 | DevTools | **Revize (Faz 1):** ayrı pencere. Yapışık hâli denendi; CEF macOS'ta DevTools'u Alloy style açamıyor ("Alloy style is not supported for this browser") ve Chrome style bir host view'un içine konamıyor: `ShowDevTools` child view ile CHECK'te durup uygulamayı kapattı. Yapışık DevTools için yol: kendi Alloy sayfamızda DevTools frontend'ini CDP üzerinden yüklemek (Faz 2'deki CDP uç noktasıyla birlikte). |
 | K19 | Link yönlendirme | localhost ve proje portları Monocode browser'ında, diğerleri sistem tarayıcısında açılır; ayarla "her şey Monocode'da" seçilebilir; **⇧ ile tıklama diğer tarafı** açar. |
 | K20 | Restore | Önceki oturumun sekmeleri **görünür olunca** yüklenir (lazy). Discard sonraki faza. |
+| K21 | Agent kapsamı (Faz 2) | Agent **oturumun projesindeki** browser sekmelerini ve **kendi açtıklarını** görür ve sürer; başka projelerin sekmeleri görünmez. |
+| K22 | Agent profili | Agent'ın açtığı sekme varsayılan olarak **projenin profilini** kullanır (login'ler dahil); `isolated: true` ile **bellekte geçici profil** (boş `cache_path`, kapanınca silinir). |
+| K23 | Arka plan sekmesi | Agent'ın sürdüğü görünmeyen sekme, overlay'deki gibi **pencerenin dışına taşınmış görünür view**'da yaşar (çizim ve screenshot sürer). Gerçek headless Faz 3'te OSR ile. |
+| K24 | Faz 2 araç seti | tabs (list/open/close/show), goto/back/forward/reload, wait (text/url/selector/load), snapshot (interactive/selector/depth), click/fill/type/press/scroll, screenshot, eval, console, network, **dialog**. Geri kalanı Faz 3 (dış CDP uç noktasıyla Playwright zaten yapabilir). |
+| K25 | Onay | Allow list'te olmayan, kullanıcı onayı isteyen araç: **`browser_eval`** (ve ileride cookie/storage yazma). Gerisi serbest (`db_execute` modeli). |
+| K26 | Dış CDP uç noktası | **Profil başına, browser seviyesinde** uç nokta: birden çok target, `Target.createTarget` yeni sekme açar (Playwright `connectOverCDP`, dev-browser `browser.newPage()`). Her zaman bizim proxy'miz; CEF `remote_debugging_port` kapalı. Loopback, rastgele token, `Origin` başlıklı istek red, Host kontrolü. |
+| K27 | Uç noktanın dağıtımı | Ayarlardan açılır (varsayılan kapalı). Monocode'un başlattığı agent oturumlarına env (`MONOCODE_BROWSER_CDP`) ile verilir, argv'ye yazılmaz; ayrıca ayarlarda **kopyala** düğmesi. Sabit port (9222) yok. |
+| K28 | Yapışık DevTools | Faz 2 sonunda kısa spike: DevTools frontend'i (`devtools://devtools/bundled/devtools_app.html?ws=…`) kendi Alloy sayfamızda, bizim CDP uç noktamıza bağlı. Çalışmazsa Faz 3'e. |
+| K29 | Faz 1 artıkları | Agent işiyle **paralel**, ayrı hatta: `cef::shutdown`, `window.opener`, sahipsiz popup, ölçüm. Diyaloğa odak agent hattında (dialog aracıyla birlikte). |
+| K30 | Test | Birim (snapshot fixture, proxy guard) + GPUI testleri + **gerçek CEF ile uçtan uca**: yerel test sayfası, MCP araçlarıyla senaryo, Playwright `connectOverCDP` smoke testi. |
+| K31 | Snapshot formatı | Girintili metin: `[@e3] button "Save"`, landmark'lar `[Main Content]`, satır sonunda durum ekleri (`checked`, `value="…"`, `focused`, `disabled`, `expanded`). JSON değil. |
+| K32 | Snapshot boyutu | Varsayılan `interactive` (etkileşimli öğeler, başlıklar, landmark'lar); `full` isteğe bağlı. İkisi de **30 KB**; kesilen yerde "`selector`/`depth` ile daralt" ipucu. |
+| K33 | Stale ref | Ref'ler belge kimliğine (main frame loader id) bağlı. Aynı belgede node kaybolduysa **role + name + nth** ile kurtarma; navigasyondan sonra `browser_stale_ref`. |
+| K34 | Kullanıcı ↔ agent | Kullanıcının bir sekmeye son 2 sn'de input'u varsa agent'ın input aksiyonu `browser_user_active` ile döner; çalışan aksiyon kesilmez. Kullanıcı input'u hiç engellenmez. |
+| K35 | Kuyruk | Sekme başına FIFO; CDP çağrıları main thread'de. Komut başına zaman aşımı 30 sn (`wait` en çok 120 sn). Sekme kapanır/çökerse bekleyen komutlar hemen `browser_page_gone`. |
+| K36 | Console/network | Her sayfada **açılıştan itibaren** ring buffer (console 500, network 300 girdi; gövde yok, `Network.getResponseBody` isteğe bağlı). |
+| K37 | Screenshot | MCP image content; varsayılan viewport, JPEG, en uzun kenar ≤1568 px; `full_page` ve `path` (dosyaya yaz) isteğe bağlı. |
+| K38 | Ortak CDP oturumu | İç araçlar ve dış istemci sekmenin **tek** DevTools oturumunu paylaşır; dış istemcinin `Emulation.*` değişiklikleri iç araçları da etkiler (belgelenir). Proxy dış istemcinin `*.disable`'ını yutar (buffer'lar kapanmasın). |
+| K39 | Agent sekmesinin yeri | Oturumun **chat'inin bulunduğu grup**, arka planda (odak çalmaz); chat görünmüyorsa odaktaki grup. |
+| K40 | URL politikası | Agent her yere gidebilir; `file://`, `chrome://`, `devtools://` reddedilir (`browser_url_refused`). |
+| K41 | MCP sunucusu | Adı `monocode_browser`, araçlar `browser_*`; `db`/`code` köprüleriyle aynı desen (loopback listener + oturum token'ı + `browser-mcp` stdio alt komutu), ama her çağrı **main thread'e** gider. Hata kodları sabit: `browser_no_page`, `browser_page_gone`, `browser_stale_ref`, `browser_no_ref`, `browser_user_active`, `browser_dialog_open`, `browser_timeout`, `browser_url_refused`, `browser_cdp_error`, `browser_not_started`. |
+| K42 | iframe | Faz 2: aynı origin iframe'leri snapshot'ta; OOPIF (cross-origin) `Target.setAutoAttach` flatten ile ayrı oturum, ref → `sessionId`. |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -454,7 +476,7 @@ Her faz bittiğinde:
 |---|---|---|
 | 0 | Bitti | `phase-0-done.md` |
 | 1 | Bitti | `phase-1-done.md` |
-| 2 | Başlamadı | — |
+| 2 | Sürüyor (başlangıç 2026-11-21, kararlar K21–K42) | — |
 | 3 | Başlamadı | — |
 | 4 | Başlamadı | — |
 | 5 | Başlamadı | — |
