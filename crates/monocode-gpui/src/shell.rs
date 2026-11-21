@@ -2875,6 +2875,9 @@ impl Shell {
                     .left_0()
                     .right_0()
                     .bottom_0()
+                    // A browser page cannot be drawn over: it shows its
+                    // snapshot while the hint lies on it.
+                    .child(crate::browser::cover_element())
                     .child(
                         div()
                             .absolute()
@@ -2921,6 +2924,7 @@ impl Shell {
                 .top_0()
                 .left_0()
                 .size_full()
+                .child(crate::browser::cover_element())
                 .child(wash)
                 .child(line)
                 .into_any_element(),
@@ -7527,6 +7531,7 @@ impl Shell {
                 .shadow_md()
                 .text_size(px(TITLE_TAB_TEXT_SIZE))
                 .text_color(content(1.))
+                .child(crate::browser::cover_element())
                 .child(crate::tab_tile::mark_tile(&TAB_TILE, tile, mark))
                 .child(div().min_w_0().truncate().child(face.title))
                 .into_any_element(),

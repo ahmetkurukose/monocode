@@ -1844,6 +1844,17 @@ thread_local! {
     static FRAMES: RefCell<HashMap<WindowId, Frame>> = RefCell::new(HashMap::new());
 }
 
+/// What overlays covered since the last sweep, taken; tests read it with
+/// no page open, when no sweep runs.
+#[cfg(test)]
+pub(crate) fn take_covers() -> Vec<Bounds<Pixels>> {
+    FRAMES.with(|f| {
+        (f.borrow_mut().values_mut())
+            .flat_map(|frame| std::mem::take(&mut frame.covers))
+            .collect()
+    })
+}
+
 #[derive(Default)]
 struct Frame {
     epoch: u64,
@@ -2281,6 +2292,11 @@ impl<V> Drop for Host<V> {
 /// frame: a page under it gives way to its snapshot, since GPUI cannot draw
 /// above the page.
 pub(crate) fn cover(bounds: Bounds<Pixels>, window: &Window) {
+    // With no page there is no sweep to take the covers, so they would pile
+    // up frame after frame; tests read them without a page.
+    if !cfg!(test) && HOSTS.with(|hosts| hosts.borrow().is_empty()) {
+        return;
+    }
     let id = window.window_handle().window_id();
     FRAMES.with(|f| f.borrow_mut().entry(id).or_default().covers.push(bounds));
 }

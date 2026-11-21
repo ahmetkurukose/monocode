@@ -14,6 +14,7 @@ pub(super) fn terminal_drag_ghost(position: Point<Pixels>, title: String) -> Any
         .max_w(px(240.))
         .h(px(28.))
         .px_2()
+        .child(crate::browser::cover_element())
         .flex()
         .items_center()
         .gap(px(6.))

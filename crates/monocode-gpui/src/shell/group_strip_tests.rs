@@ -147,6 +147,7 @@ fn a_tab_dragged_onto_a_pane_edge_splits_out_of_its_group(cx: &mut TestAppContex
     let pane = bounds(cx, format!("pane-{d}")).unwrap();
     let grab = bounds(cx, format!("group-tab-{c}")).unwrap().center();
     let edge = point(pane.right() - px(20.), pane.center().y);
+    crate::browser::take_covers();
     cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_move(edge, MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
@@ -157,7 +158,14 @@ fn a_tab_dragged_onto_a_pane_edge_splits_out_of_its_group(cx: &mut TestAppContex
             assert_eq!(drag.group, None);
         })
         .unwrap();
-    assert!(bounds(cx, format!("pane-edge-hint-{d}")).is_some());
+    let hint = bounds(cx, format!("pane-edge-hint-{d}")).unwrap();
+    // A browser page under the hint would be drawn above it; the hint
+    // covers its pane so a page gives way to its snapshot.
+    assert!(
+        crate::browser::take_covers()
+            .iter()
+            .any(|cover| cover.intersects(&hint))
+    );
     cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
     window
