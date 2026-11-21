@@ -147,6 +147,19 @@ impl JsDialog {
     }
 }
 
+impl JsDialog {
+    /// A dialog no page waits on, for the host's tests: answering it does
+    /// nothing.
+    pub fn detached(kind: DialogKind, origin: &str, message: &str) -> Self {
+        JsDialog {
+            kind,
+            origin: origin.to_owned(),
+            message: message.to_owned(),
+            reply: Arc::new(DialogReply(Mutex::new(None))),
+        }
+    }
+}
+
 impl std::fmt::Debug for JsDialog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JsDialog")
@@ -215,6 +228,16 @@ wrap_request_handler! {
             };
             self.state.send(BrowserEvent::Auth(request));
             1
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            _status: TerminationStatus,
+            _error_code: ::std::os::raw::c_int,
+            _error_string: Option<&CefString>,
+        ) {
+            self.state.send(BrowserEvent::RenderProcessGone);
         }
     }
 }

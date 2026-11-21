@@ -3,6 +3,7 @@ mod actions;
 mod app_commands;
 mod app_views;
 mod automation_runs;
+pub(crate) mod browser_agent;
 pub(crate) mod browser_links;
 mod browser_panes;
 mod classic_sidebar;

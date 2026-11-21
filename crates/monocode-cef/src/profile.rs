@@ -6,6 +6,9 @@
 //! `cache_root/Profiles/<id>`, with its own cookies, storage and cache.
 //! Contexts are created once and reused; Chromium must never see two
 //! contexts on the same folder.
+//!
+//! An agent may also open a page in a throwaway profile (K22): a request
+//! context with no folder, kept in memory until [`forget_profile`].
 
 use std::{cell::RefCell, collections::HashMap, path::PathBuf};
 
@@ -16,6 +19,9 @@ pub enum Profile {
     Default,
     /// A profile of its own, named by [`profile_id`].
     Isolated(String),
+    /// A throwaway profile in memory, by a name unique for the app's run.
+    /// Nothing of it reaches the disk.
+    Ephemeral(String),
 }
 
 impl Profile {
@@ -75,12 +81,20 @@ pub(crate) fn forget_all() {
 /// The request context a page of `profile` is created with. `None` is the
 /// global context, which is the default profile.
 pub(crate) fn request_context(profile: &Profile) -> Option<cef::RequestContext> {
-    let Profile::Isolated(id) = profile else {
-        return None;
-    };
-    if let Some(context) = CONTEXTS.with(|c| c.borrow().get(id).cloned()) {
+    let key = context_key(profile)?;
+    if let Some(context) = CONTEXTS.with(|c| c.borrow().get(&key).cloned()) {
         return Some(context);
     }
+    let id = match profile {
+        Profile::Isolated(id) => id,
+        _ => {
+            // An empty cache path keeps everything in memory.
+            let settings = cef::RequestContextSettings::default();
+            let context = cef::request_context_create_context(Some(&settings), None)?;
+            CONTEXTS.with(|c| c.borrow_mut().insert(key, context.clone()));
+            return Some(context);
+        }
+    };
     let dir = PROFILES.with(|p| p.borrow().clone())?.join(id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!(
@@ -95,8 +109,26 @@ pub(crate) fn request_context(profile: &Profile) -> Option<cef::RequestContext> 
         ..Default::default()
     };
     let context = cef::request_context_create_context(Some(&settings), None)?;
-    CONTEXTS.with(|c| c.borrow_mut().insert(id.clone(), context.clone()));
+    CONTEXTS.with(|c| c.borrow_mut().insert(key, context.clone()));
     Some(context)
+}
+
+/// Where `CONTEXTS` keeps a profile's context; a throwaway name never meets
+/// a folder's. `None` for the default profile, which is CEF's global one.
+fn context_key(profile: &Profile) -> Option<String> {
+    match profile {
+        Profile::Default => None,
+        Profile::Isolated(id) => Some(id.clone()),
+        Profile::Ephemeral(id) => Some(format!("ephemeral:{id}")),
+    }
+}
+
+/// Lets go of a throwaway profile once its page closed; its context ends
+/// with the last page holding it. Other profiles stay.
+pub fn forget_profile(profile: &Profile) {
+    if let (Profile::Ephemeral(_), Some(key)) = (profile, context_key(profile)) {
+        CONTEXTS.with(|c| c.borrow_mut().remove(&key));
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +150,19 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-')
         );
+    }
+
+    #[test]
+    fn a_throwaway_profile_never_shares_a_folders_context() {
+        let id = profile_id("/p");
+        assert_eq!(
+            context_key(&Profile::Isolated(id.clone())),
+            Some(id.clone())
+        );
+        assert_ne!(
+            context_key(&Profile::Ephemeral(id.clone())),
+            Some(id.clone())
+        );
+        assert_eq!(context_key(&Profile::Default), None);
     }
 }

@@ -58,6 +58,8 @@ pub(crate) struct SettingsContext {
     pub new_layout_boxy: bool,
     /// The selected project, or empty outside one.
     pub cwd: String,
+    /// Whose external CDP endpoint "Copy endpoint" copies (K27).
+    pub browser_scope: Option<monocode_core::browser::Scope>,
     pub project_label: String,
     pub archived: Vec<ArchivedSession>,
     /// Projects archived from the rail, as (path, label).
@@ -99,6 +101,7 @@ impl PartialEq for SettingsContext {
             && self.classic == other.classic
             && self.new_layout_boxy == other.new_layout_boxy
             && self.cwd == other.cwd
+            && self.browser_scope == other.browser_scope
             && self.project_label == other.project_label
             && self.archived == other.archived
             && self.archived_projects == other.archived_projects
@@ -291,6 +294,8 @@ pub(crate) struct SettingsView {
     accent_custom_open: bool,
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
+    /// What "Copy endpoint" last said: copied, or why not.
+    browser_endpoint: Option<Result<(), String>>,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -441,6 +446,7 @@ impl SettingsView {
             accent_custom_open: false,
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
+            browser_endpoint: None,
             _subscriptions: subscriptions,
         };
         this.watch_mobile(cx);

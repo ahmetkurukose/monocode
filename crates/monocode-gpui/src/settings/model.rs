@@ -325,6 +325,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser web links localhost dev server system default chromium shift click",
     ),
     (
+        "browser-external-cdp",
+        Section::General,
+        "Allow external CDP connections",
+        "browser chromium devtools protocol playwright dev-browser endpoint copy automation",
+    ),
+    (
         "file-word-wrap",
         Section::General,
         "Word wrap",

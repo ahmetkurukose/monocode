@@ -24,7 +24,7 @@ pub use crate::{
     dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
     download::{Download, DownloadState, cancel_download},
     popup::take_popup,
-    profile::{Profile, profile_id},
+    profile::{Profile, forget_profile, profile_id},
 };
 
 /// What a page reports. Delivered on the main thread, in order.
@@ -74,6 +74,9 @@ pub enum BrowserEvent {
     DialogsReset,
     /// The browser is gone; the view can be dropped.
     Closed,
+    /// The page's renderer process ended (a crash, or it was killed). The
+    /// page shows nothing until it loads again.
+    RenderProcessGone,
     /// A find-in-page result ([`BrowserView::find`]). `active_ordinal` counts
     /// from 1; several updates may arrive for one search, the last one final.
     FindResult {
