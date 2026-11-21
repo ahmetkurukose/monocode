@@ -1,6 +1,9 @@
 //! Navigation and waiting, over CDP `Page.*` (the `Page` trait has no
 //! navigation on purpose), and the URL policy (K40).
 
+use std::pin::pin;
+
+use futures_util::future::{Either, select};
 use serde_json::{Value, json};
 
 use super::{Ctx, MAX_WAIT_MS, Reply, invalid, quote};
@@ -74,6 +77,12 @@ pub struct Location {
     pub title: String,
     pub ready: String,
 }
+
+/// How long `browser_goto` waits for the server's first answer.
+const NAVIGATE_MS: u64 = 20_000;
+
+/// The error code on Chromium's error page (e.g. `DNS_PROBE_FINISHED_NXDOMAIN`).
+const ERROR_TEXT: &str = "(document.querySelector('.error-code') || {}).textContent || ''";
 
 const LOCATION: &str = "[location.href, document.title, document.readyState]";
 
@@ -219,6 +228,21 @@ pub async fn report(ctx: &Ctx, done: bool) -> Result<String, ToolOutput> {
             (info.url, info.title)
         }
     };
+    if url.starts_with("chrome-error://") {
+        // Chromium's own error page: the title names the host, the page the error.
+        let error = probe(ctx, ERROR_TEXT).await?.ok();
+        let error = error.as_ref().and_then(Value::as_str).unwrap_or("").trim();
+        return Ok(format!(
+            "Page {} could not load {}: Chromium shows its error page{}.",
+            ctx.id,
+            quote(&title, 200),
+            if error.is_empty() {
+                String::new()
+            } else {
+                format!(" ({error})")
+            }
+        ));
+    }
     let mut out = format!("Page {} is at {url} {}.", ctx.id, quote(&title, 200));
     if !done {
         out.push_str(" It is still loading; browser_wait with load waits for it.");
@@ -231,7 +255,19 @@ pub async fn goto(ctx: &Ctx, args: &Value) -> Reply {
         return Err(invalid("url is required"));
     };
     let url = normalize(raw)?;
-    let result = ctx.act("Page.navigate", json!({"url": url})).await?;
+    // `Page.navigate` answers once the server does: a host whose name never
+    // resolves keeps it waiting for as long as DNS does.
+    let navigate = ctx.act("Page.navigate", json!({"url": url}));
+    let result = match select(pin!(navigate), pin!(ctx.sleep(NAVIGATE_MS))).await {
+        Either::Left((result, _)) => result?,
+        Either::Right(_) => {
+            return Ok(ToolOutput::text(format!(
+                "{} {url} has not answered in {} s.",
+                report(ctx, false).await?,
+                NAVIGATE_MS / 1000
+            )));
+        }
+    };
     if let Some(error) = result["errorText"].as_str().filter(|e| !e.is_empty()) {
         return Err(invalid(format!("could not open {url}: {error}")));
     }
