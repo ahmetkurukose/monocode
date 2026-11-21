@@ -60,6 +60,11 @@ pub fn cancel_download(id: u32) {
     }
 }
 
+/// Before CEF shuts down: lets go of CEF's callbacks.
+pub(crate) fn forget_all() {
+    ACTIVE.with(|a| a.borrow_mut().clear());
+}
+
 struct Active {
     path: PathBuf,
     /// The latest one CEF handed over; it cancels the download.

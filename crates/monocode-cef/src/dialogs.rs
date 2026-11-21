@@ -51,6 +51,11 @@ impl AuthReply {
 impl Drop for AuthReply {
     fn drop(&mut self) {
         if let Some(callback) = self.take() {
+            if !crate::runtime::is_started() {
+                // CEF shut down: no call may follow, not even a release.
+                std::mem::forget(callback);
+                return;
+            }
             callback.cancel();
         }
     }
@@ -118,6 +123,10 @@ impl DialogReply {
 impl Drop for DialogReply {
     fn drop(&mut self) {
         if let Some(callback) = self.take() {
+            if !crate::runtime::is_started() {
+                std::mem::forget(callback);
+                return;
+            }
             callback.cont(0, None);
         }
     }

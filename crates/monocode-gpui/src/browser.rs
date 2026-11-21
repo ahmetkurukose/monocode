@@ -100,6 +100,14 @@ impl Engine {
                 if took > std::time::Duration::from_secs(1) {
                     log::warn!("browser: Chromium took {took:?} to start");
                 }
+                // Before the windows go: the pages close with their views
+                // still in place, then CEF shuts down and its helper
+                // processes end.
+                cx.on_app_quit(|_, _| {
+                    monocode_cef::runtime::shutdown(monocode_cef::runtime::CLOSE_TIMEOUT);
+                    async {}
+                })
+                .detach();
                 EngineState::Ready
             }
             Err(e) => {
@@ -2150,6 +2158,10 @@ mod monocode_cef {
         }
         pub fn start(_: &super::RuntimeConfig) -> Result<(), &'static str> {
             Err("the browser is not available on this platform yet")
+        }
+        pub const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
+        pub fn shutdown(_: std::time::Duration) -> bool {
+            false
         }
     }
 

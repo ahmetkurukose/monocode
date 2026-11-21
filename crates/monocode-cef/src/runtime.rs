@@ -8,6 +8,7 @@
 use std::{
     cell::{Cell, RefCell},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use cef::*;
@@ -136,6 +137,8 @@ wrap_browser_process_handler! {
 
 thread_local! {
     static STARTED: Cell<bool> = const { Cell::new(false) };
+    /// [`shutdown`] ran, once for the process.
+    static SHUTTING_DOWN: Cell<bool> = const { Cell::new(false) };
     /// Kept alive for as long as CEF runs.
     static APP: RefCell<Option<cef::App>> = const { RefCell::new(None) };
 }
@@ -156,12 +159,44 @@ pub fn start(config: &RuntimeConfig) -> Result<(), StartError> {
     Ok(())
 }
 
-/// Shuts CEF down. Call once, after the last browser closed, before exit.
-pub fn shutdown() {
-    if STARTED.with(|s| s.replace(false)) {
-        cef::shutdown();
-        APP.with(|app| app.borrow_mut().take());
+/// How long [`shutdown`] waits for the browsers to close.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Closes every browser and shuts CEF down, so that its helper processes
+/// end with the app. For the app's quit, on the main thread, outside CEF's
+/// callbacks. Runs CEF's message loop until each browser closed, for at
+/// most `timeout`; if one is still open then, CEF stays up and ends with the
+/// process. Does nothing when CEF never started, or the second time.
+/// Whether CEF shut down.
+pub fn shutdown(timeout: Duration) -> bool {
+    if !is_started() || SHUTTING_DOWN.with(|s| s.replace(true)) {
+        return false;
     }
+    let deadline = Instant::now() + timeout;
+    crate::popup::forget_all();
+    crate::view::close_all();
+    #[cfg(target_os = "macos")]
+    let closed = crate::mac::pump::run_until(|| crate::view::live() == 0, deadline);
+    #[cfg(not(target_os = "macos"))]
+    let closed = {
+        let _ = deadline;
+        crate::view::live() == 0
+    };
+    if !closed {
+        log::warn!(
+            "browser: {} pages did not close in {timeout:?}; Chromium ends with the app",
+            crate::view::live()
+        );
+        return false;
+    }
+    crate::download::forget_all();
+    crate::profile::forget_all();
+    #[cfg(target_os = "macos")]
+    crate::mac::pump::stop();
+    STARTED.with(|s| s.set(false));
+    cef::shutdown();
+    APP.with(|app| app.borrow_mut().take());
+    true
 }
 
 #[cfg(target_os = "macos")]

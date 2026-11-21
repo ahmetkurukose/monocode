@@ -19,7 +19,7 @@ use std::{
     ptr,
     sync::{
         Mutex,
-        atomic::{AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -75,6 +75,7 @@ unsafe extern "C" {
     ) -> CFRunLoopTimerRef;
     fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
     fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fire_date: CFAbsoluteTime);
+    fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
     fn CFRunLoopSourceCreate(
         allocator: CFTypeRef,
         order: isize,
@@ -90,6 +91,8 @@ static REQUESTED: Mutex<Option<Instant>> = Mutex::new(None);
 static SOURCE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 /// The process-lifetime timer (never released). Main thread only.
 static TIMER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// CEF is shutting down: the timer does no more work ([`stop`]).
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static PUMPING: Cell<bool> = const { Cell::new(false) };
@@ -131,6 +134,9 @@ extern "C" fn on_signal(_info: *const c_void) {
 }
 
 extern "C" fn on_timer(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
+    if STOPPED.load(Ordering::Acquire) {
+        return;
+    }
     if PUMPING.with(|p| p.replace(true)) {
         // Re-entered from a nested run loop inside the work below.
         AGAIN.with(|a| a.set(true));
@@ -142,6 +148,36 @@ extern "C" fn on_timer(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
     PUMPING.with(|p| p.set(false));
     if AGAIN.with(|a| a.replace(false)) {
         fire_in(Duration::ZERO);
+    }
+}
+
+/// Does CEF's work right here, outside the run loop, until `done` or
+/// `deadline`; whether `done` came first. Main thread, not from inside the
+/// work (CEF's callbacks).
+pub(crate) fn run_until(done: impl Fn() -> bool, deadline: Instant) -> bool {
+    if PUMPING.with(|p| p.replace(true)) {
+        return done();
+    }
+    let finished = loop {
+        cef::do_message_loop_work();
+        if done() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    PUMPING.with(|p| p.set(false));
+    finished
+}
+
+/// Stops the timer for good, before CEF shuts down. Main thread.
+pub(crate) fn stop() {
+    STOPPED.store(true, Ordering::Release);
+    let timer = TIMER.load(Ordering::Acquire);
+    if !timer.is_null() {
+        unsafe { CFRunLoopTimerInvalidate(timer) };
     }
 }
 
