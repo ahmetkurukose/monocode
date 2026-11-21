@@ -595,21 +595,27 @@ impl BrowserView {
         self.browser.host().map_or(0., |host| host.zoom_level())
     }
 
-    /// Opens the page's DevTools docked inside `parent` (macOS: an
-    /// `NSView*`) at `frame`, as a second child view rather than a window.
-    /// Fails if DevTools is open already.
-    pub fn show_dev_tools(
-        &self,
-        parent: *mut c_void,
-        frame: Frame,
-    ) -> Result<
-        (
-            crate::DevToolsView,
-            async_channel::Receiver<crate::DevToolsEvent>,
-        ),
-        CreateError,
-    > {
-        crate::DevToolsView::open(&self.browser, parent, frame)
+    /// Opens the page's DevTools in a window of its own, or brings it to the
+    /// front. CEF makes DevTools Chrome-style, which cannot sit inside a host
+    /// view on macOS (context.md K18).
+    pub fn show_dev_tools(&self) {
+        if let Some(host) = self.browser.host() {
+            let window_info = cef::WindowInfo::default();
+            let settings = cef::BrowserSettings::default();
+            host.show_dev_tools(Some(&window_info), None, Some(&settings), None);
+        }
+    }
+
+    pub fn close_dev_tools(&self) {
+        if let Some(host) = self.browser.host() {
+            host.close_dev_tools();
+        }
+    }
+
+    pub fn has_dev_tools(&self) -> bool {
+        self.browser
+            .host()
+            .is_some_and(|host| host.has_dev_tools() != 0)
     }
 
     /// Asks for a PNG of what the page shows now, at the screen's scale.
