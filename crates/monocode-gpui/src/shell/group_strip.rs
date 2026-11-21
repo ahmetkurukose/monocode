@@ -11,6 +11,8 @@ const STRIP_TAB_MIN_WIDTH: f32 = 96.;
 /// The `+` and `⋯` buttons at the strip's end, with their gaps.
 const STRIP_BUTTON: f32 = 24.;
 const STRIP_BUTTONS: f32 = 2. * STRIP_BUTTON + 2. + 6.;
+/// The `+` riding right after the last tab, with its gap.
+const INLINE_NEW_TAB: f32 = STRIP_BUTTON + 2.;
 /// How long a tab an open found already open glows.
 const FLASH_DURATION: f32 = 0.6;
 /// The inset layout's card floats this far below the window's top.
@@ -462,6 +464,7 @@ impl Shell {
             - trail
             - STRIP_PAD
             - STRIP_BUTTONS
+            - INLINE_NEW_TAB
             - pinned.len() as f32 * (pin + 2.)
             - share * 2.)
             .max(0.);
@@ -691,6 +694,7 @@ impl Shell {
                     .gap(px(2.))
                     .pl(px(STRIP_LEAD))
                     .children(row)
+                    .child(self.inline_new_tab(visible, cx))
                     .child(self.strip_drag_area(visible, top, cx)),
             )
             .child(self.strip_button(visible, false, cx))
@@ -815,15 +819,20 @@ impl Shell {
             })
             .when(active && focused, |d| {
                 d.child(
+                    // The focused group's tab wears its accent along the
+                    // plate's whole top edge, bending with its corners, so
+                    // the mark reads as part of the tab rather than a bar
+                    // stopping short beneath it.
                     div()
                         .debug_selector(move || format!("group-tab-focus-{id}"))
                         .absolute()
-                        .bottom(px(plate_top))
-                        .left(px(10.))
-                        .right(px(10.))
-                        .h(px(2.))
-                        .rounded_full()
-                        .bg(accent_color()),
+                        .top(px(plate_top))
+                        .left_0()
+                        .w_full()
+                        .h(px(TAB_PLATE_HEIGHT))
+                        .rounded_md()
+                        .border_t_2()
+                        .border_color(accent_color()),
                 )
             })
             .when(close, |d| {
@@ -973,6 +982,31 @@ impl Shell {
     }
 
     /// `+` (`more` false) or `⋯` at the strip's end.
+    /// The `+` right after the last tab, as in a browser: one click starts
+    /// a new chat in this group. The `+` at the strip's end keeps the menu.
+    fn inline_new_tab(&self, visible: i64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(("group-new-tab", visible as usize))
+            .debug_selector(move || format!("group-new-tab-{visible}"))
+            .group("group-new-tab")
+            .role(Role::Button)
+            .aria_label("New session")
+            .cursor_pointer()
+            .size(px(STRIP_BUTTON))
+            .flex_shrink_0()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .justify_center()
+            .opacity(0.6)
+            .hover(|s| s.opacity(1.).bg(content(0.07)))
+            .child(icon("plus", 14.).group_hover("group-new-tab", |s| s.text_color(content(1.))))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.new_session_in_group(visible, window, cx)
+            }))
+    }
+
     fn strip_button(
         &self,
         visible: i64,

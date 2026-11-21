@@ -769,3 +769,27 @@ fn an_overflowing_strip_scrolls_to_keep_the_shown_tab_in_view(cx: &mut TestAppCo
     cx.run_until_parked();
     assert!(inside(cx, b, b), "the first tab scrolled back into view");
 }
+
+#[gpui::test]
+fn the_plus_after_the_last_tab_starts_a_session_in_that_group(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (window, b, c, d) = stacked(cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+    let last = bounds(cx, format!("group-tab-{d}")).unwrap();
+    let plus = bounds(cx, format!("group-new-tab-{d}")).unwrap();
+    // It rides right after the last tab, not at the strip's far end.
+    assert!(plus.left() >= last.right() && plus.left() - last.right() < px(8.));
+    cx.simulate_click(plus.center(), Modifiers::default());
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, _| {
+            let tabs = shell.workspace.group_tabs(b);
+            assert_eq!(tabs.len(), 4, "a new session joined the group: {tabs:?}");
+            let new = *tabs.iter().find(|t| ![b, c, d].contains(t)).unwrap();
+            assert_eq!(shell.workspace.active, Some(new));
+            let tab = shell.workspace.tab_of(new).unwrap();
+            assert_eq!(shell.workspace.layout(tab).leaf_ids(), [new], "no split");
+        })
+        .unwrap();
+}
