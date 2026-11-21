@@ -11,6 +11,11 @@
 //! which. A request with an `Origin` header (a web page) is refused, and its
 //! `Host` must be the loopback address with our port (DNS rebinding).
 //!
+//! The app's docked DevTools (K28) use the same listener with tokens of their
+//! own ([`devtools_base`]): they work while external connections are off,
+//! admit only the DevTools frontend (`Origin: devtools://devtools`), and only
+//! its page-level WebSocket. They are not shown anywhere in Settings.
+//!
 //! Sharing a page (K38): a client gets a DevTools session of its own on each
 //! page it attaches to (`Target.attachToTarget` on the page's channel), so
 //! what it enables, its scripts, bindings and interception go away when it
@@ -69,8 +74,9 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Turns the endpoint on or off. Off closes every client connection and
-/// forgets the tokens: URLs handed out before stop working.
+/// Turns the endpoint on or off. Off closes every external client connection
+/// and forgets their tokens: URLs handed out before stop working. The app's
+/// DevTools keep theirs.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     if on {
@@ -92,14 +98,32 @@ pub fn endpoint(scope: &Scope) -> Result<String, String> {
     if !enabled() {
         return Err("External CDP connections are turned off in Settings".into());
     }
+    Ok(server()?.endpoint(scope, false))
+}
+
+/// What the app's DevTools frontend takes as its `ws=` parameter for
+/// `scope`'s pages, without the target: `127.0.0.1:<port>/<token>`. Append
+/// `/devtools/page/<targetId>`. Works whatever the Settings say; the token is
+/// the app's own, and only a `devtools://devtools` page may use it.
+pub fn devtools_base(scope: &Scope) -> Result<String, String> {
+    let server = server()?;
+    let base = server.endpoint(scope, true);
+    Ok(base.strip_prefix("http://").unwrap_or(&base).to_owned())
+}
+
+/// The listener, started on first use.
+fn server() -> Result<Arc<Server>, String> {
     let mut slot = SERVER.lock().unwrap_or_else(PoisonError::into_inner);
     if slot.is_none() {
         let server = Server::start(Arc::new(super::submit))
             .map_err(|e| format!("Could not start the CDP endpoint: {e}"))?;
         *slot = Some(server);
     }
-    Ok(slot.as_ref().expect("just started").endpoint(scope))
+    Ok(slot.as_ref().expect("just started").clone())
 }
+
+/// The `Origin` of the DevTools frontend's requests.
+const DEVTOOLS_ORIGIN: &str = "devtools://devtools";
 
 /// Hands a job to the main thread; false when it is not taking work.
 type Submit = Arc<dyn Fn(Job) -> bool + Send + Sync>;
@@ -121,6 +145,8 @@ struct Grant {
     token: String,
     scope: Scope,
     context: String,
+    /// The app's own DevTools frontend's ([`devtools_base`]).
+    internal: bool,
 }
 
 struct Server {
@@ -135,8 +161,9 @@ struct Server {
 #[derive(Default)]
 struct Inner {
     grants: Vec<Grant>,
-    /// Open WebSocket clients, to shut down when the endpoint turns off.
-    clients: HashMap<u64, TcpStream>,
+    /// Open WebSocket clients, to shut down when the endpoint turns off,
+    /// and whether they are the app's DevTools.
+    clients: HashMap<u64, (TcpStream, bool)>,
 }
 
 struct Request {
@@ -177,9 +204,12 @@ impl Server {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn endpoint(&self, scope: &Scope) -> String {
+    /// The base URL of `scope`'s external grant, or with `internal` its
+    /// grant for the app's DevTools.
+    fn endpoint(&self, scope: &Scope, internal: bool) -> String {
         let mut inner = self.inner();
-        let token = match inner.grants.iter().find(|g| g.scope == *scope) {
+        let found = (inner.grants.iter()).find(|g| g.scope == *scope && g.internal == internal);
+        let token = match found {
             Some(grant) => grant.token.clone(),
             None => {
                 let token = format!(
@@ -191,6 +221,7 @@ impl Server {
                     token: token.clone(),
                     scope: scope.clone(),
                     context: hex_id(),
+                    internal,
                 });
                 token
             }
@@ -198,20 +229,23 @@ impl Server {
         format!("http://127.0.0.1:{}/{token}", self.port)
     }
 
+    /// Ends every external client and grant; the app's DevTools stay.
     fn close_all(&self) {
         let mut inner = self.inner();
-        inner.grants.clear();
-        for client in inner.clients.values() {
-            let _ = client.shutdown(Shutdown::Both);
+        inner.grants.retain(|grant| grant.internal);
+        for (client, internal) in inner.clients.values() {
+            if !internal {
+                let _ = client.shutdown(Shutdown::Both);
+            }
         }
     }
 
-    fn add_client(&self, id: u64, stream: TcpStream) {
-        self.inner().clients.insert(id, stream);
+    fn add_client(&self, id: u64, stream: TcpStream, internal: bool) {
+        self.inner().clients.insert(id, (stream, internal));
     }
 
     fn remove_client(&self, id: u64) {
-        if let Some(stream) = self.inner().clients.remove(&id) {
+        if let Some((stream, _)) = self.inner().clients.remove(&id) {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -268,8 +302,10 @@ impl Server {
 
     /// The request's scope and its path after the token, or the status to
     /// refuse it with: 403 for web pages and rebound hosts, 404 otherwise.
+    /// The app's DevTools' grants admit only their frontend's page sockets.
     fn admit(&self, request: &Request) -> Result<(Grant, String), u16> {
-        if request.header("origin").is_some() {
+        let origin = request.header("origin");
+        if origin.is_some_and(|origin| origin != DEVTOOLS_ORIGIN) {
             return Err(403);
         }
         let host = request
@@ -292,7 +328,16 @@ impl Server {
                 found = Some(grant.clone());
             }
         }
-        found.map(|grant| (grant, rest.to_owned())).ok_or(404)
+        let grant = found.ok_or(404u16)?;
+        if grant.internal != origin.is_some() {
+            return Err(403);
+        }
+        let page_socket = rest.starts_with("/devtools/page/")
+            && (request.header("upgrade")).is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+        if grant.internal && !page_socket {
+            return Err(404);
+        }
+        Ok((grant, rest.to_owned()))
     }
 
     fn serve(self: &Arc<Self>, mut stream: TcpStream) {

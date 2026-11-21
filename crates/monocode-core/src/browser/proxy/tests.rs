@@ -346,7 +346,7 @@ impl Harness {
             }
         });
         let server = Server::start(Arc::new(move |job| jobs_tx.send(job).is_ok())).unwrap();
-        let base = server.endpoint(&scope());
+        let base = server.endpoint(&scope(), false);
         Harness {
             server,
             base,
@@ -1067,6 +1067,43 @@ fn a_page_connection_speaks_without_session_ids() {
 }
 
 #[test]
+fn the_apps_devtools_reach_only_page_sockets_and_outlive_the_setting() {
+    let h = Harness::new();
+    let (_, target) = h.add(PROJECT, "http://localhost:3000/", "Shop");
+    let port = h.port();
+    let base = h.server.endpoint(&scope(), true);
+    assert_ne!(base, h.base);
+    let prefix = base.trim_start_matches(&format!("http://127.0.0.1:{port}"));
+    let page = format!("{prefix}/devtools/page/{target}");
+    let frontend = [("Origin", "devtools://devtools")];
+    // Only the DevTools frontend, only its page socket.
+    assert_eq!(Client::connect(port, &page, &[]).err(), Some(403));
+    let web = [("Origin", "https://evil.example")];
+    assert_eq!(Client::connect(port, &page, &web).err(), Some(403));
+    let browser = format!("{prefix}/devtools/browser/x");
+    assert_eq!(Client::connect(port, &browser, &frontend).err(), Some(404));
+    let listing = format!("{prefix}/json/list");
+    assert_eq!(http(port, &listing, &frontend).0, 404);
+    assert_eq!(http(port, &listing, &[]).0, 403);
+    // The external token is not the frontend's.
+    let external = format!("{}/devtools/page/{target}", h.prefix());
+    assert_eq!(Client::connect(port, &external, &frontend).err(), Some(403));
+
+    let mut client = Client::connect(port, &page, &frontend).unwrap();
+    let answer = client.call("Runtime.evaluate", json!({"expression": "1+1"}), None);
+    assert_eq!(answer["result"]["result"]["value"], 2);
+    // External connections turned off: the app's DevTools carry on.
+    let mut outside = h.browser();
+    h.server.close_all();
+    assert!(outside.read().is_none());
+    assert_eq!(h.get("/json/version").0, 404);
+    let answer = client.call("Runtime.evaluate", json!({"expression": "1+1"}), None);
+    assert_eq!(answer["result"]["result"]["value"], 2);
+    assert_eq!(h.server.endpoint(&scope(), true), base);
+    assert!(Client::connect(port, &page, &frontend).is_ok());
+}
+
+#[test]
 fn puppeteer_gets_tab_targets_whose_sessions_attach_the_page() {
     let h = Harness::new();
     let (_, target) = h.add(PROJECT, "http://localhost:3000/", "Shop");
@@ -1139,7 +1176,7 @@ fn turning_off_closes_clients_and_forgets_tokens() {
     h.server.close_all();
     assert!(client.read().is_none());
     assert_eq!(h.get("/json/version").0, 404);
-    let fresh = h.server.endpoint(&scope());
+    let fresh = h.server.endpoint(&scope(), false);
     assert_ne!(fresh, h.base);
 }
 

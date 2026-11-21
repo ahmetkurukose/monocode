@@ -120,7 +120,7 @@ pub(super) fn run(
     if reading.is_err() {
         return;
     }
-    server.add_client(id, closer);
+    server.add_client(id, closer, grant.internal);
 
     let (scope, context, browser_id, out) = (
         grant.scope,
