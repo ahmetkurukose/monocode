@@ -236,11 +236,7 @@ impl PageLog {
                     });
                 }
                 let request = &p["request"];
-                let mut network = self.network.borrow_mut();
-                if network.len() >= NETWORK_ENTRIES {
-                    network.pop_front();
-                }
-                network.push_back(NetworkEntry {
+                self.push_network(NetworkEntry {
                     request_id: id,
                     method: str_of(request, "method").unwrap_or_else(|| "GET".into()),
                     url: str_of(request, "url").unwrap_or_default(),
@@ -255,7 +251,27 @@ impl PageLog {
             }
             "Network.responseReceived" => {
                 let response = &p["response"];
-                self.update(p["requestId"].as_str().unwrap_or(""), |e| {
+                let id = p["requestId"].as_str().unwrap_or("");
+                if p["type"].as_str() == Some("Document") && !self.knows(id) {
+                    // A new page's first document: Chromium starts its
+                    // request with the page, before the log listens, and
+                    // only its answer reaches the log.
+                    self.push_network(NetworkEntry {
+                        request_id: id.to_owned(),
+                        // A page opened by URL; a form posting into a new
+                        // tab would be a POST, which the answer does not say.
+                        method: "GET".into(),
+                        url: str_of(response, "url").unwrap_or_default(),
+                        kind: "Document".into(),
+                        status: None,
+                        mime: None,
+                        size: None,
+                        failed: None,
+                        finished: false,
+                        time: now_ms(),
+                    });
+                }
+                self.update(id, |e| {
                     e.status = response["status"].as_i64();
                     e.mime = str_of(response, "mimeType");
                 });
@@ -278,6 +294,19 @@ impl PageLog {
             }
             _ => {}
         }
+    }
+
+    fn push_network(&self, entry: NetworkEntry) {
+        let mut network = self.network.borrow_mut();
+        if network.len() >= NETWORK_ENTRIES {
+            network.pop_front();
+        }
+        network.push_back(entry);
+    }
+
+    /// Whether a request of `request_id` is in the log.
+    fn knows(&self, request_id: &str) -> bool {
+        (self.network.borrow().iter()).any(|e| e.request_id == request_id)
     }
 
     fn push_console(&self, mut entry: ConsoleEntry) {
@@ -495,6 +524,53 @@ mod tests {
             sent(&format!("x{i}"), "https://example.com/x", "Image");
         }
         assert_eq!(log.network(1000, None).len(), NETWORK_ENTRIES);
+    }
+
+    #[test]
+    fn a_new_pages_first_document_is_logged_from_its_answer() {
+        let (cdp, script) = Script::client();
+        let log = PageLog::start(&cdp);
+        // Its request went out before the log listened.
+        script.emit(
+            "Network.responseReceived",
+            json!({"requestId": "L1", "type": "Document", "response":
+                {"url": "http://localhost:8765/", "status": 200, "mimeType": "text/html"}}),
+        );
+        script.emit(
+            "Network.requestWillBeSent",
+            json!({"requestId": "7.1", "type": "Fetch", "request":
+                {"url": "http://localhost:8765/api", "method": "POST"}}),
+        );
+        script.emit(
+            "Network.loadingFinished",
+            json!({"requestId": "L1", "encodedDataLength": 1794.0}),
+        );
+        // Answers of anything else unheard stay out; a known document's
+        // answer adds nothing.
+        script.emit(
+            "Network.responseReceived",
+            json!({"requestId": "9.9", "type": "Script", "response": {"url": "x", "status": 200}}),
+        );
+        script.emit(
+            "Network.responseReceived",
+            json!({"requestId": "L1", "type": "Document", "response":
+                {"url": "http://localhost:8765/", "status": 200, "mimeType": "text/html"}}),
+        );
+        let all = log.network(10, None);
+        assert_eq!(all.len(), 2);
+        let first = &all[0];
+        assert_eq!(
+            (
+                first.method.as_str(),
+                first.url.as_str(),
+                first.kind.as_str()
+            ),
+            ("GET", "http://localhost:8765/", "Document")
+        );
+        assert_eq!(first.status, Some(200));
+        assert_eq!(first.mime.as_deref(), Some("text/html"));
+        assert_eq!((first.finished, first.size), (true, Some(1794.0)));
+        assert_eq!(all[1].method, "POST");
     }
 
     #[test]
