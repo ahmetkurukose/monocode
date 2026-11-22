@@ -267,6 +267,7 @@ impl Shell {
                 popup,
             } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
             PageRequest::Close => self.close_pane(pane, window, cx),
+            PageRequest::Grab(result) => self.deliver_browser_grab(pane, result, cx),
         }
     }
 
