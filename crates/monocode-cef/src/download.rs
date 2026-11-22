@@ -1,6 +1,7 @@
 //! Downloads: straight into `~/Downloads` under a name that clashes with
 //! nothing there, without a dialog (docs/native/browser/context.md §3.3).
-//! Progress comes back as [`BrowserEvent::Download`]. Every callback here
+//! A page's next download can go into another folder instead
+//! ([`crate::BrowserView::download_next_into`], K50). Progress comes back as [`BrowserEvent::Download`]. Every callback here
 //! runs on CEF's UI thread, the main thread.
 
 use std::{
@@ -63,6 +64,49 @@ pub fn cancel_download(id: u32) {
 /// Before CEF shuts down: lets go of CEF's callbacks.
 pub(crate) fn forget_all() {
     ACTIVE.with(|a| a.borrow_mut().clear());
+    NEXT_INTO.with(|n| n.borrow_mut().clear());
+}
+
+/// While this lives, a page's next download goes into a folder of the
+/// caller's. Dropped before that download starts, the page's downloads go
+/// to `~/Downloads` again.
+#[must_use]
+pub struct DownloadInto {
+    browser: i32,
+    ticket: u64,
+}
+
+impl Drop for DownloadInto {
+    fn drop(&mut self) {
+        NEXT_INTO.with(|n| {
+            let mut next = n.borrow_mut();
+            if next
+                .get(&self.browser)
+                .is_some_and(|(t, _)| *t == self.ticket)
+            {
+                next.remove(&self.browser);
+            }
+        });
+    }
+}
+
+/// Sends browser `browser`'s next download into `dir`, replacing an earlier
+/// such wish of its.
+pub(crate) fn download_into(browser: i32, dir: PathBuf) -> DownloadInto {
+    thread_local!(static TICKETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+    let ticket = TICKETS.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    });
+    NEXT_INTO.with(|n| n.borrow_mut().insert(browser, (ticket, dir)));
+    DownloadInto { browser, ticket }
+}
+
+/// The folder browser `browser`'s download starting now goes into, taken.
+fn take_into(browser: i32) -> Option<PathBuf> {
+    NEXT_INTO
+        .with(|n| n.borrow_mut().remove(&browser))
+        .map(|(_, dir)| dir)
 }
 
 struct Active {
@@ -75,6 +119,9 @@ thread_local! {
     /// Downloads between their start and their end, by id. Their paths are
     /// taken even while nothing exists there yet.
     static ACTIVE: RefCell<HashMap<u32, Active>> = RefCell::new(HashMap::new());
+    /// Where a browser's next download goes, by browser id, with the ticket
+    /// of the [`DownloadInto`] that asked.
+    static NEXT_INTO: RefCell<HashMap<i32, (u64, PathBuf)>> = RefCell::new(HashMap::new());
 }
 
 /// `~/Downloads`, made if it is missing.
@@ -177,7 +224,7 @@ wrap_download_handler! {
 
         fn on_before_download(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             download_item: Option<&mut DownloadItem>,
             suggested_name: Option<&CefString>,
             callback: Option<&mut BeforeDownloadCallback>,
@@ -186,7 +233,10 @@ wrap_download_handler! {
                 return 0;
             };
             let suggested = suggested_name.map(|s| s.to_string()).unwrap_or_default();
-            let path = unique_path(&downloads_dir(), &safe_name(&suggested));
+            let dir = (browser.map(|b| b.identifier()).and_then(take_into))
+                .filter(|dir| std::fs::create_dir_all(dir).is_ok())
+                .unwrap_or_else(downloads_dir);
+            let path = unique_path(&dir, &safe_name(&suggested));
             let id = item.id();
             ACTIVE.with(|a| {
                 a.borrow_mut().insert(id, Active { path: path.clone(), callback: None })
@@ -283,5 +333,23 @@ mod tests {
         });
         assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_for_the_next_download_is_taken_once_or_given_back() {
+        let wish = download_into(4, "/p/a".into());
+        assert_eq!(take_into(5), None);
+        assert_eq!(take_into(4), Some("/p/a".into()));
+        assert_eq!(take_into(4), None);
+        drop(wish);
+        // Dropped before a download came: gone.
+        drop(download_into(4, "/p/b".into()));
+        assert_eq!(take_into(4), None);
+        // A later wish replaces an earlier one; the earlier's drop leaves it.
+        let first = download_into(4, "/p/c".into());
+        let second = download_into(4, "/p/d".into());
+        drop(first);
+        assert_eq!(take_into(4), Some("/p/d".into()));
+        drop(second);
     }
 }

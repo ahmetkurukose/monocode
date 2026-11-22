@@ -783,7 +783,13 @@ impl Shell {
                     .group_hover("group-tab", |s| s.bg(title_tab_fill(active, true)))
                     .when(pinned, |d| d.px(px(((width - TAB_TILE.w) / 2.).max(0.))))
                     .when(close, |d| d.pr_7())
-                    .child(crate::tab_tile::mark_tile(&TAB_TILE, tile, mark))
+                    .child(
+                        crate::tab_tile::mark_tile(&TAB_TILE, tile, mark)
+                            .relative()
+                            .when(self.browser_agent_active(id, cx), |d| {
+                                d.child(super::browser_presence::agent_badge(id))
+                            }),
+                    )
                     .when(!pinned, |d| {
                         d.child(
                             div()

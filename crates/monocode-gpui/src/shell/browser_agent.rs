@@ -10,11 +10,12 @@ use super::*;
 use crate::workspace::BrowserPane;
 use gpui::{AsyncApp, WindowHandle};
 use monocode_core::browser::{
-    CdpClient, DialogInfo, Host, Page, PageId, PageInfo, Scope, log::PageLog,
+    CdpClient, DialogInfo, Host, Page, PageId, PageInfo, Scope, UserControl, log::PageLog,
 };
 use std::{
     any::Any,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -452,6 +453,39 @@ impl Page for AppPage {
     fn user_active(&self) -> bool {
         self.with_page(|page, _| page.user_active())
             .unwrap_or(false)
+    }
+
+    fn user_control(&self) -> Option<UserControl> {
+        self.with_page(|page, _| page.user_control()).flatten()
+    }
+
+    fn agent_used(&self, scope: &Scope) {
+        let (pane, session) = (self.pane, scope.session);
+        self.cx.update(|cx| {
+            let _ = self.window.update(cx, |shell, _, cx| {
+                let title = shell.agent_session_title(session, cx);
+                if let Some(page) = shell.browser_page(pane, cx) {
+                    page.update(cx, |page, cx| page.agent_used(session, title, cx));
+                }
+            });
+        })
+    }
+
+    fn expect_download(&self, dir: PathBuf) -> LocalFuture<Result<PathBuf, String>> {
+        let page = AppPage {
+            cx: self.cx.clone(),
+            window: self.window,
+            pane: self.pane,
+        };
+        Box::pin(async move {
+            // Chromium takes the folder from the page's browser.
+            page.ensure_loaded().await?;
+            let waiting = page.cx.update(|cx| {
+                let entity = page.entity(cx).ok_or("the page is gone")?;
+                Ok::<_, String>(entity.update(cx, |page, _| page.expect_download(dir)))
+            })?;
+            waiting.await
+        })
     }
 }
 
