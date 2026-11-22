@@ -1514,6 +1514,37 @@ fn uploads_choose_project_files_only() {
     let none = driver.run("browser_upload", json!({"ref": "@e3", "paths": ["a.txt"]}));
     assert!(none.is_error && text(&none).contains("is not a file input"));
     assert_eq!(page.script.calls("DOM.setFileInputFiles").len(), 1);
+    // A button that opens a hidden input from script: its chooser says
+    // which input, and the chooser is intercepted only meanwhile.
+    let script = Rc::downgrade(&page.script);
+    page.script.on("Input.dispatchMouseEvent", move |p, _| {
+        if p["type"] == "mouseReleased" {
+            script.upgrade().unwrap().emit(
+                "Page.fileChooserOpened",
+                json!({"frameId": "F", "mode": "selectMultiple", "backendNodeId": 600}),
+            );
+        }
+        Ok(json!({}))
+    });
+    let chose = driver.run(
+        "browser_upload",
+        json!({"ref": "@e3", "paths": ["a.txt", "b.png"]}),
+    );
+    assert!(
+        text(&chose).starts_with("Chose \"a.txt\", \"b.png\" for @e3"),
+        "{}",
+        text(&chose)
+    );
+    assert_eq!(
+        page.script.calls("DOM.setFileInputFiles")[1]["backendNodeId"],
+        600
+    );
+    let intercepts = page.script.calls("Page.setInterceptFileChooserDialog");
+    let intercepts: Vec<&Value> = intercepts.iter().map(|c| &c["enabled"]).collect();
+    assert_eq!(
+        intercepts,
+        [&json!(true), &json!(false), &json!(true), &json!(false)]
+    );
 }
 
 #[test]

@@ -4,8 +4,10 @@
 //! judged after symlinks resolve, so a link out of the project is refused.
 
 use std::{
+    cell::Cell,
     path::{Component, Path, PathBuf},
     pin::pin,
+    rc::Rc,
 };
 
 use base64::Engine as _;
@@ -189,6 +191,57 @@ const FILE_INPUT: &str = r#"function() {
   return all.length === 1 ? all[0] : null;
 }"#;
 
+/// How long a click may take to open a file chooser.
+const CHOOSER_MS: u64 = 1_500;
+
+/// Clicks ref with the page's file chooser intercepted: the backend node
+/// of the file input whose chooser the click opened, and whether it takes
+/// several files; `None` when it opened none. Only in the main frame.
+async fn chooser_input(
+    ctx: &Ctx,
+    args: &Value,
+    session: Option<&str>,
+) -> Result<Option<(i64, bool)>, ToolOutput> {
+    if session.is_some() {
+        return Ok(None);
+    }
+    let opened: Rc<Cell<Option<(i64, bool)>>> = Rc::default();
+    let seen = opened.clone();
+    let _events = ctx.cdp.subscribe(move |event| {
+        if event.session_id.is_none() && event.method == "Page.fileChooserOpened" {
+            let p = &event.params;
+            if let Some(backend) = p["backendNodeId"].as_i64() {
+                seen.set(Some((backend, p["mode"] == "selectMultiple")));
+            }
+        }
+    });
+    ctx.call(
+        "Page.setInterceptFileChooserDialog",
+        json!({"enabled": true}),
+    )
+    .await?;
+    let clicked = async {
+        let (x, y, _) = act::target(ctx, args).await?;
+        act::press_at(ctx, x, y, "left", false).await?;
+        let mut waited = 0;
+        while opened.get().is_none() && waited < CHOOSER_MS {
+            ctx.sleep(50).await;
+            waited += 50;
+        }
+        Ok::<_, ToolOutput>(())
+    }
+    .await;
+    // The user's own choosers open again.
+    let _ = ctx
+        .call(
+            "Page.setInterceptFileChooserDialog",
+            json!({"enabled": false}),
+        )
+        .await;
+    clicked?;
+    Ok(opened.get())
+}
+
 pub async fn upload(ctx: &Ctx, args: &Value) -> Reply {
     let Some(r) = act::ref_arg(args) else {
         return Err(invalid("ref is required"));
@@ -223,32 +276,40 @@ pub async fn upload(ctx: &Ctx, args: &Value) -> Reply {
             json!({"objectId": object, "functionDeclaration": FILE_INPUT}),
         )
         .await?;
-    let Some(input) = input["result"]["objectId"].as_str() else {
-        return Err(invalid(format!(
-            "{what} is not a file input and has none near it; pass the ref of the file input or its button"
-        )));
-    };
-    if files.len() > 1 {
-        let multiple = ctx
-            .call_in(
-                session,
-                "Runtime.callFunctionOn",
-                json!({"objectId": input, "functionDeclaration": "function() { return this.multiple; }", "returnByValue": true}),
-            )
-            .await?;
-        if multiple["result"]["value"] == false {
-            return Err(invalid(format!(
-                "{what} takes one file, not {}",
-                files.len()
-            )));
+    let (backend, multiple) = match input["result"]["objectId"].as_str() {
+        Some(input) => {
+            let multiple = ctx
+                .call_in(
+                    session,
+                    "Runtime.callFunctionOn",
+                    json!({"objectId": input, "functionDeclaration": "function() { return this.multiple; }", "returnByValue": true}),
+                )
+                .await?;
+            let node = ctx
+                .call_in(session, "DOM.describeNode", json!({"objectId": input}))
+                .await?;
+            let Some(backend) = node["node"]["backendNodeId"].as_i64() else {
+                return Err(invalid(format!("{what}'s file input is gone")));
+            };
+            (backend, multiple["result"]["value"] != false)
         }
-    }
-    let node = ctx
-        .call_in(session, "DOM.describeNode", json!({"objectId": input}))
-        .await?;
-    let Some(backend) = node["node"]["backendNodeId"].as_i64() else {
-        return Err(invalid(format!("{what}'s file input is gone")));
+        // A button that opens a file input from script: it is the input
+        // the chooser its click opens is for.
+        None => match chooser_input(ctx, args, session).await? {
+            Some(chosen) => chosen,
+            None => {
+                return Err(invalid(format!(
+                    "{what} is not a file input, has none near it and opens none when clicked; pass the ref of the file input or its button"
+                )));
+            }
+        },
     };
+    if files.len() > 1 && !multiple {
+        return Err(invalid(format!(
+            "{what} takes one file, not {}",
+            files.len()
+        )));
+    }
     let before = effects::before(ctx).await?;
     let paths: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     ctx.call_in(
