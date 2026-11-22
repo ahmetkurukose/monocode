@@ -51,6 +51,11 @@ pub(super) fn input_of(kind: objc2_app_kit::NSEventType) -> Option<UserInput> {
     }
 }
 
+/// Whether a new page takes focus: an agent's actions never move it.
+fn popup_foreground(foreground: bool, agent_active: bool, user_control: bool) -> bool {
+    foreground && (!agent_active || user_control)
+}
+
 /// Whole seconds left, rounded up: what a countdown shows.
 fn seconds_left(left: Duration) -> u128 {
     left.as_nanos().div_ceil(1_000_000_000)
@@ -170,6 +175,17 @@ impl BrowserPage {
     pub(crate) fn user_control(&self) -> Option<UserControl> {
         let shared = &self.host.shared;
         shared.presence.control.borrow().user_control(shared.now())
+    }
+
+    /// Whether a page this one opens takes the user's focus: as Chromium
+    /// asks, except while an agent drives the page (its clicks open tabs
+    /// in the background, K39) and the user has not taken control.
+    pub(super) fn popup_foreground(&self, foreground: bool) -> bool {
+        popup_foreground(
+            foreground,
+            self.active_agent().is_some(),
+            self.user_control().is_some(),
+        )
     }
 
     /// The toolbar's "Give back to agent".
@@ -299,6 +315,15 @@ mod tests {
             title: "Fix the login form".into(),
             at,
         }
+    }
+
+    #[test]
+    fn tabs_an_agents_clicks_open_stay_in_the_background() {
+        assert!(popup_foreground(true, false, false));
+        assert!(!popup_foreground(true, true, false));
+        // The user's own click while an agent works took control.
+        assert!(popup_foreground(true, true, true));
+        assert!(!popup_foreground(false, false, true));
     }
 
     #[test]

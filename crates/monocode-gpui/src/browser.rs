@@ -1964,7 +1964,7 @@ impl BrowserPage {
                 url, foreground, ..
             } => cx.emit(PageRequest::Open {
                 url,
-                foreground,
+                foreground: self.popup_foreground(foreground),
                 popup: None,
             }),
             BrowserEvent::PopupOpened {
@@ -1973,7 +1973,7 @@ impl BrowserPage {
                 foreground,
             } => cx.emit(PageRequest::Open {
                 url,
-                foreground,
+                foreground: self.popup_foreground(foreground),
                 popup: Some(id),
             }),
             BrowserEvent::CloseRequested => cx.emit(PageRequest::Close),
