@@ -43,6 +43,11 @@ use crate::{
     theme::{content, icon, icon_button, icon_button_enabled},
 };
 
+#[path = "browser_download_into.rs"]
+mod download_into;
+#[path = "browser_presence.rs"]
+mod presence;
+
 actions!(
     workspace,
     [
@@ -540,6 +545,11 @@ pub(crate) struct BrowserPage {
     /// The shown prompt takes the keyboard on the next frame.
     focus_prompt: bool,
     _prompt_subscriptions: Vec<Subscription>,
+    /// Repaints the agent's badge and label when they change on their own
+    /// (K47): the next expiry or countdown step.
+    presence_timer: Option<gpui::Task<()>>,
+    /// An agent waits for the page's next download (K50).
+    download_wait: Option<download_into::DownloadWait>,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -618,7 +628,10 @@ impl BrowserPage {
             prompt_focus: cx.focus_handle(),
             focus_prompt: false,
             _prompt_subscriptions: Vec::new(),
+            presence_timer: None,
+            download_wait: None,
         }
+        .watch_presence(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
@@ -994,6 +1007,7 @@ impl BrowserPage {
                     .bg(content(0.05))
                     .child(self.address.clone()),
             )
+            .children(self.presence_bar(cx))
             .when(self.zoom != 100, |d| {
                 d.child(
                     div()
@@ -1952,6 +1966,7 @@ impl BrowserPage {
             BrowserEvent::Download(download) => {
                 // The toolbar's indicator shows it; opening the list on its
                 // own would hide the page, which no overlay may cover.
+                self.route_download(&download);
                 match self.downloads.iter_mut().find(|d| d.id == download.id) {
                     Some(known) => *known = download,
                     None => self.downloads.push(download),
@@ -2578,6 +2593,8 @@ struct Shared {
     host: RefCell<Option<Weak<dyn Swept>>>,
     /// The user's last mouse or key input in the page (K34).
     last_input: Cell<Option<Instant>>,
+    /// Who drives the page, and the agent last using it (K47, K48).
+    presence: presence::Presence,
 }
 
 impl Shared {
@@ -2741,6 +2758,9 @@ impl<V: NativeView> Swept for Host<V> {
         if !std::ptr::eq(&*window, &*home) {
             return;
         }
+        let Some(input) = presence::input_of(event.r#type()) else {
+            return;
+        };
         let hit = if event.r#type() == NSEventType::KeyDown {
             window
                 .firstResponder()
@@ -2756,7 +2776,7 @@ impl<V: NativeView> Swept for Host<V> {
                 && at.y < rect.origin.y + rect.size.height
         };
         if hit {
-            self.shared.last_input.set(Some(now));
+            self.shared.user_input(input, now);
         }
     }
 
@@ -3334,6 +3354,7 @@ mod monocode_cef {
     pub fn take_popup(_: u64) -> Option<()> {
         None
     }
+    pub struct DownloadInto;
 
     pub struct AuthChallenge {
         pub host: String,
@@ -3389,6 +3410,9 @@ mod monocode_cef {
             _: &CreateOptions,
         ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), &'static str> {
             Self::create(parent, frame, url)
+        }
+        pub fn download_next_into(&self, _: std::path::PathBuf) -> DownloadInto {
+            DownloadInto
         }
         pub fn devtools_attach(&self, _: DevToolsSink) -> Option<DevToolsAttachment> {
             None

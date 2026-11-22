@@ -22,7 +22,7 @@ use cef::*;
 
 pub use crate::{
     dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
-    download::{Download, DownloadState, cancel_download},
+    download::{Download, DownloadInto, DownloadState, cancel_download},
     popup::take_popup,
     profile::{Profile, forget_profile, profile_id},
 };
@@ -694,6 +694,12 @@ impl BrowserView {
     /// page closes first.
     pub fn capture(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
         crate::capture::capture(&self.browser, Box::new(done));
+    }
+
+    /// The page's next download goes into `dir` (made if missing) instead
+    /// of `~/Downloads`, while the returned value lives.
+    pub fn download_next_into(&self, dir: std::path::PathBuf) -> DownloadInto {
+        crate::download::download_into(self.browser.identifier(), dir)
     }
 
     /// Chromium's id of the page's browser, unique for the app's run.

@@ -6,6 +6,7 @@ mod automation_runs;
 pub(crate) mod browser_agent;
 pub(crate) mod browser_links;
 mod browser_panes;
+mod browser_presence;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
