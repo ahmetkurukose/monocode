@@ -14,6 +14,10 @@
 //!
 //! Pages come and go without telling us: every connection looks at its
 //! scope's pages every [`POLL`] and reports the difference.
+//!
+//! Restored tabs not loaded yet (K20) are listed under a stand-in id
+//! ([`Unloaded`]) and load when a client attaches them, or when it
+//! auto-attaches every page (Playwright's `connectOverCDP`).
 
 use std::{
     any::Any,
@@ -197,6 +201,8 @@ struct State {
     pending: Option<Vec<Value>>,
     /// Every target seen, with the info last reported.
     known: HashMap<String, Value>,
+    /// Pages seen loaded or loaded for the client ([`load_all`]).
+    seen: HashSet<PageId>,
     /// Auto-attaches started, per (browser-level session, target); true once
     /// announced.
     attaching: HashMap<(Option<String>, String), Rc<Cell<bool>>>,
@@ -266,13 +272,20 @@ impl Client {
     }
 
     fn info(&self, target: &Target, tab: bool) -> Value {
-        let info = &target.info;
+        self.target_info(&target.id, &target.info, tab, true)
+    }
+
+    fn unloaded_info(&self, page: &Unloaded, tab: bool) -> Value {
+        self.target_info(&page.id, &page.info, tab, false)
+    }
+
+    fn target_info(&self, id: &str, info: &PageInfo, tab: bool, attached: bool) -> Value {
         json!({
-            "targetId": if tab { tab_id(&target.id) } else { target.id.clone() },
+            "targetId": if tab { tab_id(id) } else { id.to_owned() },
             "type": if tab { "tab" } else { "page" },
             "title": if info.title.is_empty() { &info.url } else { &info.title },
             "url": info.url,
-            "attached": true,
+            "attached": attached,
             "canAccessOpener": false,
             "browserContextId": self.context,
         })
@@ -363,8 +376,82 @@ async fn target_id(host: &Rc<dyn Host>, page: PageId, cdp: &Rc<CdpClient>) -> Op
     Some(id)
 }
 
+/// A restored tab not loaded yet (K20): no browser, so no target id from
+/// Chromium. It is listed under a stand-in id with its saved address and
+/// title, and loads when a client attaches it; then its real target
+/// replaces the stand-in (destroyed, then created).
+struct Unloaded {
+    page: Rc<dyn Page>,
+    id: String,
+    info: PageInfo,
+}
+
+/// How long a restored tab may take to load for a client (Chromium may
+/// have to start first).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn unloaded_id(page: PageId) -> String {
+    format!("MONOCODE-UNLOADED-{page}")
+}
+
+/// The scope's pages without a browser yet.
+fn unloaded(host: &Rc<dyn Host>, scope: &Scope) -> Vec<Unloaded> {
+    host.pages(scope)
+        .into_iter()
+        .filter(|page| page.cdp().is_none())
+        .map(|page| {
+            let info = page.info();
+            Unloaded {
+                id: unloaded_id(info.id),
+                info,
+                page,
+            }
+        })
+        .collect()
+}
+
+/// Loads a restored tab and returns its target.
+async fn load(host: &Rc<dyn Host>, scope: &Scope, page: &Rc<dyn Page>) -> Result<Target, String> {
+    let id = page.info().id;
+    timed(host, page.ensure_loaded(), LOAD_TIMEOUT)
+        .await
+        .ok_or("the page took too long to load")??;
+    targets(host, scope)
+        .await
+        .into_iter()
+        .find(|t| t.info.id == id)
+        .ok_or_else(|| "the page did not answer".to_owned())
+}
+
+/// Loads the scope's restored tabs, for a client that attaches every page.
+/// Each page once per client: one that did not load, or that the client saw
+/// loaded before (its renderer crashed since), is not loaded again here.
+/// False when there was none to load.
+async fn load_all(client: &Rc<Client>) -> bool {
+    let (host, scope) = (&client.host, &client.scope);
+    let pages: Vec<Unloaded> = {
+        let mut state = client.state.borrow_mut();
+        unloaded(host, scope)
+            .into_iter()
+            .filter(|p| state.seen.insert(p.info.id))
+            .collect()
+    };
+    if pages.is_empty() {
+        return false;
+    }
+    // One that does not load stays listed under its stand-in id.
+    future::join_all(pages.iter().map(|p| load(host, scope, &p.page))).await;
+    true
+}
+
+/// The client saw these pages loaded.
+fn seen(client: &Client, now: &[Target]) {
+    let mut state = client.state.borrow_mut();
+    state.seen.extend(now.iter().map(|t| t.info.id));
+}
+
 /// The scope's pages that have a live DevTools channel. Restored tabs not
-/// loaded yet (K20) are not targets until they load.
+/// loaded yet (K20) are [`Unloaded`].
 async fn targets(host: &Rc<dyn Host>, scope: &Scope) -> Vec<Target> {
     let pages: Vec<(Rc<dyn Page>, Rc<CdpClient>)> = host
         .pages(scope)
@@ -466,10 +553,9 @@ pub(super) fn version_of(host: Rc<dyn Host>, scope: Scope) -> LocalBoxFuture<'st
     async move { version(&host, &scope).await }.boxed_local()
 }
 
-fn listed(target: &Target) -> Listed {
-    let info = &target.info;
+fn listed_as(id: &str, info: &PageInfo) -> Listed {
     Listed {
-        id: target.id.clone(),
+        id: id.to_owned(),
         url: info.url.clone(),
         title: if info.title.is_empty() {
             info.url.clone()
@@ -479,8 +565,21 @@ fn listed(target: &Target) -> Listed {
     }
 }
 
+fn listed(target: &Target) -> Listed {
+    listed_as(&target.id, &target.info)
+}
+
 pub(super) fn list(host: Rc<dyn Host>, scope: Scope) -> LocalBoxFuture<'static, Vec<Listed>> {
-    async move { targets(&host, &scope).await.iter().map(listed).collect() }.boxed_local()
+    async move {
+        let mut list: Vec<Listed> = targets(&host, &scope).await.iter().map(listed).collect();
+        list.extend(
+            unloaded(&host, &scope)
+                .iter()
+                .map(|p| listed_as(&p.id, &p.info)),
+        );
+        list
+    }
+    .boxed_local()
 }
 
 pub(super) fn has_target(
@@ -488,7 +587,11 @@ pub(super) fn has_target(
     scope: Scope,
     id: String,
 ) -> LocalBoxFuture<'static, bool> {
-    async move { targets(&host, &scope).await.iter().any(|t| t.id == id) }.boxed_local()
+    async move {
+        targets(&host, &scope).await.iter().any(|t| t.id == id)
+            || unloaded(&host, &scope).iter().any(|p| p.id == id)
+    }
+    .boxed_local()
 }
 
 async fn open_target(host: &Rc<dyn Host>, scope: &Scope, url: &str) -> Result<Target, String> {
@@ -522,8 +625,13 @@ pub(super) fn close_page(
         let found = targets(&host, &scope)
             .await
             .into_iter()
-            .find(|t| t.id == id);
-        found.is_some_and(|t| host.close(&scope, t.info.id))
+            .find(|t| t.id == id)
+            .map(|t| t.info.id)
+            .or_else(|| {
+                let pages = unloaded(&host, &scope);
+                pages.iter().find(|p| p.id == id).map(|p| p.info.id)
+            });
+        found.is_some_and(|page| host.close(&scope, page))
     }
     .boxed_local()
 }
@@ -557,10 +665,18 @@ pub(super) fn open(
     async move {
         let mut started = Vec::new();
         if let Kind::Page(wanted) = &client.kind {
-            let found = targets(&client.host, &client.scope)
+            let (host, scope) = (&client.host, &client.scope);
+            let mut found = targets(host, scope)
                 .await
                 .into_iter()
                 .find(|t| t.id == *wanted);
+            if found.is_none() {
+                // A restored tab's stand-in id: the page loads now.
+                let page = unloaded(host, scope).into_iter().find(|p| p.id == *wanted);
+                if let Some(page) = page {
+                    found = load(host, scope, &page.page).await.ok();
+                }
+            }
             let session = match found {
                 Some(target) => attach(&client, &target, None, true).await.ok(),
                 None => None,
@@ -611,18 +727,37 @@ async fn watch(client: Rc<Client>) {
 }
 
 async fn refresh(client: &Rc<Client>) {
-    let now = targets(&client.host, &client.scope).await;
+    let (host, scope) = (&client.host, &client.scope);
+    let mut now = targets(host, scope).await;
+    seen(client, &now);
+    // A client that attaches every page gets restored tabs loaded.
+    if matches!(client.kind, Kind::Browser)
+        && !client.state.borrow().auto.is_empty()
+        && load_all(client).await
+    {
+        now = targets(host, scope).await;
+    }
     if client.closed() {
         return;
     }
-    if let Kind::Page(wanted) = &client.kind {
-        if !now.iter().any(|t| t.id == *wanted) {
+    if let Kind::Page(_) = &client.kind {
+        // A stand-in id's page is known by its real one once attached.
+        let attached = client
+            .state
+            .borrow()
+            .root
+            .as_ref()
+            .map(|s| s.target.clone());
+        if attached.is_none_or(|id| !now.iter().any(|t| t.id == id)) {
             // Chrome closes a page's socket when the page goes.
             let _ = client.out.send(Input::Close);
         }
         return;
     }
-    let current: HashSet<&str> = now.iter().map(|t| t.id.as_str()).collect();
+    let waiting = unloaded(host, scope);
+    let current: HashSet<&str> = (now.iter().map(|t| t.id.as_str()))
+        .chain(waiting.iter().map(|p| p.id.as_str()))
+        .collect();
     let gone: HashSet<String> = {
         let state = client.state.borrow();
         state
@@ -640,14 +775,20 @@ async fn refresh(client: &Rc<Client>) {
     for target in &now {
         announce(client, target).await;
     }
+    for page in &waiting {
+        let (info, tab) = (
+            client.unloaded_info(page, false),
+            client.unloaded_info(page, true),
+        );
+        discovered(client, &page.id, info, tab);
+    }
 }
 
-/// Reports a target that is new or changed, and auto-attaches it.
-async fn announce(client: &Rc<Client>, target: &Target) {
-    let info = client.info(target, false);
+/// Reports a target that is new or changed to a client that discovers.
+fn discovered(client: &Client, id: &str, info: Value, tab: Value) {
     let change = {
         let mut state = client.state.borrow_mut();
-        let change = match state.known.get(&target.id) {
+        let change = match state.known.get(id) {
             None => Some("Target.targetCreated"),
             Some(old) if old["url"] != info["url"] || old["title"] != info["title"] => {
                 Some("Target.targetInfoChanged")
@@ -655,7 +796,7 @@ async fn announce(client: &Rc<Client>, target: &Target) {
             Some(_) => None,
         };
         if change.is_some() {
-            state.known.insert(target.id.clone(), info.clone());
+            state.known.insert(id.to_owned(), info.clone());
         }
         change.zip(state.discover.clone())
     };
@@ -664,13 +805,19 @@ async fn announce(client: &Rc<Client>, target: &Target) {
             client.event(None, method, json!({"targetInfo": info}));
         }
         if filter.wants("tab") {
-            client.event(
-                None,
-                method,
-                json!({"targetInfo": client.info(target, true)}),
-            );
+            client.event(None, method, json!({"targetInfo": tab}));
         }
     }
+}
+
+/// Reports a target that is new or changed, and auto-attaches it.
+async fn announce(client: &Rc<Client>, target: &Target) {
+    discovered(
+        client,
+        &target.id,
+        client.info(target, false),
+        client.info(target, true),
+    );
     let keys: Vec<Option<String>> = client.state.borrow().auto.keys().cloned().collect();
     for key in keys {
         auto_attach(client, &key, target).await;
@@ -1075,16 +1222,21 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
             Some(
                 async move {
                     let now = targets(&client.host, &client.scope).await;
+                    let waiting = unloaded(&client.host, &client.scope);
                     client.state.borrow_mut().discover = Some(filter.clone());
-                    for target in &now {
-                        let info = client.info(target, false);
+                    let infos = (now.iter())
+                        .map(|t| (&t.id, client.info(t, false), client.info(t, true)))
+                        .chain(waiting.iter().map(|p| {
+                            let info = client.unloaded_info(p, false);
+                            (&p.id, info, client.unloaded_info(p, true))
+                        }));
+                    for (id, info, tab) in infos {
                         client
                             .state
                             .borrow_mut()
                             .known
-                            .insert(target.id.clone(), info.clone());
+                            .insert(id.clone(), info.clone());
                         if filter.wants("tab") {
-                            let tab = client.info(target, true);
                             client.event(None, "Target.targetCreated", json!({"targetInfo": tab}));
                         }
                         if filter.wants("page") {
@@ -1109,6 +1261,14 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
                             infos.push(client.info(&target, false));
                         }
                     }
+                    for page in unloaded(&client.host, &client.scope) {
+                        if filter.wants("tab") {
+                            infos.push(client.unloaded_info(&page, true));
+                        }
+                        if filter.wants("page") {
+                            infos.push(client.unloaded_info(&page, false));
+                        }
+                    }
                     client.reply(&request, Ok(json!({"targetInfos": infos})));
                 }
                 .boxed_local(),
@@ -1124,16 +1284,23 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
                     let info = if wanted == client.browser_id {
                         Some(client.browser_info())
                     } else {
-                        targets(&client.host, &client.scope)
-                            .await
-                            .iter()
-                            .find_map(|t| {
+                        let found =
+                            (targets(&client.host, &client.scope).await.iter()).find_map(|t| {
                                 if t.id == wanted {
                                     Some(client.info(t, false))
                                 } else {
                                     (tab_id(&t.id) == wanted).then(|| client.info(t, true))
                                 }
+                            });
+                        found.or_else(|| {
+                            unloaded(&client.host, &client.scope).iter().find_map(|p| {
+                                if p.id == wanted {
+                                    Some(client.unloaded_info(p, false))
+                                } else {
+                                    (tab_id(&p.id) == wanted).then(|| client.unloaded_info(p, true))
+                                }
                             })
+                        })
                     };
                     let answer = info
                         .map(|info| json!({"targetInfo": info}))
@@ -1156,6 +1323,9 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
             client.state.borrow_mut().auto.insert(key.clone(), filter);
             Some(
                 async move {
+                    // Every page, restored tabs too: they load now.
+                    seen(&client, &targets(&client.host, &client.scope).await);
+                    load_all(&client).await;
                     for target in targets(&client.host, &client.scope).await {
                         auto_attach(&client, &key, &target).await;
                     }
@@ -1175,7 +1345,30 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
             }
             Some(
                 async move {
-                    let now = targets(&client.host, &client.scope).await;
+                    let (host, scope) = (&client.host, &client.scope);
+                    let mut now = targets(host, scope).await;
+                    let mut wanted = wanted;
+                    // A restored tab loads, and is attached by its real id.
+                    let stand_in = unloaded(host, scope)
+                        .into_iter()
+                        .find(|p| p.id == wanted || tab_id(&p.id) == wanted);
+                    if let Some(page) = stand_in {
+                        match load(host, scope, &page.page).await {
+                            Ok(target) => {
+                                let tab = wanted != page.id;
+                                wanted = if tab {
+                                    tab_id(&target.id)
+                                } else {
+                                    target.id.clone()
+                                };
+                                now.push(target);
+                            }
+                            Err(error) => {
+                                client.reply(&request, Err(failed(error)));
+                                return;
+                            }
+                        }
+                    }
                     let answer = if let Some(target) = now.iter().find(|t| t.id == wanted) {
                         attach(&client, target, key, false)
                             .await
@@ -1256,14 +1449,15 @@ fn browser_command(client: &Rc<Client>, request: Request) -> Option<LocalBoxFutu
             Some(
                 async move {
                     let now = targets(&client.host, &client.scope).await;
-                    let Some(target) = now
-                        .iter()
-                        .find(|t| t.id == wanted || tab_id(&t.id) == wanted)
-                    else {
+                    let waiting = unloaded(&client.host, &client.scope);
+                    let found = (now.iter().map(|t| (&t.id, t.info.id)))
+                        .chain(waiting.iter().map(|p| (&p.id, p.info.id)))
+                        .find(|(id, _)| **id == wanted || tab_id(id) == wanted);
+                    let Some((_, page)) = found else {
                         client.reply(&request, Err(invalid("No target with given id found")));
                         return;
                     };
-                    let closed = client.host.close(&client.scope, target.info.id);
+                    let closed = client.host.close(&client.scope, page);
                     client.reply(&request, Ok(json!({"success": closed})));
                     if closed {
                         refresh(&client).await;

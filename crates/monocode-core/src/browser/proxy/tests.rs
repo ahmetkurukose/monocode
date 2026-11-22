@@ -47,6 +47,9 @@ struct FakePage {
     sessions: Cell<u32>,
     sent: RefCell<Vec<Value>>,
     cdp: RefCell<Option<Rc<CdpClient>>>,
+    /// A restored tab's client, until `ensure_loaded` loads it.
+    unloaded: RefCell<Option<Rc<CdpClient>>>,
+    loads: Cell<u32>,
     drawn: Rc<Cell<i32>>,
 }
 
@@ -134,6 +137,10 @@ impl Page for FakePage {
     }
 
     fn ensure_loaded(&self) -> LocalBoxFuture<'static, Result<(), String>> {
+        if let Some(cdp) = self.unloaded.take() {
+            self.loads.set(self.loads.get() + 1);
+            *self.cdp.borrow_mut() = Some(cdp);
+        }
         async { Ok(()) }.boxed_local()
     }
 
@@ -196,6 +203,8 @@ impl FakeHost {
             sessions: Cell::new(0),
             sent: RefCell::default(),
             cdp: RefCell::default(),
+            unloaded: RefCell::default(),
+            loads: Cell::new(0),
             drawn: Rc::default(),
         });
         let (weak, inbox) = (Rc::downgrade(&page), self.inbox.clone());
@@ -212,6 +221,14 @@ impl FakeHost {
         }));
         *page.cdp.borrow_mut() = Some(cdp);
         self.pages.borrow_mut().push(page.clone());
+        page
+    }
+
+    /// A restored tab not loaded yet (K20): no CDP client until it loads.
+    fn add_unloaded(&self, project: &str, url: &str, title: &str) -> Rc<FakePage> {
+        let page = self.add(project, url, title);
+        let cdp = page.cdp.borrow_mut().take();
+        *page.unloaded.borrow_mut() = cdp;
         page
     }
 
@@ -377,6 +394,22 @@ impl Harness {
             let page = host.add(project, url, title);
             (page.id, page.target.clone())
         })
+    }
+
+    fn add_unloaded(
+        &self,
+        project: &'static str,
+        url: &'static str,
+        title: &'static str,
+    ) -> (PageId, String) {
+        self.with(move |host| {
+            let page = host.add_unloaded(project, url, title);
+            (page.id, page.target.clone())
+        })
+    }
+
+    fn loads(&self, id: PageId) -> u32 {
+        self.with(move |host| host.page(id).loads.get())
     }
 
     fn port(&self) -> u16 {
@@ -1221,4 +1254,107 @@ fn small_pieces() {
     );
     assert_eq!(request.header("x-y"), Some("z"));
     assert!(super::parse_head(b"nonsense\r\n\r\n").is_none());
+}
+
+#[test]
+fn restored_tabs_are_listed_before_they_load_and_load_when_attached() {
+    let h = Harness::new();
+    let (page, target) = h.add_unloaded(PROJECT, "http://localhost:3000/cart", "Cart");
+    let stand_in = format!("MONOCODE-UNLOADED-{page}");
+
+    // Listed with the saved address and title, under a stand-in id.
+    let (_, body) = h.get("/json/list");
+    let list: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(list.len(), 1, "{body}");
+    assert_eq!(list[0]["id"], stand_in.as_str());
+    assert_eq!(list[0]["url"], "http://localhost:3000/cart");
+    assert_eq!(list[0]["title"], "Cart");
+    let mut client = h.browser();
+    let answer = client.call("Target.getTargets", json!({}), None);
+    let infos = answer["result"]["targetInfos"].as_array().unwrap().clone();
+    assert_eq!(infos.len(), 1, "{answer}");
+    assert_eq!(infos[0]["targetId"], stand_in.as_str());
+    assert_eq!(infos[0]["attached"], false);
+    let answer = client.call("Target.setDiscoverTargets", json!({"discover": true}), None);
+    assert_eq!(answer["result"], json!({}));
+    let created = client.event("Target.targetCreated");
+    assert_eq!(
+        created["params"]["targetInfo"]["targetId"],
+        stand_in.as_str()
+    );
+    assert_eq!(h.loads(page), 0);
+
+    // Playwright's connect attaches every page: the tab loads, and is
+    // attached by Chromium's id.
+    let attached = client.playwright_connect();
+    assert_eq!(attached.len(), 1, "{attached:?}");
+    assert_eq!(
+        attached[0]["params"]["targetInfo"]["targetId"],
+        target.as_str()
+    );
+    assert_eq!(h.loads(page), 1);
+    let session = attached[0]["params"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answer = client.call(
+        "Runtime.evaluate",
+        json!({"expression": "1+1"}),
+        Some(&session),
+    );
+    assert_eq!(answer["result"]["result"]["value"], 2);
+    // The stand-in goes for the real target.
+    let destroyed = client.event("Target.targetDestroyed");
+    assert_eq!(destroyed["params"]["targetId"], stand_in.as_str());
+    let (_, body) = h.get("/json/list");
+    let list: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(list[0]["id"], target.as_str(), "{body}");
+
+    // A page the client saw loaded that loses its browser (a crashed
+    // renderer) is not loaded again behind the user's back.
+    h.with(move |host| {
+        let page = host.page(page);
+        let cdp = page.cdp.borrow_mut().take();
+        *page.unloaded.borrow_mut() = cdp;
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(h.loads(page), 1);
+}
+
+#[test]
+fn a_restored_tab_loads_for_attach_to_target_and_its_own_socket() {
+    let h = Harness::new();
+    let (first, target) = h.add_unloaded(PROJECT, "http://localhost:3000/", "Shop");
+    let mut client = h.browser();
+    let stand_in = format!("MONOCODE-UNLOADED-{first}");
+    let answer = client.call(
+        "Target.attachToTarget",
+        json!({"targetId": stand_in, "flatten": true}),
+        None,
+    );
+    let session = answer["result"]["sessionId"].as_str().unwrap().to_owned();
+    let event = client.event("Target.attachedToTarget");
+    assert_eq!(event["params"]["sessionId"], session.as_str());
+    assert_eq!(event["params"]["targetInfo"]["targetId"], target.as_str());
+    assert_eq!(h.loads(first), 1);
+
+    let (second, _) = h.add_unloaded(PROJECT, "http://localhost:3000/b", "B");
+    let path = format!("{}/devtools/page/MONOCODE-UNLOADED-{second}", h.prefix());
+    let mut page = Client::connect(h.port(), &path, &[]).unwrap();
+    let answer = page.call("Runtime.evaluate", json!({"expression": "1+1"}), None);
+    assert_eq!(answer["result"]["result"]["value"], 2, "{answer}");
+    assert_eq!(h.loads(second), 1);
+    // The socket stays open after the stand-in id is gone.
+    thread::sleep(Duration::from_millis(700));
+    let answer = page.call("Runtime.evaluate", json!({"expression": "1+1"}), None);
+    assert_eq!(answer["result"]["result"]["value"], 2, "{answer}");
+
+    // Closing by the stand-in id closes the page without loading it.
+    let (third, _) = h.add_unloaded(PROJECT, "http://localhost:3000/c", "C");
+    let answer = client.call(
+        "Target.closeTarget",
+        json!({"targetId": format!("MONOCODE-UNLOADED-{third}")}),
+        None,
+    );
+    assert_eq!(answer["result"]["success"], true, "{answer}");
 }
