@@ -45,6 +45,11 @@ impl BrowserPage {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn waits_for_download(&self) -> bool {
+        self.download_wait.is_some()
+    }
+
     /// Hands a download's progress to the agent waiting for it, if any;
     /// before [`BrowserPage::downloads`] learns of it.
     pub(super) fn route_download(&mut self, download: &Download) {

@@ -477,8 +477,19 @@ impl Page for AppPage {
             window: self.window,
             pane: self.pane,
         };
+        // Chromium takes the folder from the page's browser. A page that
+        // is up takes it now, before the action that starts the download:
+        // asked for when first polled, the folder came after a quick one.
+        let now = page.cx.update(|cx| {
+            let entity = page.entity(cx)?;
+            entity.update(cx, |page, _| {
+                (page.cdp().is_some()).then(|| page.expect_download(dir.clone()))
+            })
+        });
+        if let Some(waiting) = now {
+            return waiting;
+        }
         Box::pin(async move {
-            // Chromium takes the folder from the page's browser.
             page.ensure_loaded().await?;
             let waiting = page.cx.update(|cx| {
                 let entity = page.entity(cx).ok_or("the page is gone")?;
@@ -758,6 +769,34 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert_eq!(rx.len(), 2);
+    }
+
+    #[gpui::test]
+    fn a_page_that_is_up_takes_the_download_folder_before_the_action(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, session) = super::super::tests::window(cx);
+        let pane = window
+            .update(cx, |shell, window, cx| {
+                shell.open(session, window, cx);
+                shell.new_browser_pane(Some("https://a.test/".into()), window, cx);
+                shell.workspace.active.unwrap()
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let page = window
+            .update(cx, |shell, _, cx| shell.browser_page(pane, cx).unwrap())
+            .unwrap();
+        page.read_with(cx, |page, _| {
+            page.set_cdp_for_test(monocode_core::browser::CdpClient::new(Box::new(|_| true)))
+        });
+        let host = AppHost::new(cx.to_async());
+        let scope = scope(session, "/work/monocode");
+        let dir = tempfile::tempdir().unwrap();
+        // Not polled yet: the click that starts a download comes first.
+        let waiting = (host.page(&scope, pane).unwrap()).expect_download(dir.path().join("dl"));
+        assert!(page.read_with(cx, |page, _| page.waits_for_download()));
+        drop(waiting);
     }
 
     #[gpui::test]

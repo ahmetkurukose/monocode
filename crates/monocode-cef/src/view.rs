@@ -422,6 +422,8 @@ mod client {
             dialogs: cef::JsdialogHandler,
             // "Send to Agent" (context.md K49).
             context_menu: cef::ContextMenuHandler,
+            // An agent's downloads in a row (K50).
+            permission: cef::PermissionHandler,
         }
 
         impl Client {
@@ -460,6 +462,10 @@ mod client {
             fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
                 Some(self.context_menu.clone())
             }
+
+            fn permission_handler(&self) -> Option<cef::PermissionHandler> {
+                Some(self.permission.clone())
+            }
         }
     }
 }
@@ -477,6 +483,7 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
         crate::dialogs::PageRequestHandler::new(state.clone()),
         crate::dialogs::PageDialogHandler::new(state.clone()),
         crate::context_menu::PageContextMenuHandler::new(state),
+        crate::download::PagePermissionHandler::new(),
     )
 }
 

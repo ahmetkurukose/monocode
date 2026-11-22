@@ -102,6 +102,23 @@ pub(crate) fn download_into(browser: i32, dir: PathBuf) -> DownloadInto {
     DownloadInto { browser, ticket }
 }
 
+/// Whether a download browser `browser` starts now goes into a caller's
+/// folder.
+fn expects_download(browser: i32) -> bool {
+    NEXT_INTO.with(|n| n.borrow().contains_key(&browser))
+}
+
+/// Whether we accept a page's permission prompt ourselves; else CEF's
+/// default answers it. A page's second download in a row asks
+/// for "multiple downloads", which an Alloy page would ignore, so the
+/// download never starts. An agent's input does not count as the user's
+/// gesture that lifts the limit, so its downloads are allowed while it
+/// waits for one ([`download_into`]).
+pub(crate) fn accept_permission(requested: u32, expecting: bool) -> bool {
+    let multiple = sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS;
+    expecting && requested == multiple as u32
+}
+
 /// The folder browser `browser`'s download starting now goes into, taken.
 fn take_into(browser: i32) -> Option<PathBuf> {
     NEXT_INTO
@@ -206,6 +223,30 @@ fn snapshot(item: &DownloadItem, path: PathBuf) -> Download {
     }
 }
 
+wrap_permission_handler! {
+    pub(crate) struct PagePermissionHandler {}
+
+    impl PermissionHandler {
+        fn on_show_permission_prompt(
+            &self,
+            browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            _requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            let expecting = browser.is_some_and(|b| expects_download(b.identifier()));
+            match callback {
+                Some(callback) if accept_permission(requested_permissions, expecting) => {
+                    callback.cont(PermissionRequestResult::ACCEPT);
+                    1
+                }
+                _ => 0,
+            }
+        }
+    }
+}
+
 wrap_download_handler! {
     pub(crate) struct PageDownloadHandler {
         state: PageState,
@@ -283,6 +324,22 @@ wrap_download_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_waiting_for_a_download_may_download_again() {
+        let multiple =
+            sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS as u32;
+        let camera = sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_CAMERA_STREAM as u32;
+        assert!(accept_permission(multiple, true));
+        // The user's own downloads, and every other prompt, as CEF decides.
+        assert!(!accept_permission(multiple, false));
+        assert!(!accept_permission(camera, true));
+        assert!(!accept_permission(multiple | camera, true));
+        let _into = download_into(7, PathBuf::from("/tmp/x"));
+        assert!(expects_download(7));
+        drop(_into);
+        assert!(!expects_download(7));
+    }
 
     #[test]
     fn a_download_takes_the_first_free_name() {
