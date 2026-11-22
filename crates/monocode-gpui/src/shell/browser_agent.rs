@@ -682,7 +682,10 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.open(session, window, cx);
-                assert!(!shell.workspace.preferences.browser_external_cdp);
+                // On by default (K27).
+                assert!(shell.workspace.preferences.browser_external_cdp);
+                shell.workspace.preferences.browser_external_cdp = false;
+                shell.apply_preferences(cx);
                 assert!(!proxy::enabled());
                 shell.workspace.preferences.browser_external_cdp = true;
                 shell.apply_preferences(cx);
