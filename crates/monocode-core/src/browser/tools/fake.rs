@@ -5,6 +5,7 @@ use std::{
     any::Any,
     cell::{Cell, RefCell},
     future::Future,
+    path::PathBuf,
     pin::Pin,
     rc::{Rc, Weak},
     sync::{
@@ -19,7 +20,8 @@ use futures_util::future::LocalBoxFuture;
 use serde_json::{Value, json};
 
 use crate::browser::{
-    Call, CdpClient, DialogInfo, Host, Page, PageId, PageInfo, Scope, ToolOutput, log::PageLog,
+    Call, CdpClient, DialogInfo, Host, Page, PageId, PageInfo, Scope, ToolOutput, UserControl,
+    log::PageLog,
 };
 
 type Handler = Rc<dyn Fn(&Value, Option<&str>) -> Result<Value, String>>;
@@ -202,6 +204,9 @@ impl Clock {
     }
 }
 
+/// A finished download: a file name and its bytes, or why it failed.
+pub type Download = Result<(String, Vec<u8>), String>;
+
 pub struct FakePage {
     pub info: RefCell<PageInfo>,
     pub cdp: RefCell<Option<Rc<CdpClient>>>,
@@ -210,6 +215,14 @@ pub struct FakePage {
     pub dialog: RefCell<Option<DialogInfo>>,
     pub answered: RefCell<Vec<(bool, Option<String>)>>,
     pub user_active: Cell<bool>,
+    pub user_control: Cell<Option<UserControl>>,
+    /// The scopes `agent_used` was called with, in order.
+    pub agent_uses: RefCell<Vec<Scope>>,
+    /// What `expect_download` resolves with: a file name it writes into
+    /// the folder (with these bytes), or an error; `None` never resolves.
+    pub download: RefCell<Option<Download>>,
+    /// The folders `expect_download` was given.
+    pub download_dirs: RefCell<Vec<PathBuf>>,
     pub leases: Rc<Cell<usize>>,
     pub load_error: RefCell<Option<String>>,
     /// The CDP client of a page not loaded yet: `ensure_loaded` gives it.
@@ -272,6 +285,10 @@ impl FakePage {
             dialog: RefCell::default(),
             answered: RefCell::default(),
             user_active: Cell::new(false),
+            user_control: Cell::new(None),
+            agent_uses: RefCell::default(),
+            download: RefCell::default(),
+            download_dirs: RefCell::default(),
             leases: Rc::default(),
             load_error: RefCell::default(),
             cold: RefCell::default(),
@@ -335,6 +352,27 @@ impl Page for FakePage {
     fn user_active(&self) -> bool {
         self.user_active.get()
     }
+
+    fn user_control(&self) -> Option<UserControl> {
+        self.user_control.get()
+    }
+
+    fn agent_used(&self, scope: &Scope) {
+        self.agent_uses.borrow_mut().push(scope.clone());
+    }
+
+    fn expect_download(&self, dir: PathBuf) -> LocalBoxFuture<'static, Result<PathBuf, String>> {
+        self.download_dirs.borrow_mut().push(dir.clone());
+        match self.download.borrow().clone() {
+            None => Box::pin(futures_util::future::pending()),
+            Some(Err(error)) => Box::pin(async move { Err(error) }),
+            Some(Ok((name, bytes))) => Box::pin(async move {
+                let path = dir.join(name);
+                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+                Ok(path)
+            }),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -344,6 +382,8 @@ pub struct FakeHost {
     pub opened: RefCell<Vec<(String, bool)>>,
     pub closed: RefCell<Vec<PageId>>,
     pub shown: RefCell<Vec<PageId>>,
+    /// The project folder of the calls' scope; default [`scope`]'s.
+    pub project: RefCell<Option<String>>,
 }
 
 impl FakeHost {
@@ -457,8 +497,12 @@ impl Driver {
     pub fn call(&mut self, tool: &str, arguments: Value) -> Answer {
         let answer: Answer = Rc::default();
         let out = answer.clone();
+        let mut scope = scope();
+        if let Some(project) = self.host.project.borrow().clone() {
+            scope.project = project;
+        }
         let call = Call {
-            scope: scope(),
+            scope,
             tool: tool.to_owned(),
             arguments,
             reply: Box::new(move |output| {
