@@ -147,6 +147,15 @@ Tuş gecikmesi CDP input'uyla ölçüldü; macOS'un gerçek input yolu ölçülm
 **Battery Saver.** Pil %20'nin altındayken Chromium'un Battery Saver'ı **hem Chrome'da hem Monocode'da**
 sayfaları 30 fps'e kilitliyor. Monocode'da bunu kapatacak ayar yok (bkz. açık kararlar).
 
+## Kapanıştan sonra (2026-11-22, kullanıcının uygulamasında deneme)
+- Erişilemeyen sunucuya `browser_goto` 30 sn'lik zaman aşımına düşüyordu; artık 20 sn'de
+  "cevap vermedi" diyor, Chromium'un hata sayfasını hata koduyla bildiriyor.
+- `browser_network` `data:` URL'lerini kırpmadan basıyordu; başarısız isteklerde boyut hatalıydı.
+- Dış CDP bağlantıları varsayılan açık (K27 revize).
+- Anahtarlık: Chromium kullanıcının Chromium.app'inin "Chromium Safe Storage" kaydını istiyor,
+  ad-hoc build'lerde her açılışta login şifresi sorup sayfayı kilitliyordu. Kendi kaydımız +
+  ad-hoc build'lerde mock keychain (§5.1).
+
 ## Faz 3'e devredilenler
 - Battery Saver politikası (kullanıcı kararı bekliyor).
 - Programlı smooth scroll'da %1–5 uzun kare (Chrome'da ~%0); profillenmedi. Wheel Chrome'la aynı.
