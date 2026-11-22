@@ -1074,6 +1074,8 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// Monocode: see [`Window::overlay_bounds`].
+    pub(crate) overlay_bounds: Vec<Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1130,6 +1132,7 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            overlay_bounds: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1154,6 +1157,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.overlay_bounds.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -3838,6 +3842,11 @@ impl Window {
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
+            if tooltip_element.is_some()
+                && let Some(tooltip) = &self.tooltip_bounds
+            {
+                self.next_frame.overlay_bounds.push(tooltip.bounds);
+            }
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
@@ -4072,6 +4081,20 @@ impl Window {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
             let paint_end = self.paint_index();
+            if let Some(bounds) = self
+                .next_frame
+                .scene
+                .painted_bounds(paint_start.scene_index..paint_end.scene_index)
+            {
+                let scale = self.scale_factor();
+                self.next_frame.overlay_bounds.push(Bounds::new(
+                    point(px(bounds.origin.x.0 / scale), px(bounds.origin.y.0 / scale)),
+                    size(
+                        px(bounds.size.width.0 / scale),
+                        px(bounds.size.height.0 / scale),
+                    ),
+                ));
+            }
             deferred_draw.paint_range = paint_start..paint_end;
         }
         self.next_frame.deferred_draws = deferred_draws;
@@ -4594,6 +4617,14 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// Monocode: where the deferred draws painted so far in this frame and
+    /// the tooltip of this frame drew, in window coordinates. An app that
+    /// embeds a native view, which hides what is painted over it, reads this
+    /// from a deferred draw of the highest priority to see every overlay.
+    pub fn overlay_bounds(&self) -> &[Bounds<Pixels>] {
+        &self.next_frame.overlay_bounds
     }
 
     /// Defers the drawing of the given element, scheduling it to be painted on top of the currently-drawn tree
