@@ -110,8 +110,12 @@ pub(crate) struct Preferences {
     /// browser.
     pub browser_all_links: bool,
     /// Tools outside Monocode (Playwright, dev-browser) may connect to the
-    /// browser over CDP (docs/native/browser/context.md K27).
+    /// browser over CDP (docs/native/browser/context.md K27). On by default.
     pub browser_external_cdp: bool,
+    /// Which default `browser_external_cdp` was last set to, so saved
+    /// preferences get the new default once and the user's choice after.
+    #[serde(default)]
+    pub browser_external_cdp_rev: u32,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -217,7 +221,8 @@ impl Default for Preferences {
             claude_chrome: false,
             code_agents: true,
             browser_all_links: false,
-            browser_external_cdp: false,
+            browser_external_cdp: true,
+            browser_external_cdp_rev: BROWSER_EXTERNAL_CDP_REV,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),
@@ -245,6 +250,8 @@ impl Default for Preferences {
 const PROJECT_APPS_REV: u32 = 1;
 /// 1: the explorer shows ignored files by default.
 const SHOW_EXCLUDED_FILES_REV: u32 = 1;
+/// 1: external CDP connections became on by default.
+const BROWSER_EXTERNAL_CDP_REV: u32 = 1;
 
 impl Preferences {
     /// What a fresh install starts with, and what Restore defaults returns
@@ -281,6 +288,10 @@ impl Preferences {
             self.show_excluded_files = true;
         }
         self.show_excluded_files_rev = SHOW_EXCLUDED_FILES_REV;
+        if self.browser_external_cdp_rev < 1 {
+            self.browser_external_cdp = true;
+        }
+        self.browser_external_cdp_rev = BROWSER_EXTERNAL_CDP_REV;
     }
 
     /// Unknown values fall back to the plain list.
@@ -477,5 +488,21 @@ mod decoration_tests {
             serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         again.migrate();
         assert!(!again.show_excluded_files);
+    }
+
+    #[test]
+    fn external_cdp_connections_are_on_by_default_once() {
+        assert!(Preferences::default().browser_external_cdp);
+        assert!(Preferences::fresh_install().browser_external_cdp);
+        let mut saved: Preferences =
+            serde_json::from_str(r#"{"browser_external_cdp":false}"#).unwrap();
+        saved.migrate();
+        assert!(saved.browser_external_cdp);
+        // Turning it off afterwards sticks across the next load.
+        saved.browser_external_cdp = false;
+        let mut again: Preferences =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        again.migrate();
+        assert!(!again.browser_external_cdp);
     }
 }

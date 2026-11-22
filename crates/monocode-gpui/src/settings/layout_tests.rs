@@ -360,6 +360,7 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
         .unwrap();
     window
         .update(visual, |view, _, cx| {
+            view.update(cx, |p| p.browser_external_cdp = false);
             view.update(cx, |p| p.browser_external_cdp = true);
             // No shell turned the endpoint on here: the reason shows.
             view.copy_cdp_endpoint(cx);
@@ -367,5 +368,5 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
         })
         .unwrap();
     visual.run_until_parked();
-    assert_eq!(*changed.borrow(), [true]);
+    assert_eq!(*changed.borrow(), [false, true]);
 }
