@@ -1251,6 +1251,19 @@ fn a_quiet_dom_is_not_read_again() {
     assert!(press.contains("~   [@e3] button \"Try again\""), "{press}");
     assert!(trees() > read);
     assert_eq!(page.script.calls("Page.createIsolatedWorld").len(), 1);
+    // The DOM moves again but no control does: not "nothing changed".
+    let bump = count.clone();
+    page.script.on("Input.dispatchKeyEvent", move |p, _| {
+        if p["type"] == "keyUp" {
+            bump.set(bump.get() + 1.0);
+        }
+        Ok(json!({}))
+    });
+    let press = text(&driver.run("browser_press", json!({"key": "Enter"})));
+    assert_eq!(
+        press,
+        "Pressed Enter. The page changed, but none of its controls did (browser_snapshot with mode full shows its text)."
+    );
 }
 
 #[test]

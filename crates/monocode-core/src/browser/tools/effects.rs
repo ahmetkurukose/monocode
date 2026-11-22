@@ -287,6 +287,8 @@ pub struct Effects {
     facts: String,
     /// The changed lines, or why they are not shown.
     delta: Delta,
+    /// The change counter saw the DOM move.
+    moved: bool,
 }
 
 enum Delta {
@@ -310,6 +312,10 @@ impl Effects {
             Delta::TooLong(n) => out.push_str(&format!(
                 " The page changed a lot ({n} lines); take a browser_snapshot to see it."
             )),
+            // Text or styles moved, none of the outline's lines did.
+            Delta::Lines(_) if self.moved && quiet_note => out.push_str(
+                " The page changed, but none of its controls did (browser_snapshot with mode full shows its text).",
+            ),
             _ if self.facts.is_empty() && quiet_note => {
                 out.push_str(" Nothing on the page changed.");
             }
@@ -352,12 +358,12 @@ pub async fn settle(ctx: &Ctx, before: Before) -> Result<Effects, ToolOutput> {
         facts.push_str(&nav::report(ctx, done).await?);
         facts.push_str(" Refs of earlier snapshots no longer work.");
     }
-    // Then the DOM: quiet, or the budget spent.
-    let mut moved = true;
+    // Then the DOM: quiet, or the budget spent. `None`: not known.
+    let mut moved = None;
     if !navigated {
         match before.counter {
             Some((world, start)) => match quiet(ctx, world).await? {
-                Ok(Some(count)) => moved = count != start,
+                Ok(Some(count)) => moved = Some(count != start),
                 Ok(None) => {}
                 Err(dialog) => return Ok(dialog_effects(ctx, &before, facts, &dialog)),
             },
@@ -387,7 +393,7 @@ pub async fn settle(ctx: &Ctx, before: Before) -> Result<Effects, ToolOutput> {
     if let Some(dialog) = ctx.page.dialog() {
         return Ok(dialog_effects(ctx, &before, facts, &dialog));
     }
-    let delta = if navigated || !moved {
+    let delta = if navigated || moved == Some(false) {
         Delta::None
     } else {
         timed(&ctx.host, SNAPSHOT_MS, read_delta(ctx, &before))
@@ -399,6 +405,7 @@ pub async fn settle(ctx: &Ctx, before: Before) -> Result<Effects, ToolOutput> {
         navigated,
         facts,
         delta,
+        moved: moved == Some(true),
     })
 }
 
@@ -502,6 +509,7 @@ fn dialog_effects(
         navigated: false,
         facts,
         delta: Delta::None,
+        moved: false,
     }
 }
 
