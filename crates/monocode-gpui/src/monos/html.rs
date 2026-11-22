@@ -171,6 +171,17 @@ impl Html {
     pub(super) fn hide(&self) {
         #[cfg(target_os = "macos")]
         if let Some(view) = self.view.borrow().as_ref() {
+            // A hidden view with the keyboard hands it to the window, not to
+            // GPUI's view: the field focused next would hear no key.
+            if let Some(window) = view.clip.window() {
+                let held = (window.firstResponder())
+                    .and_then(|responder| responder.downcast::<NSView>().ok())
+                    .is_some_and(|responder| responder.isDescendantOf(&view.clip));
+                // SAFETY: main thread; the clip is ours.
+                if held && let Some(parent) = unsafe { view.clip.superview() } {
+                    window.makeFirstResponder(Some(&parent));
+                }
+            }
             view.clip.setHidden(true);
         }
     }
