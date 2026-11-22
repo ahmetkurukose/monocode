@@ -1,7 +1,7 @@
 //! Reading a page: snapshots (K31–K33, K42), screenshots (K37), eval, the
 //! console and network log (K36), and answering dialogs.
 
-use std::{collections::HashSet, io::Cursor, path::PathBuf};
+use std::{collections::HashSet, io::Cursor};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use super::{
     Ctx, Reply, cap, invalid, quote,
     snapshot::{self, AxTree, Frame, Mode, Options},
+    state::Shot,
 };
 use crate::browser::{CdpError, Content, Page, ToolOutput, log::Level};
 
@@ -263,31 +264,34 @@ async fn sweep(ctx: &Ctx) -> Result<Vec<(i64, String)>, ToolOutput> {
     Ok(out)
 }
 
-pub async fn snapshot(ctx: &Ctx, args: &Value) -> Reply {
-    let mode = match args.get("mode").and_then(Value::as_str) {
-        None | Some("interactive") => Mode::Interactive,
-        Some("full") => Mode::Full,
-        Some(other) => return Err(invalid(format!("mode is interactive or full, not {other}"))),
-    };
-    let max_depth = match args.get("depth") {
-        None | Some(Value::Null) => None,
-        Some(depth) => Some(
-            depth
-                .as_u64()
-                .ok_or_else(|| invalid("depth must be a whole number"))? as usize,
-        ),
-    };
-    let selector = args
-        .get("selector")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty());
+/// One reading of a page's accessibility outline.
+pub struct Reading {
+    pub loader: Option<String>,
+    pub title: String,
+    pub url: String,
+    pub lines: Vec<String>,
+}
+
+/// What snapshots are compared by: only those of alike options (see
+/// [`Shot::key`]).
+pub fn shot_key(mode: Mode, selector: Option<&str>, depth: Option<usize>) -> String {
+    format!("{mode:?}|{}|{depth:?}", selector.unwrap_or(""))
+}
+
+/// Reads the page's outline; its refs go into the page's table.
+pub async fn read(
+    ctx: &Ctx,
+    mode: Mode,
+    selector: Option<&str>,
+    max_depth: Option<usize>,
+) -> Result<Reading, ToolOutput> {
     let tree = ctx.call("Page.getFrameTree", json!({})).await?;
     let frame_tree = &tree["frameTree"];
     let loader = frame_tree["frame"]["loaderId"].as_str().map(str::to_owned);
     {
         let mut refs = ctx.state.refs.borrow_mut();
         if refs.loader != loader {
-            refs.reset(loader);
+            refs.reset(loader.clone());
         }
     }
     let frames = frames(ctx, frame_tree).await?;
@@ -313,20 +317,85 @@ pub async fn snapshot(ctx: &Ctx, args: &Value) -> Reply {
         .root()
         .map(|r| r.name.clone())
         .unwrap_or_default();
+    Ok(Reading {
+        loader,
+        title,
+        url: frames[0].url.clone(),
+        lines,
+    })
+}
+
+pub async fn snapshot(ctx: &Ctx, args: &Value) -> Reply {
+    let mode = match args.get("mode").and_then(Value::as_str) {
+        None | Some("interactive") => Mode::Interactive,
+        Some("full") => Mode::Full,
+        Some(other) => return Err(invalid(format!("mode is interactive or full, not {other}"))),
+    };
+    let max_depth = match args.get("depth") {
+        None | Some(Value::Null) => None,
+        Some(depth) => Some(
+            depth
+                .as_u64()
+                .ok_or_else(|| invalid("depth must be a whole number"))? as usize,
+        ),
+    };
+    let selector = args
+        .get("selector")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let delta = args.get("delta").and_then(Value::as_bool).unwrap_or(false);
+    let reading = read(ctx, mode, selector, max_depth).await?;
+    let shot = Shot {
+        loader: reading.loader.clone(),
+        key: shot_key(mode, selector, max_depth),
+        lines: reading.lines.clone(),
+    };
+    let before = ctx.state.seen.replace(Some(shot.clone()));
     let mut out = format!(
-        "Page {} {} {}{}\n",
+        "Page {} {} {}{}",
         ctx.id,
-        quote(&title, 200),
-        frames[0].url,
+        quote(&reading.title, 200),
+        reading.url,
         selector.map(|s| format!(", under {s}")).unwrap_or_default()
     );
-    if lines.is_empty() {
+    if delta {
+        match before {
+            Some(before) if before.loader == shot.loader && before.key == shot.key => {
+                let changes = snapshot::delta(&before.lines, &shot.lines);
+                if changes.is_empty() {
+                    out.push_str(": nothing changed since your last snapshot.");
+                    return Ok(ToolOutput::text(out));
+                }
+                // A delta longer than the page says less than the page.
+                if changes.len() <= shot.lines.len() {
+                    out.push_str(
+                        ", what changed since your last snapshot (+ added, - removed, ~ changed):\n",
+                    );
+                    out.push_str(&changes.join("\n"));
+                    return Ok(ToolOutput::text(cap(
+                        out,
+                        "take a snapshot without delta, narrowed with selector or depth",
+                    )));
+                }
+                out.push_str("\n(Most of it changed since your last snapshot; all of it follows.)");
+            }
+            Some(before) if before.loader == shot.loader => out.push_str(
+                "\n(Your last snapshot of this page had another mode, selector or depth; all of it follows.)",
+            ),
+            Some(_) => out.push_str(
+                "\n(It is a new document since your last snapshot; all of it follows.)",
+            ),
+            None => out.push_str("\n(There is no earlier snapshot to compare; all of it follows.)"),
+        }
+    }
+    out.push('\n');
+    if reading.lines.is_empty() {
         out.push_str(match mode {
             Mode::Interactive => "(nothing interactive here; try mode full)",
             Mode::Full => "(nothing here)",
         });
     } else {
-        out.push_str(&lines.join("\n"));
+        out.push_str(&reading.lines.join("\n"));
     }
     Ok(ToolOutput::text(cap(
         out,
@@ -365,6 +434,15 @@ pub async fn screenshot(ctx: &Ctx, args: &Value) -> Reply {
         .get("full_page")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Saved only inside the project (K51).
+    let save = match args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some(raw) => Some(super::files::writable(&ctx.scope.project, raw)?),
+        None => None,
+    };
     let metrics = ctx.call("Page.getLayoutMetrics", json!({})).await?;
     let view = &metrics["cssVisualViewport"];
     let number = |v: &Value, key: &str, default: f64| v[key].as_f64().unwrap_or(default);
@@ -431,20 +509,7 @@ pub async fn screenshot(ctx: &Ctx, args: &Value) -> Reply {
             String::new()
         }
     );
-    if let Some(path) = args
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|p| !p.trim().is_empty())
-    {
-        let path = PathBuf::from(path.trim());
-        let path = if path.is_absolute() {
-            path
-        } else {
-            PathBuf::from(&ctx.scope.project).join(path)
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    if let Some(path) = save {
         std::fs::write(&path, &jpeg)
             .map_err(|e| invalid(format!("could not write {}: {e}", path.display())))?;
         said.push_str(&format!(" Saved to {}.", path.display()));

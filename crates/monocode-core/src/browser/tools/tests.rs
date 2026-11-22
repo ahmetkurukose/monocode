@@ -354,7 +354,10 @@ fn snapshot_then_click_by_ref() {
     );
 
     let click = driver.run("browser_click", json!({"ref": "@e3"}));
-    assert_eq!(text(&click), "Clicked @e3 (button \"Log in\").");
+    assert_eq!(
+        text(&click),
+        "Clicked @e3 (button \"Log in\"). Nothing on the page changed."
+    );
     let mouse = page.script.calls("Input.dispatchMouseEvent");
     let kinds: Vec<&str> = mouse.iter().map(|m| m["type"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["mouseMoved", "mousePressed", "mouseReleased"]);
@@ -378,7 +381,10 @@ fn snapshot_then_click_by_ref() {
         "browser_click",
         json!({"x": 5, "y": 7, "double": true, "button": "right"}),
     );
-    assert_eq!(text(&double), "Double-clicked (5, 7).");
+    assert_eq!(
+        text(&double),
+        "Double-clicked (5, 7). Nothing on the page changed."
+    );
     let mouse = page.script.calls("Input.dispatchMouseEvent");
     assert_eq!(mouse.len(), 3 + 5);
     assert_eq!(mouse[7]["clickCount"], 2);
@@ -460,27 +466,37 @@ fn refs_unknown_and_recovered() {
 }
 
 #[test]
-fn user_activity_blocks_input_only() {
+fn user_control_blocks_input_only() {
     let host = FakeHost::with_pages(&[1]);
     let page = page_with(&host, 1);
     let mut driver = Driver::new(&host);
     driver.run("browser_snapshot", json!({}));
+    // The old 2 s rule no longer blocks anything.
     page.user_active.set(true);
+    assert!(!driver.run("browser_press", json!({"key": "Tab"})).is_error);
+    page.user_control.set(Some(crate::browser::UserControl {
+        resumes_in: std::time::Duration::from_millis(11_200),
+    }));
     for (tool, args) in [
         ("browser_click", json!({"ref": "@e3"})),
         ("browser_fill", json!({"ref": "@e1", "value": "a"})),
         ("browser_type", json!({"text": "a"})),
         ("browser_press", json!({"key": "Enter"})),
         ("browser_scroll", json!({"dy": 100})),
+        ("browser_upload", json!({"ref": "@e1", "paths": ["a.txt"]})),
+        ("browser_download", json!({"ref": "@e3"})),
     ] {
-        assert_eq!(
-            code(&driver.run(tool, args)),
-            "browser_user_active",
-            "{tool}"
-        );
+        let out = driver.run(tool, args);
+        assert_eq!(code(&out), "browser_user_control", "{tool}");
+        assert!(text(&out).contains("in 12 s"), "{}", text(&out));
     }
     assert!(page.script.calls("Input.dispatchMouseEvent").is_empty());
+    assert_eq!(page.script.calls("Input.dispatchKeyEvent").len(), 2);
     assert!(!driver.run("browser_snapshot", json!({})).is_error);
+    // Every command, refused or not, tells the app the agent used the page.
+    let uses = page.agent_uses.borrow();
+    assert_eq!(uses.len(), 10);
+    assert!(uses.iter().all(|s| *s == fake::scope()));
 }
 
 #[test]
@@ -601,7 +617,8 @@ fn commands_time_out_and_free_the_page() {
     assert!(text(&slow).contains("30 s"));
     assert!(!next.borrow().as_ref().unwrap().is_error);
     assert_eq!(page.leases.get(), 0);
-    assert!((30_000..31_000).contains(&host.clock.now()));
+    // The press after it reads nothing from the stuck page, briefly.
+    assert!((30_000..36_000).contains(&host.clock.now()));
 }
 
 #[test]
@@ -802,7 +819,7 @@ fn keys_text_and_fields() {
     let page = page_with(&host, 1);
     let mut driver = Driver::new(&host);
     let press = driver.run("browser_press", json!({"key": "Meta+A"}));
-    assert_eq!(text(&press), "Pressed Meta+A.");
+    assert_eq!(text(&press), "Pressed Meta+A. Nothing on the page changed.");
     let keys = page.script.calls("Input.dispatchKeyEvent");
     assert_eq!(keys[0]["type"], "rawKeyDown");
     assert_eq!(keys[0]["modifiers"], 4);
@@ -818,7 +835,7 @@ fn keys_text_and_fields() {
     let typed = driver.run("browser_type", json!({"text": "Hé\n", "ref": "@e1"}));
     assert_eq!(
         text(&typed),
-        "Typed 3 characters into @e1 (textbox \"Email\")."
+        "Typed 3 characters into @e1 (textbox \"Email\"). Nothing on the page changed."
     );
     assert_eq!(page.script.calls("DOM.focus")[0]["backendNodeId"], 104);
     let keys = page.script.calls("Input.dispatchKeyEvent");
@@ -849,7 +866,7 @@ fn keys_text_and_fields() {
     );
     assert_eq!(
         text(&fill),
-        "Filled @e1 (textbox \"Email\") with \"ann@example.com\"."
+        "Filled @e1 (textbox \"Email\") with \"ann@example.com\". Nothing on the page changed."
     );
     assert_eq!(
         page.script.calls("Input.insertText")[1]["text"],
@@ -926,10 +943,17 @@ fn screenshots() {
     assert_eq!(params["captureBeyondViewport"], false);
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("shots/full.jpg");
+    let project = std::fs::canonicalize(dir.path()).unwrap();
+    *host.project.borrow_mut() = Some(project.to_str().unwrap().to_owned());
+    let path = project.join("shots/full.jpg");
+    let outside = driver.run(
+        "browser_screenshot",
+        json!({"path": project.parent().unwrap().join("x.jpg").to_str().unwrap()}),
+    );
+    assert_eq!(code(&outside), "browser_path_refused");
     let full = driver.run(
         "browser_screenshot",
-        json!({"full_page": true, "path": path.to_str().unwrap()}),
+        json!({"full_page": true, "path": "shots/full.jpg"}),
     );
     assert!(text(&full).contains("its first 16384 CSS px"));
     assert!(text(&full).contains(&format!("Saved to {}.", path.display())));
@@ -1063,4 +1087,524 @@ fn cap_cuts_at_a_line_end() {
         5000 - kept
     )));
     assert_eq!(cap("short".into(), "x"), "short");
+}
+
+/// A project folder for the calls, symlinks resolved.
+fn project(host: &Rc<FakeHost>) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = std::fs::canonicalize(dir.path()).unwrap().join("project");
+    std::fs::create_dir_all(&path).unwrap();
+    *host.project.borrow_mut() = Some(path.to_str().unwrap().to_owned());
+    (dir, path)
+}
+
+/// The login form with the button renamed and an alert added.
+fn login_failed() -> Value {
+    json!({"nodes": [
+        node("1", "RootWebArea", "Log in", 1, &["2"]),
+        node("2", "main", "", 2, &["3", "4", "5", "6", "7"]),
+        node("3", "heading", "Log in", 3, &[]),
+        node("4", "textbox", "Email", 104, &[]),
+        node("5", "textbox", "Password", 105, &[]),
+        node("6", "button", "Try again", 106, &[]),
+        node("7", "link", "Forgot password?", 107, &[]),
+    ]})
+}
+
+#[test]
+fn a_click_says_what_it_did() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let script = Rc::downgrade(&page.script);
+    let tabs = Rc::downgrade(&host);
+    page.script.on("Input.dispatchMouseEvent", move |p, _| {
+        if p["type"] == "mouseReleased" {
+            let script = script.upgrade().unwrap();
+            script.reply("Accessibility.getFullAXTree", login_failed());
+            script.emit(
+                "Runtime.exceptionThrown",
+                json!({"exceptionDetails": {"text": "Uncaught", "exception": {"description": "Error: boom"}}}),
+            );
+            script.emit(
+                "Page.downloadWillBegin",
+                json!({"frameId": "F", "guid": "g", "url": "https://example.com/r.csv", "suggestedFilename": "r.csv"}),
+            );
+            let tabs = tabs.upgrade().unwrap();
+            let popup = FakePage::new(7);
+            popup.info.borrow_mut().url = "https://example.com/help".into();
+            tabs.pages.borrow_mut().push(popup);
+        }
+        Ok(json!({}))
+    });
+    let click = text(&driver.run("browser_click", json!({"ref": "@e3"})));
+    assert_eq!(
+        click,
+        "Clicked @e3 (button \"Log in\"). It opened page 7 (https://example.com/help). \
+It started a download of \"r.csv\" (https://example.com/r.csv). Console error: \"Error: boom\".\n\
+The page changed (+ added, - removed, ~ changed):\n\
+~   [@e3] button \"Try again\"\n\
++   [@e4] link \"Forgot password?\""
+    );
+    // The delta is the new baseline: the same page again is no change.
+    let again = text(&driver.run("browser_press", json!({"key": "Tab"})));
+    assert_eq!(again, "Pressed Tab. Nothing on the page changed.");
+    let delta = text(&driver.run("browser_snapshot", json!({"delta": true})));
+    assert!(
+        delta.ends_with(": nothing changed since your last snapshot."),
+        "{delta}"
+    );
+}
+
+#[test]
+fn a_big_change_asks_for_a_snapshot() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let mut nodes = vec![node(
+        "1",
+        "RootWebArea",
+        "List",
+        1,
+        &(0..60)
+            .map(|i| format!("n{i}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )];
+    for i in 0..60 {
+        nodes.push(node(
+            &format!("n{i}"),
+            "button",
+            &format!("Item {i}"),
+            1000 + i,
+            &[],
+        ));
+    }
+    let big = json!({"nodes": nodes});
+    let script = Rc::downgrade(&page.script);
+    page.script.on("Input.dispatchKeyEvent", move |p, _| {
+        if p["type"] == "keyUp" {
+            script
+                .upgrade()
+                .unwrap()
+                .reply("Accessibility.getFullAXTree", big.clone());
+        }
+        Ok(json!({}))
+    });
+    let press = text(&driver.run("browser_press", json!({"key": "Enter"})));
+    assert!(
+        press.ends_with("The page changed a lot (65 lines); take a browser_snapshot to see it."),
+        "{press}"
+    );
+}
+
+#[test]
+fn a_quiet_dom_is_not_read_again() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let count = Rc::new(std::cell::Cell::new(5.0));
+    let counter = count.clone();
+    page.script
+        .reply("Page.createIsolatedWorld", json!({"executionContextId": 9}));
+    page.script.on("Runtime.evaluate", move |p, _| {
+        let expression = p["expression"].as_str().unwrap_or("");
+        Ok(if p["contextId"] == 9 {
+            assert!(expression.contains("__monocodeChanges"));
+            json!({"result": {"type": "number", "value": counter.get()}})
+        } else if expression.starts_with("[location.href") {
+            json!({"result": {"value": ["https://example.com/", "Example", "complete"]}})
+        } else {
+            json!({"result": {"type": "undefined"}})
+        })
+    });
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let trees = || page.script.calls("Accessibility.getFullAXTree").len();
+    let read = trees();
+    let press = text(&driver.run("browser_press", json!({"key": "Tab"})));
+    assert_eq!(press, "Pressed Tab. Nothing on the page changed.");
+    assert_eq!(trees(), read, "no snapshot when nothing moved");
+    // The world is made once per document.
+    assert_eq!(page.script.calls("Page.createIsolatedWorld").len(), 1);
+    assert_eq!(
+        page.script.calls("Page.createIsolatedWorld")[0]["frameId"],
+        "F"
+    );
+    // The DOM moved: the page is read again.
+    let script = Rc::downgrade(&page.script);
+    let moved = count.clone();
+    page.script.on("Input.dispatchKeyEvent", move |p, _| {
+        if p["type"] == "keyUp" {
+            moved.set(6.0);
+            script
+                .upgrade()
+                .unwrap()
+                .reply("Accessibility.getFullAXTree", login_failed());
+        }
+        Ok(json!({}))
+    });
+    let press = text(&driver.run("browser_press", json!({"key": "Enter"})));
+    assert!(press.contains("~   [@e3] button \"Try again\""), "{press}");
+    assert!(trees() > read);
+    assert_eq!(page.script.calls("Page.createIsolatedWorld").len(), 1);
+}
+
+#[test]
+fn an_action_waits_for_the_navigation_it_started() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let loader = loader_of(&page);
+    let script = Rc::downgrade(&page.script);
+    let started = Rc::new(std::cell::Cell::new(false));
+    let start = started.clone();
+    page.script.on("Input.dispatchKeyEvent", move |p, _| {
+        if p["type"] == "keyUp" {
+            start.set(true);
+            script
+                .upgrade()
+                .unwrap()
+                .emit("Page.frameStartedLoading", json!({"frameId": "F"}));
+        }
+        Ok(json!({}))
+    });
+    // The new document commits a while after the request starts.
+    let polls = Rc::new(std::cell::Cell::new(0));
+    let switch = loader.clone();
+    page.script.on("Page.getFrameTree", move |_, _| {
+        if started.get() {
+            polls.set(polls.get() + 1);
+            if polls.get() > 10 {
+                *switch.borrow_mut() = "L2".into();
+            }
+        }
+        Ok(json!({"frameTree": {"frame": {"id": "F", "loaderId": *switch.borrow(), "url": "https://example.com/"}}}))
+    });
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let at = host.clock.now();
+    let press = text(&driver.run("browser_press", json!({"key": "Enter"})));
+    assert!(
+        press.starts_with("Pressed Enter. The page navigated: Page 1 is at https://example.com/"),
+        "{press}"
+    );
+    assert!(press.ends_with("Refs of earlier snapshots no longer work."));
+    assert!(host.clock.now() - at >= 400, "it waited for the commit");
+    // A stop without a new document (a download, a 204) ends the wait.
+    let script = Rc::downgrade(&page.script);
+    page.script.on("Input.dispatchKeyEvent", move |p, _| {
+        if p["type"] == "keyUp" {
+            let script = script.upgrade().unwrap();
+            script.emit("Page.frameStartedLoading", json!({"frameId": "F"}));
+            script.emit("Page.frameStoppedLoading", json!({"frameId": "F"}));
+        }
+        Ok(json!({}))
+    });
+    let at = host.clock.now();
+    let press = text(&driver.run("browser_press", json!({"key": "Enter"})));
+    assert!(!press.contains("navigated"), "{press}");
+    assert!(host.clock.now() - at < 1_000);
+}
+
+#[test]
+fn delta_snapshots() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let loader = loader_of(&page);
+    let mut driver = Driver::new(&host);
+    let first = text(&driver.run("browser_snapshot", json!({"delta": true})));
+    assert!(
+        first.contains(
+            "(There is no earlier snapshot to compare; all of it follows.)\n[Main Content]"
+        )
+    );
+    let same = text(&driver.run("browser_snapshot", json!({"delta": true})));
+    assert_eq!(
+        same,
+        "Page 1 \"Log in\" https://example.com/: nothing changed since your last snapshot."
+    );
+    page.script
+        .reply("Accessibility.getFullAXTree", login_failed());
+    let changed = text(&driver.run("browser_snapshot", json!({"delta": true})));
+    assert_eq!(
+        changed,
+        "Page 1 \"Log in\" https://example.com/, what changed since your last snapshot (+ added, - removed, ~ changed):\n\
+~   [@e3] button \"Try again\"\n\
++   [@e4] link \"Forgot password?\""
+    );
+    // Another mode is not compared with.
+    let full = text(&driver.run("browser_snapshot", json!({"delta": true, "mode": "full"})));
+    assert!(full.contains("another mode, selector or depth"));
+    // A new document starts over.
+    *loader.borrow_mut() = "L2".into();
+    let new = text(&driver.run("browser_snapshot", json!({"delta": true, "mode": "full"})));
+    assert!(new.contains("(It is a new document since your last snapshot; all of it follows.)"));
+}
+
+#[test]
+fn expect_url_guards_every_page_tool() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    for (tool, args) in [
+        (
+            "browser_click",
+            json!({"ref": "@e3", "expect_url": "https://shop.test/*"}),
+        ),
+        (
+            "browser_snapshot",
+            json!({"expect_url": "https://example.com/other"}),
+        ),
+        (
+            "browser_console",
+            json!({"expect_url": "https://shop.test/"}),
+        ),
+        (
+            "browser_goto",
+            json!({"url": "a.test", "expect_url": "http://example.com/"}),
+        ),
+    ] {
+        let out = driver.run(tool, args);
+        assert_eq!(code(&out), "browser_expected_url_mismatch", "{tool}");
+        assert!(text(&out).contains("page 1 is at https://example.com/"));
+    }
+    assert!(page.script.calls("Input.dispatchMouseEvent").is_empty());
+    assert!(page.script.calls("Page.navigate").is_empty());
+    for pattern in [
+        "https://example.com/",
+        "https://example.com",
+        "https://example.*/",
+    ] {
+        let ok = driver.run(
+            "browser_click",
+            json!({"ref": "@e3", "expect_url": pattern}),
+        );
+        assert!(!ok.is_error, "{pattern}: {}", text(&ok));
+    }
+}
+
+#[test]
+fn pdfs_are_saved_in_the_project() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    let (_dir, project) = project(&host);
+    let pdf = b"%PDF-1.7 fake";
+    page.script.reply(
+        "Page.printToPDF",
+        json!({"data": base64::engine::general_purpose::STANDARD.encode(pdf)}),
+    );
+    let mut driver = Driver::new(&host);
+    let out = driver.run(
+        "browser_pdf",
+        json!({"path": "out/page.pdf", "landscape": true}),
+    );
+    let path = project.join("out/page.pdf");
+    assert_eq!(
+        text(&out),
+        format!("Saved page 1 as a PDF (13 B) to {}.", path.display())
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), pdf);
+    let params = &page.script.calls("Page.printToPDF")[0];
+    assert_eq!(
+        (
+            params["landscape"].as_bool(),
+            params["printBackground"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+    for escape in ["../page.pdf", "/tmp/page.pdf"] {
+        let refused = driver.run("browser_pdf", json!({"path": escape}));
+        assert_eq!(code(&refused), "browser_path_refused", "{escape}");
+    }
+    assert_eq!(page.script.calls("Page.printToPDF").len(), 1);
+    page.script.on("Page.printToPDF", |_, _| {
+        Err("PrintToPDF is not implemented".into())
+    });
+    let failed = driver.run("browser_pdf", json!({"path": "b.pdf"}));
+    assert_eq!(code(&failed), "browser_cdp_error");
+    assert!(driver.run("browser_pdf", json!({})).is_error);
+}
+
+/// Answers the file-input lookups: the ref's input is `input-1`, node 500.
+fn file_inputs(page: &FakePage, found: bool, multiple: bool) {
+    page.script.on("Runtime.callFunctionOn", move |p, _| {
+        let function = p["functionDeclaration"].as_str().unwrap_or("");
+        Ok(if function.contains("isConnected") {
+            json!({"result": {"type": "boolean", "value": true}})
+        } else if function.contains("input[type=file]") {
+            if found {
+                json!({"result": {"type": "object", "objectId": "input-1"}})
+            } else {
+                json!({"result": {"type": "object", "subtype": "null", "value": null}})
+            }
+        } else if function.contains("this.multiple") {
+            json!({"result": {"type": "boolean", "value": multiple}})
+        } else {
+            json!({"result": {"type": "undefined"}})
+        })
+    });
+    page.script.on("DOM.describeNode", |p, _| {
+        assert_eq!(p["objectId"], "input-1");
+        Ok(json!({"node": {"backendNodeId": 500}}))
+    });
+}
+
+#[test]
+fn uploads_choose_project_files_only() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let (dir, project) = project(&host);
+    std::fs::write(project.join("a.txt"), "a").unwrap();
+    std::fs::write(project.join("b.png"), "b").unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "s").unwrap();
+    std::os::unix::fs::symlink(&secret, project.join("link.txt")).unwrap();
+    file_inputs(&page, true, false);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let out = driver.run("browser_upload", json!({"ref": "@e3", "paths": ["a.txt"]}));
+    assert_eq!(
+        text(&out),
+        "Chose \"a.txt\" for @e3 (button \"Log in\"). Nothing on the page changed."
+    );
+    let set = &page.script.calls("DOM.setFileInputFiles")[0];
+    assert_eq!(set["backendNodeId"], 500);
+    assert_eq!(
+        set["files"],
+        json!([project.join("a.txt").to_str().unwrap()])
+    );
+    // One file only, for an input without multiple.
+    let two = driver.run(
+        "browser_upload",
+        json!({"ref": "@e3", "paths": ["a.txt", "b.png"]}),
+    );
+    assert!(two.is_error && text(&two).contains("takes one file"));
+    for escape in ["link.txt", "../secret.txt", secret.to_str().unwrap()] {
+        let refused = driver.run("browser_upload", json!({"ref": "@e3", "paths": [escape]}));
+        assert_eq!(code(&refused), "browser_path_refused", "{escape}");
+    }
+    let missing = driver.run(
+        "browser_upload",
+        json!({"ref": "@e3", "paths": ["none.txt"]}),
+    );
+    assert!(missing.is_error && text(&missing).contains("there is no file none.txt"));
+    assert!(
+        driver
+            .run("browser_upload", json!({"ref": "@e3", "paths": []}))
+            .is_error
+    );
+    file_inputs(&page, false, false);
+    let none = driver.run("browser_upload", json!({"ref": "@e3", "paths": ["a.txt"]}));
+    assert!(none.is_error && text(&none).contains("is not a file input"));
+    assert_eq!(page.script.calls("DOM.setFileInputFiles").len(), 1);
+}
+
+#[test]
+fn downloads_land_in_the_project() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let (dir, project) = project(&host);
+    *page.download.borrow_mut() = Some(Ok(("r.csv".into(), b"a,b\n".to_vec())));
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let out = driver.run("browser_download", json!({"ref": "@e3"}));
+    let file = project.join("downloads/r.csv");
+    assert_eq!(
+        text(&out),
+        format!(
+            "Downloaded {} (4 B) from clicking @e3 (button \"Log in\").",
+            file.display()
+        )
+    );
+    assert_eq!(page.download_dirs.borrow()[0], project.join("downloads"));
+    assert_eq!(page.script.calls("Input.dispatchMouseEvent").len(), 3);
+
+    // By URL, into a folder of the agent's choice.
+    let out = driver.run(
+        "browser_download",
+        json!({"url": "https://example.com/r.csv", "dir": "data/in"}),
+    );
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(project.join("data/in/r.csv").is_file());
+    let fetch = page
+        .script
+        .calls("Runtime.evaluate")
+        .into_iter()
+        .find(|p| {
+            p["expression"]
+                .as_str()
+                .unwrap()
+                .contains("a.download = ''")
+        })
+        .expect("the page fetched the URL");
+    assert!(
+        fetch["expression"]
+            .as_str()
+            .unwrap()
+            .contains("\"https://example.com/r.csv\"")
+    );
+    assert_eq!(fetch["userGesture"], true);
+
+    // Folders outside the project, bad URLs, both or neither.
+    std::os::unix::fs::symlink(dir.path(), project.join("up")).unwrap();
+    for (args, expected) in [
+        (json!({"ref": "@e3", "dir": "../x"}), "browser_path_refused"),
+        (json!({"ref": "@e3", "dir": "up"}), "browser_path_refused"),
+        (json!({"url": "file:///etc/passwd"}), "browser_url_refused"),
+    ] {
+        assert_eq!(
+            code(&driver.run("browser_download", args.clone())),
+            expected,
+            "{args}"
+        );
+    }
+    assert!(driver.run("browser_download", json!({})).is_error);
+    assert!(
+        driver
+            .run("browser_download", json!({"ref": "@e3", "url": "a.test"}))
+            .is_error
+    );
+    assert_eq!(page.download_dirs.borrow().len(), 2);
+
+    // Failed, and never finished.
+    *page.download.borrow_mut() = Some(Err("canceled".into()));
+    let failed = driver.run("browser_download", json!({"ref": "@e3"}));
+    assert_eq!(code(&failed), "browser_download_failed");
+    assert!(text(&failed).contains("canceled"));
+    *page.download.borrow_mut() = None;
+    let at = host.clock.now();
+    let slow = driver.run(
+        "browser_download",
+        json!({"ref": "@e3", "timeout_ms": 2000}),
+    );
+    assert_eq!(code(&slow), "browser_timeout");
+    assert!(text(&slow).contains("in 2 s"));
+    assert!((2_000..3_000).contains(&(host.clock.now() - at)));
+}
+
+#[test]
+fn scrolling_a_ref_reports_its_scroll_container() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    page.script.on("Runtime.callFunctionOn", |p, _| {
+        let function = p["functionDeclaration"].as_str().unwrap_or("");
+        Ok(if function.contains("isConnected") {
+            json!({"result": {"value": true}})
+        } else if function.contains("scrollTop") {
+            json!({"result": {"value": [0, 300, 2000, 400, false]}})
+        } else {
+            json!({"result": {"type": "undefined"}})
+        })
+    });
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let out = text(&driver.run("browser_scroll", json!({"ref": "@e3", "dy": 300})));
+    assert_eq!(
+        out,
+        "Scrolled @e3 (button \"Log in\") into view by (0, 300); its scroll container is scrolled to x=0, y=300 of 2000 px (400 px are shown)."
+    );
 }
