@@ -1,6 +1,6 @@
 # Browser: Chromium tabanlı tam browser — bağlam ve kararlar
 
-Durum: karar dokümanı; Faz 0–2 bitti. Başlangıç: 2026-11-20. Branch: `browser/cef-spike`.
+Durum: karar dokümanı; Faz 0–3 bitti. Başlangıç: 2026-11-20. Branch: `browser/cef-spike`.
 Bu doküman işin **neden**ini, verilen **bütün kararları**, teknik **detayları** ve **faz planını**
 (§12) toplar. Faz bitişleri ve dokümanın güncel tutulma kuralı §13'te.
 Araştırma raporları `research/` altında (İngilizce):
@@ -402,8 +402,9 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 | Overlay | Child view üstüne GPUI çizemez. Faz 1: son kare görüntüsü (K16); tooltip'ler ve ortak yardımcıları kullanmayan overlay'ler hâlâ sayfanın altında kalır. Kalıcı çözüm Faz 3 (OSR). |
 | Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır. Faz 2: agent'ın sürdüğü sekme gizlenmez, pencere dışında çizer (K23); pencere ekran dışındayken Chromium'un görünen sekmeyi de gizlediği görüldü ve aynı yolla çözüldü. |
 | DevTools yapışması | **Çözüldü (Faz 2, K28):** frontend kendi Alloy view'umuzda, CDP proxy'si üzerinden. |
-| Battery Saver | **Faz 2 bulgusu:** pil %20 altındayken Chromium sayfaları 30 fps'e kilitler (Chrome'da da). Politika kararı bekliyor. |
-| Başlangıç kilitlenmesi | **Faz 2 bulgusu:** ~15 açılışta 2 kez `cef_initialize` içinde malloc kilidinde bekleme. İncelenecek. |
+| Battery Saver | **Çözüldü (Faz 3, K52):** Chrome gibi açık, Settings'ten kapatılabilir. |
+| Başlangıç kilitlenmesi | **Çözüldü (Faz 3):** `setlocale` ↔ `fork()` kilit sırası çakışması; `main`'in başında tek thread'liyken `setlocale`. |
+| Çıkıştan sonra kalan süreç | **Faz 3 bulgusu:** ağır fork yükünde `exec` öncesi takılan fork çocuğu profili tutuyor. Çözüm uygulama geneli: `process.rs`'te `posix_spawn` (ayrı iş). |
 | Bellek | Faz 2 ölçümü (`phase-2-done.md`): 1 sekmede helper'lar 482 MB, 5 sekmede 1077 MB (Chrome: 612 / 1063). Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
 | EDR | Framework artık uygulamayla ve bizim imzamızla geliyor; indirme kaynaklı risk kalktı. |
 | Sandbox ↔ dağıtım | **Çözüldü (K7 revizyonu):** sandbox yalnızca uygulama bundle'ından okumaya izin veriyor; framework gömüldü. |
@@ -445,7 +446,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   her popup'ta `window.opener`, sahiplenilmeyen popup sızıntısı, dönüşte diyaloğa odak,
   scroll fps / input gecikmesi ölçümü (`phase-1-done.md`).
 
-### Faz 3 — Gelişmiş agent ve geliştirici özellikleri (kararlar K43–K53)
+### Faz 3 — Gelişmiş agent ve geliştirici özellikleri (bitti, `phase-3-done.md`; kararlar K43–K53)
 - Faz 2'den devralınan: Battery Saver ayarı (K52), başlangıç kilitlenmesi, programlı scroll'da uzun kareler, yapışık DevTools eksikleri, küçük kusurlar (`phase-2-done.md`).
 - Aksiyon etkileri (K45), delta snapshot ve `expect_url` (K46).
 - Varlık UI'ı (K47) ve kontrol modeli (K48).
@@ -455,6 +456,7 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 - ~~OSR~~ → Faz 6 (K43, K44).
 
 ### Faz 4 — Tam browser
+- Faz 3'ten devralınan: yapışık DevTools'ta ~48 px görünüm farkı, DevTools sağ tık menüsünde "Send to Agent", popup indirmelerinin klasör yönlendirmesi, programlı scroll (`phase-3-done.md`).
 - Memory Saver (discard) ve throttle lease'leri.
 - Site izinleri, sertifika istisnası, geçmiş, yeni sekme sayfası, ses kapatma, yazdırma.
 - Keychain tabanlı şifre yöneticisi, autofill, Touch ID, passkey (USB).
@@ -497,7 +499,7 @@ Her faz bittiğinde:
 | 0 | Bitti | `phase-0-done.md` |
 | 1 | Bitti | `phase-1-done.md` |
 | 2 | Bitti | `phase-2-done.md` |
-| 3 | Sürüyor (başlangıç 2026-11-22, kararlar K43–K53) | — |
+| 3 | Bitti | `phase-3-done.md` |
 | 4 | Başlamadı | — |
 | 5 | Başlamadı | — |
 | 6 | Başlamadı | — |
