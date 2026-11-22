@@ -4,6 +4,7 @@
 //! - [`cdp`]: a page's CDP multiplexer, shared by everyone who speaks CDP to it.
 //! - [`host`]: what the app gives: pages of a scope, opening, closing, timers.
 //! - [`log`]: a page's console and network log (K36).
+//! - [`grab`]: the element grab, a picked element for an agent (K49).
 //! - [`tools`]: the tool set and its implementation over [`host`].
 //! - [`bridge`]: the MCP server: loopback listener, session tokens, the
 //!   `browser-mcp` stdio subcommand, provider wiring.
@@ -16,6 +17,7 @@
 pub mod bridge;
 pub mod cdp;
 pub mod control;
+pub mod grab;
 pub mod host;
 pub mod log;
 pub mod proxy;

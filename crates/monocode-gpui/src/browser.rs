@@ -36,6 +36,9 @@ use gpui::{
 };
 use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
+mod grab;
+pub(crate) use grab::ToggleGrab;
+
 use crate::{
     input::{self, Input},
     modal,
@@ -389,6 +392,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-+"), ZoomIn, page),
         KeyBinding::new(&format!("{m}--"), ZoomOut, page),
         KeyBinding::new(&format!("{m}-0"), ResetZoom, page),
+        // Not ⇧⌘G, which is Find Previous.
+        KeyBinding::new(&format!("{m}-alt-g"), ToggleGrab, page),
         // The find field is a Composer, whose ⇧Enter would add a newline.
         KeyBinding::new("shift-enter", FindPrevious, Some("BrowserFind > Composer")),
         KeyBinding::new("escape", CloseFind, Some(FIND_CONTEXT)),
@@ -477,6 +482,8 @@ pub(crate) enum PageRequest {
     },
     /// The page closed itself (`window.close()`).
     Close,
+    /// An element the user grabbed for an agent (K49), or why it failed.
+    Grab(grab::GrabResult),
 }
 
 /// Something the page waits on the user for, shown as a modal over it.
@@ -550,6 +557,7 @@ pub(crate) struct BrowserPage {
     presence_timer: Option<gpui::Task<()>>,
     /// An agent waits for the page's next download (K50).
     download_wait: Option<download_into::DownloadWait>,
+    grab: grab::GrabMode,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -630,6 +638,7 @@ impl BrowserPage {
             _prompt_subscriptions: Vec::new(),
             presence_timer: None,
             download_wait: None,
+            grab: Default::default(),
         }
         .watch_presence(cx)
     }
@@ -726,6 +735,7 @@ impl BrowserPage {
                     find.result = Some((count, active_ordinal));
                 }
             }
+            BrowserEvent::GrabAt { x, y } => self.grab_at(x, y, cx),
             BrowserEvent::Focused => self.follow_page_focus(cx),
             other => self.on_page_event(other, cx),
         }
@@ -1028,6 +1038,7 @@ impl BrowserPage {
                         .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
                 )
             })
+            .child(self.grab_button(ready, cx))
             .child(
                 icon_button_enabled("browser-devtools", "DevTools", "code", ready)
                     .when(self.devtools.is_some(), |b| b.bg(content(0.1)))
@@ -1550,6 +1561,8 @@ impl Render for BrowserPage {
                 cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(zoom_step(this.zoom, -1), cx)),
             )
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
+            .on_action(cx.listener(|this, _: &ToggleGrab, window, cx| this.toggle_grab(window, cx)))
+            .on_key_down(cx.listener(|this, event, _, cx| this.grab_key(event, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -3292,6 +3305,10 @@ mod monocode_cef {
             final_update: bool,
         },
         Focused,
+        GrabAt {
+            x: i32,
+            y: i32,
+        },
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]

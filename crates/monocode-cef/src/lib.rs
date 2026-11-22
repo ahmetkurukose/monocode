@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod view;
 
 mod capture;
+mod context_menu;
 mod devtools;
 
 mod dialogs;

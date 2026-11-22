@@ -86,6 +86,12 @@ pub enum BrowserEvent {
     },
     /// The page took the keyboard (a click in it, or [`BrowserView::set_focus`]).
     Focused,
+    /// The user chose "Send to Agent" in the page's context menu, right-
+    /// clicking at `(x, y)` in the view (points, page zoom not applied).
+    GrabAt {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// How a page is created.
@@ -414,6 +420,8 @@ mod client {
             download: cef::DownloadHandler,
             request: cef::RequestHandler,
             dialogs: cef::JsdialogHandler,
+            // "Send to Agent" (context.md K49).
+            context_menu: cef::ContextMenuHandler,
         }
 
         impl Client {
@@ -448,6 +456,10 @@ mod client {
             fn jsdialog_handler(&self) -> Option<cef::JsdialogHandler> {
                 Some(self.dialogs.clone())
             }
+
+            fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+                Some(self.context_menu.clone())
+            }
         }
     }
 }
@@ -463,7 +475,8 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
         PageFocusHandler::new(state.clone()),
         crate::download::PageDownloadHandler::new(state.clone()),
         crate::dialogs::PageRequestHandler::new(state.clone()),
-        crate::dialogs::PageDialogHandler::new(state),
+        crate::dialogs::PageDialogHandler::new(state.clone()),
+        crate::context_menu::PageContextMenuHandler::new(state),
     )
 }
 
