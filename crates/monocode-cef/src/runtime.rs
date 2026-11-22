@@ -17,6 +17,23 @@ use cef::*;
 /// framework is, so that they need not derive it from their own path.
 pub const FRAMEWORK_SWITCH: &str = "monocode-cef-framework";
 
+/// The keychain item Chromium keeps its cookie and storage key in (macOS).
+/// Our own: CEF's default, "Chromium Safe Storage", is the item of the
+/// Chromium browser the user may have installed.
+pub const KEYCHAIN_SERVICE: &str = "Monocode Browser Safe Storage";
+pub const KEYCHAIN_ACCOUNT: &str = "Monocode";
+
+/// Whether the keychain can keep the app's access across builds: true when
+/// the app is signed with a team's identity. Ad-hoc signed builds should use
+/// [`RuntimeConfig::mock_keychain`], or every new build asks for the login
+/// keychain password.
+pub fn keychain_usable() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mac::signing::has_team_identity();
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
 /// How to start CEF.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -29,8 +46,9 @@ pub struct RuntimeConfig {
     /// Root of all browser profiles (`root_cache_path`).
     pub cache_root: PathBuf,
     /// Encrypt cookies with a fixed key instead of the OS keychain. For
-    /// development builds, whose signature changes on every build and would
-    /// otherwise ask for keychain access each time.
+    /// development and ad-hoc signed builds, whose signature changes on every
+    /// build and would otherwise ask for keychain access each time
+    /// ([`keychain_usable`]).
     pub mock_keychain: bool,
     /// UI locale, e.g. `en-US`. Empty: CEF's default.
     pub locale: String,
@@ -236,6 +254,8 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
         root_cache_path: path(&config.cache_root),
         cache_path: path(&profile),
         persist_session_cookies: 1,
+        keychain_service_name: KEYCHAIN_SERVICE.into(),
+        keychain_account_name: KEYCHAIN_ACCOUNT.into(),
         locale: config.locale.as_str().into(),
         log_file: config.log_file.as_deref().map(path).unwrap_or_default(),
         log_severity: if config.log_file.is_some() {

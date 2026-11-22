@@ -289,6 +289,11 @@ Monocode.app (GPUI, Rust)               ← CEF browser process burada (UI threa
   `crates/monocode-gpui/macos/Entitlements.plist`, helper'lar
   `crates/monocode-cef/macos/Helper.entitlements` (`allow-jit`,
   `allow-unsigned-executable-memory`).
+- **Anahtarlık (2026-11-22):** Chromium cookie/depolama anahtarını kendi kaydımızda tutar
+  (`keychain_service_name` = "Monocode Browser Safe Storage"); CEF'in varsayılanı
+  "Chromium Safe Storage" kullanıcının kurulu Chromium'unun kaydıdır, kullanılmaz. Takım
+  kimliği olmayan (ad-hoc) imzalı build'lerde anahtarlık hiç kullanılmaz (`use-mock-keychain`):
+  izin imzanın hash'ine bağlı olduğundan her build login şifresi sorup sayfayı bekletiyordu.
 - Chromium sandbox'ı **açık**: GPU, ağ (`network`), depolama (`service`) ve renderer süreçleri
   sandbox'lı çalışır (Faz 0'da doğrulandı).
 - **Kurumsal ortam notu** (geliştiricinin makinesi): Kandji/Iru MDM, SentinelOne EDR,

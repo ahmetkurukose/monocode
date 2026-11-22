@@ -197,9 +197,10 @@ fn start(profiles: &Path) -> Result<(), String> {
         framework_dir,
         helper: find_helper(&frameworks).ok_or(missing)?,
         cache_root: profiles.to_path_buf(),
-        // A development build's signature changes with every build, which
-        // would ask for keychain access each time.
-        mock_keychain: cfg!(debug_assertions),
+        // A development or ad-hoc signed build's signature changes with
+        // every build, which would ask for the keychain password each time
+        // (and hold the page up until it is answered).
+        mock_keychain: cfg!(debug_assertions) || !monocode_cef::runtime::keychain_usable(),
         locale: String::new(),
         log_file: Some(profiles.join("chromium.log")),
     };
@@ -3058,6 +3059,9 @@ mod monocode_cef {
             Err("the browser is not available on this platform yet")
         }
         pub const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
+        pub fn keychain_usable() -> bool {
+            true
+        }
         pub fn shutdown(_: std::time::Duration) -> bool {
             false
         }
