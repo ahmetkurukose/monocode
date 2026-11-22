@@ -81,12 +81,38 @@ fn native_keeps(stroke: &Keystroke, composing: bool) -> bool {
         )
 }
 
+/// The app shortcuts that still run while a page's docked DevTools have the
+/// keyboard: closing the tab, the DevTools themselves (⌥⌘I), switching tabs
+/// and quitting. Every other key is DevTools': ⌘F searches the panel, ⌘P
+/// opens a file, ⇧⌘P runs a command, ⌘K clears the console, ⌘[ / ⌘]
+/// switch panels and ⌘R reloads the page, as in Chrome.
+fn devtools_lets_app(action: &dyn Action) -> bool {
+    matches!(
+        action.name(),
+        "workspace::CloseTab"
+            | "workspace::ToggleBrowserDevTools"
+            | "workspace::ActivateTab"
+            | "workspace::NextTab"
+            | "workspace::PreviousTab"
+            | "application::Quit"
+    )
+}
+
+/// What has the keyboard, for [`candidates`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Keys {
+    Workspace,
+    /// A browser page, whose bindings outrank the workspace's (page zoom
+    /// over interface zoom).
+    Page,
+    /// A page's docked DevTools: only [`devtools_lets_app`] shortcuts.
+    DevTools,
+}
+
 /// Keymap owns precedence, disabled bindings, physical-key matching and chords.
-/// `browser` adds a browser page's context, whose bindings outrank the
-/// workspace's (page zoom over interface zoom).
-fn candidates(keys: &[Keystroke], browser: bool, cx: &App) -> Vec<KeyBinding> {
+fn candidates(keys: &[Keystroke], focus: Keys, cx: &App) -> Vec<KeyBinding> {
     let mut contexts = vec![KeyContext::parse("Workspace").expect("static workspace key context")];
-    if browser {
+    if focus == Keys::Page {
         contexts.push(KeyContext::parse(BROWSER_CONTEXT).expect("static browser key context"));
     }
     let keymap = cx.key_bindings();
@@ -96,12 +122,29 @@ fn candidates(keys: &[Keystroke], browser: bool, cx: &App) -> Vec<KeyBinding> {
         .into_iter()
         .chain(keymap.possible_next_bindings_for_input(keys, &contexts))
         .filter(|binding| {
-            workspace_action(binding.action()) || (browser && browser_action(binding.action()))
+            let action = binding.action();
+            match focus {
+                Keys::Workspace => workspace_action(action),
+                Keys::Page => workspace_action(action) || browser_action(action),
+                Keys::DevTools => devtools_lets_app(action),
+            }
         })
         .collect()
 }
 
+/// What the focused context stack says has the keyboard.
+fn keys_in(stack: &[KeyContext]) -> Keys {
+    if stack.iter().any(|c| c.contains(DEVTOOLS_CONTEXT)) {
+        Keys::DevTools
+    } else if stack.iter().any(|c| c.contains(BROWSER_CONTEXT)) {
+        Keys::Page
+    } else {
+        Keys::Workspace
+    }
+}
+
 const BROWSER_CONTEXT: &str = crate::browser::KEY_CONTEXT;
+const DEVTOOLS_CONTEXT: &str = crate::browser::DEVTOOLS_KEY_CONTEXT;
 
 pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -> Shortcuts {
     let window_id = window.window_handle().window_id();
@@ -145,19 +188,17 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
             cx.stop_propagation();
             return;
         }
-        // GPUI focus follows a browser page that takes the keyboard, so its
-        // context is in the focused stack while Chromium has the keys.
-        let browser = window
-            .context_stack()
-            .iter()
-            .any(|context| context.contains(BROWSER_CONTEXT));
+        // GPUI focus follows a browser page, or its docked DevTools, that
+        // takes the keyboard, so its context is in the focused stack while
+        // Chromium has the keys.
+        let focus = keys_in(&window.context_stack());
         let mut sequence = pending.borrow_mut();
         sequence.push(event.keystroke.clone());
-        let mut matches = candidates(&sequence, browser, cx);
+        let mut matches = candidates(&sequence, focus, cx);
         if matches.is_empty() && sequence.len() > 1 {
             sequence.clear();
             sequence.push(event.keystroke.clone());
-            matches = candidates(&sequence, browser, cx);
+            matches = candidates(&sequence, focus, cx);
         }
         let action = matches
             .iter()
@@ -277,9 +318,14 @@ mod tests {
     fn a_browser_page_outranks_the_workspace_while_chromium_has_the_keys(cx: &mut TestAppContext) {
         cx.update(|cx| {
             super::super::bind_keys(cx);
-            let first = |stroke: &str, browser| {
+            let first = |stroke: &str, browser: bool| {
                 let keys = [Keystroke::parse(stroke).unwrap()];
-                super::candidates(&keys, browser, cx)
+                let focus = if browser {
+                    super::Keys::Page
+                } else {
+                    super::Keys::Workspace
+                };
+                super::candidates(&keys, focus, cx)
                     .first()
                     .map(|b| b.action().name())
             };
@@ -306,6 +352,62 @@ mod tests {
             assert_eq!(first(&format!("{m}-w"), true), Some("workspace::CloseTab"));
             assert_eq!(first(&format!("{m}-["), true), Some("workspace::VisitBack"));
         });
+    }
+
+    #[gpui::test]
+    fn docked_devtools_keep_their_shortcuts_but_a_few_of_the_apps(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            super::super::bind_keys(cx);
+            let first = |stroke: &str| {
+                let keys = [Keystroke::parse(stroke).unwrap()];
+                super::candidates(&keys, super::Keys::DevTools, cx)
+                    .first()
+                    .map(|b| b.action().name())
+            };
+            let m = if cfg!(target_os = "macos") {
+                "cmd"
+            } else {
+                "ctrl"
+            };
+            // DevTools' own: search, open file, command menu, clear console,
+            // panel switching, reload, zoom; and nothing of the page's.
+            for key in [
+                "f", "p", "shift-p", "k", "[", "]", "r", "shift-r", "l", "=", "-", "0", "b", "t",
+                "shift-f", "d", "j",
+            ] {
+                assert_eq!(first(&format!("{m}-{key}")), None, "{m}-{key}");
+            }
+            assert_eq!(first(&format!("{m}-w")), Some("workspace::CloseTab"));
+            assert_eq!(
+                first(&format!("{m}-alt-i")),
+                Some("workspace::ToggleBrowserDevTools")
+            );
+            assert_eq!(first(&format!("{m}-1")), Some("workspace::ActivateTab"));
+            assert_eq!(first(&format!("{m}-shift-]")), Some("workspace::NextTab"));
+        });
+    }
+
+    #[test]
+    fn the_focused_context_stack_tells_page_devtools_and_workspace_apart() {
+        use gpui::KeyContext;
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            names
+                .iter()
+                .map(|n| KeyContext::parse(n).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            super::keys_in(&stack(&["Workspace"])),
+            super::Keys::Workspace
+        );
+        assert_eq!(
+            super::keys_in(&stack(&["Workspace", "BrowserPage"])),
+            super::Keys::Page
+        );
+        assert_eq!(
+            super::keys_in(&stack(&["Workspace", "BrowserPage", "BrowserDevTools"])),
+            super::Keys::DevTools
+        );
     }
 
     #[gpui::test]
