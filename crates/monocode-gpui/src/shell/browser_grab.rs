@@ -58,6 +58,9 @@ impl Shell {
     }
 
     fn browser_grab_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        if std::env::var_os("MONOCODE_BROWSER_GRAB_DEV").is_some() {
+            eprintln!("MONOCODE_BROWSER_GRAB_DEV: failed: {message}");
+        }
         self.notification_state
             .browser_grab
             .update(cx, |notice, cx| notice.show(message, cx));
@@ -99,6 +102,9 @@ impl Shell {
             let written = work.await;
             let _ = this.update(cx, |this, cx| match written {
                 Ok(paths) => {
+                    if std::env::var_os("MONOCODE_BROWSER_GRAB_DEV").is_some() {
+                        eprintln!("MONOCODE_BROWSER_GRAB_DEV: chat {id} got {paths:?}");
+                    }
                     view.update(cx, |chat, cx| chat.attach_files(paths, cx));
                     this.pending_chat_reveal = Some(id);
                     this.pending_composer_focus = Some(id);
@@ -106,6 +112,57 @@ impl Shell {
                 }
                 Err(error) => this.browser_grab_failed(error, cx),
             });
+        })
+        .detach();
+    }
+
+    /// Development hook, not a user feature: with
+    /// `MONOCODE_BROWSER_GRAB_DEV=<file>` set, the app reads a command a
+    /// script writes to the file, then removes it: `grab <pane> <x> <y>`
+    /// grabs at a point of the view as the context menu's "Send to Agent"
+    /// does, `pick <pane>` starts or stops the picker as ⌥⌘G does, and
+    /// `zoom <pane> <percent>` zooms the page. Where a grab went is logged.
+    pub(super) fn start_browser_grab_dev_hook(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(file) = std::env::var_os("MONOCODE_BROWSER_GRAB_DEV").filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let file = std::path::PathBuf::from(file);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let Ok(command) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let _ = std::fs::remove_file(&file);
+                let words: Vec<i64> = (command.split_whitespace().skip(1))
+                    .filter_map(|w| w.parse().ok())
+                    .collect();
+                let verb = command.split_whitespace().next().unwrap_or("").to_owned();
+                let alive = this.update_in(cx, |this, window, cx| {
+                    let Some(&pane) = words.first() else { return };
+                    let Some(page) = this.browser_page(pane, cx) else {
+                        eprintln!("MONOCODE_BROWSER_GRAB_DEV: no page {pane}");
+                        return;
+                    };
+                    eprintln!(
+                        "MONOCODE_BROWSER_GRAB_DEV: {} on {pane}, for chat {:?}",
+                        command.trim(),
+                        this.browser_grab_target(pane)
+                    );
+                    page.update(cx, |page, cx| match (verb.as_str(), &words[1..]) {
+                        ("grab", [x, y]) => page.grab_at(*x as i32, *y as i32, cx),
+                        ("pick", []) => page.toggle_grab(window, cx),
+                        ("zoom", [percent]) => page.set_zoom(*percent as u16, cx),
+                        _ => eprintln!("MONOCODE_BROWSER_GRAB_DEV: unknown command"),
+                    });
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
         })
         .detach();
     }

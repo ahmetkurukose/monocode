@@ -98,7 +98,7 @@ impl BrowserPage {
     }
 
     /// The context menu's "Send to Agent", at `(x, y)` in the view.
-    pub(super) fn grab_at(&mut self, x: i32, y: i32, cx: &mut Context<Self>) {
+    pub(crate) fn grab_at(&mut self, x: i32, y: i32, cx: &mut Context<Self>) {
         let Some(cdp) = self.cdp() else {
             return;
         };

@@ -795,7 +795,7 @@ impl BrowserPage {
         }
     }
 
-    fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
+    pub(crate) fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
         if percent == self.zoom {
             return;
         }

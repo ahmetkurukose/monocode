@@ -7713,6 +7713,7 @@ impl Render for Shell {
             }
             // For testing the agent layer from outside (development only).
             self.start_browser_agent_dev_hook(cx);
+            self.start_browser_grab_dev_hook(window, cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
