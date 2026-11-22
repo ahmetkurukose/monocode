@@ -961,6 +961,17 @@ fn screenshots() {
     let params = &page.script.calls("Page.captureScreenshot")[1];
     assert_eq!(params["captureBeyondViewport"], true);
     assert_eq!(params["clip"]["height"], 16384.0);
+
+    // Zoomed to 150%: the clip is the same view, counted unzoomed.
+    page.script.reply(
+        "Page.getLayoutMetrics",
+        json!({"cssVisualViewport": {"pageX": 0, "pageY": 50, "clientWidth": 800, "clientHeight": 600, "zoom": 1.5}}),
+    );
+    driver.run("browser_screenshot", json!({}));
+    let params = &page.script.calls("Page.captureScreenshot")[2];
+    assert_eq!(params["clip"]["y"], 75.0);
+    assert_eq!(params["clip"]["width"], 1200.0);
+    assert_eq!(params["clip"]["height"], 900.0);
 }
 
 #[test]

@@ -527,6 +527,30 @@ pub fn clip(rect: &Rect, view: &Viewport) -> Option<Rect> {
     })
 }
 
+/// `area` in CSS pixels as `Page.captureScreenshot`'s clip wants it under
+/// the browser's zoom, which counts it unzoomed.
+pub fn zoomed(area: Rect, zoom: f64) -> Rect {
+    let zoom = if zoom.is_finite() && zoom > 0. {
+        zoom
+    } else {
+        1.
+    };
+    Rect {
+        x: area.x * zoom,
+        y: area.y * zoom,
+        width: area.width * zoom,
+        height: area.height * zoom,
+    }
+}
+
+/// The browser's zoom of the page (1 at 100%).
+async fn page_zoom(cdp: &CdpClient) -> f64 {
+    let metrics = cdp.call("Page.getLayoutMetrics", json!({}), None).await;
+    (metrics.ok())
+        .and_then(|m| m["cssVisualViewport"]["zoom"].as_f64())
+        .unwrap_or(1.)
+}
+
 /// The encodings tried in turn until one fits [`MAX_IMAGE`]: format,
 /// JPEG quality, scale.
 const SHOTS: [(&str, u8, f64); 4] = [
@@ -712,7 +736,7 @@ async fn describe(cdp: &CdpClient, context: i64) -> Result<Grab, String> {
     )
     .await;
     let image = match clip(&element.rect, &element.viewport) {
-        Some(area) => screenshot(cdp, area).await,
+        Some(area) => screenshot(cdp, zoomed(area, page_zoom(cdp).await)).await,
         None => None,
     };
     let _ = call(

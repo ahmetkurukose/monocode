@@ -204,6 +204,17 @@ fn the_crop_is_the_visible_part_in_page_coordinates() {
     );
     let below = Rect { y: 700., ..rect };
     assert_eq!(clip(&below, &view), None);
+    // At 150% the screenshot's clip counts the same box unzoomed.
+    assert_eq!(
+        zoomed(clip(&rect, &view).unwrap(), 1.5),
+        Rect {
+            x: 0.,
+            y: 2325.,
+            width: 135.,
+            height: 75.,
+        }
+    );
+    assert_eq!(zoomed(rect, 0.), rect);
 }
 
 fn png(len: usize) -> String {

@@ -477,6 +477,10 @@ pub async fn screenshot(ctx: &Ctx, args: &Value) -> Reply {
         )
     };
     let scale = (MAX_EDGE / (width.max(height).max(1.0) * ratio)).min(1.0);
+    // The clip counts CSS pixels unzoomed: at 150% the page's 800 are 1200.
+    let zoom = number(view, "zoom", 1.0);
+    let zoom = if zoom > 0.0 { zoom } else { 1.0 };
+    let (x, y, width, height) = (x * zoom, y * zoom, width * zoom, height * zoom);
     let shot = ctx
         .call(
             "Page.captureScreenshot",
