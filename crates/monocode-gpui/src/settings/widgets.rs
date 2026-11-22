@@ -257,6 +257,7 @@ impl SettingsView {
                     | "working-agents"
                     | "action-opens-terminal"
                     | "browser-all-links"
+                    | "browser-battery-saver"
                     | "close-to-tray"
                     | "terminal-copy-on-select"
                     | "main-pane-glass"
