@@ -331,6 +331,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser chromium devtools protocol playwright dev-browser endpoint copy automation",
     ),
     (
+        "browser-battery-saver",
+        Section::General,
+        "Browser battery saver",
+        "browser chromium energy power battery low frame rate fps throttle",
+    ),
+    (
         "file-word-wrap",
         Section::General,
         "Word wrap",

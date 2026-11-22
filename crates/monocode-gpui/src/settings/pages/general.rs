@@ -240,6 +240,20 @@ impl SettingsView {
                 )],
             ));
             workspace.push(self.external_cdp_row(&p, cx));
+            workspace.push(self.row(
+                Some("browser-battery-saver"),
+                false,
+                "Browser battery saver",
+                Some("Like Chrome, pages run at a lower frame rate when the battery is low. Off, they never do.".into()),
+                vec![self.toggle(
+                    "browser-battery-saver",
+                    "Browser battery saver",
+                    p.browser_battery_saver,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.browser_battery_saver = on),
+                )],
+            ));
         }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(

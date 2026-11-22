@@ -226,6 +226,7 @@ pub(crate) fn engine_started() -> bool {
     monocode_cef::runtime::is_started()
 }
 
+
 /// The running app's `Contents/Frameworks`.
 fn bundle_frameworks() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -3128,16 +3129,30 @@ pub(crate) fn cover_element() -> impl IntoElement {
         .inset_0()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What the last sweep took as covered, for tests.
+    static SWEPT: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What the last sweep took as covered, taken.
+#[cfg(test)]
+pub(crate) fn take_swept() -> Vec<Bounds<Pixels>> {
+    SWEPT.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
 /// Painted after everything else in a window: hides the views that were not
 /// painted in this frame, moves away the ones an overlay covers, and starts
-/// the next frame.
+/// the next frame. Overlays are what called [`cover`], and every deferred
+/// draw (menus, popovers, modals) and tooltip GPUI painted in this frame
+/// (`Window::overlay_bounds`, K44).
 pub(crate) fn sweep() -> impl IntoElement {
     gpui::deferred(
         canvas(
             |_, _, _| {},
             |_, _, window, cx| {
                 let id = window.window_handle().window_id();
-                let (epoch, covers) = FRAMES.with(|f| {
+                let (epoch, mut covers) = FRAMES.with(|f| {
                     let mut frames = f.borrow_mut();
                     let frame = frames.entry(id).or_default();
                     let covers = std::mem::take(&mut frame.covers);
@@ -3145,6 +3160,9 @@ pub(crate) fn sweep() -> impl IntoElement {
                     frame.epoch += 1;
                     (epoch, covers)
                 });
+                covers.extend_from_slice(window.overlay_bounds());
+                #[cfg(test)]
+                SWEPT.with(|s| s.borrow_mut().clone_from(&covers));
                 let live: Vec<Rc<dyn Swept>> = HOSTS.with(|hosts| {
                     let mut hosts = hosts.borrow_mut();
                     hosts.retain(|host| host.strong_count() > 0);
@@ -3461,6 +3479,9 @@ mod monocode_cef {
         pub fn close(&self) {}
     }
 }
+
+#[cfg(test)]
+mod overlay_tests;
 
 #[cfg(test)]
 mod tests {
