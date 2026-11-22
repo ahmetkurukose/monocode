@@ -75,6 +75,17 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K40 | URL politikası | **Revize (Faz 2):** izin listesi: http/https, `about:blank`, data, blob. Diğerleri (`file:`, `chrome:`, `devtools:`, `javascript:`, `view-source:`) `browser_url_refused`. |
 | K41 | MCP sunucusu | Adı `monocode_browser`, araçlar `browser_*`; `db`/`code` köprüleriyle aynı desen (loopback listener + oturum token'ı + `browser-mcp` stdio alt komutu), ama her çağrı **main thread'e** gider. Hata kodları sabit: `browser_no_page`, `browser_page_gone`, `browser_stale_ref`, `browser_no_ref`, `browser_user_active`, `browser_dialog_open`, `browser_timeout`, `browser_url_refused`, `browser_cdp_error`, `browser_not_started`. |
 | K42 | iframe | Faz 2: aynı origin iframe'leri snapshot'ta; OOPIF (cross-origin) `Target.setAutoAttach` flatten ile ayrı oturum, ref → `sessionId`. |
+| K43 | Faz 3 kapsamı | OSR Faz 3'ten çıktı. Faz 3 = agent iyileştirmeleri + Grab + PDF/upload/download + Faz 2'den devralınanlar. |
+| K44 | Overlay | OSR yapılmaz; "son kare" (K16) kalıcı. GPUI'nin overlay katmanında (deferred/anchored) **tek kanca**: sayfayla kesişen her overlay kendiliğinden cover bildirir, tooltip'ler dahil. OSR Linux/Wayland fazına (Faz 6) bağlandı. |
+| K45 | Aksiyon etkileri | click/fill/type/press/scroll **her zaman** etkilerini döner: navigasyon başlarsa 50 ms pay + en çok 5 sn oturma, sonra 100 ms DOM sessizliği (en çok 750 ms). İçerik: URL/başlık değişimi, yeni sekme/popup, indirme, console hataları, diyalog, **en çok 40 satır delta**; fazlası "snapshot al" der. |
+| K46 | Delta snapshot | `browser_snapshot {delta: true}` isteğe bağlı; baseline sayfanın son snapshot'ı. `expect_url` her sayfa aracında isteğe bağlı guard (`browser_expected_url_mismatch`). |
+| K47 | Varlık UI'ı | Agent'ın kullandığı sekmede **sekme rozeti** + araç çubuğunda "Agent kullanıyor · <oturum>" etiketi ve kontrol düğmesi; son komuttan 20 sn sonra kalkar. İmleç animasyonu ve parıltı **yok**. |
+| K48 | Kontrol | Agent aktifken (son komut ≤20 sn) kullanıcının sayfaya **tıklaması veya tuşu** kontrolü alır (scroll ve fare hareketi almaz). Agent'ın input araçları `browser_user_control` döner (ne zaman yeniden deneyeceğini söyler). Kontrol, "Agent'a geri ver" düğmesiyle ya da kullanıcı **16 sn** dokunmayınca agent'a döner. K34'ün 2 sn kuralının yerini alır. |
+| K49 | Grab | Araç çubuğu düğmesi + kısayol + sağ tık "Agent'a gönder". Seçilen öğe chat composer'ına **pill** olarak gider: sekmeyi bir agent açtıysa onun oturumuna, değilse odaktaki chat'e. İçerik: seçici, a11y rol/isim, yakın metin, computed style özeti, ≤4 KB HTML, React bileşen adı + kaynak dosya, kırpılmış görüntü. Sırlar (şifre alanı değerleri, token benzeri öznitelikler) temizlenir. |
+| K50 | Yeni araçlar | `browser_pdf`, `browser_upload`, `browser_download` yerel araç. HAR ve intercept yalnız dış CDP (Playwright) üzerinden. |
+| K51 | Dosya sınırı | Upload yalnız proje klasöründeki dosyalar; download ve PDF yalnız proje klasörüne yazar. |
+| K52 | Battery Saver | Chrome gibi açık (düşük pilde 30 fps); Settings → General'dan kapatılabilir. |
+| K53 | Faz 3 iş bölümü | Paralel agent'lar ayrı worktree'lerde düzenler ama **tek ortak `CARGO_TARGET_DIR`** ile build eder (disk). Doğrulama: birleşik dalda uçtan uca agent + kullanıcının uygulamasında araçlarla tur. |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -434,13 +445,14 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   her popup'ta `window.opener`, sahiplenilmeyen popup sızıntısı, dönüşte diyaloğa odak,
   scroll fps / input gecikmesi ölçümü (`phase-1-done.md`).
 
-### Faz 3 — Gelişmiş agent ve geliştirici özellikleri
-- Faz 2'den devralınan: Battery Saver politikası, programlı scroll'da uzun kareler, başlangıç kilitlenmesi, yapışık DevTools eksikleri, ana belgenin `GET` görünmesi (`phase-2-done.md`).
-- Delta snapshot, aksiyon etkileri, `expect_url` guard.
-- Agent varlık UI'ı (rozet, imleç animasyonu) ve kullanıcı odağı koruması.
-- Grab / Annotate / Draw ile agent'a geri bildirim.
-- HAR kaydı, intercept, upload/download talepleri, PDF.
-- GPUI Metal renderer BGRA yaması + OSR; overlay'lerin kalıcı çözümü (§4.7).
+### Faz 3 — Gelişmiş agent ve geliştirici özellikleri (kararlar K43–K53)
+- Faz 2'den devralınan: Battery Saver ayarı (K52), başlangıç kilitlenmesi, programlı scroll'da uzun kareler, yapışık DevTools eksikleri, küçük kusurlar (`phase-2-done.md`).
+- Aksiyon etkileri (K45), delta snapshot ve `expect_url` (K46).
+- Varlık UI'ı (K47) ve kontrol modeli (K48).
+- Grab (K49).
+- PDF, upload, download (K50, K51).
+- Overlay kancası (K44).
+- ~~OSR~~ → Faz 6 (K43, K44).
 
 ### Faz 4 — Tam browser
 - Memory Saver (discard) ve throttle lease'leri.
@@ -485,7 +497,7 @@ Her faz bittiğinde:
 | 0 | Bitti | `phase-0-done.md` |
 | 1 | Bitti | `phase-1-done.md` |
 | 2 | Bitti | `phase-2-done.md` |
-| 3 | Başlamadı | — |
+| 3 | Sürüyor (başlangıç 2026-11-22, kararlar K43–K53) | — |
 | 4 | Başlamadı | — |
 | 5 | Başlamadı | — |
 | 6 | Başlamadı | — |

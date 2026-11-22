@@ -15,12 +15,14 @@
 
 pub mod bridge;
 pub mod cdp;
+pub mod control;
 pub mod host;
 pub mod log;
 pub mod proxy;
 pub mod tools;
 
 pub use cdp::{CdpClient, CdpError, CdpEvent, Subscription};
+pub use control::{ControlState, UserControl, UserInput};
 pub use host::{DialogInfo, DialogKind, Host, Page, PageId, PageInfo, Scope};
 
 /// What a tool answers: MCP `content` items, and whether it failed.
