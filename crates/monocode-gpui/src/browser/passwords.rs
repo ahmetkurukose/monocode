@@ -323,9 +323,10 @@ mod tests {
     fn the_password_manager_follows_its_setting(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             assert!(password_manager_enabled(cx), "on by default");
-            let mut prefs = crate::settings::Preferences::default();
-            prefs.browser_offer_passwords = false;
-            cx.set_global(prefs);
+            cx.set_global(crate::settings::Preferences {
+                browser_offer_passwords: false,
+                ..Default::default()
+            });
             assert!(!password_manager_enabled(cx));
         });
     }

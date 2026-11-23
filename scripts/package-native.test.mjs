@@ -31,6 +31,11 @@ test(
       "#!/bin/sh\nprintf 'Monocode Native 0.16.0-preview.2\\n'\n",
     );
     await chmod(binary, 0o755);
+    // The bundle also carries Chromium's helper and the terminal's exec step.
+    for (const name of ["monocode-cef-helper", "monocode-pty-exec"]) {
+      await writeFile(join(release, name), "#!/bin/sh\nexit 0\n");
+      await chmod(join(release, name), 0o755);
+    }
     const fakeTool = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -42,7 +47,7 @@ if (name === 'ditto') {
   if (args[0] === '-c') fs.writeFileSync(args.at(-1), 'zip');
   else {
     fs.cpSync(args[0], args[1], { recursive: true });
-    if (process.env.NATIVE_TEST_SPARSE_DMG_BYTES) {
+    if (process.env.NATIVE_TEST_SPARSE_DMG_BYTES && args[1].endsWith('.app')) {
       fs.truncateSync(path.join(args[1], 'Contents/MacOS/monocode-gpui'), Number(process.env.NATIVE_TEST_SPARSE_DMG_BYTES));
     }
   }
@@ -75,8 +80,14 @@ if (name === 'xcrun' && args[0] === 'stapler' && process.env.NATIVE_TEST_STAPLER
       await writeFile(join(bin, name), fakeTool);
       await chmod(join(bin, name), 0o755);
     }
+    // A stand-in for the Chromium framework the bundle script copies in.
+    const framework = join(directory, "Chromium Embedded Framework.framework");
+    await mkdir(join(framework, "Libraries"), { recursive: true });
+    await writeFile(join(framework, "Chromium Embedded Framework"), "framework");
+    await writeFile(join(framework, "Libraries/libcef_sandbox.dylib"), "sandbox");
     const overrides = {
       PATH: `${bin}${delimiter}${process.env.PATH}`,
+      MONOCODE_CEF_FRAMEWORK: framework,
       APPLE_SIGNING_IDENTITY: "Developer ID Application: Fixture (TESTTEAM)",
       APPLE_API_KEY_PATH: join(directory, "fixture.p8"),
       APPLE_API_KEY: "FIXTURE",

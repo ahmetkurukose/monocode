@@ -77,9 +77,7 @@ impl Host<monocode_cef::BrowserView> {
         &self,
         cdp: &Rc<CdpClient>,
     ) -> Option<monocode_core::browser::passwords::watch::PasswordWatch> {
-        if vaults::store_name(&self.options.borrow().profile).is_none() {
-            return None;
-        }
+        vaults::store_name(&self.options.borrow().profile)?;
         let shared = Rc::downgrade(&self.shared);
         Some(monocode_core::browser::passwords::watch::watch(
             cdp,
@@ -969,9 +967,10 @@ mod tests {
     fn the_password_manager_turned_off_offers_and_fills_nothing(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             vaults::open_for_test(cx);
-            let mut prefs = crate::settings::Preferences::default();
-            prefs.browser_offer_passwords = false;
-            cx.set_global(prefs);
+            cx.set_global(crate::settings::Preferences {
+                browser_offer_passwords: false,
+                ..Default::default()
+            });
         });
         let page = page("https://a.test/login", cx);
         page.update(cx, |page, cx| {

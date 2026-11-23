@@ -144,6 +144,7 @@ impl Shell {
     /// A page an agent session opens (K39): a tab in the group of the
     /// session's chat if it is open, else in the focused group, in the
     /// background. `isolated` gives it a throwaway profile (K22).
+    #[cfg(test)]
     pub(super) fn open_agent_browser_page(
         &mut self,
         session: i64,

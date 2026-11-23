@@ -43,10 +43,8 @@ fn a_saved_password_is_sealed_on_disk_and_opens_with_the_key() {
     drop(vault);
     // The file never holds the password in the clear.
     let mut bytes = std::fs::read(&path).unwrap();
-    for extra in ["default.db-wal"] {
-        if let Ok(more) = std::fs::read(dir.path().join(extra)) {
-            bytes.extend(more);
-        }
+    if let Ok(more) = std::fs::read(dir.path().join("default.db-wal")) {
+        bytes.extend(more);
     }
     assert!(!bytes.windows(13).any(|w| w == b"correct horse"));
     // The same key opens it again; another key is refused.
