@@ -550,6 +550,7 @@ impl Shell {
             BrowserPane {
                 owner,
                 url,
+                fresh: true,
                 ..Default::default()
             },
         );

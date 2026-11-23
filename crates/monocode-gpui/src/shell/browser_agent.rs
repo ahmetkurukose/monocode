@@ -151,10 +151,24 @@ impl Shell {
         isolated: bool,
         cx: &mut Context<Self>,
     ) -> i64 {
+        self.open_agent_browser_page_in(session, None, url, isolated, cx)
+    }
+
+    /// [`Self::open_agent_browser_page`] for the scope's `project`, which
+    /// its visits go to when the session is not this window's (K55).
+    pub(super) fn open_agent_browser_page_in(
+        &mut self,
+        session: i64,
+        project: Option<String>,
+        url: String,
+        isolated: bool,
+        cx: &mut Context<Self>,
+    ) -> i64 {
         let pane = self.create_browser_pane(session, url);
         if let Some(state) = self.workspace.browser_panes.get_mut(&pane) {
             state.opened_by = Some(session);
             state.ephemeral = isolated.then(ephemeral_profile_name);
+            state.project = project;
         }
         let active = self.workspace.active;
         let chat = self.workspace.tab_of(session).map(|_| session);
@@ -274,12 +288,13 @@ impl Host for AppHost {
         let cx = self.cx.clone();
         let target = cx.update(|cx| self.target(scope, cx));
         let (session, url) = (scope.session, url.to_owned());
+        let project = scope.project.clone();
         Box::pin(async move {
             let window = target.ok_or("there is no window to open the page in")?;
             let pane = cx
                 .update(|cx| {
                     window.update(cx, |shell, _, cx| {
-                        shell.open_agent_browser_page(session, url, isolated, cx)
+                        shell.open_agent_browser_page_in(session, Some(project), url, isolated, cx)
                     })
                 })
                 .map_err(|_| "the window closed".to_owned())?;
@@ -316,6 +331,20 @@ impl Host for AppHost {
     fn sleep(&self, duration: Duration) -> LocalFuture<()> {
         let timer = self.cx.background_executor().timer(duration);
         Box::pin(timer)
+    }
+
+    /// The scope's project's visits only (K65): the store decides the
+    /// project from the scope, whatever the query says.
+    fn history(
+        &self,
+        scope: &Scope,
+        query: &monocode_core::browser::history::Query,
+    ) -> Result<Vec<monocode_core::browser::history::Visit>, String> {
+        self.cx.update(|cx| {
+            let stores = crate::browser::history::stores(cx);
+            let now = crate::browser::history::now_ms();
+            Ok(stores.borrow_mut().of_project(&scope.project, query, now))
+        })
     }
 }
 
@@ -395,6 +424,10 @@ impl Page for AppPage {
                 (info.url, info.title) = (page.url.clone(), page.title.clone());
                 info.loading = page.loading();
                 info.discarded = page.discarded();
+            }
+            // A new tab page (K66) has no web page: to agents it is blank.
+            if info.url.is_empty() {
+                info.url = "about:blank".into();
             }
             info.shown = shell.agent_page_shown(pane);
             info.by_agent = state.opened_by.is_some();

@@ -32,9 +32,24 @@ impl Shell {
                 session: state.owner,
                 project: owner.cwd.clone(),
             });
+        // Visits go to the project's history in the profile's store (K55);
+        // a throwaway profile keeps none.
+        crate::browser::history::init(self.browser_history_dir(), cx);
+        let history = crate::browser::history::store_name(&profile).and_then(|store| {
+            let folder = (self.session_summaries.get(&state.owner))
+                .map(|owner| owner.cwd.clone())
+                .or_else(|| state.project.clone())?;
+            Some(crate::browser::history::PageHistory {
+                project: monocode_core::files::path_key(&folder),
+                store,
+            })
+        });
+        let links = self.browser_page_links(pane, cx);
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
+            page.set_history(history, !state.fresh, state.opened_by.is_some());
+            page.links = Some(links);
             page.devtools_scope = devtools_scope;
             page.restore_dev_tools(
                 state.docked_devtools,
@@ -291,6 +306,11 @@ impl Shell {
             } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
             PageRequest::Close => self.close_pane(pane, window, cx),
             PageRequest::Grab(result) => self.deliver_browser_grab(pane, result, cx),
+            PageRequest::ShowTab(other) => {
+                if self.workspace.browser_panes.contains_key(&other) {
+                    self.open_browser_pane(other, window, cx);
+                }
+            }
         }
     }
 
@@ -314,6 +334,7 @@ impl Shell {
         if let Some(state) = self.workspace.browser_panes.get_mut(&pane) {
             state.opened_by = opener_state.opened_by;
             state.ephemeral = opener_state.ephemeral;
+            state.project = opener_state.project;
         }
         let active = self.workspace.active;
         if self.workspace.tab_of(opener).is_some() {

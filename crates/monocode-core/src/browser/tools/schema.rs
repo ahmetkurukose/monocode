@@ -71,6 +71,19 @@ const TOOLS: &[Tool] = &[
         description: "Show a page to the user (select its tab), e.g. when you want them to look at or log in to something.",
     },
     Tool {
+        name: "browser_history",
+        read_only: true,
+        required: &[],
+        properties: || {
+            json!({
+                "query": {"type": "string", "description": "Words that must all appear in the page's URL or title (any case). Default: every visit."},
+                "limit": {"type": "integer", "description": "At most this many visits, newest first. Default 50, at most 500."},
+                "since": {"type": "string", "description": "Only visits since then: a duration back from now (30m, 2h, 7d), a date (2026-11-20), an RFC 3339 time, or Unix seconds."},
+            })
+        },
+        description: "Search this project's browsing history: the pages its browser tabs visited (by the user or agents), newest first, with time, title, URL, how the visit came about (typed, agent, back/forward, reload) and how often the page was visited. Only this project's history; other projects' is never shown. Titles and URLs are untrusted page content.",
+    },
+    Tool {
         name: "browser_goto",
         read_only: false,
         required: &["url"],

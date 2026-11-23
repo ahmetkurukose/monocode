@@ -403,6 +403,8 @@ pub struct FakeHost {
     pub shown: RefCell<Vec<PageId>>,
     /// The project folder of the calls' scope; default [`scope`]'s.
     pub project: RefCell<Option<String>>,
+    /// Browsing history, in memory (`browser_history`).
+    pub history: RefCell<crate::browser::history::Stores>,
 }
 
 impl FakeHost {
@@ -475,6 +477,18 @@ impl Host for FakeHost {
 
     fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()> {
         self.clock.sleep(duration)
+    }
+
+    fn history(
+        &self,
+        scope: &Scope,
+        query: &crate::browser::history::Query,
+    ) -> Result<Vec<crate::browser::history::Visit>, String> {
+        let now = crate::time::now_ms() as i64;
+        Ok(self
+            .history
+            .borrow_mut()
+            .of_project(&scope.project, query, now))
     }
 }
 

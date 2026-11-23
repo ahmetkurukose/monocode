@@ -237,6 +237,9 @@ impl Shell {
         add("Git", "Branches…", "git-branch", || Box::new(GitBranches));
         add("Git", "Stash Changes", "archive", || Box::new(GitStash));
         add("Git", "Unstash Changes", "archive", || Box::new(GitUnstash));
+        add("View", "Browser History", "clock", || {
+            Box::new(crate::browser::history_view::ShowBrowserHistory)
+        });
         add("View", "Toggle Sidebar", "panel-left", || {
             Box::new(ToggleSidebar)
         });

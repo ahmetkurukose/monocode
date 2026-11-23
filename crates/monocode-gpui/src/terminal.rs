@@ -588,6 +588,11 @@ impl Terminal {
         }
         foreground_label(self.master_fd, self.shell_pid)
     }
+    /// The shell's process, while it runs (the new tab page's dev servers
+    /// descend from it).
+    pub(crate) fn shell_pid(&self) -> Option<u32> {
+        (self.shell_pid > 1 && !self.exited).then_some(self.shell_pid)
+    }
     /// Hangs up the job holding the terminal, leaving the shell at its prompt.
     pub(crate) fn stop_foreground(&mut self, cx: &mut Context<Self>) {
         #[cfg(unix)]

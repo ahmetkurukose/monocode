@@ -7,6 +7,7 @@ pub(crate) mod browser_agent;
 mod browser_audio;
 mod browser_grab;
 mod browser_lifecycle;
+mod browser_history;
 pub(crate) mod browser_links;
 mod browser_panes;
 mod browser_presence;
@@ -269,6 +270,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-w"), CloseTab, context),
         KeyBinding::new(&format!("{modifier}-shift-w"), CloseAllTabs, context),
         KeyBinding::new(&format!("{modifier}-shift-t"), ReopenClosedTab, context),
+        KeyBinding::new(
+            &format!("{modifier}-y"),
+            crate::browser::history_view::ShowBrowserHistory,
+            context,
+        ),
         KeyBinding::new(
             &format!("{modifier}-shift-a"),
             ArchiveSession,
@@ -640,6 +646,8 @@ pub(crate) struct Shell {
     saved_everywhere: Option<(String, crate::everywhere::Tab)>,
     /// The command palette (⌘P).
     palette: Option<everywhere::PaletteOpen>,
+    /// The browser's history window (⌘Y).
+    browser_history: Option<browser_history::HistoryOpen>,
     shift_taps: everywhere::ShiftTaps,
     /// Typed into the composer of the next conversation created.
     next_session_draft: Option<String>,
@@ -1091,6 +1099,7 @@ impl Shell {
             everywhere: None,
             saved_everywhere: None,
             palette: None,
+            browser_history: None,
             shift_taps: Default::default(),
             next_session_draft: None,
             image_lightbox: None,
@@ -7694,6 +7703,8 @@ impl Render for Shell {
             window.focus(&view.read(cx).input.focus_handle(cx), cx);
         }
         if !std::mem::replace(&mut self.window_services_started, true) {
+            // Before an agent's browser_history or any page asks for it.
+            crate::browser::history::init(self.browser_history_dir(), cx);
             self.start_database_footer(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);
@@ -8046,6 +8057,11 @@ impl Render for Shell {
                     this.open_palette(window, cx)
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::browser::history_view::ShowBrowserHistory, window, cx| {
+                    this.open_browser_history(window, cx)
+                },
+            ))
             .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| {
                 this.open_everywhere(Some(crate::everywhere::Tab::All), None, window, cx)
             }))
@@ -8150,9 +8166,14 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewCodex, window, cx| {
-                // ⌘T in the focused dock opens another terminal there.
+                // ⌘T in the focused dock opens another terminal there, and
+                // in a browser page a new tab page (K66).
+                let page = (this.workspace.active)
+                    .is_some_and(|id| this.workspace.browser_panes.contains_key(&id));
                 if this.dock_focused(window, cx).is_some() {
                     this.new_terminal(window, cx);
+                } else if page {
+                    this.new_browser_pane(None, window, cx);
                 } else {
                     this.new_chat(cx);
                 }
@@ -8283,6 +8304,9 @@ impl Render for Shell {
                 }
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
+                    return;
+                }
+                if this.close_browser_history(window, cx) {
                     return;
                 }
                 if this.everywhere.is_some() {
@@ -8540,6 +8564,7 @@ impl Render for Shell {
             .children(self.resource_modal(window, cx))
             .children(self.everywhere_modal(window, cx))
             .children(self.palette_modal(window, cx))
+            .children(self.browser_history_modal(window, cx))
             .children(self.git_overlays(window, cx))
             .children(self.search_modal(window, cx))
             .children(self.remote_project_modal(window, cx))
