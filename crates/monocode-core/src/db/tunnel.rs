@@ -175,6 +175,14 @@ pub fn state(
     TunnelState::Failed(reason.unwrap_or_else(|| "The tunnel exited.".into()))
 }
 
+/// [`state`] for one source: one `lsof` on its port rather than on all.
+pub fn state_of(tunnel: &Tunnel, port: u16, dir: &Path) -> TunnelState {
+    let listeners = listener_on(port)
+        .map(|listener| HashMap::from([(port, listener)]))
+        .unwrap_or_default();
+    state(tunnel, port, &listeners, dir)
+}
+
 fn classify_listener(kind: TunnelKind, listener: &Listener) -> TunnelState {
     if is_expected(kind, &listener.command) {
         TunnelState::Running { pid: listener.pid }

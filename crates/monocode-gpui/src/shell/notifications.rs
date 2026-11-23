@@ -414,7 +414,7 @@ impl Shell {
         }));
     }
 
-    fn notification_chats(&self, cx: &App) -> Vec<Entity<Conversation>> {
+    pub(super) fn notification_chats(&self, cx: &App) -> Vec<Entity<Conversation>> {
         let mut views: Vec<_> = self.sessions.values().cloned().collect();
         if let Some(monos) = &self.monos {
             views.extend(monos.read(cx).all_notification_chats(cx));
@@ -667,6 +667,7 @@ impl Shell {
     /// one count per session that waits for input or finished unseen. Call it
     /// after any event that changes either side; render is not guaranteed.
     pub(super) fn reconcile_dock_badge(&mut self, cx: &mut Context<Self>) {
+        self.observe_keep_awake(cx);
         let chats = self.notification_chats(cx);
         let snapshot: Vec<_> = chats
             .iter()

@@ -73,6 +73,8 @@ pub(crate) struct SettingsContext {
     pub quick_error: Option<String>,
     pub catalogs: HashMap<String, Vec<(String, String)>>,
     pub inbox_connections: HashMap<String, (bool, String)>,
+    /// The monday.com boards the Inbox follows (its `ViewState.monday_boards`).
+    pub monday_boards: Vec<String>,
     /// Mobile access, or `None` when this desktop cannot offer it.
     pub mobile: Option<monocode_core::mobile::Status>,
     /// The pairing code on show.
@@ -114,6 +116,7 @@ impl PartialEq for SettingsContext {
             && self.quick_error == other.quick_error
             && self.catalogs == other.catalogs
             && self.inbox_connections == other.inbox_connections
+            && self.monday_boards == other.monday_boards
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
     }
@@ -134,6 +137,10 @@ pub(crate) enum SettingsEvent {
     CheckAppUpdates,
     CheckHarnessUpdates,
     ManageInboxProvider(String),
+    /// Settings → Integrations: the monday.com boards the Inbox follows.
+    MondayBoards(Vec<String>),
+    /// A project's `.monocode/integrations.json` changed: the Inbox lists again.
+    IntegrationsChanged,
     Changed(Box<Preferences>),
     /// The Appearance page's Layout picker: true for Focused, false for Classic.
     NewLayout(bool),
@@ -286,6 +293,7 @@ pub(crate) struct SettingsView {
     mcp_filter: String,
     fields: HashMap<&'static str, Entity<Input>>,
     connections: pages::ConnectionsState,
+    integrations: pages::IntegrationsState,
     skill_preview: Option<std::path::PathBuf>,
     skill_preview_text: Option<Result<std::sync::Arc<skill_document::DocumentData>, String>>,
     skill_preview_generation: u64,
@@ -441,6 +449,7 @@ impl SettingsView {
             mcp_filter: "all".into(),
             fields: HashMap::new(),
             connections: pages::ConnectionsState::default(),
+            integrations: pages::IntegrationsState::default(),
             skill_preview: None,
             skill_preview_text: None,
             skill_preview_generation: 0,
@@ -460,6 +469,7 @@ impl SettingsView {
         };
         this.watch_mobile(cx);
         this.watch_connections(cx);
+        this.watch_integrations(cx);
         if this.prefs.notifications {
             this.probe_notification_permission(false, cx);
         }
@@ -533,6 +543,7 @@ impl SettingsView {
             self.section = section;
             self.watch_mobile(cx);
             self.watch_connections(cx);
+            self.watch_integrations(cx);
             if section == Section::Mcp {
                 self.refresh_mcp_health(cx);
             }

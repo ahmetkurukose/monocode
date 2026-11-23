@@ -94,6 +94,7 @@ impl Shell {
                 .as_ref()
                 .map(|inbox| inbox.read(cx).connection_statuses())
                 .unwrap_or_default(),
+            monday_boards: self.monday_boards(cx),
             sessions: self
                 .order
                 .iter()
@@ -149,6 +150,31 @@ impl Shell {
                 .collect(),
         }
     }
+    /// The boards the Inbox follows: the open view's, else what it saved.
+    fn monday_boards(&self, cx: &App) -> Vec<String> {
+        match &self.inbox {
+            Some(inbox) => inbox.read(cx).monday_boards(),
+            None => locked(&self.store)
+                .map(|db| monocode_core::inbox::ViewState::load(&db).monday_boards)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Settings chose the boards to follow. An open Inbox takes them into
+    /// the state it saves, so its next save cannot put the old ones back.
+    fn set_monday_boards(&mut self, boards: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(inbox) = self.inbox.clone() {
+            inbox.update(cx, |inbox, cx| inbox.set_monday_boards(boards, cx));
+        } else if let Err(error) = locked(&self.store).and_then(|db| {
+            let mut state = monocode_core::inbox::ViewState::load(&db);
+            state.monday_boards = boards;
+            state.save(&db)
+        }) {
+            self.error = Some(error);
+        }
+        self.sync_settings(cx);
+    }
+
     pub(super) fn open_settings(
         &mut self,
         section: Section,
@@ -175,6 +201,12 @@ impl Shell {
                     this.open_inbox(window, cx);
                     if let Some(inbox) = &this.inbox {
                         inbox.update(cx, |inbox, cx| inbox.open_connection(provider.clone(), cx));
+                    }
+                }
+                SettingsEvent::MondayBoards(boards) => this.set_monday_boards(boards.clone(), cx),
+                SettingsEvent::IntegrationsChanged => {
+                    if let Some(inbox) = &this.inbox {
+                        inbox.update(cx, |inbox, cx| inbox.refresh(cx));
                     }
                 }
                 SettingsEvent::WhatsNew => {
@@ -399,6 +431,7 @@ impl Shell {
             let prefs = self.workspace.preferences.clone();
             monos.update(cx, |m, cx| m.set_preferences(prefs, cx));
         }
+        self.apply_keep_awake(cx);
         crate::settings::apply_keybindings(&self.workspace.preferences, cx);
         // After the keymap, so the menu shows rebound shortcuts.
         crate::app_menu::install(&self.workspace.preferences, cx);
@@ -681,6 +714,7 @@ mod tests {
         for (section, selector) in Section::ALL.into_iter().zip([
             "settings-nav-general",
             "settings-nav-connections",
+            "settings-nav-integrations",
             "settings-nav-appearance",
             "settings-nav-terminal",
             "settings-nav-keybindings",

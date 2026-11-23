@@ -66,6 +66,8 @@ use std::{
 // this width the empty session drops its title.
 const COMPOSER_COLUMN: f32 = COLUMN;
 const COMPOSER_RADIUS: f32 = 12.;
+/// Stopping a turn this soon after Send gives its prompt back to the composer.
+const QUICK_STOP: std::time::Duration = std::time::Duration::from_secs(5);
 // RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model,
 // with AccessPicker's icons; Full access is amber.
 const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
@@ -118,6 +120,8 @@ enum ComposerMenu {
     Setting(usize),
     /// The commit pill's chevron above the composer.
     GitActions,
+    /// The prompts sent from any session, beside Send.
+    History,
 }
 struct OpenMenu {
     kind: ComposerMenu,
@@ -230,6 +234,10 @@ pub(crate) struct Conversation {
     account_anchor: AnchorSlot,
     workspace_anchor: AnchorSlot,
     git_action_anchor: AnchorSlot,
+    history_anchor: AnchorSlot,
+    /// The prompt that started the running turn, and when. Stopping it
+    /// within [`QUICK_STOP`] puts the prompt back in the composer.
+    last_launch: Option<(String, std::time::Instant)>,
     /// Files this session's edit tools changed, across its whole history.
     session_edits: Vec<String>,
     /// Where `session_edits` stand in Git: uncommitted ones show the pill.
@@ -695,6 +703,8 @@ impl Conversation {
             account_anchor: AnchorSlot::default(),
             workspace_anchor: AnchorSlot::default(),
             git_action_anchor: AnchorSlot::default(),
+            history_anchor: AnchorSlot::default(),
+            last_launch: None,
             session_edits: Vec::new(),
             session_git: Default::default(),
             session_unpushed: false,
@@ -931,6 +941,7 @@ impl Conversation {
                 .unwrap_or_default();
             let attachments = std::mem::take(&mut self.attachments);
             if !text.trim().is_empty() || !attachments.is_empty() {
+                crate::prompt_history::remember(&text, cx);
                 cx.emit(mono::Submitted { text, attachments });
                 cx.notify();
             }
@@ -978,6 +989,7 @@ impl Conversation {
         if prompt.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
+        crate::prompt_history::remember(&prompt, cx);
         self.completion
             .update(cx, |completion, cx| completion.dismiss(cx));
         let mode = if self.settings.orchestrator {
@@ -1122,6 +1134,8 @@ impl Conversation {
         self.transcript
             .update(cx, |v, _| v.identity(&self.summary.provider, &model_label));
         self.begin_turn(cx);
+        self.last_launch =
+            (!prompt.trim().is_empty()).then(|| (prompt.clone(), std::time::Instant::now()));
         let generation = self.submission_generation;
         let source_provider = self.summary.provider.clone();
         let source_account = self.settings.account.id.clone();
@@ -1596,7 +1610,8 @@ impl Conversation {
 }
 
 /// How long a new worktree waits for its generated name before using the prompt's words.
-const WORKTREE_NAMING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Long enough for a cold provider CLI, so the folder and the branch share one name.
+const WORKTREE_NAMING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 impl EventEmitter<SessionChanged> for Conversation {}
 impl EventEmitter<MergeWorktree> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
@@ -2141,6 +2156,18 @@ impl Conversation {
         if self.git_action_choice(id, cx) {
             return;
         }
+        if let Some(ix) = id.strip_prefix("prompt-history:") {
+            if let Some(prompt) = ix
+                .parse::<usize>()
+                .ok()
+                .and_then(|ix| crate::prompt_history::entries(cx).into_iter().nth(ix))
+            {
+                self.input
+                    .update(cx, |input, cx| input.set_text(prompt, cx));
+                cx.notify();
+            }
+            return;
+        }
         if let Some(choice) = id.strip_prefix("recent-model:") {
             if let Ok((provider, model)) = serde_json::from_str::<(String, Option<String>)>(choice)
                 && let Some(kind) = Kind::parse(&provider)
@@ -2501,6 +2528,7 @@ impl Conversation {
             ComposerMenu::Account => &self.account_anchor,
             ComposerMenu::Workspace => &self.workspace_anchor,
             ComposerMenu::GitActions => &self.git_action_anchor,
+            ComposerMenu::History => &self.history_anchor,
             ComposerMenu::Setting(ix) => self
                 .mono_ui
                 .setting_anchors
@@ -2778,6 +2806,29 @@ impl Conversation {
                 let items = self.mono_access_options();
                 ("Access", items, 288., MenuStyle::Access)
             }
+            ComposerMenu::History => {
+                let entries = crate::prompt_history::entries(cx);
+                let items = if entries.is_empty() {
+                    vec![
+                        MenuAction::new("prompt-history-empty", "No prompts yet")
+                            .disabled(true)
+                            .into(),
+                    ]
+                } else {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, prompt)| {
+                            MenuAction::new(
+                                format!("prompt-history:{ix}"),
+                                crate::prompt_history::label(prompt),
+                            )
+                            .into()
+                        })
+                        .collect()
+                };
+                ("Recent prompts", items, 420., MenuStyle::Explorer)
+            }
             ComposerMenu::Setting(ix) => self.mono_setting_menu(ix),
         }
     }
@@ -2856,6 +2907,26 @@ impl Conversation {
         }
         if self.busy {
             self.stop(cx);
+        }
+    }
+    /// Stop pressed by the person (the button or Escape). A turn stopped
+    /// within [`QUICK_STOP`] of its Send gives its prompt back to the composer.
+    pub(crate) fn stop_by_user(&mut self, cx: &mut Context<Self>) {
+        if self.cancel_edit_last_turn(cx) || !self.busy {
+            return;
+        }
+        let quick = self
+            .last_launch
+            .take()
+            .filter(|(_, at)| at.elapsed() < QUICK_STOP)
+            .map(|(prompt, _)| prompt);
+        self.stop(cx);
+        if let Some(prompt) = quick
+            && self.input.read(cx).content.is_empty()
+        {
+            self.input
+                .update(cx, |input, cx| input.set_text(prompt, cx));
+            cx.notify();
         }
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -2959,6 +3030,7 @@ impl Conversation {
                     .when(open.kind == ComposerMenu::Account, |p| {
                         p.width(250.).max_height(260.)
                     })
+                    .when(open.kind == ComposerMenu::History, |p| p.max_height(440.))
             })
             .into_iter()
             .collect();
@@ -3184,7 +3256,15 @@ impl Conversation {
                                             .child(icon("chevron-down", 12.)),
                                     ),
                             )
-                            .child(self.action(has_value, window, cx)),
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(self.history_button(cx))
+                                    .child(self.action(has_value, window, cx)),
+                            ),
                     )
                     .children(self.attachment_drop_overlay(12.)),
             )
@@ -3418,6 +3498,25 @@ impl Conversation {
             )
     }
 
+    /// The clock beside Send: the prompts sent from any session.
+    fn history_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.menu_is(ComposerMenu::History);
+        tool_pill("composer-history", "Recent prompts")
+            .debug_selector(|| "composer-history".into())
+            .aria_expanded(open)
+            .when(open, |d| d.bg(content(0.2)))
+            .child(self.history_anchor.probe())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_menu(ComposerMenu::History, window, cx)
+            }))
+            .w(px(26.))
+            .justify_center()
+            .child(
+                icon("clock", 14.)
+                    .text_color(content(0.5))
+                    .group_hover("composer-history", |s| s.text_color(content(1.))),
+            )
+    }
     // ComposerAction: a solid submit, dimmed while empty; Stop while busy.
     fn action(&self, has_value: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.responding() && !has_value;
@@ -3480,7 +3579,7 @@ impl Conversation {
                     return;
                 }
                 if busy {
-                    this.stop(cx);
+                    this.stop_by_user(cx);
                 } else {
                     let modifiers = event.modifiers();
                     let alternate = if cfg!(target_os = "macos") {

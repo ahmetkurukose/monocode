@@ -66,8 +66,13 @@ impl Status {
             signature: String::new(),
         })
     }
-    pub(super) fn update(&mut self, monos: &[(String, String)], run: Rc<dyn Fn(&str)>) {
-        let signature = format!("{monos:?}");
+    pub(super) fn update(
+        &mut self,
+        monos: &[(String, String)],
+        awake: crate::keep_awake::Status,
+        run: Rc<dyn Fn(&str)>,
+    ) {
+        let signature = format!("{monos:?} {:?} {}", awake.mode, awake.active);
         if self.signature == signature {
             return;
         }
@@ -95,9 +100,44 @@ impl Status {
             run.clone(),
         ));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&keep_awake_item(mtm, awake, &run));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&Item::new(mtm, "Quit MonoCode", "quit".into(), run));
         self.item.setMenu(Some(&menu));
     }
+}
+/// "Keep Computer Awake" and its modes, the footer menu's choices.
+fn keep_awake_item(
+    mtm: MainThreadMarker,
+    awake: crate::keep_awake::Status,
+    run: &Rc<dyn Fn(&str)>,
+) -> Retained<NSMenuItem> {
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(&NSString::from_str("Keep Computer Awake"));
+    let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
+    let state = NSMenuItem::new(mtm);
+    state.setTitle(&NSString::from_str(&awake.summary()));
+    state.setEnabled(false);
+    menu.addItem(&state);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    for mode in crate::keep_awake::Mode::ALL {
+        let choice = Item::new(
+            mtm,
+            mode.label(),
+            format!("awake:{}", mode.key()),
+            run.clone(),
+        );
+        choice.setToolTip(Some(&NSString::from_str(mode.description())));
+        // NSControlStateValueOn: a checkmark.
+        let state: isize = if mode == awake.mode { 1 } else { 0 };
+        unsafe {
+            let _: () = msg_send![&*choice, setState: state];
+        }
+        menu.addItem(&choice);
+    }
+    item.setSubmenu(Some(&menu));
+    item
 }
 impl Drop for Status {
     fn drop(&mut self) {

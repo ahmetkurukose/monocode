@@ -52,7 +52,7 @@ fn incoming_commits(root: &Path, spec: &str) -> Vec<IncomingCommit> {
 }
 
 /// Commits selected by `revs` (newest first, capped), as `git log` takes them.
-fn commits_in(root: &Path, revs: &[&str]) -> Vec<IncomingCommit> {
+pub(super) fn commits_in(root: &Path, revs: &[&str]) -> Vec<IncomingCommit> {
     let limit = format!("--max-count={MAX_INCOMING}");
     let mut args = vec!["log", &limit, "--format=%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e"];
     args.extend_from_slice(revs);

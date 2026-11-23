@@ -29,7 +29,7 @@ use gpui::{
 use monocode_core::db::{
     ColumnInfo, Connection, ConsoleStore, DataSource, DataSourceStore, DbColor, DbError, DbKind,
     HistoryEntry, HistoryStore, QueryResult, RoutineKind, SchemaObjects, TableDetails, TableInfo,
-    TableKind, analysis, format, params, runtime::runtime, source, split,
+    TableKind, analysis, format, params, runtime::runtime, source, split, tunnel::TunnelState,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -582,6 +582,8 @@ pub(crate) struct DatabaseView {
     passwords: HashMap<String, String>,
     dialog: Option<(Entity<SourceDialog>, Subscription)>,
     confirm_remove: Option<String>,
+    /// A source whose tunnel is closed: asking before opening it.
+    confirm_tunnel: Option<String>,
     preview: Option<(String, String)>,
     tree_width: f32,
     editor_height: f32,
@@ -749,6 +751,7 @@ impl DatabaseView {
             passwords: HashMap::new(),
             dialog: None,
             confirm_remove: None,
+            confirm_tunnel: None,
             preview: None,
             tree_width: saved.tree_width.clamp(200., 700.),
             editor_height: saved.editor_height.clamp(80., 900.),
@@ -2537,6 +2540,65 @@ impl DatabaseView {
         cx.notify();
     }
 
+    /// Expanding a source: connects, but when its tunnel is closed asks
+    /// first instead of opening it unprompted.
+    fn connect_or_ask(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(source) = self.source(id) else {
+            return;
+        };
+        let (Some(tunnel), Some(dir)) =
+            (source.tunnel.clone(), monocode_core::db::conn::tunnel_dir())
+        else {
+            return self.connect_source(id, cx);
+        };
+        let busy = self.nodes.get(id).is_some_and(|node| {
+            matches!(node.link, Link::Connecting)
+                || node.conn.as_ref().is_some_and(|c| !c.is_closed())
+        });
+        if busy {
+            return;
+        }
+        let port = source.port;
+        let key = id.to_owned();
+        // One `lsof`: off the UI thread.
+        let check =
+            cx.background_spawn(
+                async move { monocode_core::db::tunnel::state_of(&tunnel, port, &dir) },
+            );
+        cx.spawn(async move |this, cx| {
+            let state = check.await;
+            let _ = this.update(cx, |this, cx| {
+                // Collapsed again while the check ran: leave it closed.
+                if !this.expanded.contains(&format!("s:{key}")) {
+                    return;
+                }
+                match state {
+                    TunnelState::Stopped | TunnelState::Failed(_) => {
+                        this.confirm_tunnel = Some(key);
+                        cx.notify();
+                    }
+                    _ => this.connect_source(&key, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The tunnel question answered: open it and connect, or fold the
+    /// source back up.
+    fn answer_tunnel(&mut self, open: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.confirm_tunnel.take() else {
+            return;
+        };
+        if open {
+            self.connect_source(&id, cx);
+        } else {
+            self.expanded.remove(&format!("s:{id}"));
+            self.save_state();
+        }
+        cx.notify();
+    }
+
     /// Loads the completion catalog once per connection, over a connection
     /// that is already open (a console's).
     fn load_catalog(&mut self, source: &str, conn: Arc<Connection>, cx: &mut Context<Self>) {
@@ -2824,7 +2886,7 @@ impl DatabaseView {
                 self.select_source(id, cx);
                 if self.toggle(format!("s:{id}")) {
                     self.expanded.insert(format!("c:{id}"));
-                    self.connect_source(id, cx);
+                    self.connect_or_ask(id, cx);
                 }
             }
             TreeRow::Schema(source, schema) => {

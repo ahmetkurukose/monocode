@@ -88,6 +88,8 @@ impl AssetSource for Assets {
    "inbox-gitlab"=>include_bytes!("../assets/inbox-gitlab.svg"),
    "inbox-gitlab-color.svg"=>include_bytes!("../assets/inbox-gitlab-color.svg"),
    "inbox-azuredevops"=>include_bytes!("../assets/inbox-azuredevops.svg"),
+   "inbox-monday"=>include_bytes!("../assets/inbox-monday.svg"),
+   "inbox-monday-color.svg"=>include_bytes!("../assets/inbox-monday-color.svg"),
 
    "note"=>include_bytes!("../assets/note.svg"),
    "zap"=>include_bytes!("../assets/zap.svg"),
@@ -100,6 +102,8 @@ impl AssetSource for Assets {
    "archive"=>include_bytes!("../assets/hugeicons/archive.svg"),
    "bell-off"=>include_bytes!("../assets/hugeicons/bell-off.svg"),
    "moon"=>include_bytes!("../assets/hugeicons/moon.svg"),
+   "dot"=>include_bytes!("../assets/hugeicons/dot.svg"),
+   "coffee"=>include_bytes!("../assets/hugeicons/coffee.svg"),
    "sun"=>include_bytes!("../assets/hugeicons/sun.svg"),
    "check"=>include_bytes!("../assets/hugeicons/check.svg"),
    "check-2"=>include_bytes!("../assets/hugeicons/check-2.svg"),

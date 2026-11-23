@@ -234,6 +234,7 @@ fn provider_mark(provider: &str) -> gpui::Svg {
     let (path, color) = match provider {
         "linear" => ("inbox-linear", content(0.8)),
         "jira" => ("inbox-jira", rgb(0x2684ff).into()),
+        "monday" => ("inbox-monday", rgb(0xff3d57).into()),
         "gitlab" => ("inbox-gitlab", rgb(0xfc6d26).into()),
         "azuredevops" => ("inbox-azuredevops", content(0.8)),
         _ => ("inbox-github", content(0.8)),
@@ -306,7 +307,7 @@ fn project_name(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-fn label_badge(label: &model::Label, compact: bool) -> Div {
+pub(crate) fn label_badge(label: &model::Label, compact: bool) -> Div {
     let color = u32::from_str_radix(label.color.trim().trim_start_matches('#'), 16)
         .ok()
         .filter(|_| label.color.trim().trim_start_matches('#').len() == 6);
@@ -500,6 +501,9 @@ impl Inbox {
             "Open a project to fill the inbox".into()
         } else if self.filters_active() || !self.search.read(cx).content.is_empty() {
             "No items match these filters".into()
+        } else if self.state.source == "monday" {
+            "No monday.com items. Choose boards in the filter menu or in Settings → Integrations."
+                .into()
         } else if model::is_tracker(&self.state.source) {
             format!("No {} issues", model::provider_label(&self.state.source))
         } else {
@@ -1936,6 +1940,7 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let can_post = !self.posting && !self.comment.read(cx).content.trim().is_empty();
+        let pr_meta = self.pr_meta.as_ref().filter(|meta| meta.key == item.key());
         let body = if ix == 0 {
             div()
                 .pt(px(20.))
@@ -1943,7 +1948,19 @@ impl Inbox {
                 .flex()
                 .flex_col()
                 .gap(px(20.))
-                .when(!item.labels.is_empty(), |d| {
+                .when_some(pr_meta, |d, meta| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "inbox-pr-metadata".into())
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(meta.picker.clone())
+                            .when(meta.saving, |d| d.child(message("Saving…")))
+                            .when_some(meta.error.clone(), |d, text| d.child(error(text))),
+                    )
+                })
+                .when(pr_meta.is_none() && !item.labels.is_empty(), |d| {
                     d.child(
                         div()
                             .flex()
@@ -2628,38 +2645,39 @@ impl Inbox {
                 );
             }
         }
-        let provider_options = if self.state.source == "linear" {
-            &self.snapshot.linear_teams
-        } else {
-            &self.snapshot.jira_projects
+        let provider_options = match self.state.source.as_str() {
+            "linear" => &self.snapshot.linear_teams,
+            "monday" => &self.snapshot.monday_boards,
+            _ => &self.snapshot.jira_projects,
         };
         if tracker && !provider_options.is_empty() {
             rows.push(
-                caption(if self.state.source == "linear" {
-                    "TEAMS"
-                } else {
-                    "PROJECTS"
+                caption(match self.state.source.as_str() {
+                    "linear" => "TEAMS",
+                    "monday" => "BOARDS",
+                    _ => "PROJECTS",
                 })
                 .into_any_element(),
             );
             for (ix, option) in provider_options.iter().enumerate() {
                 let id = option.id.clone();
-                let hidden = if self.state.source == "linear" {
-                    &self.state.hidden_linear_teams
-                } else {
-                    &self.state.hidden_jira_projects
+                // monday boards are followed (opt-in); teams and projects hidden.
+                let checked = match self.state.source.as_str() {
+                    "linear" => !self.state.hidden_linear_teams.contains(&id),
+                    "monday" => self.state.monday_boards.contains(&id),
+                    _ => !self.state.hidden_jira_projects.contains(&id),
                 };
                 rows.push(
                     menu_row(
                         format!("inbox-tracker-filter-{ix}"),
                         option.name.clone(),
-                        !hidden.contains(&id),
+                        checked,
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.state.source == "linear" {
-                            toggle(&mut this.state.hidden_linear_teams, id.clone());
-                        } else {
-                            toggle(&mut this.state.hidden_jira_projects, id.clone());
+                        match this.state.source.as_str() {
+                            "linear" => toggle(&mut this.state.hidden_linear_teams, id.clone()),
+                            "monday" => toggle(&mut this.state.monday_boards, id.clone()),
+                            _ => toggle(&mut this.state.hidden_jira_projects, id.clone()),
                         }
                         this.filters_changed(true, cx);
                     }))
@@ -2809,6 +2827,9 @@ impl Inbox {
             }
             "linear" => "Create a personal API key in Linear → Settings → Security & Access.",
             "jira" => "Connect your Jira Cloud site with your Atlassian email and an API token.",
+            "monday" => {
+                "Use your personal API token: in monday.com, open your avatar → Developers → API token, or Administration → Connections → Personal API token."
+            }
             "gitlab" => {
                 "Connect GitLab.com or your GitLab instance with a personal access token with API access."
             }
@@ -2871,17 +2892,29 @@ impl Inbox {
                             .text_color(content(0.5))
                             .child(hint),
                     )
-                    .when(provider != "github" && provider != "linear", |d| {
+                    .when(connected && provider == "monday", |d| {
                         d.child(
                             div()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(content(0.1))
-                                .child(self.connect_url.clone()),
+                                .text_size(px(12.))
+                                .line_height(px(19.))
+                                .text_color(content(0.7))
+                                .child(self.connected_account(&provider)),
                         )
                     })
+                    .when(
+                        !matches!(provider.as_str(), "github" | "linear" | "monday"),
+                        |d| {
+                            d.child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(content(0.1))
+                                    .child(self.connect_url.clone()),
+                            )
+                        },
+                    )
                     .when(provider == "jira", |d| {
                         d.child(
                             div()
@@ -2946,6 +2979,26 @@ impl Inbox {
                     ),
             ))
             .into_any_element()
+    }
+
+    /// Who a token signed in as: the account's email, team and site.
+    fn connected_account(&self, provider: &str) -> String {
+        let status = self
+            .snapshot
+            .connections
+            .get(provider)
+            .cloned()
+            .unwrap_or_default();
+        let account = [status.email, status.organization, status.site]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if account.is_empty() {
+            "Connected".into()
+        } else {
+            format!("Signed in as {account}")
+        }
     }
 
     fn project_menu(&self, cx: &mut Context<Self>) -> AnyElement {

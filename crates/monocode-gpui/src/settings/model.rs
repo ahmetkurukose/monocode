@@ -8,6 +8,7 @@ pub(crate) enum Section {
     #[default]
     General,
     Connections,
+    Integrations,
     Appearance,
     Terminal,
     Keybindings,
@@ -28,6 +29,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
         &[
             Section::General,
             Section::Connections,
+            Section::Integrations,
             Section::Appearance,
             Section::Terminal,
             Section::Keybindings,
@@ -51,9 +53,10 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 14] = [
+    pub(crate) const ALL: [Section; 15] = [
         Section::General,
         Section::Connections,
+        Section::Integrations,
         Section::Appearance,
         Section::Terminal,
         Section::Keybindings,
@@ -71,6 +74,7 @@ impl Section {
         match self {
             Section::General => "general",
             Section::Connections => "connections",
+            Section::Integrations => "integrations",
             Section::Appearance => "appearance",
             Section::Terminal => "terminal",
             Section::Keybindings => "keybindings",
@@ -89,6 +93,7 @@ impl Section {
         match self {
             Section::General => "General",
             Section::Connections => "Connections",
+            Section::Integrations => "Integrations",
             Section::Appearance => "Appearance",
             Section::Terminal => "Terminal",
             Section::Keybindings => "Keybindings",
@@ -109,6 +114,9 @@ impl Section {
                 "The build you are running, how MonoCode reaches you, and the panels it shows."
             }
             Section::Connections => "Connect your machines and run agents remotely through SSH.",
+            Section::Integrations => {
+                "Work trackers and code hosts the Inbox reads, and the board each project works from."
+            }
             Section::Appearance => {
                 "Theme, tint, translucency, workspace layout, and conversation backgrounds."
             }
@@ -132,9 +140,7 @@ impl Section {
                 "Discover and manage file skills from project, personal, and harness folders."
             }
             Section::Monos => "The resident agent beside your tabs, and which projects have one.",
-            Section::Inbox => {
-                "Manage Inbox services and notification preferences for each project."
-            }
+            Section::Inbox => "Notification preferences for each project's Inbox.",
             Section::Archive => "Projects and conversations you have archived.",
             Section::Worktrees => "Manage additional worktrees for each project.",
         }
@@ -143,6 +149,9 @@ impl Section {
         match self {
             Section::General => "version update sounds notifications notes rail",
             Section::Connections => "ssh remote host machine server environment always on",
+            Section::Integrations => {
+                "monday tracker board item github gitlab linear jira atlassian azure devops connect token integration"
+            }
             Section::Appearance => {
                 "theme dark light color accent glass blur zoom scale wallpaper rail sidebar"
             }
@@ -162,9 +171,7 @@ impl Section {
             }
             Section::Skills => "skill instructions prompt",
             Section::Monos => "mono resident agent mascot claim project title bar",
-            Section::Inbox => {
-                "github gitlab linear jira atlassian azure devops connect token integration"
-            }
+            Section::Inbox => "notifications mute resume sounds banners reminders",
             Section::Archive => "archived restore delete hidden",
             Section::Worktrees => "git branch worktree working copy project create delete",
         }
@@ -174,6 +181,7 @@ impl Section {
         match self {
             Section::General => "sliders",
             Section::Connections => "internet",
+            Section::Integrations => "kanban",
             Section::Appearance => "palette",
             Section::Terminal => "terminal",
             Section::Keybindings => "keyboard",
@@ -608,32 +616,50 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "mute resume sounds banners reminders categories",
     ),
     (
+        "monday",
+        Section::Integrations,
+        "monday.com",
+        "monday board item tracker api token personal connect",
+    ),
+    (
+        "monday-boards",
+        Section::Integrations,
+        "Boards in Inbox",
+        "monday follow boards list refresh",
+    ),
+    (
+        "monday-project",
+        Section::Integrations,
+        "Project board",
+        "monday bind board status column people column map write back pull request integrations.json team",
+    ),
+    (
         "github",
-        Section::Inbox,
+        Section::Integrations,
         "GitHub",
         "gh cli connect pull request sign in",
     ),
     (
         "gitlab",
-        Section::Inbox,
+        Section::Integrations,
         "GitLab",
         "token self-managed merge request connect",
     ),
     (
         "azuredevops",
-        Section::Inbox,
+        Section::Integrations,
         "ADO",
         "azure devops boards repos pull request pat organization connect",
     ),
     (
         "jira",
-        Section::Inbox,
+        Section::Integrations,
         "Jira",
         "atlassian cloud site email api token issues projects connect",
     ),
     (
         "linear",
-        Section::Inbox,
+        Section::Integrations,
         "Linear",
         "api key issues teams connect",
     ),

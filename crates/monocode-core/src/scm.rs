@@ -1,5 +1,6 @@
 //! Source control for the Changes and History panes, ported from
 //! src-tauri/src/fs.rs. Synchronous: callers run these on a background executor.
+mod pull_request;
 mod review;
 pub(crate) mod shell;
 mod stash;
@@ -17,6 +18,13 @@ use crate::files::remote as remote_workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub(crate) use pull_request::github_enterprise_authenticated;
+pub use pull_request::{
+    pr_apply_metadata, pr_base_ref, pr_branch_check, pr_branches, pr_candidates, pr_fetch,
+    pr_file_diff, pr_local_branches, pr_metadata, pr_open, pr_push, pr_push_state, pr_range,
+    pr_set_metadata, pr_setup, CreatedPr, PrBranchCheck, PrCandidates, PrMetadata, PrPush, PrRange,
+    PrRepo, PrSetup, PrSubmit, PrTeam, PrTemplate, PrUser,
+};
 pub use review::{
     commit_file_diff, commit_files, diff_files, file_diff, file_diff_head, file_diff_versions,
     file_history, file_version_diff, review_index, stage_contents, FileDiff, FileDiffVersion,
@@ -1296,6 +1304,47 @@ fn parse_gh_pr_list(json: &str) -> Option<Pr> {
 }
 
 fn gh_run(root: &Path, args: &[&str]) -> Result<String, String> {
+    gh_run_with(root, args, &[], false)
+}
+
+/// [`gh_run`] with extra environment (applied after the project's gh account
+/// variables, so `GH_HOST` here wins) and, with `allow_empty`, success on no output.
+fn gh_run_with(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    allow_empty: bool,
+) -> Result<String, String> {
+    let output = gh_output(root, args, envs)?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() && !allow_empty {
+            return Err("gh returned no output".into());
+        }
+        return Ok(text);
+    }
+    Err(gh_failure(&output, args))
+}
+
+/// What a failed `gh` said: stderr, else stdout, else the command.
+fn gh_failure(output: &std::process::Output, args: &[&str]) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("gh {} failed", args.join(" "))
+    }
+}
+
+/// Run `gh` with the GUI and project gh environment plus `envs`, whatever its status.
+fn gh_output(
+    root: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<std::process::Output, String> {
     let program = shell::resolve_gui_binary("gh")
         .ok_or_else(|| "GitHub CLI (`gh`) is not installed.".to_string())?;
     let mut cmd = Command::new(&program);
@@ -1307,31 +1356,15 @@ fn gh_run(root: &Path, args: &[&str]) -> Result<String, String> {
         .env("GIT_PAGER", "cat");
     shell::apply_gui_env(&mut cmd);
     shell::apply_gh_env(&mut cmd, root);
+    cmd.envs(envs.iter().copied());
     crate::process::configure_child(&mut cmd);
-    let output = crate::process::output(&mut cmd).map_err(|error| {
+    crate::process::output(&mut cmd).map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
             "GitHub CLI (`gh`) is not installed.".to_string()
         } else {
             error.to_string()
         }
-    })?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            return Err("gh returned no output".into());
-        }
-        return Ok(text);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("gh {} failed", args.join(" "))
-    };
-    Err(detail)
+    })
 }
 
 fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, String> {

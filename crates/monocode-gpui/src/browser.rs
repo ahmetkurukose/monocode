@@ -546,6 +546,10 @@ pub(crate) struct BrowserPage {
     /// focus (a click, ⌘L, a new blank page); made at the first render,
     /// which has the window.
     address_keyboard: Option<Subscription>,
+    /// Gives the keyboard back to GPUI when its focus leaves the page for a
+    /// field elsewhere, such as a chat's input; made with
+    /// [`Self::address_keyboard`].
+    keyboard_out: Option<Subscription>,
     /// Where the page last drew, to take GPUI focus when Chromium gets it.
     window: Option<AnyWindowHandle>,
     engine: Entity<Engine>,
@@ -665,6 +669,7 @@ impl BrowserPage {
             zoom_pending: zoom != 100,
             find: None,
             address_keyboard: None,
+            keyboard_out: None,
             window: None,
             engine,
             profiles,
@@ -909,6 +914,17 @@ impl BrowserPage {
             let len = field.content.len();
             field.select_range(0..len, cx);
         });
+    }
+
+    /// GPUI focus left the page: the page, or its docked DevTools, gives
+    /// the keyboard back if it has it.
+    fn release_keyboard(&self) {
+        let hosts = std::iter::once(&self.host).chain(self.devtools.as_ref().map(|d| &d.host));
+        for host in hosts {
+            if host.release_keyboard() {
+                host.with_view(|view| view.set_focus(false));
+            }
+        }
     }
 
     /// Takes the keyboard back from Chromium for a GPUI field.
@@ -1655,6 +1671,14 @@ impl Render for BrowserPage {
             self.suggest._focus_out = Some(cx.on_focus_out(&address, window, |this, _, _, cx| {
                 this.suggest.focused = false;
                 this.close_suggestions(cx);
+            }));
+        }
+        if self.keyboard_out.is_none() {
+            self.keyboard_out = Some(cx.on_focus_out(&self.focus, window, |this, _, window, _| {
+                // A window going to the back keeps its page's keyboard.
+                if window.is_window_active() {
+                    this.release_keyboard();
+                }
             }));
         }
         // A blank tab is GPUI's new tab page: Chromium waits for a navigation.
@@ -2889,12 +2913,51 @@ impl<V> Host<V> {
             link.cdp.on_message(None);
         }
     }
+
+    /// Gives the keyboard back to GPUI's view if the page has it. True when
+    /// it did.
+    fn release_keyboard(&self) -> bool {
+        self.view
+            .borrow()
+            .as_ref()
+            .is_some_and(Hosted::release_keyboard)
+    }
 }
 
 struct Hosted<V> {
     #[cfg(target_os = "macos")]
     clip: objc2::rc::Retained<objc2_app_kit::NSView>,
     view: V,
+}
+
+impl<V> Hosted<V> {
+    /// A page that has AppKit's first responder keeps it when GPUI focuses
+    /// a field elsewhere (a chat's input), and hands it to the window, not
+    /// to GPUI's view, when it is hidden. Either way the field shows its
+    /// caret and hears no key until it is clicked. The keyboard goes to the
+    /// view the page sits in: GPUI's. True when the page had it.
+    fn release_keyboard(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::NSView;
+            let Some(window) = self.clip.window() else {
+                return false;
+            };
+            let held = (window.firstResponder())
+                .and_then(|responder| responder.downcast::<NSView>().ok())
+                .is_some_and(|view| view.isDescendantOf(&self.clip));
+            if !held {
+                return false;
+            }
+            // SAFETY: main thread; the clip is ours.
+            if let Some(parent) = unsafe { self.clip.superview() } {
+                window.makeFirstResponder(Some(&parent));
+            }
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
 }
 
 /// Covered views wait this far outside the window (points).
@@ -3043,6 +3106,7 @@ impl<V: NativeView> Host<V> {
         match next {
             Placement::Hidden => {
                 if prev != Placement::Hidden {
+                    hosted.release_keyboard();
                     #[cfg(target_os = "macos")]
                     hosted.clip.setHidden(true);
                     hosted.view.set_visible(false);
@@ -3058,7 +3122,11 @@ impl<V: NativeView> Host<V> {
                 // Paint put the clip in place this frame; a covered one moves
                 // out of the window instead of hiding, which would stop
                 // Chromium drawing and so capturing it. So does one an agent
-                // keeps drawing.
+                // keeps drawing; that one, off screen, is not the user's to
+                // type into.
+                if next == Placement::Away {
+                    hosted.release_keyboard();
+                }
                 #[cfg(target_os = "macos")]
                 if next != Placement::Shown {
                     hosted

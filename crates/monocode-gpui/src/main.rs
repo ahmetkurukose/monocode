@@ -56,6 +56,7 @@ mod image_memory;
 mod inbox;
 mod ink_field;
 mod input;
+mod keep_awake;
 mod markdown;
 mod markdown_model;
 #[cfg(target_os = "macos")]
@@ -72,7 +73,10 @@ mod pane_motion;
 mod particle_text;
 mod phase_tile;
 mod pickers;
+mod prompt_history;
 mod popover;
+mod pr_dialog;
+mod pr_metadata;
 mod project_background;
 mod project_search;
 mod project_settings;

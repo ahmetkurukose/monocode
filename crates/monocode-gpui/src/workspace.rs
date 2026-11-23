@@ -2921,13 +2921,11 @@ mod tests {
         assert_eq!(restored.focused.get(&1), Some(&-4));
         assert!(restored.projects.contains(&"/p".to_string()));
         let again = serde_json::to_string(&restored).unwrap();
-        for gone in [
-            "project_browser_urls",
-            "keep_awake",
-            "zoom_percent",
-            "user_agent",
-        ] {
-            assert!(!again.contains(gone), "{gone}: {again}");
+        assert!(!again.contains("project_browser_urls"), "{again}");
+        // The page's old WebKit fields; `keep_awake` is also a preference now.
+        let pane = serde_json::to_string(&restored.browser_panes).unwrap();
+        for gone in ["keep_awake", "zoom_percent", "user_agent"] {
+            assert!(!pane.contains(gone), "{gone}: {pane}");
         }
     }
 }

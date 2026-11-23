@@ -8,9 +8,12 @@ use crate::tab_tile::tab_tile_inset;
 
 /// Tabs share the strip down to this, then it scrolls.
 const STRIP_TAB_MIN_WIDTH: f32 = 96.;
-/// The `+` and `⋯` buttons at the strip's end, with their gaps.
+/// The `+` and `⋯` buttons, with their gaps. The `+` rides after the last
+/// tab or sits by the `⋯`; either way it takes the same room.
 const STRIP_BUTTON: f32 = 24.;
 const STRIP_BUTTONS: f32 = 2. * STRIP_BUTTON + 2. + 6.;
+/// The empty room after the tabs never gets narrower than this.
+const STRIP_SPACE_MIN: f32 = 16.;
 /// How long a tab an open found already open glows.
 const FLASH_DURATION: f32 = 0.6;
 /// The inset layout's card floats this far below the window's top.
@@ -462,6 +465,7 @@ impl Shell {
             - trail
             - STRIP_PAD
             - STRIP_BUTTONS
+            - STRIP_SPACE_MIN
             - pinned.len() as f32 * (pin + 2.)
             - share * 2.)
             .max(0.);
@@ -488,6 +492,16 @@ impl Shell {
                 snap(tab_w)
             }
         };
+        // The `+` follows the last tab while the tabs fit; once they hit their
+        // floor and scroll, it stays put by the `⋯`. The room it takes is
+        // the same in both places, so the choice cannot flip back and forth.
+        let laid: f32 = (slots.iter())
+            .map(|s| match s {
+                Slot::Live { key, open } => width_of(*key) * open,
+                Slot::Closing { open, .. } => snap(tab_w) * open,
+            })
+            .sum();
+        let add_inline = laid <= avail + 0.5;
         // The shown tab (or the flashed one) scrolls into view.
         let flashed = self
             .tab_flash
@@ -691,9 +705,14 @@ impl Shell {
                     .gap(px(2.))
                     .pl(px(STRIP_LEAD))
                     .children(row)
+                    .when(add_inline, |d| {
+                        d.child(self.strip_button(visible, false, cx))
+                    })
                     .child(self.strip_drag_area(visible, top, cx)),
             )
-            .child(self.strip_button(visible, false, cx))
+            .when(!add_inline, |d| {
+                d.child(self.strip_button(visible, false, cx))
+            })
             .child(self.strip_button(visible, true, cx).mr(px(STRIP_TRAIL)))
             .when(trail > 0., |d| {
                 d.child(titlebar_drag_area().w(px(trail)).flex_shrink_0())
@@ -827,15 +846,20 @@ impl Shell {
             })
             .when(active && focused, |d| {
                 d.child(
+                    // The focused group's tab wears its accent along the
+                    // plate's whole top edge, bending with its corners, so
+                    // the mark reads as part of the tab rather than a bar
+                    // stopping short beneath it.
                     div()
                         .debug_selector(move || format!("group-tab-focus-{id}"))
                         .absolute()
-                        .bottom(px(plate_top))
-                        .left(px(10.))
-                        .right(px(10.))
-                        .h(px(2.))
-                        .rounded_full()
-                        .bg(accent_color()),
+                        .top(px(plate_top))
+                        .left_0()
+                        .w_full()
+                        .h(px(TAB_PLATE_HEIGHT))
+                        .rounded_md()
+                        .border_t_2()
+                        .border_color(accent_color()),
                 )
             })
             .when(close, |d| {
@@ -953,7 +977,7 @@ impl Shell {
             .debug_selector(move || format!("group-strip-space-{visible}"))
             .relative()
             .flex_1()
-            .min_w(px(16.))
+            .min_w(px(STRIP_SPACE_MIN))
             .h_full()
             .child(bounds.probe())
             .when(top, |d| d.window_control_area(WindowControlArea::Drag))
@@ -984,7 +1008,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// `+` (`more` false) or `⋯` at the strip's end.
+    /// `+` (`more` false) or `⋯`. Both open their menu; the `+` picks what
+    /// the new tab opens.
     fn strip_button(
         &self,
         visible: i64,

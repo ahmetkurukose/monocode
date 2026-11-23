@@ -1,6 +1,6 @@
 # Jira Cloud inbox
 
-Open **Settings → Inbox → Jira**, enter your Jira site, Atlassian account email,
+Open **Settings → Integrations → Jira**, enter your Jira site, Atlassian account email,
 and an API token **without scopes**, then select **Connect**. The connection is
 validated before credentials are saved. Create a token from
 [your Atlassian account](https://id.atlassian.com/manage-profile/security/api-tokens).

@@ -210,7 +210,15 @@ impl Monos {
             let app = std::cell::RefCell::new(_cx.to_async());
             let run = std::rc::Rc::new(move |id: &str| {
                 let _ = entity.update(&mut *app.borrow_mut(), |this, cx| {
-                    if id == "quit" {
+                    if let Some(mode) = id.strip_prefix("awake:") {
+                        // Deferred: saving the mode updates this entity too.
+                        let mode = crate::keep_awake::Mode::parse(mode);
+                        let owner = this.owner.clone();
+                        let app: &mut App = cx;
+                        app.defer(move |cx| {
+                            let _ = owner.update(cx, |o, cx| o.set_keep_awake(mode, cx));
+                        });
+                    } else if id == "quit" {
                         // The shared quit stops providers first; a bare quit
                         // would orphan them.
                         crate::quit(cx);
@@ -241,9 +249,13 @@ impl Monos {
                 .map(|m| (m.id.clone(), m.label()))
                 .collect::<Vec<_>>();
             if let Some(status) = &mut self.status {
-                status.update(&monos, run);
+                status.update(&monos, crate::keep_awake::status(_cx), run);
             }
         }
+    }
+    /// Keep computer awake's mode or state changed: the menu bar shows it.
+    pub(crate) fn keep_awake_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_status(cx);
     }
     pub(crate) fn hide_html(&self, cx: &App) {
         for view in self.html_documents.values() {

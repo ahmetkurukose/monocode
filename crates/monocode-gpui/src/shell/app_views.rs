@@ -206,6 +206,9 @@ impl Shell {
                 }
                 notes::Event::OpenSource(id) => this.open(*id, window, cx),
                 notes::Event::AddToChat(note) => this.note_to_chat(note.clone(), window, cx),
+                notes::Event::OpenIntegrations => {
+                    this.open_settings(crate::settings::Section::Integrations, window, cx)
+                }
             },
         ));
         self.app_view_events
@@ -247,6 +250,19 @@ impl Shell {
             inbox.update(cx, |inbox, cx| inbox.refresh(cx));
         }
         self.show_app_view(AppView::Inbox, window, cx);
+    }
+
+    /// Open the Inbox with `pr` selected.
+    pub(super) fn reveal_pull_request(
+        &mut self,
+        pr: inbox::RevealPr,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_inbox(window, cx);
+        if let Some(inbox) = &self.inbox {
+            inbox.update(cx, |inbox, cx| inbox.reveal_pull_request(pr, cx));
+        }
     }
 
     pub(super) fn ensure_background_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
