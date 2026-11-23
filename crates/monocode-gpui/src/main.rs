@@ -73,6 +73,7 @@ mod pane_motion;
 mod particle_text;
 mod phase_tile;
 mod pickers;
+mod prompt_history;
 mod popover;
 mod project_background;
 mod project_search;
