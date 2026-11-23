@@ -234,7 +234,7 @@ pub async fn fill(
                     json!({
                         "functionDeclaration": FILL_IN_CONTEXT,
                         "executionContextId": context,
-                        "arguments": args(Some(field)),
+                        "arguments": args(Some(field.as_str())),
                         "returnByValue": true,
                     }),
                     None,
@@ -307,7 +307,10 @@ pub async fn fill(
                 password: value["password"] == true,
             });
         }
-        let why = value["why"].as_str().unwrap_or("nothing to fill").to_owned();
+        let why = value["why"]
+            .as_str()
+            .unwrap_or("nothing to fill")
+            .to_owned();
         // A world made after the watcher's script: it runs there now.
         if why == "not ready" && attempt == 0 && !matches!(target, FillTarget::Field { .. }) {
             continue;
@@ -387,11 +390,18 @@ mod tests {
     #[test]
     fn reports_parse_into_signals() {
         assert_eq!(
-            parse(r#"{"t":"focus","kind":"password","field":"f1","rect":{"x":1,"y":2,"width":3,"height":4},"top":true}"#),
+            parse(
+                r#"{"t":"focus","kind":"password","field":"f1","rect":{"x":1,"y":2,"width":3,"height":4},"top":true}"#
+            ),
             Some(Signal::Focus {
                 kind: FieldKind::Password,
                 field: "f1".into(),
-                rect: Rect { x: 1., y: 2., width: 3., height: 4. },
+                rect: Rect {
+                    x: 1.,
+                    y: 2.,
+                    width: 3.,
+                    height: 4.
+                },
                 top: true
             })
         );
@@ -422,7 +432,10 @@ mod tests {
             "Page.getFrameTree",
             json!({"frameTree": {"frame": {"id": "F"}}}),
         );
-        script.reply("Page.createIsolatedWorld", json!({"executionContextId": 12}));
+        script.reply(
+            "Page.createIsolatedWorld",
+            json!({"executionContextId": 12}),
+        );
         script.reply(
             "Runtime.callFunctionOn",
             json!({"result": {"type": "object", "value": {"ok": true, "username": true, "password": true}}}),
@@ -436,12 +449,20 @@ mod tests {
             }
         );
         let world = &script.calls("Page.createIsolatedWorld")[0];
-        assert_eq!((world["frameId"].as_str(), world["worldName"].as_str()), (Some("F"), Some(WORLD)));
+        assert_eq!(
+            (world["frameId"].as_str(), world["worldName"].as_str()),
+            (Some("F"), Some(WORLD))
+        );
         let call = &script.calls("Runtime.callFunctionOn")[0];
         assert_eq!(call["executionContextId"], 12);
         assert_eq!(call["arguments"][1]["value"], "s3cret!");
         // The password is an argument, never part of code the page could see.
-        assert!(!call["functionDeclaration"].as_str().unwrap().contains("s3cret"));
+        assert!(
+            !call["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("s3cret")
+        );
     }
 
     #[test]
@@ -470,7 +491,10 @@ mod tests {
         let filled = run(fill(&cdp, &target, "", "pw12")).unwrap();
         assert!(filled.password && !filled.username);
         assert_eq!(script.calls("Page.createIsolatedWorld")[0]["frameId"], "F2");
-        assert_eq!(script.calls("Runtime.callFunctionOn")[1]["objectId"], "o-33-5");
+        assert_eq!(
+            script.calls("Runtime.callFunctionOn")[1]["objectId"],
+            "o-33-5"
+        );
         let installed = &script.calls("Runtime.evaluate")[0];
         assert_eq!(installed["contextId"], 5);
 
@@ -483,6 +507,9 @@ mod tests {
             context: 3,
             field: "f1".into(),
         };
-        assert_eq!(run(fill(&cdp, &field, "a", "b")).unwrap_err(), "no login form");
+        assert_eq!(
+            run(fill(&cdp, &field, "a", "b")).unwrap_err(),
+            "no login form"
+        );
     }
 }

@@ -1875,8 +1875,10 @@ fn saved_passwords_are_masked_in_everything_an_agent_reads() {
     page.script.on("Runtime.evaluate", move |p, _| {
         Ok(match p["expression"].as_str().unwrap() {
             "read" => json!({"result": {"type": "string", "value": "Tr0ub4dor&3 x"}}),
-            "throw" => json!({"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught",
-                "exception": {"description": "Error: bad Tr0ub4dor&3 x"}}}),
+            "throw" => {
+                json!({"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught",
+                "exception": {"description": "Error: bad Tr0ub4dor&3 x"}}})
+            }
             _ => json!({"result": {"type": "undefined"}}),
         })
     });
@@ -1908,7 +1910,10 @@ fn saved_passwords_are_masked_in_everything_an_agent_reads() {
 /// A page whose sign-in form fills.
 fn login_page(host: &Rc<FakeHost>) -> Rc<FakePage> {
     let page = host.page(1);
-    page.script.reply("Page.createIsolatedWorld", json!({"executionContextId": 30}));
+    page.script.reply(
+        "Page.createIsolatedWorld",
+        json!({"executionContextId": 30}),
+    );
     page.script.on("Runtime.callFunctionOn", |p, _| {
         let function = p["functionDeclaration"].as_str().unwrap_or("");
         Ok(if function.contains("__monocodePasswords") {
@@ -1931,11 +1936,21 @@ fn an_agent_fills_a_saved_login_without_seeing_it() {
     let filled = driver.run("browser_fill_login", json!({}));
     assert!(!filled.is_error, "{}", text(&filled));
     let said = text(&filled);
-    assert!(said.starts_with("Filled the saved login \"alice\" for https://example.com (user name and password)"), "{said}");
+    assert!(
+        said.starts_with(
+            "Filled the saved login \"alice\" for https://example.com (user name and password)"
+        ),
+        "{said}"
+    );
     assert!(!said.contains("s3cret"));
     // Filled in the watcher's world, the password an argument.
     let fill = (page.script.calls("Runtime.callFunctionOn").into_iter())
-        .find(|c| c["functionDeclaration"].as_str().unwrap().contains("__monocodePasswords"))
+        .find(|c| {
+            c["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("__monocodePasswords")
+        })
         .unwrap();
     assert_eq!(fill["executionContextId"], 30);
     assert_eq!(fill["arguments"][1]["value"], "s3cret-pw");
@@ -1953,7 +1968,10 @@ fn fill_login_says_which_logins_there_are_and_why_not() {
     *page.logins.borrow_mut() = Ok(vec![]);
     let empty = driver.run("browser_fill_login", json!({}));
     assert!(text(&empty).contains("no saved login for https://example.com"));
-    *page.logins.borrow_mut() = Ok(vec![credential("alice", "aaaa1"), credential("bob", "bbbb2")]);
+    *page.logins.borrow_mut() = Ok(vec![
+        credential("alice", "aaaa1"),
+        credential("bob", "bbbb2"),
+    ]);
     let which = driver.run("browser_fill_login", json!({}));
     assert!(which.is_error);
     assert_eq!(
@@ -1969,4 +1987,29 @@ fn fill_login_says_which_logins_there_are_and_why_not() {
     page.info.borrow_mut().url = "about:blank".into();
     let blank = driver.run("browser_fill_login", json!({}));
     assert!(text(&blank).starts_with("browser_no_login: page 1 is not a web site"));
+}
+
+#[test]
+fn action_effects_mask_saved_passwords_too() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    *page.logins.borrow_mut() = Ok(vec![credential("alice", "Tr0ub4dor&3 x")]);
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let script = Rc::downgrade(&page.script);
+    page.script.on("Input.dispatchMouseEvent", move |p, _| {
+        if p["type"] == "mouseReleased" {
+            // The page shows the password on its button now.
+            let mut tree = login_failed();
+            tree["nodes"][5]["name"]["value"] = json!("Copy Tr0ub4dor&3 x");
+            script
+                .upgrade()
+                .unwrap()
+                .reply("Accessibility.getFullAXTree", tree);
+        }
+        Ok(json!({}))
+    });
+    let click = text(&driver.run("browser_click", json!({"ref": "@e3"})));
+    assert!(!click.contains("Tr0ub4dor"), "{click}");
+    assert!(click.contains("[@e3] button \"Copy ••••\""), "{click}");
 }

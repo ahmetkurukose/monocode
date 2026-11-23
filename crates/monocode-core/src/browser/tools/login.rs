@@ -46,16 +46,13 @@ pub async fn fill_login(ctx: &Ctx, args: &Value) -> Reply {
             .join(", ")
     };
     let login = match wanted {
-        Some(user) => logins
-            .iter()
-            .find(|l| l.username == user)
-            .ok_or_else(|| {
-                no_login(format!(
-                    "no saved login for {} at {origin}; the saved ones are {}",
-                    quote(user, 80),
-                    names()
-                ))
-            })?,
+        Some(user) => logins.iter().find(|l| l.username == user).ok_or_else(|| {
+            no_login(format!(
+                "no saved login for {} at {origin}; the saved ones are {}",
+                quote(user, 80),
+                names()
+            ))
+        })?,
         None if logins.len() == 1 => &logins[0],
         None => {
             return Err(invalid(format!(

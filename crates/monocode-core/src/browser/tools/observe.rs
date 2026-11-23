@@ -279,7 +279,9 @@ async fn password_fields(ctx: &Ctx) -> Result<std::collections::HashSet<i64>, To
         json!({"expression": PASSWORD_FIELDS, "objectGroup": group}),
     )
     .await?;
-    let array = found.as_ref().and_then(|f| f["result"]["objectId"].as_str());
+    let array = found
+        .as_ref()
+        .and_then(|f| f["result"]["objectId"].as_str());
     if let Some(array) = array {
         let properties = soft(
             ctx,
@@ -288,8 +290,16 @@ async fn password_fields(ctx: &Ctx) -> Result<std::collections::HashSet<i64>, To
             json!({"objectId": array, "ownProperties": true}),
         )
         .await?;
-        for property in properties.iter().flat_map(|p| p["result"].as_array()).flatten() {
-            if property["name"].as_str().and_then(|n| n.parse::<usize>().ok()).is_none() {
+        for property in properties
+            .iter()
+            .flat_map(|p| p["result"].as_array())
+            .flatten()
+        {
+            if property["name"]
+                .as_str()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_none()
+            {
                 continue;
             }
             let Some(object) = property["value"]["objectId"].as_str() else {

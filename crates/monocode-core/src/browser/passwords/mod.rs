@@ -11,8 +11,9 @@
 //! - [`capture`]: whether a sign-in worked, so it is worth saving.
 //! - [`mask`]: agents fill saved logins but never read them (K57).
 //!
-//! Imports (K61) add logins through [`vault::Vault::merge`] (new site and
-//! user name added, saved ones kept) or [`vault::Vault::upsert`].
+//! Imports (K61) add logins through [`vault::Vault::import`], by the
+//! import's own merge rule ([`crate::browser::import::merge_logins`]: one
+//! login per site and user name, the newer password wins).
 
 pub mod capture;
 pub mod crypto;
@@ -23,7 +24,7 @@ pub mod watch;
 
 pub use crypto::VaultKey;
 pub use mask::{MASK, mask_output, mask_text};
-pub use vault::{Login, LoginInput, MergeReport, Offer, Vault, Vaults, origin_of};
+pub use vault::{ImportReport, Login, Offer, Vault, Vaults, origin_of};
 
 /// A saved login an agent may fill (the password stays in the app: tools
 /// never put it in an answer).

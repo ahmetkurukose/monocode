@@ -15,6 +15,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::crypto::VaultKey;
+use crate::browser::import::{ImportedLogin, merge_logins};
 
 /// The default profile's vault.
 pub const DEFAULT_PROFILE: &str = "default";
@@ -68,28 +69,19 @@ pub struct Login {
     pub times_used: i64,
 }
 
-/// A login to add, e.g. one imported from another browser.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoginInput {
-    /// Any URL of the site; its origin is kept.
-    pub origin: String,
-    pub username: String,
-    pub password: String,
-    pub created_at: Option<i64>,
-    pub last_used_at: Option<i64>,
-}
-
-/// What [`Vault::merge`] did (an import's report).
+/// What [`Vault::import`] did with another browser's logins (K61).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MergeReport {
+pub struct ImportReport {
     /// New site and user name: added.
     pub added: usize,
-    /// Saved already with the same password.
-    pub duplicates: usize,
-    /// Saved already with another password: the saved one is kept.
-    pub conflicts: usize,
-    /// No web origin or no password: left out.
-    pub invalid: usize,
+    /// Saved already with an older password: the imported one replaced it.
+    pub updated: usize,
+    /// Saved already with the same password, or a newer one: kept.
+    pub unchanged: usize,
+    /// No web origin (an app's, `android://…`) or no password: left out.
+    pub skipped: usize,
+    /// "Never save" sites put on the vault's list.
+    pub never_save: usize,
 }
 
 /// What the browser offers after a successful sign-in (Chromium's
@@ -364,60 +356,133 @@ impl Vault {
         Ok(Offer::Save)
     }
 
-    /// Adds `items` that are not saved yet: a new site and user name is
-    /// added, the same password is a duplicate, another password a
-    /// conflict (the saved one stays). Re-importing merges again (K61).
-    pub fn merge(&self, items: &[LoginInput], now: i64) -> Result<MergeReport, String> {
-        let mut report = MergeReport::default();
-        for item in items {
-            let Some(origin) = origin_of(&item.origin) else {
-                report.invalid += 1;
-                continue;
-            };
-            if item.password.is_empty() {
-                report.invalid += 1;
-                continue;
-            }
-            let existing: Option<i64> = sql(self
-                .conn
-                .query_row(
-                    "SELECT id FROM logins WHERE origin = ?1 AND username = ?2",
-                    params![origin, item.username],
-                    |r| r.get(0),
-                )
-                .optional())?;
-            if let Some(id) = existing {
-                if self.password(id)? == item.password {
-                    report.duplicates += 1;
-                } else {
-                    report.conflicts += 1;
-                }
-                continue;
-            }
-            let sealed = self.key.seal_text(&origin, &item.password)?;
-            let created = item.created_at.unwrap_or(now);
-            sql(self.conn.execute(
-                "INSERT INTO logins(origin, signon_realm, username, password, created_at,
-                                    last_used_at, changed_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?5)",
-                params![
-                    origin,
-                    format!("{origin}/"),
-                    item.username,
-                    sealed,
-                    created,
-                    item.last_used_at.unwrap_or(0)
-                ],
-            ))?;
-            report.added += 1;
-        }
-        Ok(report)
+    /// The saved login of `origin` and `username` as an import reads one
+    /// (its password open), and its id.
+    fn as_imported(
+        &self,
+        origin: &str,
+        username: &str,
+    ) -> Result<Option<(i64, ImportedLogin)>, String> {
+        let row = sql(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM logins WHERE origin = ?1 AND username = ?2",
+                    Self::COLUMNS
+                ),
+                params![origin, username],
+                Self::login,
+            )
+            .optional())?;
+        let Some(login) = row else {
+            return Ok(None);
+        };
+        let password = self.password(login.id)?;
+        Ok(Some((
+            login.id,
+            ImportedLogin {
+                origin: login.origin,
+                signon_realm: login.signon_realm,
+                username: login.username,
+                password,
+                created_ms: login.created_at,
+                last_used_ms: login.last_used_at,
+                password_modified_ms: login.changed_at,
+                times_used: login.times_used,
+            },
+        )))
     }
 
-    /// Adds or replaces one imported login (the import's "replace" choice
-    /// for a conflict). Its id.
-    pub fn upsert(&self, item: &LoginInput, now: i64) -> Result<i64, String> {
-        self.save(&item.origin, &item.username, &item.password, now)
+    /// Adds another browser's `logins` and "never save" sites (K61) by the
+    /// import's own rule ([`merge_logins`]): one login per site and user
+    /// name; a saved one gives way only to another password that is newer
+    /// (changed, or else saved, later), and a tie keeps what is saved.
+    /// Importing again merges again. `now` stands in for missing times.
+    pub fn import(
+        &self,
+        logins: &[ImportedLogin],
+        never_save: &[String],
+        now: i64,
+    ) -> Result<ImportReport, String> {
+        let mut report = ImportReport::default();
+        let tx = sql(self.conn.unchecked_transaction())?;
+        let or_now = |ms: i64| if ms > 0 { ms } else { now };
+        for login in logins {
+            let Some(origin) = origin_of(&login.origin) else {
+                report.skipped += 1;
+                continue;
+            };
+            if login.password.is_empty() {
+                report.skipped += 1;
+                continue;
+            }
+            let incoming = ImportedLogin {
+                origin: origin.clone(),
+                signon_realm: format!("{origin}/"),
+                ..login.clone()
+            };
+            let saved = self.as_imported(&origin, &login.username)?;
+            let id = saved.as_ref().map(|(id, _)| *id);
+            let merge = merge_logins(saved.map(|(_, l)| l).into_iter().collect(), [incoming]);
+            let updated = merge.updated > 0;
+            let Some(merged) = merge.logins.into_iter().next() else {
+                continue;
+            };
+            match id {
+                None => {
+                    let sealed = self.key.seal_text(&origin, &merged.password)?;
+                    sql(self.conn.execute(
+                        "INSERT INTO logins(origin, signon_realm, username, password, created_at,
+                                            last_used_at, changed_at, times_used)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            origin,
+                            merged.signon_realm,
+                            merged.username,
+                            sealed,
+                            or_now(merged.created_ms),
+                            merged.last_used_ms.max(0),
+                            or_now(merged.stamp()),
+                            merged.times_used.max(0)
+                        ],
+                    ))?;
+                    report.added += 1;
+                }
+                Some(id) if updated => {
+                    let sealed = self.key.seal_text(&origin, &merged.password)?;
+                    sql(self.conn.execute(
+                        "UPDATE logins SET password = ?2, changed_at = ?3,
+                           last_used_at = MAX(last_used_at, ?4), times_used = MAX(times_used, ?5)
+                         WHERE id = ?1",
+                        params![
+                            id,
+                            sealed,
+                            or_now(merged.stamp()),
+                            merged.last_used_ms,
+                            merged.times_used
+                        ],
+                    ))?;
+                    report.updated += 1;
+                }
+                Some(id) => {
+                    // Kept; with the same password it learns how much the
+                    // login was used.
+                    sql(self.conn.execute(
+                        "UPDATE logins SET last_used_at = ?2, times_used = ?3 WHERE id = ?1",
+                        params![id, merged.last_used_ms, merged.times_used],
+                    ))?;
+                    report.unchanged += 1;
+                }
+            }
+        }
+        for site in never_save {
+            if origin_of(site).is_some() {
+                self.never_save(site, now)?;
+                report.never_save += 1;
+            }
+        }
+        sql(tx.commit())?;
+        Ok(report)
     }
 }
 

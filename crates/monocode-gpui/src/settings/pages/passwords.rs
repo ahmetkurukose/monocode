@@ -43,7 +43,12 @@ impl SettingsView {
             return search.clone();
         }
         let search = cx.new(|cx| {
-            let mut field = Input::field("Search passwords", "Search sites and user names", content(0.35), cx);
+            let mut field = Input::field(
+                "Search passwords",
+                "Search sites and user names",
+                content(0.35),
+                cx,
+            );
             field.set_font_size(13.);
             field
         });
@@ -229,26 +234,33 @@ impl SettingsView {
             rows,
         )];
         let never_rows: Vec<AnyElement> = if never.is_empty() {
-            vec![note("When you choose \"Never for this site\", the site shows here.")]
+            vec![note(
+                "When you choose \"Never for this site\", the site shows here.",
+            )]
         } else {
             never
                 .iter()
                 .enumerate()
                 .map(|(ix, (profile, origin))| {
                     let (profile, origin) = (profile.clone(), origin.clone());
-                    let id = gpui::ElementId::NamedInteger("browser-never-remove".into(), ix as u64);
+                    let id =
+                        gpui::ElementId::NamedInteger("browser-never-remove".into(), ix as u64);
                     self.row(
                         None,
                         ix == 0,
                         monocode_core::browser::sites::host_of(&origin),
                         several.then(|| format!("{profile} profile").into()),
-                        vec![crate::modal::ghost_button(id, "Remove")
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                let _ = vaults::with_vault(&profile, cx, |v| v.allow_saving(&origin));
-                                vaults::changed(cx);
-                            }))
-                            .into_any_element()],
+                        vec![
+                            crate::modal::ghost_button(id, "Remove")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let _ = vaults::with_vault(&profile, cx, |v| {
+                                        v.allow_saving(&origin)
+                                    });
+                                    vaults::changed(cx);
+                                }))
+                                .into_any_element(),
+                        ],
                     )
                 })
                 .collect()
@@ -273,7 +285,12 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key: LoginKey = (profile.to_owned(), login.id);
-        if self.passwords.editing.as_ref().is_some_and(|e| e.key == key) {
+        if self
+            .passwords
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.key == key)
+        {
             return self.edit_row(ix, login, cx);
         }
         let revealed = self.passwords.revealed.get(&key).cloned();
@@ -290,20 +307,21 @@ impl SettingsView {
         let copied = self.passwords.copied.as_ref() == Some(&key);
         let id = |name: &'static str| gpui::ElementId::NamedInteger(name.into(), ix as u64);
         let (k1, k2, k3, k4) = (key.clone(), key.clone(), key.clone(), key.clone());
-        let label = div()
-            .flex()
-            .flex_col()
-            .child(site)
-            .when_some(revealed.clone(), |d, password| {
-                d.child(
-                    div()
-                        .mt_1()
-                        .font_family("Menlo")
-                        .text_size(px(12.))
-                        .text_color(content(0.85))
-                        .child(password),
-                )
-            });
+        let label =
+            div()
+                .flex()
+                .flex_col()
+                .child(site)
+                .when_some(revealed.clone(), |d, password| {
+                    d.child(
+                        div()
+                            .mt_1()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .text_color(content(0.85))
+                            .child(password),
+                    )
+                });
         self.row(
             None,
             ix == 0,
@@ -312,7 +330,11 @@ impl SettingsView {
             vec![
                 icon_action(
                     id("browser-password-reveal"),
-                    if revealed.is_some() { "Hide password" } else { "Show password" },
+                    if revealed.is_some() {
+                        "Hide password"
+                    } else {
+                        "Show password"
+                    },
                     "eye",
                     26.,
                     14.,
@@ -325,10 +347,15 @@ impl SettingsView {
                         return;
                     }
                     let key = k1.clone();
-                    this.with_password(key.clone(), "show a saved password", cx, move |this, password, cx| {
-                        this.passwords.revealed.insert(key, password);
-                        cx.notify();
-                    });
+                    this.with_password(
+                        key.clone(),
+                        "show a saved password",
+                        cx,
+                        move |this, password, cx| {
+                            this.passwords.revealed.insert(key, password);
+                            cx.notify();
+                        },
+                    );
                 }))
                 .into_any_element(),
                 icon_action(
@@ -342,47 +369,75 @@ impl SettingsView {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let key = k2.clone();
-                    this.with_password(key.clone(), "copy a saved password", cx, move |this, password, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(password.clone()));
-                        this.passwords.copied = Some(key);
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(CLIPBOARD_FOR).await;
-                            let _ = this.update(cx, |this, cx| {
-                                let still = cx
-                                    .read_from_clipboard()
-                                    .and_then(|c| c.text())
-                                    .is_some_and(|t| t == password);
-                                if still {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
-                                }
-                                this.passwords.copied = None;
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-                        cx.notify();
-                    });
+                    this.with_password(
+                        key.clone(),
+                        "copy a saved password",
+                        cx,
+                        move |this, password, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(password.clone()));
+                            this.passwords.copied = Some(key);
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(CLIPBOARD_FOR).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    let still = cx
+                                        .read_from_clipboard()
+                                        .and_then(|c| c.text())
+                                        .is_some_and(|t| t == password);
+                                    if still {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            String::new(),
+                                        ));
+                                    }
+                                    this.passwords.copied = None;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                            cx.notify();
+                        },
+                    );
                 }))
                 .into_any_element(),
-                icon_action(id("browser-password-edit"), "Edit", "pencil-edit-02", 26., 14., 0.55, false)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let key = k3.clone();
-                        let window = window.window_handle();
-                        this.with_password(key.clone(), "edit a saved password", cx, move |this, password, cx| {
+                icon_action(
+                    id("browser-password-edit"),
+                    "Edit",
+                    "pencil-edit-02",
+                    26.,
+                    14.,
+                    0.55,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let key = k3.clone();
+                    let window = window.window_handle();
+                    this.with_password(
+                        key.clone(),
+                        "edit a saved password",
+                        cx,
+                        move |this, password, cx| {
                             this.start_editing(key, password, window, cx);
-                        });
-                    }))
-                    .into_any_element(),
-                icon_action(id("browser-password-delete"), "Delete", "delete-02", 26., 14., 0.55, false)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let (profile, id) = k4.clone();
-                        if let Some(Err(error)) = vaults::with_vault(&profile, cx, |v| v.delete(id)) {
-                            this.passwords.error = Some(error);
-                        }
-                        this.passwords.revealed.remove(&k4);
-                        vaults::changed(cx);
-                    }))
-                    .into_any_element(),
+                        },
+                    );
+                }))
+                .into_any_element(),
+                icon_action(
+                    id("browser-password-delete"),
+                    "Delete",
+                    "delete-02",
+                    26.,
+                    14.,
+                    0.55,
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let (profile, id) = k4.clone();
+                    if let Some(Err(error)) = vaults::with_vault(&profile, cx, |v| v.delete(id)) {
+                        this.passwords.error = Some(error);
+                    }
+                    this.passwords.revealed.remove(&k4);
+                    vaults::changed(cx);
+                }))
+                .into_any_element(),
             ],
         )
     }

@@ -2768,9 +2768,8 @@ struct Shared {
     /// The page's sound, and whether the user muted it (`browser_audio.rs`).
     audio: audio::Audio,
     /// Where the password watcher's reports go (`browser_passwords.rs`).
-    passwords: RefCell<
-        Option<async_channel::Sender<monocode_core::browser::passwords::watch::Report>>,
-    >,
+    passwords:
+        RefCell<Option<async_channel::Sender<monocode_core::browser::passwords::watch::Report>>>,
 }
 
 impl Shared {

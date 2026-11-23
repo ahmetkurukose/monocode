@@ -216,9 +216,42 @@ impl BrowserPage {
                 log::warn!("browser passwords: {error}");
                 return;
             }
-            // Locked: decided again once the vault opens.
+            // Locked with passwords saved: open it, then decide (the site
+            // may be saved already, or never to be).
+            None if vaults::saved_any(cx) && vaults::state(cx) != VaultState::Open => {
+                if let VaultState::Unavailable(why) = vaults::state(cx) {
+                    // The Keychain said no: the bar says so, Save tries again.
+                    self.show_offer(store, submission, None, Some(why), cx);
+                    return;
+                }
+                let unlocking = vaults::unlock(cx);
+                cx.spawn(async move |this, cx| {
+                    let state = unlocking.await;
+                    let _ = this.update(cx, |page, cx| match state {
+                        VaultState::Open => page.offer_to_save(submission, cx),
+                        VaultState::Unavailable(why) => {
+                            page.show_offer(store, submission, None, Some(why), cx)
+                        }
+                        _ => {}
+                    });
+                })
+                .detach();
+                return;
+            }
+            // Nothing saved yet: the vault opens on Save.
             None => None,
         };
+        self.show_offer(store, submission, update, None, cx);
+    }
+
+    fn show_offer(
+        &mut self,
+        store: String,
+        submission: monocode_core::browser::passwords::capture::Submission,
+        update: Option<i64>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.passwords.offer = Some(SaveOffer {
             store,
             url: submission.url,
@@ -229,7 +262,7 @@ impl BrowserPage {
             at: Instant::now(),
             shown: true,
             busy: false,
-            error: None,
+            error,
         });
         cx.notify();
     }
@@ -336,9 +369,9 @@ impl BrowserPage {
                     return;
                 };
                 let now = monocode_core::time::now_ms() as i64;
-                if let Some(Err(error)) = vaults::with_vault(&offer.store, cx, |vault| {
-                    vault.never_save(&offer.url, now)
-                }) {
+                if let Some(Err(error)) =
+                    vaults::with_vault(&offer.store, cx, |vault| vault.never_save(&offer.url, now))
+                {
                     log::warn!("browser passwords: {error}");
                 }
                 vaults::changed(cx);
@@ -427,7 +460,9 @@ impl BrowserPage {
         cx: &mut App,
     ) -> Result<Vec<monocode_core::browser::passwords::Credential>, String> {
         let Some(store) = self.password_store() else {
-            return Err("this page browses with a throwaway profile, which keeps no passwords".into());
+            return Err(
+                "this page browses with a throwaway profile, which keeps no passwords".into(),
+            );
         };
         if !vaults::password_manager_enabled(cx) {
             return Err("the user turned Monocode's password manager off".into());
@@ -453,10 +488,12 @@ impl BrowserPage {
             .map(|found| {
                 found
                     .into_iter()
-                    .map(|(login, password)| monocode_core::browser::passwords::Credential {
-                        username: login.username,
-                        password,
-                    })
+                    .map(
+                        |(login, password)| monocode_core::browser::passwords::Credential {
+                            username: login.username,
+                            password,
+                        },
+                    )
                     .collect()
             })
     }
@@ -468,7 +505,11 @@ impl BrowserPage {
         };
         let now = monocode_core::time::now_ms() as i64;
         let _ = vaults::with_vault(&store, cx, |vault| {
-            match vault.logins(Some(&origin))?.iter().find(|l| l.username == username) {
+            match vault
+                .logins(Some(&origin))?
+                .iter()
+                .find(|l| l.username == username)
+            {
                 Some(login) => vault.note_used(login.id, now),
                 None => Ok(()),
             }
@@ -667,16 +708,21 @@ impl BrowserPage {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().text_size(px(12.)).truncate().child(
-                        format!(
-                            "{what} the password for {}?",
-                            if offer.username.is_empty() {
-                                "this site"
-                            } else {
-                                &offer.username
-                            }
-                        ),
-                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .truncate()
+                            .child(format!(
+                                "{what} the password for {}?",
+                                if offer.username.is_empty() {
+                                    "this site"
+                                } else {
+                                    &offer.username
+                                }
+                            )),
+                    )
                     .child(
                         modal::primary_button("browser-passwords-key-save", what)
                             .h(px(24.))
@@ -809,7 +855,12 @@ impl BrowserPage {
     #[cfg(test)]
     pub(crate) fn password_offer_for_test(&self) -> Option<(String, String, bool, bool)> {
         let o = self.passwords.offer.as_ref()?;
-        Some((o.origin.clone(), o.username.clone(), o.update.is_some(), o.shown))
+        Some((
+            o.origin.clone(),
+            o.username.clone(),
+            o.update.is_some(),
+            o.shown,
+        ))
     }
 }
 

@@ -31,6 +31,8 @@ pub(crate) struct Passwords {
     /// The last successful Touch ID check: reveals and copies within
     /// [`REAUTH_FOR`] ask no more.
     authenticated: Option<Instant>,
+    /// Who waits for the unlocking under way.
+    waiting: Vec<async_channel::Sender<VaultState>>,
     /// Bumped on every change, so views can tell.
     pub(crate) revision: u64,
 }
@@ -49,6 +51,7 @@ pub(crate) fn init(dir: Option<PathBuf>, cx: &mut App) {
             state: VaultState::Locked,
             vaults: None,
             authenticated: None,
+            waiting: Vec::new(),
             revision: 0,
         }))));
     }
@@ -112,51 +115,45 @@ pub(crate) fn warm(cx: &mut App) {
     }
 }
 
-/// Waits until the vaults are no longer unlocking.
-fn settled(passwords: Rc<RefCell<Passwords>>, cx: &mut App) -> gpui::Task<VaultState> {
-    cx.spawn(async move |cx| {
-        loop {
-            let state = passwords.borrow().state.clone();
-            if state != VaultState::Unlocking {
-                return state;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
-        }
-    })
-}
-
 /// Asks the Keychain for the key, off the main thread; again after it was
 /// refused. The returned task resolves when the state is settled either
-/// way; dropping it does not stop the unlocking.
+/// way (one Keychain read for everyone who asks meanwhile); dropping it
+/// does not stop the unlocking.
 pub(crate) fn unlock(cx: &mut App) -> gpui::Task<VaultState> {
     let passwords = global(cx);
-    let (dir, now) = {
-        let p = passwords.borrow();
-        (p.dir.clone(), p.state.clone())
+    let (answer, settled) = async_channel::bounded::<VaultState>(1);
+    let dir = {
+        let mut p = passwords.borrow_mut();
+        let current = p.state.clone();
+        match current {
+            VaultState::Open => return gpui::Task::ready(VaultState::Open),
+            // Someone asked already: wait for their answer.
+            VaultState::Unlocking => {
+                p.waiting.push(answer);
+                None
+            }
+            VaultState::Locked | VaultState::Unavailable(_) => {
+                p.state = VaultState::Unlocking;
+                p.waiting.push(answer);
+                Some(p.dir.clone())
+            }
+        }
     };
-    match now {
-        VaultState::Open => return gpui::Task::ready(VaultState::Open),
-        // Someone asked already: wait for their answer.
-        VaultState::Unlocking => return settled(passwords, cx),
-        VaultState::Locked | VaultState::Unavailable(_) => {}
-    }
-    passwords.borrow_mut().state = VaultState::Unlocking;
-    let exist = dir.as_deref().is_some_and(Vaults::exist_in);
-    let source = key_source(dir.as_deref());
-    let key = cx
-        .background_executor()
-        .spawn(async move { keychain::get_or_create(&*source, exist) });
-    let done = passwords.clone();
-    cx.spawn(async move |cx| {
-        let key = key.await;
-        cx.update(|cx| {
-            {
-                let mut p = done.borrow_mut();
-                p.state = match key {
+    if let Some(dir) = dir {
+        let exist = dir.as_deref().is_some_and(Vaults::exist_in);
+        let source = key_source(dir.as_deref());
+        let key = cx
+            .background_executor()
+            .spawn(async move { keychain::get_or_create(&*source, exist) });
+        let done = passwords.clone();
+        cx.spawn(async move |cx| {
+            let key = key.await;
+            cx.update(|cx| {
+                let state = match key {
                     Ok(key) => {
-                        p.vaults = Some(Rc::new(RefCell::new(Vaults::new(p.dir.clone(), key))));
+                        let dir = done.borrow().dir.clone();
+                        done.borrow_mut().vaults =
+                            Some(Rc::new(RefCell::new(Vaults::new(dir, key))));
                         VaultState::Open
                     }
                     Err(error) => {
@@ -164,13 +161,21 @@ pub(crate) fn unlock(cx: &mut App) -> gpui::Task<VaultState> {
                         VaultState::Unavailable(unavailable_text(&error))
                     }
                 };
-                p.revision += 1;
-            }
-            cx.refresh_windows();
+                let waiting = {
+                    let mut p = done.borrow_mut();
+                    p.state = state.clone();
+                    p.revision += 1;
+                    std::mem::take(&mut p.waiting)
+                };
+                for tx in waiting {
+                    let _ = tx.try_send(state.clone());
+                }
+                cx.refresh_windows();
+            })
         })
-    })
-    .detach();
-    settled(passwords, cx)
+        .detach();
+    }
+    cx.spawn(async move |_| settled.recv().await.unwrap_or(VaultState::Locked))
 }
 
 /// The Keychain item of the data folder the vaults are in (tests: memory).
@@ -263,12 +268,11 @@ mod device_owner {
         let reason = NSString::from_str(reason);
         // The context lives until its answer.
         let kept = std::sync::Mutex::new(Some(context.clone()));
-        let block = block2::RcBlock::new(
-            move |ok: objc2::runtime::Bool, _error: *mut AnyObject| {
+        let block =
+            block2::RcBlock::new(move |ok: objc2::runtime::Bool, _error: *mut AnyObject| {
                 let _ = tx.try_send(ok.as_bool());
                 drop(kept.lock().ok().and_then(|mut k| k.take()));
-            },
-        );
+            });
         // LAPolicyDeviceOwnerAuthentication = 2.
         let _: () = unsafe {
             msg_send![&*context, evaluatePolicy: 2isize, localizedReason: &*reason, reply: &*block]
@@ -281,5 +285,48 @@ mod device_owner {
         let (tx, rx) = async_channel::bounded::<bool>(1);
         let _ = tx.try_send(true);
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn the_key_is_read_once_for_everyone_who_asks(cx: &mut gpui::TestAppContext) {
+        let answers = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            init(None, cx);
+            assert_eq!(state(cx), VaultState::Locked);
+            assert!(vaults(cx).is_none());
+            for _ in 0..2 {
+                let unlocking = unlock(cx);
+                let answers = answers.clone();
+                cx.spawn(async move |_| {
+                    let state = unlocking.await;
+                    answers.borrow_mut().push(state);
+                })
+                .detach();
+            }
+            assert_eq!(state(cx), VaultState::Unlocking);
+        });
+        cx.run_until_parked();
+        assert_eq!(*answers.borrow(), [VaultState::Open, VaultState::Open]);
+        cx.update(|cx| {
+            assert_eq!(state(cx), VaultState::Open);
+            let logins = with_vault("default", cx, |vault| vault.logins(None));
+            assert_eq!(logins, Some(Ok(Vec::new())));
+        });
+    }
+
+    #[gpui::test]
+    fn the_password_manager_follows_its_setting(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert!(password_manager_enabled(cx), "on by default");
+            let mut prefs = crate::settings::Preferences::default();
+            prefs.browser_offer_passwords = false;
+            cx.set_global(prefs);
+            assert!(!password_manager_enabled(cx));
+        });
     }
 }

@@ -63,14 +63,7 @@ pub struct Tracker {
 
 impl Tracker {
     /// A form of document `context` at `url` was sent with `password`.
-    pub fn submitted(
-        &mut self,
-        url: &str,
-        username: &str,
-        password: &str,
-        context: i64,
-        now: u64,
-    ) {
+    pub fn submitted(&mut self, url: &str, username: &str, password: &str, context: i64, now: u64) {
         let Some(origin) = origin_of(url) else {
             return;
         };
@@ -227,7 +220,10 @@ mod tests {
         assert_eq!(t.forms(1, false, 20), None);
         assert_eq!(t.tick(20 + NEXT_DOCUMENT_MS), None);
         assert_eq!(t.forms(2, false, 100), None);
-        assert!(matches!(t.tick(100 + NEXT_DOCUMENT_MS), Some(Verdict::Success(_))));
+        assert!(matches!(
+            t.tick(100 + NEXT_DOCUMENT_MS),
+            Some(Verdict::Success(_))
+        ));
     }
 
     #[test]

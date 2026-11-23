@@ -87,7 +87,10 @@ mod tests {
         let s = secrets();
         assert_eq!(mask_text("pw: p@ss w\"rd&1!", &s), "pw: ••••!");
         // JSON-escaped (eval results, console arguments).
-        assert_eq!(mask_text(r#"{"pw":"p@ss w\"rd&1"}"#, &s), r#"{"pw":"••••"}"#);
+        assert_eq!(
+            mask_text(r#"{"pw":"p@ss w\"rd&1"}"#, &s),
+            r#"{"pw":"••••"}"#
+        );
         // URL-encoded (network log URLs, form bodies).
         assert_eq!(
             mask_text("POST /login?pw=p%40ss+w%22rd%261", &s),
