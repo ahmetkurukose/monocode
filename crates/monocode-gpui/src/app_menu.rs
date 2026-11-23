@@ -139,6 +139,7 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
         ]),
         Menu::new("Git").items([
             MenuItem::action("Commit…", GitCommit),
+            MenuItem::action("New Pull Request…", GitNewPullRequest),
             MenuItem::action("Update Project", GitUpdate),
             MenuItem::action("Update Project (Rebase)", GitUpdateRebase),
             MenuItem::separator(),

@@ -5,7 +5,7 @@ mod diff;
 mod document;
 mod ui;
 pub(crate) use avatar::image as avatar_image;
-pub(crate) use ui::relative_time;
+pub(crate) use ui::{label_badge, relative_time};
 
 use crate::{
     diff_view::{DiffEvent, DiffView},

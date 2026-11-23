@@ -306,7 +306,7 @@ fn project_name(path: &std::path::Path) -> String {
         .into_owned()
 }
 
-fn label_badge(label: &model::Label, compact: bool) -> Div {
+pub(crate) fn label_badge(label: &model::Label, compact: bool) -> Div {
     let color = u32::from_str_radix(label.color.trim().trim_start_matches('#'), 16)
         .ok()
         .filter(|_| label.color.trim().trim_start_matches('#').len() == 6);

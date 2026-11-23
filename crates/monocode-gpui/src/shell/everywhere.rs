@@ -225,6 +225,9 @@ impl Shell {
             Box::new(SplitTerminal)
         });
         add("Git", "Commit…", "git-commit", || Box::new(GitCommit));
+        add("Git", "New Pull Request…", "git-pull-request", || {
+            Box::new(GitNewPullRequest)
+        });
         add("Git", "Update Project", "refresh-cw", || {
             Box::new(GitUpdate)
         });
