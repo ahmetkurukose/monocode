@@ -7705,6 +7705,7 @@ impl Render for Shell {
         if !std::mem::replace(&mut self.window_services_started, true) {
             // Before an agent's browser_history or any page asks for it.
             crate::browser::history::init(self.browser_history_dir(), cx);
+            crate::browser::passwords::init(self.browser_passwords_dir(), cx);
             self.start_database_footer(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);
@@ -8060,6 +8061,11 @@ impl Render for Shell {
             .on_action(cx.listener(
                 |this, _: &crate::browser::history_view::ShowBrowserHistory, window, cx| {
                     this.open_browser_history(window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::browser::ShowBrowserPasswords, window, cx| {
+                    this.open_settings(crate::settings::Section::Passwords, window, cx)
                 },
             ))
             .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| {

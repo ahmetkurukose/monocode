@@ -258,6 +258,7 @@ impl SettingsView {
                     | "action-opens-terminal"
                     | "browser-all-links"
                     | "browser-battery-saver"
+                    | "browser-offer-passwords"
                     | "close-to-tray"
                     | "terminal-copy-on-select"
                     | "main-pane-glass"

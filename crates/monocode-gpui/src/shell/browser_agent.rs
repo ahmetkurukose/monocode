@@ -520,6 +520,29 @@ impl Page for AppPage {
         self.with_page(|page, _| page.cert_block()).flatten()
     }
 
+    fn saved_logins(&self) -> Result<Vec<monocode_core::browser::passwords::Credential>, String> {
+        self.cx.update(|cx| {
+            let page = self.entity(cx).ok_or("the page is gone")?;
+            page.update(cx, |page, cx| page.agent_logins(cx))
+        })
+    }
+
+    fn login_used(&self, username: &str) {
+        self.cx.update(|cx| {
+            if let Some(page) = self.entity(cx) {
+                page.update(cx, |page, cx| page.agent_login_used(username, cx));
+            }
+        })
+    }
+
+    fn secrets(&self) -> Vec<String> {
+        self.cx.update(|cx| {
+            self.entity(cx)
+                .map(|page| page.update(cx, |page, cx| page.agent_secrets(cx)))
+                .unwrap_or_default()
+        })
+    }
+
     fn expect_download(&self, dir: PathBuf) -> LocalFuture<Result<PathBuf, String>> {
         let page = AppPage {
             cx: self.cx.clone(),

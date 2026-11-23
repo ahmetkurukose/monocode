@@ -264,6 +264,63 @@ async fn sweep(ctx: &Ctx) -> Result<Vec<(i64, String)>, ToolOutput> {
     Ok(out)
 }
 
+/// The main frame's password fields (backend ids), whose values a snapshot
+/// never shows (K57), even after a "show password" toggle made them text.
+const PASSWORD_FIELDS: &str = "(() => [...document.querySelectorAll('input')].filter(i => \
+i.type === 'password' || /password/i.test(i.autocomplete || '')).slice(0, 50))()";
+
+async fn password_fields(ctx: &Ctx) -> Result<std::collections::HashSet<i64>, ToolOutput> {
+    let group = json!("monocode-secret");
+    let mut out = std::collections::HashSet::new();
+    let found = soft(
+        ctx,
+        None,
+        "Runtime.evaluate",
+        json!({"expression": PASSWORD_FIELDS, "objectGroup": group}),
+    )
+    .await?;
+    let array = found
+        .as_ref()
+        .and_then(|f| f["result"]["objectId"].as_str());
+    if let Some(array) = array {
+        let properties = soft(
+            ctx,
+            None,
+            "Runtime.getProperties",
+            json!({"objectId": array, "ownProperties": true}),
+        )
+        .await?;
+        for property in properties
+            .iter()
+            .flat_map(|p| p["result"].as_array())
+            .flatten()
+        {
+            if property["name"]
+                .as_str()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            let Some(object) = property["value"]["objectId"].as_str() else {
+                continue;
+            };
+            let node = soft(ctx, None, "DOM.describeNode", json!({"objectId": object})).await?;
+            if let Some(backend) = node.and_then(|n| n["node"]["backendNodeId"].as_i64()) {
+                out.insert(backend);
+            }
+        }
+        let _ = soft(
+            ctx,
+            None,
+            "Runtime.releaseObjectGroup",
+            json!({"objectGroup": group}),
+        )
+        .await?;
+    }
+    Ok(out)
+}
+
 /// One reading of a page's accessibility outline.
 pub struct Reading {
     pub loader: Option<String>,
@@ -300,10 +357,12 @@ pub async fn read(
         None => None,
     };
     let clickables = sweep(ctx).await?;
+    let secret = password_fields(ctx).await?;
     let options = Options {
         mode,
         root,
         max_depth,
+        secret,
     };
     let lines = snapshot::render(
         &frames,

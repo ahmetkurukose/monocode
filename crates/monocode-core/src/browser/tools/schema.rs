@@ -174,6 +174,20 @@ const TOOLS: &[Tool] = &[
         description: effects!("Replace the text of a field, or pick a <select> option."),
     },
     Tool {
+        name: "browser_fill_login",
+        read_only: false,
+        required: &[],
+        properties: || {
+            with_page(json!({
+                "ref": {"type": "string", "description": "The sign-in form's user name or password field. Default: the page's first sign-in form."},
+                "username": {"type": "string", "description": "Which saved login, when the site has more than one."},
+            }))
+        },
+        description: effects!(
+            "Fill the user's saved login (user name and password) for the page's site into its sign-in form. You never see the password: it is masked as •••• in every answer. Fails with browser_no_login when the user has none saved for the site, the page uses a throwaway profile, or the password manager is locked or off. Does not submit the form."
+        ),
+    },
+    Tool {
         name: "browser_type",
         read_only: false,
         required: &["text"],

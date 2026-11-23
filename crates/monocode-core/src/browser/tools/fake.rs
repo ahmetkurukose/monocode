@@ -230,6 +230,10 @@ pub struct FakePage {
     pub permission_notes: RefCell<Vec<crate::browser::sites::PermissionNote>>,
     pub waiting_permission: RefCell<Option<crate::browser::sites::PermissionNote>>,
     pub cert_error: RefCell<Option<crate::browser::sites::CertBlock>>,
+    /// What `saved_logins` answers.
+    pub logins: RefCell<Result<Vec<crate::browser::passwords::Credential>, String>>,
+    /// The user names `login_used` was told of.
+    pub logins_used: RefCell<Vec<String>>,
 }
 
 impl FakePage {
@@ -299,6 +303,8 @@ impl FakePage {
             permission_notes: RefCell::default(),
             waiting_permission: RefCell::default(),
             cert_error: RefCell::default(),
+            logins: RefCell::new(Err("no saved passwords here".into())),
+            logins_used: RefCell::default(),
         })
     }
 }
@@ -378,6 +384,21 @@ impl Page for FakePage {
 
     fn cert_error(&self) -> Option<crate::browser::sites::CertBlock> {
         self.cert_error.borrow().clone()
+    }
+
+    fn saved_logins(&self) -> Result<Vec<crate::browser::passwords::Credential>, String> {
+        self.logins.borrow().clone()
+    }
+
+    fn login_used(&self, username: &str) {
+        self.logins_used.borrow_mut().push(username.to_owned());
+    }
+
+    fn secrets(&self) -> Vec<String> {
+        match &*self.logins.borrow() {
+            Ok(logins) => logins.iter().map(|l| l.password.clone()).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn expect_download(&self, dir: PathBuf) -> LocalBoxFuture<'static, Result<PathBuf, String>> {

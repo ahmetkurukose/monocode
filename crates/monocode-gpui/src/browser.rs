@@ -44,6 +44,7 @@ pub(crate) mod history;
 pub(crate) mod history_view;
 pub(crate) mod import;
 pub(crate) mod new_tab;
+pub(crate) mod passwords;
 mod suggest;
 
 use crate::{
@@ -57,6 +58,9 @@ use crate::{
 mod audio;
 #[path = "browser_download_into.rs"]
 mod download_into;
+#[path = "browser_passwords.rs"]
+mod page_passwords;
+pub(crate) use page_passwords::ShowBrowserPasswords;
 #[path = "browser_presence.rs"]
 mod presence;
 #[path = "browser_sites.rs"]
@@ -226,6 +230,8 @@ impl Engine {
                     async {}
                 })
                 .detach();
+                // Saved passwords unlock once per run, now (K56).
+                passwords::warm(cx);
                 EngineState::Ready
             }
             Err(e) => {
@@ -589,6 +595,8 @@ pub(crate) struct BrowserPage {
     discarded: Option<discard::Discarded>,
     /// Where the page's visits go (K55).
     history: history::Recorder,
+    /// Saving and filling the site's passwords (K56, K57).
+    passwords: page_passwords::PagePasswords,
     /// The shell's other tabs and the project's processes; the shell sets it.
     pub(crate) links: Option<new_tab::ShellLinks>,
     /// A blank tab's page (K66).
@@ -634,6 +642,7 @@ impl BrowserPage {
             // Snapshots sit in GPU atlases until given back.
             cx.on_release(|page, cx| {
                 page.sites_released();
+                page.passwords_released();
                 page.host.release(cx);
                 if let Some(docked) = &page.devtools {
                     docked.host.release(cx);
@@ -683,11 +692,13 @@ impl BrowserPage {
             life: Default::default(),
             discarded: None,
             history: Default::default(),
+            passwords: Default::default(),
             links: None,
             new_tab: Default::default(),
             suggest: Default::default(),
         }
         .watch_presence(cx)
+        .listen_passwords(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
@@ -734,6 +745,7 @@ impl BrowserPage {
             BrowserEvent::Address(url) => {
                 self.sync_zoom(cx);
                 self.sites_follow_address(&url);
+                self.passwords_follow_address(&url);
                 self.record_visit(&url, cx);
                 if url != self.url {
                     self.url = url.clone();
@@ -1109,8 +1121,10 @@ impl BrowserPage {
                             cx.stop_propagation();
                         }
                     }))
-                    .child(self.address.clone()),
+                    .child(self.address.clone())
+                    .children(self.password_key_button(cx)),
             )
+            .children(self.password_fill_button(cx))
             .child(
                 icon_button("browser-history", "History", "clock").on_click(cx.listener(
                     |_, _, window, cx| {
@@ -1685,6 +1699,7 @@ impl Render for BrowserPage {
             .child(self.toolbar(cx))
             .children(self.find_bar(cx))
             .children(self.permission_bar(cx))
+            .children(self.password_bar(cx))
             .when_some(self.failure.clone(), |d, failure| {
                 d.child(
                     div()
@@ -1709,6 +1724,7 @@ impl Render for BrowserPage {
             .relative()
             .children(self.downloads_popover(cx))
             .children(self.site_popover(cx))
+            .children(self.passwords_popover(cx))
             .children(self.suggestions_popover(cx))
             .children(self.prompt_overlay(cx))
     }
@@ -2751,6 +2767,9 @@ struct Shared {
     generation: Cell<u64>,
     /// The page's sound, and whether the user muted it (`browser_audio.rs`).
     audio: audio::Audio,
+    /// Where the password watcher's reports go (`browser_passwords.rs`).
+    passwords:
+        RefCell<Option<async_channel::Sender<monocode_core::browser::passwords::watch::Report>>>,
 }
 
 impl Shared {
@@ -2839,10 +2858,11 @@ impl Host<monocode_cef::BrowserView> {
         let log = PageLog::start(&cdp);
         discard::watch_edits(&cdp);
         let audio = self.watch_audio(&cdp);
+        let passwords = self.watch_passwords(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new((attachment, audio)),
+            _attachment: Box::new((attachment, audio, passwords)),
         });
     }
 }

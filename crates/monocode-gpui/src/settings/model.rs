@@ -11,6 +11,7 @@ pub(crate) enum Section {
     Appearance,
     Terminal,
     Keybindings,
+    Passwords,
     Chat,
     Providers,
     Mcp,
@@ -30,6 +31,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
             Section::Appearance,
             Section::Terminal,
             Section::Keybindings,
+            Section::Passwords,
         ],
     ),
     (
@@ -49,12 +51,13 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 13] = [
+    pub(crate) const ALL: [Section; 14] = [
         Section::General,
         Section::Connections,
         Section::Appearance,
         Section::Terminal,
         Section::Keybindings,
+        Section::Passwords,
         Section::Chat,
         Section::Providers,
         Section::Mcp,
@@ -71,6 +74,7 @@ impl Section {
             Section::Appearance => "appearance",
             Section::Terminal => "terminal",
             Section::Keybindings => "keybindings",
+            Section::Passwords => "passwords",
             Section::Chat => "chat",
             Section::Providers => "providers",
             Section::Mcp => "mcp",
@@ -88,6 +92,7 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Terminal => "Terminal",
             Section::Keybindings => "Keybindings",
+            Section::Passwords => "Passwords",
             Section::Chat => "Chat",
             Section::Providers => "Providers",
             Section::Mcp => "MCP",
@@ -112,6 +117,9 @@ impl Section {
             }
             Section::Keybindings => {
                 "Every shortcut the workspace handles, from the app menu and the key handler."
+            }
+            Section::Passwords => {
+                "Passwords the browser saved when you signed in, and sites it never saves for."
             }
             Section::Chat => {
                 "How transcripts read, what the composer does with a follow-up, how files save, and how diffs open."
@@ -140,6 +148,9 @@ impl Section {
             }
             Section::Terminal => "shell font size text zoom select copy clipboard selection iterm",
             Section::Keybindings => "shortcut hotkey keyboard binding",
+            Section::Passwords => {
+                "browser password login sign in credentials vault keychain touch id autofill saved never"
+            }
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
             }
@@ -166,6 +177,7 @@ impl Section {
             Section::Appearance => "palette",
             Section::Terminal => "terminal",
             Section::Keybindings => "keyboard",
+            Section::Passwords => "key",
             Section::Chat => "message-square",
             Section::Providers => "bot",
             Section::Mcp => "globe",
@@ -341,6 +353,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::General,
         "Browser memory saver",
         "browser chromium memory ram discard sleep inactive background tabs unload",
+    ),
+    (
+        "browser-offer-passwords",
+        Section::Passwords,
+        "Offer to save passwords",
+        "browser password manager save sign in login autofill suggest 1password",
     ),
     (
         "browser-site-permissions",

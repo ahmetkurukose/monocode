@@ -18,6 +18,8 @@ struct FakeImporter {
     requests: Mutex<Vec<ImportRequest>>,
     written: Mutex<usize>,
     saved: Mutex<usize>,
+    /// What the password vault says instead of taking the logins.
+    vault_refused: Option<String>,
 }
 
 fn profile(browser: SourceBrowser, folder: &str, name: &str) -> SourceProfile {
@@ -107,12 +109,15 @@ impl Importer for FakeImporter {
         logins: Vec<ImportedLogin>,
         _: Vec<String>,
         _: &mut App,
-    ) -> Option<VaultMerge> {
+    ) -> Task<Result<VaultMerge, String>> {
+        if let Some(why) = &self.vault_refused {
+            return Task::ready(Err(why.clone()));
+        }
         *self.saved.lock().unwrap() += logins.len();
-        Some(VaultMerge {
+        Task::ready(Ok(VaultMerge {
             added: logins.len(),
             updated: 0,
-        })
+        }))
     }
 }
 
@@ -246,4 +251,38 @@ fn a_denied_keychain_is_said_plainly(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(*importer.written.lock().unwrap(), 0);
+}
+
+#[gpui::test]
+fn passwords_the_vault_refuses_are_said_to_be_read_but_not_saved(cx: &mut TestAppContext) {
+    let importer = Arc::new(FakeImporter {
+        vault_refused: Some("the Keychain did not give the key".into()),
+        ..Default::default()
+    });
+    let window = window(importer.clone(), cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| view.open_browser_import(cx))
+        .unwrap();
+    visual.run_until_parked();
+    click(visual, "settings-browser-import-run");
+    window
+        .update(visual, |view, _, _| {
+            let ImportStatus::Done { lines, notes } = &view.browser_import.status else {
+                panic!("{:?}", view.browser_import.status);
+            };
+            // Read, none of it new or updated: the vault kept nothing.
+            assert_eq!(lines[1], "Passwords: 1 read, 1 never-save sites");
+            assert!(
+                notes.contains(
+                    &"Passwords were read but not saved: the Keychain did not give the key"
+                        .to_owned()
+                ),
+                "{notes:?}"
+            );
+        })
+        .unwrap();
+    // The cookies went in all the same.
+    assert_eq!(*importer.written.lock().unwrap(), 2);
+    assert_eq!(*importer.saved.lock().unwrap(), 0);
 }

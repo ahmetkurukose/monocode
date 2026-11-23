@@ -4439,6 +4439,7 @@ dependencies = [
  "quinn",
  "rand 0.9.5",
  "regex",
+ "ring",
  "rquickjs",
  "rusqlite",
  "rusty-leveldb",

@@ -203,20 +203,25 @@ impl SettingsView {
                     notes.push("App-bound cookies (v20) can only be read by the browser that made them.".into());
                 }
             }
-            if let Some(read) = data.logins {
+            if let Some(read) = data.logins
+                && !(read.logins.is_empty() && read.never_save.is_empty())
+            {
+                set(
+                    ImportStatus::Running(format!(
+                        "Saving {} passwords… macOS may ask to allow Monocode to use its Keychain item.",
+                        read.logins.len()
+                    )),
+                    cx,
+                );
                 let saved = cx.update(|cx| {
                     importer.save_logins(&target, read.logins, read.never_save, cx)
                 });
-                match saved {
-                    Some(merge) => {
+                match saved.await {
+                    Ok(merge) => {
                         summary.logins_added = merge.added;
                         summary.logins_updated = merge.updated;
                     }
-                    None if summary.logins_read > 0 => notes.push(
-                        "Passwords were read but not saved: the password vault is not available yet."
-                            .into(),
-                    ),
-                    None => {}
+                    Err(why) => notes.push(format!("Passwords were read but not saved: {why}")),
                 }
             }
             set(
@@ -239,7 +244,7 @@ impl SettingsView {
             Some("browser-import"),
             false,
             "Import from another browser",
-            Some("Cookies and saved passwords from Chrome, Arc or Brave, once; importing again merges. Google sign-ins stay behind: sign in to Google in Monocode directly.".into()),
+            Some("Cookies and saved passwords from Chrome, Arc or Brave, once; importing again merges, and the newer password wins. Passwords go to Settings → Passwords. Google sign-ins stay behind: sign in to Google in Monocode directly.".into()),
             vec![
                 secondary_button("browser-import-open", "Import…", false, false)
                     .child(if open { "Close" } else { "Import…" })
