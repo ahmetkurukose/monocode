@@ -11,6 +11,7 @@ mod github;
 pub mod gitlab;
 pub mod jira;
 pub mod linear;
+pub mod monday;
 
 use crate::{desktop_preferences::DesktopPreferences, session_groups::WorkItem, store::Store};
 use chrono::{Datelike, Local, TimeZone};
@@ -21,18 +22,26 @@ use std::{
     process::Command,
 };
 
-pub const PROVIDERS: [&str; 5] = ["github", "linear", "jira", "gitlab", "azuredevops"];
+pub const PROVIDERS: [&str; 6] = [
+    "github",
+    "linear",
+    "jira",
+    "monday",
+    "gitlab",
+    "azuredevops",
+];
 pub fn provider_label(provider: &str) -> &'static str {
     match provider {
         "linear" => "Linear",
         "jira" => "Jira",
+        "monday" => "monday.com",
         "gitlab" => "GitLab",
         "azuredevops" => "ADO",
         _ => "GitHub",
     }
 }
 pub fn is_tracker(provider: &str) -> bool {
-    matches!(provider, "linear" | "jira")
+    matches!(provider, "linear" | "jira" | "monday")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +433,8 @@ pub struct ViewState {
     pub seen: Seen,
     pub hidden_linear_teams: Vec<String>,
     pub hidden_jira_projects: Vec<String>,
+    /// The monday.com boards the Inbox lists, beside those projects bind.
+    pub monday_boards: Vec<String>,
     pub list_width: f32,
     /// Width of the pull request's file tree.
     pub diff_tree_width: f32,
@@ -436,6 +447,7 @@ impl Default for ViewState {
             seen: Seen::default(),
             hidden_linear_teams: vec![],
             hidden_jira_projects: vec![],
+            monday_boards: vec![],
             list_width: 280.,
             diff_tree_width: DIFF_TREE_WIDTH,
         }
@@ -453,13 +465,16 @@ impl ViewState {
         teams.sort();
         let mut jira = self.hidden_jira_projects.clone();
         jira.sort();
+        let mut monday = self.monday_boards.clone();
+        monday.sort();
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             self.filters.assigned_to_me,
             self.filters.fetch_state(),
             paths.join("|"),
             teams.join(","),
-            jira.join(",")
+            jira.join(","),
+            monday.join(",")
         )
     }
     pub fn load(store: &Store) -> Self {
@@ -521,6 +536,8 @@ pub struct Snapshot {
     pub connections: BTreeMap<String, Status>,
     pub linear_teams: Vec<OptionRow>,
     pub jira_projects: Vec<OptionRow>,
+    /// Every monday.com board the user can see, for picking which to follow.
+    pub monday_boards: Vec<OptionRow>,
 }
 
 /// The Tauri InboxNotificationTracker: provider baselines and revisions are
@@ -565,6 +582,7 @@ impl NotificationTracker {
                         &item.team_id
                     }
                 ),
+                "monday" => format!("monday:board:{}", item.project_id),
                 _ if !item.project_path.is_empty() => crate::files::path_key(&item.project_path),
                 _ => format!("{}:{}", item.provider, item.repo.to_lowercase()),
             };
@@ -685,6 +703,7 @@ impl Service {
         match provider {
             "linear" => convert(linear::linear_status(self.data_dir.clone())?),
             "jira" => convert(jira::jira_status(self.data_dir.clone())?),
+            "monday" => monday::monday_status(self.data_dir.clone()),
             "gitlab" => convert(gitlab::gitlab_status(self.data_dir.clone())?),
             "azuredevops" => convert(azure_devops::azure_devops_status(self.data_dir.clone())?),
             _ => {
@@ -714,6 +733,7 @@ impl Service {
     ) -> Result<Status, String> {
         match provider {
             "linear" => convert(linear::linear_set_token(self.data_dir.clone(), token)?),
+            "monday" => monday::monday_set_token(self.data_dir.clone(), token),
             "jira" => convert(jira::jira_set_config(
                 self.data_dir.clone(),
                 url,
@@ -776,6 +796,18 @@ impl Service {
                         },
                         Some(limit),
                     )?);
+                }
+                if provider == "monday" {
+                    snapshot.monday_boards =
+                        monday::monday_list_boards(self.data_dir.clone(), false)?;
+                    let boards = monday::inbox_boards(&state.monday_boards, projects);
+                    return monday::monday_list_items(
+                        self.data_dir.clone(),
+                        &boards,
+                        state.filters.assigned_to_me,
+                        state.filters.fetch_state(),
+                        limit as usize,
+                    );
                 }
                 if provider == "jira" {
                     let projects = jira::jira_list_projects(self.data_dir.clone())?;
@@ -950,6 +982,7 @@ impl Service {
                 self.data_dir.clone(),
                 item.id.clone(),
             )?),
+            "monday" => monday::monday_item_details(item.id.clone()),
             "jira" => convert(jira::jira_issue_details(
                 self.data_dir.clone(),
                 item.identifier.clone(),
@@ -987,6 +1020,7 @@ impl Service {
                 self.data_dir.clone(),
                 item.id.clone(),
             )?),
+            "monday" => monday::monday_item_thread(item.id.clone()),
             "jira" => convert(jira::jira_issue_thread(
                 self.data_dir.clone(),
                 item.identifier.clone(),
@@ -1016,6 +1050,7 @@ impl Service {
             "linear" => {
                 linear::linear_issue_comment(self.data_dir.clone(), item.id.clone(), body, reply_to)
             }
+            "monday" => monday::monday_item_comment(item.id.clone(), body),
             "jira" => {
                 jira::jira_issue_comment(self.data_dir.clone(), item.identifier.clone(), body)
             }
