@@ -73,8 +73,8 @@ fn start(command: &mut Command, background: bool) -> io::Result<Child> {
         if !spawns_without_fork(command) {
             // A bare name with a changed PATH. Missing there, exec would fail
             // too: report that without the fork. Found, it is a caller that
-            // should have used `program_on_path`; a release build still
-            // starts it the old way.
+            // should have used `program_on_path`; it still starts the old way
+            // (a user-set binary name can land here, so never panic).
             let program = command.get_program();
             let path = child_path(command).unwrap_or_default();
             if find_on_path(program, &path).is_none() {
@@ -84,8 +84,8 @@ fn start(command: &mut Command, background: bool) -> io::Result<Child> {
                 ));
             }
             if cfg!(debug_assertions) {
-                panic!(
-                    "{program:?} has PATH set but is a bare name, so std would fork; \
+                eprintln!(
+                    "process: {program:?} has PATH set but is a bare name, so std forks; \
                      use process::program_on_path"
                 );
             }
