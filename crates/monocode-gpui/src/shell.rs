@@ -1319,9 +1319,11 @@ impl Shell {
         // also reports a lone modifier's release as a keystroke named after
         // it: that is the tap itself.
         this.observations
-            .push(cx.observe_keystrokes(|this, event, _, _| {
+            .push(cx.observe_keystrokes(|this, event, window, cx| {
                 let key = event.keystroke.key.as_str();
-                if !matches!(key, "shift" | "control" | "alt" | "platform" | "function") {
+                if key == "shift" {
+                    this.shift_released(window, cx);
+                } else if !matches!(key, "control" | "alt" | "platform" | "function") {
                     this.shift_taps.reset()
                 }
             }));

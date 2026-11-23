@@ -19,6 +19,9 @@ pub(super) struct ShiftTaps {
     down: Option<Instant>,
     last_tap: Option<Instant>,
     shift: bool,
+    /// When a release was last counted, so the same one is not counted again
+    /// when it arrives a second way.
+    counted: Option<Instant>,
 }
 impl ShiftTaps {
     /// Whether this change completes a double tap.
@@ -34,6 +37,7 @@ impl ShiftTaps {
             return false;
         }
         if !m.shift && was {
+            self.counted = Some(now);
             let Some(down) = self.down.take() else {
                 return false;
             };
@@ -51,6 +55,21 @@ impl ShiftTaps {
             self.last_tap = Some(now);
         }
         false
+    }
+    /// Shift was pressed and let go with nothing else in between, as the
+    /// window reports it to keystroke observers. The modifier changes above
+    /// only reach the workspace along the focused element's path; this one
+    /// arrives wherever the focus is, so a tap still counts when they did not.
+    pub(super) fn released(&mut self, now: Instant) -> bool {
+        if (self.counted).is_some_and(|at| now.duration_since(at).as_millis() < 30) {
+            return false;
+        }
+        if !self.shift {
+            // The press never reached us: how long it was held is unknown.
+            self.shift = true;
+            self.down = Some(now);
+        }
+        self.modifiers(&Modifiers::default(), now)
     }
     /// A key or a click came between: no tap counts.
     pub(super) fn reset(&mut self) {
@@ -96,9 +115,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.shift_taps.modifiers(modifiers, Instant::now()) {
-            return;
+        if self.shift_taps.modifiers(modifiers, Instant::now()) {
+            self.double_shift(window, cx);
         }
+    }
+
+    /// A lone Shift was released, seen by the window's keystroke observer.
+    pub(super) fn shift_released(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shift_taps.released(Instant::now()) {
+            self.double_shift(window, cx);
+        }
+    }
+
+    fn double_shift(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.everywhere.is_some() {
             self.close_everywhere(window, cx);
         } else {
@@ -691,6 +720,19 @@ mod tests {
         taps.modifiers(&shift(true), at(700));
         assert!(!taps.modifiers(&shift(false), at(750)));
 
+        // Releases that arrive without their presses still make a double tap,
+        // and one that arrives both ways is counted once.
+        let mut taps = ShiftTaps::default();
+        assert!(!taps.released(at(60)));
+        assert!(taps.released(at(210)));
+        let mut taps = ShiftTaps::default();
+        taps.modifiers(&shift(true), at(0));
+        assert!(!taps.modifiers(&shift(false), at(60)));
+        assert!(!taps.released(at(61)), "the same release again");
+        taps.modifiers(&shift(true), at(150));
+        assert!(taps.modifiers(&shift(false), at(210)));
+        assert!(!taps.released(at(211)));
+
         // A held Shift is not a tap.
         let mut taps = ShiftTaps::default();
         taps.modifiers(&shift(true), at(0));
@@ -748,6 +790,57 @@ mod tests {
                 assert!(input.focus_handle(cx).is_focused(w));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn double_shift_opens_search_everywhere_from_every_app_view(cx: &mut TestAppContext) {
+        use super::super::app_views::AppView;
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            crate::popover::bind(cx);
+        });
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let db = tempfile::tempdir().unwrap();
+        for view in [AppView::Inbox, AppView::Database, AppView::Notes] {
+            window
+                .update(cx, |shell, w, cx| {
+                    shell.database_dir = db.path().to_owned();
+                    shell.open_app(view, w, cx);
+                })
+                .unwrap();
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.run_until_parked();
+            for _ in 0..2 {
+                visual.simulate_modifiers_change(shift(true));
+                visual.simulate_modifiers_change(shift(false));
+            }
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, w, cx| {
+                    assert!(shell.everywhere.is_some(), "from the {view:?} view");
+                    shell.close_everywhere(w, cx);
+                    // A click on something that takes no focus leaves the
+                    // window with none.
+                    w.blur(cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+            for _ in 0..2 {
+                visual.simulate_modifiers_change(shift(true));
+                visual.simulate_modifiers_change(shift(false));
+            }
+            visual.run_until_parked();
+            window
+                .update(visual, |shell, w, cx| {
+                    assert!(
+                        shell.everywhere.is_some(),
+                        "from the {view:?} view with nothing focused"
+                    );
+                    shell.close_everywhere(w, cx);
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]
