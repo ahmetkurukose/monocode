@@ -9,10 +9,16 @@
 //! with an overridden PATH. So nothing here uses `pre_exec`: the signal mask
 //! and priority are applied around the spawn by [`spawn`], [`output`] and
 //! [`status`], and [`program_on_path`] turns a bare name into a path.
+//! Terminal children, which need a session and a controlling terminal, start
+//! through [`pty::spawn`] on macOS.
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+
+/// Terminal children, which need a session and a controlling terminal.
+#[cfg(target_os = "macos")]
+pub mod pty;
 
 /// Mark a background child; start it with [`spawn`], [`output`] or
 /// [`status`], which give it the ordinary signal mask and a lower priority.

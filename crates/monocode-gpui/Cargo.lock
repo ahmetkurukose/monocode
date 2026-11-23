@@ -4498,6 +4498,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "signal-hook",
  "similar",
  "streaming-iterator",
  "syntect",
