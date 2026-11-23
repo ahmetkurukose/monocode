@@ -7,6 +7,7 @@
 pub mod cache;
 pub mod config;
 pub mod monday;
+pub mod writeback;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
