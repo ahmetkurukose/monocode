@@ -127,6 +127,23 @@ pub trait Page {
     fn cert_error(&self) -> Option<super::sites::CertBlock> {
         None
     }
+
+    /// What became of the page's recent passkey requests, oldest first
+    /// (K58): each start and end.
+    fn passkey_notes(&self) -> Vec<super::passkeys::PasskeyNote> {
+        Vec::new()
+    }
+
+    /// The passkey request the page waits on now, if any.
+    fn pending_passkey(&self) -> Option<super::passkeys::PasskeyNote> {
+        None
+    }
+
+    /// Cancels the passkey requests the page waits on, as the user's
+    /// "cancel" would. Resolves with whether there was one.
+    fn cancel_passkey(&self) -> LocalBoxFuture<'static, bool> {
+        Box::pin(async { false })
+    }
 }
 
 pub trait Host {

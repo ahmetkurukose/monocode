@@ -57,6 +57,8 @@ use crate::{
 mod audio;
 #[path = "browser_download_into.rs"]
 mod download_into;
+#[path = "browser_passkeys.rs"]
+mod passkeys;
 #[path = "browser_presence.rs"]
 mod presence;
 #[path = "browser_sites.rs"]
@@ -1685,6 +1687,7 @@ impl Render for BrowserPage {
             .child(self.toolbar(cx))
             .children(self.find_bar(cx))
             .children(self.permission_bar(cx))
+            .children(self.passkey_bar(cx))
             .when_some(self.failure.clone(), |d, failure| {
                 d.child(
                     div()
@@ -2751,6 +2754,8 @@ struct Shared {
     generation: Cell<u64>,
     /// The page's sound, and whether the user muted it (`browser_audio.rs`).
     audio: audio::Audio,
+    /// The page's passkey requests (`browser_passkeys.rs`).
+    passkeys: passkeys::Passkeys,
 }
 
 impl Shared {
@@ -2839,10 +2844,11 @@ impl Host<monocode_cef::BrowserView> {
         let log = PageLog::start(&cdp);
         discard::watch_edits(&cdp);
         let audio = self.watch_audio(&cdp);
+        let passkeys = self.watch_passkeys(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new((attachment, audio)),
+            _attachment: Box::new((attachment, audio, passkeys)),
         });
     }
 }
@@ -2853,6 +2859,7 @@ impl<V> Host<V> {
     fn end_agent(&self) {
         // A page that went plays nothing.
         self.shared.audio.set_audible(false, &self.shared);
+        self.shared.passkeys.clear();
         let link = self.agent.borrow_mut().take();
         if let Some(link) = link {
             link.cdp.on_message(None);
