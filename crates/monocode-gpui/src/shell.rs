@@ -28,6 +28,7 @@ mod file_panes;
 mod github_star;
 mod group_strip;
 mod idle_agents;
+mod keep_awake;
 #[cfg(test)]
 mod image_lightbox_tests;
 mod layout;
@@ -450,6 +451,8 @@ pub(crate) enum MenuTarget {
     Actions,
     /// The footer Databases button's data sources.
     Databases,
+    /// The footer Keep computer awake button's modes.
+    KeepAwake,
     /// Connections found elsewhere, offered for import.
     DatabaseImport,
     /// A tab in a group's strip.
@@ -735,6 +738,7 @@ pub(crate) struct Shell {
     action_dialog: Option<actions::ActionDialog>,
     actions_anchor: AnchorSlot,
     databases_anchor: AnchorSlot,
+    keep_awake_anchor: AnchorSlot,
     db_footer: database_footer::DbFooter,
     git_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
@@ -1161,6 +1165,7 @@ impl Shell {
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
             databases_anchor: AnchorSlot::default(),
+            keep_awake_anchor: AnchorSlot::default(),
             db_footer: Default::default(),
             git_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
@@ -5689,6 +5694,12 @@ impl Shell {
                 300.,
                 MenuStyle::Explorer,
             ),
+            MenuTarget::KeepAwake => (
+                "Keep computer awake".into(),
+                self.keep_awake_menu(cx),
+                300.,
+                MenuStyle::Access,
+            ),
             MenuTarget::DatabaseImport => (
                 "Import connections".into(),
                 self.database_import_menu(),
@@ -6048,6 +6059,7 @@ impl Shell {
             MenuTarget::FooterChip(id) => self.run_code_chip_menu(id, action, window, cx),
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
             MenuTarget::Databases => self.run_databases_menu(action, window, cx),
+            MenuTarget::KeepAwake => self.run_keep_awake_menu(action, cx),
             MenuTarget::DatabaseImport => self.run_database_import_menu(action, window, cx),
             MenuTarget::GroupTab(id) => self.run_group_tab_menu(id, action, window, cx),
             MenuTarget::GroupAdd(visible) => self.run_group_add_menu(visible, action, window, cx),
@@ -8512,7 +8524,7 @@ impl Render for Shell {
                     .when(
                         matches!(
                             open.target,
-                            MenuTarget::Databases | MenuTarget::DatabaseImport
+                            MenuTarget::Databases | MenuTarget::DatabaseImport | MenuTarget::KeepAwake
                         ),
                         |p| {
                             p.side(Side::Top)
