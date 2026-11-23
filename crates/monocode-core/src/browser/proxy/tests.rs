@@ -125,6 +125,7 @@ impl Page for FakePage {
             shown: false,
             by_agent: false,
             isolated: false,
+            discarded: false,
         }
     }
 

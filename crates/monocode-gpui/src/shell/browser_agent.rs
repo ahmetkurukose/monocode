@@ -381,6 +381,7 @@ impl Page for AppPage {
                 shown: false,
                 by_agent: false,
                 isolated: false,
+                discarded: false,
             };
             let Ok(shell) = self.window.read(cx) else {
                 return info;
@@ -393,6 +394,7 @@ impl Page for AppPage {
                 let page = page.read(cx);
                 (info.url, info.title) = (page.url.clone(), page.title.clone());
                 info.loading = page.loading();
+                info.discarded = page.discarded();
             }
             info.shown = shell.agent_page_shown(pane);
             info.by_agent = state.opened_by.is_some();

@@ -278,6 +278,7 @@ impl FakePage {
                 shown: false,
                 by_agent: false,
                 isolated: false,
+                discarded: false,
             }),
             cdp: RefCell::new(Some(cdp)),
             log: RefCell::new(Some(log)),

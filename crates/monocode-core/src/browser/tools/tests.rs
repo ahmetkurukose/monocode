@@ -121,6 +121,15 @@ fn page_targeting() {
     let tabs = driver.run("browser_tabs", json!({}));
     assert!(text(&tabs).contains("* 1 \"Example\""));
     assert!(text(&tabs).contains("2 \"Example\" https://example.com/ (the user sees it)"));
+    // A page Memory Saver discarded says so (K64).
+    host.page(1).info.borrow_mut().discarded = true;
+    let tabs = driver.run("browser_tabs", json!({}));
+    assert!(
+        text(&tabs).contains("(discarded to save memory; loads again when used)"),
+        "{}",
+        text(&tabs)
+    );
+    host.page(1).info.borrow_mut().discarded = false;
 
     let unknown = driver.run("browser_snapshot", json!({"page": 9}));
     assert_eq!(code(&unknown), "browser_no_page");

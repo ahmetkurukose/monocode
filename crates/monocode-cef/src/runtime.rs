@@ -152,7 +152,6 @@ wrap_browser_process_handler! {
         }
 
         fn on_context_initialized(&self) {
-            CONTEXT_READY.with(|r| r.set(true));
             apply_battery_saver();
         }
     }
@@ -164,52 +163,40 @@ thread_local! {
     static SHUTTING_DOWN: Cell<bool> = const { Cell::new(false) };
     /// Kept alive for as long as CEF runs.
     static APP: RefCell<Option<cef::App>> = const { RefCell::new(None) };
-    /// Chromium's global preferences can be set ([`set_battery_saver`]).
-    static CONTEXT_READY: Cell<bool> = const { Cell::new(false) };
-    /// What [`set_battery_saver`] was last told.
-    static BATTERY_SAVER: Cell<bool> = const { Cell::new(true) };
 }
 
 /// Chromium's battery saver setting, in its local state. Its values:
-/// 0 off, 1 on below 20% battery (the default), 2 on battery, 3 always.
+/// 0 off, 1 on below 20% battery (Chrome's default), 2 on battery, 3 always.
 pub const BATTERY_SAVER_PREF: &str = "performance_tuning.battery_saver_mode.state";
 
-/// Chromium's battery saver (context.md K52). On is Chrome's default: pages
-/// run at 30 fps when the battery is low. Off never limits them. Applied
-/// once CEF is up and at each change. Main thread.
-pub fn set_battery_saver(on: bool) {
-    if BATTERY_SAVER.with(|b| b.replace(on)) != on {
-        apply_battery_saver();
-    }
-}
-
+/// Chromium's own battery saver stays off (context.md K52, revised): it
+/// limits every page to 30 fps at once, the shown one and the ones agents
+/// drive included (it throttles all frame sinks). The app's Battery Saver
+/// freezes pages out of sight instead (monocode-gpui, `browser/lifecycle.rs`).
+/// `MONOCODE_BROWSER_CHROMIUM_BATTERY_SAVER=<0-3>` sets Chromium's state
+/// instead, for measuring (development hook).
 fn apply_battery_saver() {
-    if !CONTEXT_READY.with(Cell::get) {
-        return;
-    }
-    let on = BATTERY_SAVER.with(Cell::get);
-    if let Err(e) = write_battery_saver(on) {
-        log::warn!("browser: could not set the battery saver: {e}");
+    let state = std::env::var("MONOCODE_BROWSER_CHROMIUM_BATTERY_SAVER")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|state| (0..=3).contains(state))
+        .unwrap_or(0);
+    if let Err(e) = write_battery_saver(state) {
+        log::warn!("browser: could not set Chromium's battery saver: {e}");
     }
 }
 
-/// Off writes 0; on restores Chromium's default.
-fn write_battery_saver(on: bool) -> Result<(), String> {
+fn write_battery_saver(state: i32) -> Result<(), String> {
     let prefs = preference_manager_get_global().ok_or("no global preferences")?;
     let name = CefString::from(BATTERY_SAVER_PREF);
     if prefs.can_set_preference(Some(&name)) == 0 {
         return Err(format!("{BATTERY_SAVER_PREF} cannot be set"));
     }
-    let mut value = if on {
-        None
-    } else {
-        let value = value_create().ok_or("no value")?;
-        value.set_int(0);
-        Some(value)
-    };
+    let mut value = value_create().ok_or("no value")?;
+    value.set_int(state);
     // With storage: CEF fails the call when it has nowhere to write a reason.
     let mut error = CefString::from("unknown error");
-    if prefs.set_preference(Some(&name), value.as_mut(), Some(&mut error)) == 0 {
+    if prefs.set_preference(Some(&name), Some(&mut value), Some(&mut error)) == 0 {
         return Err(error.to_string());
     }
     Ok(())
@@ -284,7 +271,6 @@ pub fn shutdown(timeout: Duration) -> bool {
     #[cfg(target_os = "macos")]
     crate::mac::pump::stop();
     STARTED.with(|s| s.set(false));
-    CONTEXT_READY.with(|r| r.set(false));
     cef::shutdown();
     APP.with(|app| app.borrow_mut().take());
     true

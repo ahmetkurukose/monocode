@@ -542,6 +542,9 @@ fn tabs(host: &dyn Host, scope: &Scope) -> ToolOutput {
         if info.loading {
             notes.push("loading");
         }
+        if info.discarded {
+            notes.push("discarded to save memory; loads again when used");
+        }
         out.push_str(&format!(
             "{} {} {} {}{}\n",
             if current == Some(info.id) { "*" } else { " " },

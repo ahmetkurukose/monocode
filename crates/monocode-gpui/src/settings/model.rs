@@ -334,7 +334,13 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser-battery-saver",
         Section::General,
         "Browser battery saver",
-        "browser chromium energy power battery low frame rate fps throttle",
+        "browser chromium energy power battery low frame rate fps throttle freeze background tabs",
+    ),
+    (
+        "browser-memory-saver",
+        Section::General,
+        "Browser memory saver",
+        "browser chromium memory ram discard sleep inactive background tabs unload",
     ),
     (
         "file-word-wrap",

@@ -392,8 +392,6 @@ impl Shell {
         if monocode_core::browser::proxy::enabled() != external_cdp {
             monocode_core::browser::proxy::set_enabled(external_cdp);
         }
-        // Kept for Chromium's start when it has not started yet (K52).
-        monocode_cef::runtime::set_battery_saver(self.workspace.preferences.browser_battery_saver);
         if let Some(monos) = &self.monos {
             let prefs = self.workspace.preferences.clone();
             monos.update(cx, |m, cx| m.set_preferences(prefs, cx));

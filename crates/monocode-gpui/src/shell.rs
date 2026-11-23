@@ -5,6 +5,7 @@ mod app_views;
 mod automation_runs;
 pub(crate) mod browser_agent;
 mod browser_grab;
+mod browser_lifecycle;
 pub(crate) mod browser_links;
 mod browser_panes;
 mod browser_presence;
@@ -7714,6 +7715,7 @@ impl Render for Shell {
             // For testing the agent layer from outside (development only).
             self.start_browser_agent_dev_hook(cx);
             self.start_browser_grab_dev_hook(window, cx);
+            self.start_browser_lifecycle(cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
