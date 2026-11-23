@@ -20,10 +20,10 @@ use serde_json::json;
 
 pub(crate) use pull_request::github_enterprise_authenticated;
 pub use pull_request::{
-    pr_apply_metadata, pr_branch_check, pr_branches, pr_candidates, pr_fetch, pr_file_diff,
-    pr_local_branches, pr_metadata, pr_open, pr_push, pr_push_state, pr_range, pr_set_metadata,
-    pr_setup, CreatedPr, PrBranchCheck, PrCandidates, PrMetadata, PrPush, PrRange, PrRepo,
-    PrSetup, PrSubmit, PrTeam, PrTemplate, PrUser,
+    pr_apply_metadata, pr_base_ref, pr_branch_check, pr_branches, pr_candidates, pr_fetch,
+    pr_file_diff, pr_local_branches, pr_metadata, pr_open, pr_push, pr_push_state, pr_range,
+    pr_set_metadata, pr_setup, CreatedPr, PrBranchCheck, PrCandidates, PrMetadata, PrPush, PrRange,
+    PrRepo, PrSetup, PrSubmit, PrTeam, PrTemplate, PrUser,
 };
 pub use review::{
     commit_file_diff, commit_files, diff_files, file_diff, file_diff_head, file_diff_versions,

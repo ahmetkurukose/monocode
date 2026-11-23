@@ -583,18 +583,6 @@ impl PrDialog {
         cx.notify();
     }
 
-    /// The ref the base branch has locally.
-    fn base_ref(&self) -> String {
-        match self.base() {
-            Some(repo) if !repo.remote.is_empty() => {
-                format!("{}/{}", repo.remote, self.base_branch)
-            }
-            // A fork parent with no remote of its own: GitHub knows its branch
-            // as the head repo's remote does not, so try the plain name.
-            _ => self.base_branch.clone(),
-        }
-    }
-
     /// Base or head changed: everything about the range starts over.
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
@@ -610,10 +598,15 @@ impl PrDialog {
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));
         let (backend, cwd) = (self.backend.clone(), self.cwd.clone());
-        let (base_ref, head_ref) = (self.base_ref(), self.head_branch.clone());
-        let work = cx
-            .background_executor()
-            .spawn(async move { backend.range(&cwd, &base_ref, &head_ref) });
+        let (base, base_branch) = (
+            self.base().cloned().unwrap_or_default(),
+            self.base_branch.clone(),
+        );
+        let head_ref = self.head_branch.clone();
+        let work = cx.background_executor().spawn(async move {
+            let base_ref = backend.base_ref(&cwd, &base, &base_branch)?;
+            backend.range(&cwd, &base_ref, &head_ref)
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| this.apply_range(generation, result, cx));

@@ -996,6 +996,56 @@ fn commit_sha(root: &Path, spec: &str) -> Result<String, String> {
     .ok_or_else(|| format!("Unknown branch: {spec}"))
 }
 
+/// The local ref for `branch` of the base `repo`: `remote/branch` when the repo has a
+/// remote, else the branch fetched from GitHub into a private ref
+/// (`refs/monocode/pr-base/<owner>/<name>/<branch>`) over the same transport as the
+/// main remote (SSH or HTTPS), so a fork parent without a remote can still be a base.
+pub fn pr_base_ref(cwd: &Path, repo: &PrRepo, branch: &str) -> Result<String, String> {
+    let root = local_root(cwd)?;
+    let branch = arg_name("branch", branch)?;
+    if !repo.remote.is_empty() {
+        return Ok(format!("{}/{branch}", repo.remote));
+    }
+    let url = parent_fetch_url(&root, repo)?;
+    let local = format!(
+        "refs/monocode/pr-base/{}/{}/{branch}",
+        repo.owner, repo.name
+    );
+    git_checked(
+        &root,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            &url,
+            &format!("+refs/heads/{branch}:{local}"),
+        ],
+    )?;
+    Ok(local)
+}
+
+/// Fetch URL for a repository without a remote: the main remote's URL with its
+/// owner/name swapped, keeping its scheme and credentials setup.
+fn parent_fetch_url(root: &Path, repo: &PrRepo) -> Result<String, String> {
+    let remote = git_remote_name(root).ok_or_else(|| "No git remote".to_string())?;
+    let url = git_stdout(root, &["remote", "get-url", &remote])
+        .ok_or_else(|| format!("No URL for remote {remote}"))?;
+    Ok(swap_repo_in_url(&url, repo))
+}
+
+pub(super) fn swap_repo_in_url(url: &str, repo: &PrRepo) -> String {
+    let url = url.trim();
+    let slug = format!("{}/{}.git", repo.owner, repo.name);
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if let Some((authority, _)) = rest.split_once('/') {
+            return format!("{scheme}://{authority}/{slug}");
+        }
+    } else if let Some((authority, _)) = url.split_once(':') {
+        return format!("{authority}:{slug}");
+    }
+    format!("https://{}/{slug}", repo.host)
+}
+
 /// Commits and files of `base_ref...head_ref` (refs like `origin/main`, `feature/x`).
 pub fn pr_range(cwd: &Path, base_ref: &str, head_ref: &str) -> Result<PrRange, String> {
     let root = local_root(cwd)?;

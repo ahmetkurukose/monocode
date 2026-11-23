@@ -38,6 +38,14 @@ pub(crate) trait PrBackend: Send + Sync + 'static {
     fn branches(&self, cwd: &Path, repo: &PrRepo) -> Result<Vec<String>, String>;
     fn local_branches(&self, cwd: &Path) -> Result<Vec<String>, String>;
     fn range(&self, cwd: &Path, base_ref: &str, head_ref: &str) -> Result<PrRange, String>;
+    /// The local ref of the base branch (a fork parent's is fetched first).
+    fn base_ref(&self, _cwd: &Path, repo: &PrRepo, branch: &str) -> Result<String, String> {
+        Ok(if repo.remote.is_empty() {
+            branch.to_string()
+        } else {
+            format!("{}/{branch}", repo.remote)
+        })
+    }
     fn commit_files(&self, cwd: &Path, sha: &str) -> Result<Vec<ChangedFile>, String>;
     fn file_diff(&self, cwd: &Path, old: &str, new: &str, path: &str) -> Result<FileDiff, String>;
     fn push_state(
@@ -91,6 +99,9 @@ impl PrBackend for Gh {
     }
     fn range(&self, cwd: &Path, base_ref: &str, head_ref: &str) -> Result<PrRange, String> {
         scm::pr_range(cwd, base_ref, head_ref)
+    }
+    fn base_ref(&self, cwd: &Path, repo: &PrRepo, branch: &str) -> Result<String, String> {
+        scm::pr_base_ref(cwd, repo, branch)
     }
     fn commit_files(&self, cwd: &Path, sha: &str) -> Result<Vec<ChangedFile>, String> {
         scm::commit_files(cwd, sha)

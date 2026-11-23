@@ -2202,3 +2202,26 @@ mod pull_requests {
         assert_eq!(default_first(branches, "main"), ["main", "a", "b"]);
     }
 }
+
+#[test]
+fn pr_parent_fetch_url_keeps_the_main_remote_transport() {
+    use super::pull_request::swap_repo_in_url;
+    let parent = super::PrRepo {
+        host: "github.com".into(),
+        owner: "up".into(),
+        name: "proj".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        swap_repo_in_url("git@github.com:me/proj.git", &parent),
+        "git@github.com:up/proj.git"
+    );
+    assert_eq!(
+        swap_repo_in_url("https://github.com/me/proj", &parent),
+        "https://github.com/up/proj.git"
+    );
+    assert_eq!(
+        swap_repo_in_url("ssh://git@ghe.corp:2222/me/proj.git", &parent),
+        "ssh://git@ghe.corp:2222/up/proj.git"
+    );
+}
