@@ -234,6 +234,9 @@ pub struct FakePage {
     pub logins: RefCell<Result<Vec<crate::browser::passwords::Credential>, String>>,
     /// The user names `login_used` was told of.
     pub logins_used: RefCell<Vec<String>>,
+    pub passkey_notes: RefCell<Vec<crate::browser::passkeys::PasskeyNote>>,
+    /// The pending passkey request; `cancel_passkey` takes it.
+    pub pending_passkey: Rc<RefCell<Option<crate::browser::passkeys::PasskeyNote>>>,
 }
 
 impl FakePage {
@@ -302,6 +305,8 @@ impl FakePage {
             cold: RefCell::default(),
             permission_notes: RefCell::default(),
             waiting_permission: RefCell::default(),
+            passkey_notes: RefCell::default(),
+            pending_passkey: Rc::default(),
             cert_error: RefCell::default(),
             logins: RefCell::new(Err("no saved passwords here".into())),
             logins_used: RefCell::default(),
@@ -399,6 +404,19 @@ impl Page for FakePage {
             Ok(logins) => logins.iter().map(|l| l.password.clone()).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    fn passkey_notes(&self) -> Vec<crate::browser::passkeys::PasskeyNote> {
+        self.passkey_notes.borrow().clone()
+    }
+
+    fn pending_passkey(&self) -> Option<crate::browser::passkeys::PasskeyNote> {
+        self.pending_passkey.borrow().clone()
+    }
+
+    fn cancel_passkey(&self) -> LocalBoxFuture<'static, bool> {
+        let pending = self.pending_passkey.clone();
+        Box::pin(async move { pending.borrow_mut().take().is_some() })
     }
 
     fn expect_download(&self, dir: PathBuf) -> LocalBoxFuture<'static, Result<PathBuf, String>> {

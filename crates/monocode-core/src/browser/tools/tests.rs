@@ -1725,6 +1725,63 @@ fn a_permission_the_page_asks_for_during_an_action_is_reported() {
 }
 
 #[test]
+fn a_passkey_request_is_reported_and_can_be_cancelled() {
+    use crate::browser::passkeys::{PasskeyBlock, PasskeyKind, PasskeyNote};
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    let note = |seq, pending, reason| PasskeyNote {
+        seq,
+        kind: PasskeyKind::Get,
+        origin: "https://accounts.google.com".into(),
+        pending,
+        reason,
+    };
+    page.passkey_notes.borrow_mut().push(note(2, false, None));
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let asked = Rc::downgrade(&page);
+    page.script.on("Input.dispatchMouseEvent", move |p, _| {
+        if p["type"] == "mouseReleased" {
+            let page = asked.upgrade().unwrap();
+            let waiting = note(3, true, Some(PasskeyBlock::BluetoothDenied));
+            page.passkey_notes.borrow_mut().push(waiting.clone());
+            *page.pending_passkey.borrow_mut() = Some(waiting);
+        }
+        Ok(json!({}))
+    });
+    let click = text(&driver.run("browser_click", json!({"ref": "@e3"})));
+    assert!(
+        click.contains(
+            r#"passkeyRequest {"kind":"get","origin":"https://accounts.google.com","state":"pending","reason":"bluetooth_denied"}"#
+        ),
+        "{click}"
+    );
+    // Only what the action brought.
+    assert!(!click.contains(r#""state":"settled""#), "{click}");
+
+    let tabs = text(&driver.run("browser_tabs", json!({})));
+    assert!(
+        tabs.contains("a passkey request waits for the user's phone"),
+        "{tabs}"
+    );
+    // Only the user finishes it; an agent can cancel it.
+    let accept = driver.run("browser_dialog", json!({"action": "accept"}));
+    assert!(text(&accept).contains("only the user"), "{}", text(&accept));
+    let dismiss = text(&driver.run("browser_dialog", json!({"action": "dismiss"})));
+    assert!(
+        dismiss.starts_with("Cancelled the passkey request"),
+        "{dismiss}"
+    );
+    assert!(page.pending_passkey.borrow().is_none());
+    let again = driver.run("browser_dialog", json!({"action": "dismiss"}));
+    assert!(
+        text(&again).contains("has no dialog open"),
+        "{}",
+        text(&again)
+    );
+}
+
+#[test]
 fn an_untrusted_certificate_stops_an_agents_navigation() {
     use crate::browser::sites::CertBlock;
     let host = FakeHost::with_pages(&[1]);

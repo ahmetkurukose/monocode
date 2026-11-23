@@ -61,6 +61,8 @@ mod download_into;
 #[path = "browser_passwords.rs"]
 mod page_passwords;
 pub(crate) use page_passwords::ShowBrowserPasswords;
+#[path = "browser_passkeys.rs"]
+mod passkeys;
 #[path = "browser_presence.rs"]
 mod presence;
 #[path = "browser_sites.rs"]
@@ -699,6 +701,7 @@ impl BrowserPage {
         }
         .watch_presence(cx)
         .listen_passwords(cx)
+        .watch_media_asks(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
@@ -1700,6 +1703,7 @@ impl Render for BrowserPage {
             .children(self.find_bar(cx))
             .children(self.permission_bar(cx))
             .children(self.password_bar(cx))
+            .children(self.passkey_bar(cx))
             .when_some(self.failure.clone(), |d, failure| {
                 d.child(
                     div()
@@ -2770,6 +2774,10 @@ struct Shared {
     /// Where the password watcher's reports go (`browser_passwords.rs`).
     passwords:
         RefCell<Option<async_channel::Sender<monocode_core::browser::passwords::watch::Report>>>,
+    /// The page's passkey requests (`browser_passkeys.rs`).
+    passkeys: passkeys::Passkeys,
+    /// The page's held camera and microphone requests (`browser_sites.rs`).
+    media: sites::MediaAsks,
 }
 
 impl Shared {
@@ -2859,10 +2867,12 @@ impl Host<monocode_cef::BrowserView> {
         discard::watch_edits(&cdp);
         let audio = self.watch_audio(&cdp);
         let passwords = self.watch_passwords(&cdp);
+        let passkeys = self.watch_passkeys(&cdp);
+        let media = self.watch_media(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new((attachment, audio, passwords)),
+            _attachment: Box::new((attachment, audio, passwords, passkeys, media)),
         });
     }
 }
@@ -2873,6 +2883,7 @@ impl<V> Host<V> {
     fn end_agent(&self) {
         // A page that went plays nothing.
         self.shared.audio.set_audible(false, &self.shared);
+        self.shared.passkeys.clear();
         let link = self.agent.borrow_mut().take();
         if let Some(link) = link {
             link.cdp.on_message(None);

@@ -90,7 +90,28 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <key>NSLocationWhenInUseUsageDescription</key><string>Websites in the browser can ask for your location.</string>
 </dict></plist>
 PLIST
-native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"
+# The signing identity: MONOCODE_NATIVE_SIGNING_IDENTITY (a Developer ID for
+# releases, "-" for ad hoc), else the stable local certificate
+# scripts/native-dev-signing-cert.sh makes, when this Mac has it (K59).
+native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:-}"
+native_local_name="${MONOCODE_NATIVE_LOCAL_IDENTITY:-Monocode Local Signing}"
+if [ -z "$native_identity" ]; then
+  native_local_hash="$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -v name="\"$native_local_name\"" 'index($0, name) { print $2; exit }')"
+  if [ -n "$native_local_hash" ]; then
+    native_identity="$native_local_hash"
+    MONOCODE_NATIVE_LOCAL_SIGNING=1
+    printf 'Signing with "%s" (%s).\n' "$native_local_name" "$native_local_hash"
+  else
+    native_identity=-
+  fi
+fi
+if [ "$native_identity" = - ]; then
+  # An ad-hoc signature is the code's hash: macOS ties what the user allowed
+  # to it, so every build starts over.
+  echo 'warning: signing ad hoc. macOS forgets the Bluetooth, camera and microphone permissions and the keychain'"'"'s "Always Allow" with every build.' >&2
+  echo 'warning: run scripts/native-dev-signing-cert.sh once to sign every build with the same local certificate.' >&2
+fi
 # Signs one bundle. Ad-hoc and local signatures have no hardened runtime, so
 # they need no entitlements to load the downloaded Chromium framework.
 native_sign() {

@@ -49,8 +49,12 @@ until they give it back or leave it alone for a while (the answer says when); re
 keep working. A JavaScript dialog blocks its page until you answer it with browser_dialog. \
 You cannot grant site permissions (camera, microphone, location, notifications, ...): in a \
 background tab the page's request is denied, and on the page the user sees the user is asked; \
-actions report each request as permissionRequest with its outcome. A site without a trusted \
-certificate fails with browser_cert_error, and only the user can proceed past it. \
+actions report each request as permissionRequest with its outcome. A sign-in with a passkey \
+waits on the user's phone (Chromium shows a QR code): actions and browser_tabs report it as \
+passkeyRequest (pending, then settled; reason bluetooth_denied or bluetooth_off when the Mac \
+cannot reach the phone); only the user can finish it, and browser_dialog dismiss cancels it. \
+A site without a trusted certificate fails with browser_cert_error, and only the user can \
+proceed past it. \
 Files (uploads, downloads, PDFs, saved screenshots) stay inside the project folder. \
 browser_history searches the pages this project visited. To sign in, browser_fill_login \
 fills the user's saved login for the page's site; you never see the password, and passwords \
@@ -191,7 +195,7 @@ async fn command(
 ) -> Reply {
     let _lease = page.keep_drawn();
     match tool {
-        "browser_dialog" => return observe::dialog(&*page, &args),
+        "browser_dialog" => return observe::dialog(&*page, &args).await,
         "browser_console" => return observe::console(&*page, &args),
         "browser_network" => return observe::network(&*page, &args).await,
         _ => {}
@@ -564,6 +568,12 @@ fn tabs(host: &dyn Host, scope: &Scope) -> ToolOutput {
             notes.push(format!(
                 "a permission prompt for {} waits for the user",
                 waiting.permissions.join(", ")
+            ));
+        }
+        if let Some(passkey) = page.pending_passkey() {
+            notes.push(format!(
+                "passkeyRequest {}: a passkey request waits for the user's phone; cancel it with browser_dialog dismiss",
+                passkey.record()
             ));
         }
         if let Some(block) = page.cert_error() {

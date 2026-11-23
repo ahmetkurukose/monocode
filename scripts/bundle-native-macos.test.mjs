@@ -17,9 +17,13 @@ test("Finder launches use development data for dev bundles and installed data fo
   const target = join(directory, "target with spaces");
   await mkdir(bin);
   // Exercise packaging without signing or opening an app.
+  // codesign notes how it was called; security lists the identities the
+  // test gives it (none by default).
+  const signed = join(directory, "codesign.log");
   for (const [name, script] of [
     ["uname", "#!/bin/sh\nprintf 'Darwin\\n'\n"],
-    ["codesign", "#!/bin/sh\nexit 0\n"],
+    ["codesign", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${signed}"\n`],
+    ["security", "#!/bin/sh\nprintf '%s' \"$TEST_IDENTITIES\"\n"],
   ]) {
     await writeFile(join(bin, name), script);
     await chmod(join(bin, name), 0o755);
@@ -91,6 +95,49 @@ test("Finder launches use development data for dev bundles and installed data fo
       }
     });
   }
+  await t.test("a stable local certificate signs when this Mac has one; ad hoc warns", async () => {
+    const package_ = (extra) => {
+      const packaged = spawnSync("bash", ["scripts/bundle-native-macos.sh", "native-dev", target, "0.16.0"], {
+        cwd: root,
+        env: { ...env, ...extra },
+        encoding: "utf8",
+      });
+      assert.ifError(packaged.error);
+      assert.equal(packaged.status, 0, packaged.stdout + packaged.stderr);
+      return packaged;
+    };
+    await rm(signed, { force: true });
+    const adHoc = package_({ TEST_IDENTITIES: "" });
+    assert.match(adHoc.stderr, /signing ad hoc.*Bluetooth, camera and microphone/);
+    assert.match(adHoc.stderr, /native-dev-signing-cert\.sh/);
+    for (const line of (await readFile(signed, "utf8")).trim().split("\n")) {
+      assert.match(line, /^--force --sign - /);
+    }
+    await rm(signed, { force: true });
+    const local = package_({
+      TEST_IDENTITIES: [
+        '  1) 1111111111111111111111111111111111111111 "Apple Development: Someone (TEAM)"',
+        '  2) ABCDEF0123456789ABCDEF0123456789ABCDEF01 "Monocode Local Signing"',
+        "     2 valid identities found",
+        "",
+      ].join("\n"),
+    });
+    assert.doesNotMatch(local.stderr, /ad hoc/);
+    assert.match(local.stdout, /Signing with "Monocode Local Signing"/);
+    const lines = (await readFile(signed, "utf8")).trim().split("\n");
+    // The app, its five helpers and (a new identity) the framework again.
+    assert.ok(lines.length >= 6, lines.join("\n"));
+    for (const line of lines) {
+      // A local certificate: no hardened runtime, no timestamp server.
+      assert.match(line, /^--force --sign ABCDEF0123456789ABCDEF0123456789ABCDEF01 /);
+    }
+    // An identity given explicitly wins.
+    await rm(signed, { force: true });
+    package_({ TEST_IDENTITIES: local.stdout, MONOCODE_NATIVE_SIGNING_IDENTITY: "-" });
+    for (const line of (await readFile(signed, "utf8")).trim().split("\n")) {
+      assert.match(line, /^--force --sign - /);
+    }
+  });
   await t.test("a chosen name names the bundle and what the Finder shows, not the app's identity", async () => {
     const output = join(target, "release");
     const packaged = spawnSync("bash", ["scripts/bundle-native-macos.sh", "release", target, "0.16.0"], {
