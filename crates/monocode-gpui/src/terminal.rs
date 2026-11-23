@@ -1,6 +1,8 @@
 //! Port of TerminalView.tsx: a login shell on a PTY, emulated by
 //! alacritty_terminal and painted as a grid of cell-snapped text runs.
 pub(crate) mod hosted;
+#[cfg(target_os = "macos")]
+mod pty;
 pub(crate) mod run;
 mod shell;
 use shell::default_shell;
@@ -272,8 +274,8 @@ fn spawn_child(
         env.insert(key.clone(), value.clone());
     }
     let options = tty::Options {
-        shell: Some(tty::Shell::new(shell::pty_program(&program), args)),
-        working_directory: Some(workdir),
+        shell: Some(tty::Shell::new(shell::pty_program(&program), args.clone())),
+        working_directory: Some(workdir.clone()),
         drain_on_exit: run.is_some(),
         env,
         #[cfg(target_os = "windows")]
@@ -288,7 +290,20 @@ fn spawn_child(
     let mut master_fd = -1;
     let mut shell_pid = 0;
     let mut output = None;
-    let sender = match tty::new(&options, window, id) {
+    // On macOS the child starts without fork (see `pty`); alacritty's own
+    // PTY forks to set up the child's session.
+    #[cfg(target_os = "macos")]
+    let opened = pty::new(
+        &shell::pty_program(&program),
+        &args,
+        &options.env,
+        &workdir,
+        window,
+        id,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let opened = tty::new(&options, window, id);
+    let sender = match opened {
         Ok(pty) => {
             #[cfg(unix)]
             {
