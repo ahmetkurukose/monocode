@@ -1172,7 +1172,7 @@ fn run_command_raw(program: &str, root: &Path, args: &[&str]) -> Result<String, 
     crate::scm::shell::apply_gui_env(&mut command);
     crate::scm::shell::apply_gh_env(&mut command, root);
     crate::process::configure_child(&mut command);
-    let output = command.output().map_err(|e| e.to_string())?;
+    let output = crate::process::output(&mut command).map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();

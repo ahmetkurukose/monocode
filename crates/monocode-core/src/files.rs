@@ -141,16 +141,17 @@ fn git_ignored_names(dir: &Path, names: &[&str]) -> Option<HashSet<String>> {
     if names.is_empty() {
         return Some(HashSet::new());
     }
-    let mut child = crate::scm::git_cmd()
-        .arg("-C")
-        .arg(dir)
-        .args(["check-ignore", "--stdin", "-z"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = crate::process::spawn(
+        crate::scm::git_cmd()
+            .arg("-C")
+            .arg(dir)
+            .args(["check-ignore", "--stdin", "-z"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
 
     let mut input = Vec::with_capacity(names.iter().map(|n| n.len() + 1).sum());
     for name in names {
@@ -456,7 +457,7 @@ pub fn open_path_with_default_app(path: &Path) -> Result<(), String> {
     let mut command = Command::new("xdg-open");
     command.arg(&path);
     crate::process::configure_child(&mut command);
-    let output = command.output().map_err(|error| error.to_string())?;
+    let output = crate::process::output(&mut command).map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
     } else {
@@ -485,7 +486,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
         let mut command = Command::new("open");
         command.args(["-R", path_str]);
         crate::process::configure_child(&mut command);
-        let status = command.status().map_err(|e| e.to_string())?;
+        let status = crate::process::status(&mut command).map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("Could not reveal in Finder.".into());
         }
@@ -501,7 +502,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
         let mut command = Command::new("explorer");
         command.raw_arg(format!("/select,\"{path_str}\""));
         crate::process::configure_child(&mut command);
-        command.spawn().map_err(|e| e.to_string())?;
+        crate::process::spawn(&mut command).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -513,7 +514,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
         let mut command = Command::new("xdg-open");
         command.arg(parent);
         crate::process::configure_child(&mut command);
-        let status = command.status().map_err(|e| e.to_string())?;
+        let status = crate::process::status(&mut command).map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("Could not open the containing folder.".into());
         }

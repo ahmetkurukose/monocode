@@ -182,7 +182,14 @@ fn gui_search_path_from(
         .into_owned()
 }
 
-/// Login-shell PATH, HOME/USER/SHELL from passwd, and a UTF-8 locale.
+/// A command for `name` as found on the PATH [`apply_gui_env`] sets, so it
+/// still starts without a fork (see `process::program_on_path`).
+pub(crate) fn gui_command(name: &str) -> Command {
+    Command::new(crate::process::program_on_path(name, gui_search_path()))
+}
+
+/// Login-shell PATH, HOME/USER/SHELL from passwd, and a UTF-8 locale. The
+/// program must be a path: see [`gui_command`].
 pub(crate) fn apply_gui_env(cmd: &mut Command) {
     cmd.env("PATH", gui_search_path());
     if let Some(id) = passwd_identity() {
@@ -330,7 +337,7 @@ fn login_shell_vars(
         }
     }
     crate::process::isolate(&mut cmd);
-    let child = cmd.spawn().ok()?;
+    let child = crate::process::spawn(&mut cmd).ok()?;
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

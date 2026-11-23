@@ -77,7 +77,7 @@ impl Launcher for ProcessLauncher {
         // A language server is background work: it keeps the scheduling
         // hints that runs and debuggers go without.
         crate::process::configure_child(&mut command);
-        let mut child = command.spawn()?;
+        let mut child = crate::process::spawn(&mut command)?;
         let streams = (child.stdout.take(), child.stdin.take());
         let (Some(stdout), Some(stdin)) = streams else {
             child::kill_group(&mut child);

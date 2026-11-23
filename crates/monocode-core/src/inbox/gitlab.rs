@@ -1,7 +1,6 @@
 //! Native adapter of the original Tauri Inbox provider. Network parsing and secret-file formats remain identical.
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -902,14 +901,12 @@ fn encode_path_component(value: &str) -> String {
 }
 
 fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::scm::shell::gui_command("git");
     crate::process::configure_child(&mut cmd);
     crate::scm::shell::apply_gui_env(&mut cmd);
-    let output = cmd
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .current_dir(root)
-        .output()
-        .map_err(|_| "Could not run git".to_string())?;
+    cmd.args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .current_dir(root);
+    let output = crate::process::output(&mut cmd).map_err(|_| "Could not run git".to_string())?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err("Could not read git remotes".into());
     }

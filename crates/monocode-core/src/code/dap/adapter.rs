@@ -161,7 +161,7 @@ impl Adapter for Debugpy {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             crate::process::configure_child(&mut probe);
-            probe.status()
+            crate::process::status(&mut probe)
         };
         match can_import(DEBUGPY) {
             Ok(status) if status.success() => {}
@@ -186,7 +186,7 @@ impl Adapter for Debugpy {
                 return Err(DapError::Start(format!(
                     "Could not run {}: {error}.",
                     python.display()
-                )))
+                )));
             }
         }
         Ok(AdapterStart {

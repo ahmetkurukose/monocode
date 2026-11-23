@@ -438,16 +438,17 @@ pub fn selected_context(cwd: &Path, paths: &[String]) -> Result<StagedContext, S
     let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
     let index = scratch.path().join("index");
     let run = |args: &[&str]| -> Result<String, String> {
-        let output = git_cmd()
-            .arg("--literal-pathspecs")
-            .arg("--no-pager")
-            .arg("-C")
-            .arg(&root)
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-            .map_err(|e| e.to_string())?;
+        let output = crate::process::output(
+            git_cmd()
+                .arg("--literal-pathspecs")
+                .arg("--no-pager")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_OPTIONAL_LOCKS", "0"),
+        )
+        .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -1307,7 +1308,7 @@ fn gh_run(root: &Path, args: &[&str]) -> Result<String, String> {
     shell::apply_gui_env(&mut cmd);
     shell::apply_gh_env(&mut cmd, root);
     crate::process::configure_child(&mut cmd);
-    let output = cmd.output().map_err(|error| {
+    let output = crate::process::output(&mut cmd).map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
             "GitHub CLI (`gh`) is not installed.".to_string()
         } else {
@@ -1353,24 +1354,27 @@ fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, String> {
 /// Any git can start a filter (git-lfs), which a Finder launch's bare PATH
 /// lacks. The cached search path finds it without waiting on the login shell.
 pub(crate) fn git_cmd() -> Command {
-    let mut cmd = Command::new("git");
+    git_cmd_on(shell::cached_gui_search_path())
+}
+
+/// Git as found on `path`, which is also its PATH.
+fn git_cmd_on(path: String) -> Command {
+    let mut cmd = Command::new(crate::process::program_on_path("git", &path));
     crate::process::configure_child(&mut cmd);
-    cmd.env("PATH", shell::cached_gui_search_path())
-        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("PATH", path).env("GIT_TERMINAL_PROMPT", "0");
     cmd
 }
 
 fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) -> Command {
-    let mut cmd = git_cmd();
     let args = args.strip_prefix(&["--literal-pathspecs"]).unwrap_or(args);
     if matches!(
         args.first().copied(),
         Some("commit" | "push" | "pull" | "fetch" | "clone" | "merge" | "rebase")
     ) {
         // Signers, hooks, and credential helpers may only be on the login-shell PATH.
-        cmd.env("PATH", gui_path());
+        return git_cmd_on(gui_path());
     }
-    cmd
+    git_cmd()
 }
 
 fn git_cmd_for_args(args: &[&str]) -> Command {
@@ -1387,14 +1391,12 @@ fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
         // the environment the project's shell would set.
         shell::apply_gh_env(&mut cmd, root);
     }
-    let output = cmd
-        .arg("--no-pager")
+    cmd.arg("--no-pager")
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|e| e.to_string())?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let output = crate::process::output(&mut cmd).map_err(|e| e.to_string())?;
     if output.status.success() {
         return Ok(());
     }
@@ -1416,14 +1418,15 @@ fn git_run(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = git_cmd_for_args(args)
-        .arg("--no-pager")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .ok()?;
+    let output = crate::process::output(
+        git_cmd_for_args(args)
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0"),
+    )
+    .ok()?;
     if git_status_ok(&output.status, args) {
         return Some(output.stdout);
     }
@@ -1677,12 +1680,11 @@ fn upstream_from_lookup(lookup: Option<(ExitStatus, Vec<u8>)>) -> Result<bool, S
 /// or a stalled filesystem. Drain stdout concurrently so a full pipe cannot
 /// deadlock the child. Mutating Git operations keep their existing lifetime.
 fn metadata_stdout(command: &mut Command, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    let mut child = crate::process::spawn(command).ok()?;
     let deadline = Instant::now() + timeout;
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();

@@ -145,7 +145,7 @@ impl Client {
         crate::process::configure_user_child(&mut command);
         // Its own group, so that helpers the adapter starts die with it.
         child::lead_group(&mut command);
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = crate::process::spawn_user(&mut command).map_err(|error| {
             DapError::Start(format!(
                 "Could not start {}: {error}.",
                 start.program.display()

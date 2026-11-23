@@ -322,7 +322,7 @@ pub fn merged_at(pull_request: &str) -> Result<Option<u64>, String> {
     .env("GH_PROMPT_DISABLED", "1");
     crate::scm::shell::apply_gui_env(&mut cmd);
     crate::process::configure_child(&mut cmd);
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = crate::process::output(&mut cmd).map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }

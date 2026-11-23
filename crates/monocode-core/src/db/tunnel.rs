@@ -2,7 +2,7 @@
 //! command that makes a remote server reachable on a data source's local port.
 //!
 //! Ported from dbports (`internal/tunnel`). Processes are started detached,
-//! in their own session, so they outlive Monocode like they outlive the
+//! in their own process group, so they outlive Monocode like they outlive the
 //! dbports TUI; what is running is learned from `lsof`, not from handles we
 //! keep. Everything is keyed by port: several data sources (other databases,
 //! other users) may share one tunnel.
@@ -352,7 +352,7 @@ fn install_hint(program: &str) -> String {
 const UNSUPPORTED: &str = "Tunnels are only supported on macOS and Linux.";
 
 /// Spawns the tunnel detached and returns its pid. The process gets its own
-/// session (no controlling terminal, not in our process group), so it keeps
+/// process group (not ours, so it is never signalled with us), so it keeps
 /// running when Monocode quits. May block a few seconds the first time, while
 /// the login shell's PATH is read.
 pub fn start(tunnel: &Tunnel, port: u16, dir: &Path) -> Result<u32, String> {
@@ -402,17 +402,13 @@ fn spawn_detached(tunnel: &Tunnel, port: u16, dir: &Path) -> Result<u32, String>
         .env("PATH", &path)
         .stdin(Stdio::null())
         .stdout(log)
-        .stderr(stderr);
-    // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|e| {
+        .stderr(stderr)
+        // Its own group, so `stop` can signal it and what it starts, and a
+        // terminal's Ctrl-C (a dev build) never reaches it. Not `setsid` in a
+        // `pre_exec`: that makes std fork, which this Chromium-hosting
+        // process must not (see `process`).
+        .process_group(0);
+    let mut child = crate::process::spawn_user(&mut command).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             install_hint(&program)
         } else {

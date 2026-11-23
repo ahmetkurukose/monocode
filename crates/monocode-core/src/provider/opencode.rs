@@ -168,10 +168,7 @@ fn command(request: &Request) -> Result<Command, String> {
     Ok(command)
 }
 fn exec(request: &Request, args: &[&str], cancel: &AtomicBool) -> Result<String, String> {
-    let mut child = command(request)?
-        .args(args)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let mut child = process::spawn(command(request)?.args(args)).map_err(|e| e.to_string())?;
     let _registration = process::register(child.id());
     let _account = crate::accounts::track(child.id(), request.kind, &request.settings.account);
     let stdout = child.stdout.take().unwrap();
@@ -310,10 +307,12 @@ fn connect(
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     drop(listener);
-    let mut child = command(request)?
-        .args(["serve", "--hostname=127.0.0.1", &format!("--port={port}")])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let mut child = process::spawn(command(request)?.args([
+        "serve",
+        "--hostname=127.0.0.1",
+        &format!("--port={port}"),
+    ]))
+    .map_err(|e| e.to_string())?;
     let registration = process::register(child.id());
     let account = crate::accounts::track(child.id(), request.kind, &request.settings.account);
     let stdout = child.stdout.take().unwrap();

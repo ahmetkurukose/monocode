@@ -1,47 +1,34 @@
 //! Child policy extracted from src-tauri/src/background_work.rs.
-use std::process::Command;
+//!
+//! Every child must start through `posix_spawn`, never `fork`: this process
+//! hosts Chromium, and a forked child can hang before `exec` on a lock
+//! another thread held at the fork (seen in `xpc_atfork_child` on Chromium's
+//! allocator lock), keeping the browser profile locked after the app quits.
+//! std's `Command::spawn` uses `posix_spawn` on macOS unless the command has
+//! a `pre_exec` closure, a uid/gid/groups, `setsid`, or a bare program name
+//! with an overridden PATH. So nothing here uses `pre_exec`: the signal mask
+//! and priority are applied around the spawn by [`spawn`], [`output`] and
+//! [`status`], and [`program_on_path`] turns a bare name into a path.
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
-/// Apply scheduling hints before exec so descendants inherit them.
-/// Best effort: a refused hint must not prevent a provider from launching.
+/// Mark a background child; start it with [`spawn`], [`output`] or
+/// [`status`], which give it the ordinary signal mask and a lower priority.
 pub fn configure_child(command: &mut Command) {
-    configure(command, true);
+    configure(command);
 }
 
 /// For a program the user runs and waits for (a run, a debug adapter and
-/// the debuggee it starts): the ordinary signal mask and no console window,
-/// like `configure_child`, but at the user's own priority. The hints above
-/// are for background work and are inherited by every descendant.
+/// the debuggee it starts): no console window, like `configure_child`. Start
+/// it with [`spawn_user`]: the ordinary signal mask, at the user's own
+/// priority, since a priority is inherited by every descendant.
 pub fn configure_user_child(command: &mut Command) {
-    configure(command, false);
+    configure(command);
 }
 
-fn configure(command: &mut Command, background: bool) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Only system calls here: the post-fork child must not allocate or lock.
-        unsafe {
-            command.pre_exec(move || {
-                // A GUI executor's worker may block signals. exec preserves
-                // that mask; Tokio-based provider children then never receive
-                // SIGCHLD and their command sessions never finish. Give the
-                // provider the ordinary process mask before it starts.
-                let mut signals = std::mem::zeroed();
-                libc::sigemptyset(&mut signals);
-                if libc::sigprocmask(libc::SIG_SETMASK, &signals, std::ptr::null_mut()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if !background {
-                    return Ok(());
-                }
-                let priority = libc::getpriority(libc::PRIO_PROCESS, 0).max(10);
-                libc::setpriority(libc::PRIO_PROCESS, 0, priority);
-                #[cfg(target_os = "macos")]
-                setiopolicy_np(0, 0, 3); // DISK, PROCESS, THROTTLE
-                Ok(())
-            });
-        }
-    }
+fn configure(command: &mut Command) {
     // A GUI-subsystem parent gives every console child (git, gh) its own
     // visible console window unless asked not to.
     #[cfg(windows)]
@@ -49,15 +36,181 @@ fn configure(command: &mut Command, background: bool) {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let _ = (command, background);
+    let _ = command;
 }
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn setiopolicy_np(kind: i32, scope: i32, policy: i32) -> i32;
+/// Start a background child (see [`configure_child`]).
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
+    start(command, true)
+}
+
+/// Start a child the user runs (see [`configure_user_child`]).
+pub fn spawn_user(command: &mut Command) -> io::Result<Child> {
+    start(command, false)
+}
+
+/// `Command::output` for a background child. Like it, stdout and stderr are
+/// captured and stdin reads nothing; this overrides any stdio set before.
+pub fn output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(command)?.wait_with_output()
+}
+
+/// `Command::status` for a background child: stdio is inherited unless set.
+pub fn status(command: &mut Command) -> io::Result<ExitStatus> {
+    spawn(command)?.wait()
+}
+
+fn start(command: &mut Command, background: bool) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        if !spawns_without_fork(command) {
+            // A bare name with a changed PATH. Missing there, exec would fail
+            // too: report that without the fork. Found, it is a caller that
+            // should have used `program_on_path`; a release build still
+            // starts it the old way.
+            let program = command.get_program();
+            let path = child_path(command).unwrap_or_default();
+            if find_on_path(program, &path).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} was not found on PATH", program.display()),
+                ));
+            }
+            if cfg!(debug_assertions) {
+                panic!(
+                    "{program:?} has PATH set but is a bare name, so std would fork; \
+                     use process::program_on_path"
+                );
+            }
+        }
+        let child = with_ordinary_signal_mask(|| command.spawn())?;
+        if background {
+            lower_priority(child.id());
+        }
+        Ok(child)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = background;
+        command.spawn()
+    }
+}
+
+/// A GUI executor's worker may block signals, and `posix_spawn` (like exec)
+/// keeps the spawning thread's mask: std does not reset it. Tokio-based
+/// provider children then never receive SIGCHLD and their command sessions
+/// never finish. So the calling thread has the ordinary mask while it spawns.
+/// A signal pending meanwhile runs its handler here, as on any other thread.
+#[cfg(unix)]
+fn with_ordinary_signal_mask<T>(spawn: impl FnOnce() -> T) -> T {
+    // SAFETY: plain calls on this thread's own signal mask.
+    unsafe {
+        let mut empty = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        let mut previous = std::mem::zeroed();
+        let changed = libc::pthread_sigmask(libc::SIG_SETMASK, &empty, &mut previous) == 0;
+        let result = spawn();
+        if changed {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        }
+        result
+    }
+}
+
+/// Background work runs at nice 10 or more, set just after the spawn since
+/// nothing may run in the child before exec. Descendants it starts later
+/// inherit it; one started in the microseconds before does not. macOS has
+/// no call to set another process's I/O policy (`setiopolicy_np` acts on the
+/// caller only, `PRIO_DARWIN_BG` too and it would also throttle the child's
+/// network), so its disk I/O is no longer throttled. Best effort: a child
+/// that already exited or refuses keeps the priority it has.
+#[cfg(unix)]
+fn lower_priority(pid: u32) {
+    // SAFETY: plain syscalls on a pid we just started.
+    unsafe {
+        // The child inherited this process's nice value.
+        let priority = libc::getpriority(libc::PRIO_PROCESS, 0).max(10);
+        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, priority);
+    }
+}
+
+/// Whether std can start `command` with `posix_spawn` as far as its program
+/// and environment go: not a bare name with PATH set or removed. A
+/// `pre_exec` closure, or `env_clear` with a bare name, also forces a fork
+/// but cannot be seen from outside on stable Rust.
+pub fn spawns_without_fork(command: &Command) -> bool {
+    let program_is_path = command.get_program().as_encoded_bytes().contains(&b'/');
+    program_is_path || child_path(command).is_none() || cfg!(not(unix))
+}
+
+/// The PATH `command` sets for its child, if it changes it.
+fn child_path(command: &Command) -> Option<OsString> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("PATH"))
+        .map(|(_, value)| value.map(OsStr::to_owned).unwrap_or_default())
+}
+
+/// The program to start as `name` in a child whose PATH is `path`: the first
+/// executable `name` on it. A bare name with an overridden PATH makes std
+/// fork (`posix_spawnp` would search this process's PATH instead), so give
+/// such a command this path. A name with a slash, or one found nowhere, is
+/// returned as given; starting a missing one then fails with NotFound.
+/// Windows resolves against the child's PATH itself, so it is left alone.
+pub fn program_on_path(name: impl AsRef<OsStr>, path: impl AsRef<OsStr>) -> PathBuf {
+    let (name, path) = (name.as_ref(), path.as_ref());
+    if cfg!(not(unix)) || name.as_encoded_bytes().contains(&b'/') {
+        return name.into();
+    }
+    find_on_path(name, path).unwrap_or_else(|| name.into())
+}
+
+/// Recent lookups: git is resolved for every git command. A hit is checked
+/// again, so a binary that went away is looked up anew.
+fn find_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    type Cache = Mutex<HashMap<(OsString, OsString), PathBuf>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (name.to_owned(), path.to_owned());
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    if let Some(found) = cached.filter(|found| is_executable(found)) {
+        return Some(found);
+    }
+    let found = std::env::split_paths(path)
+        // An empty or relative entry would depend on the child's directory.
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))?;
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, found.clone());
+    Some(found)
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// New native provider processes use a separate group for cancellation.
@@ -369,7 +522,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]).stdin(Stdio::piped());
         isolate(&mut command);
-        command.spawn().unwrap()
+        super::spawn(&mut command).unwrap()
     }
     #[test]
     // `retire_pid` reaps the child with waitpid.
@@ -509,7 +662,7 @@ mod tests {
                 ])
                 .env(CHILD, "1");
             isolate(&mut command);
-            let result = command.output();
+            let result = output(&mut command);
             libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
             let output = result.unwrap();
             assert!(
@@ -517,6 +670,86 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stdout)
             );
+        }
+    }
+    #[test]
+    fn the_spawning_thread_keeps_its_own_signal_mask() {
+        unsafe {
+            let mut blocked = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGUSR2);
+            let mut before = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut before);
+            let status = status(Command::new("/usr/bin/true").stdout(Stdio::null()));
+            let mut after = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, &before, &mut after);
+            assert!(status.unwrap().success());
+            assert_eq!(libc::sigismember(&after, libc::SIGUSR2), 1);
+        }
+    }
+    #[test]
+    fn background_children_run_at_nice_ten_and_user_children_do_not() {
+        let nice = |pid: u32| unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+        let ours = nice(0);
+        let mut background = spawn("cat >/dev/null");
+        assert_eq!(nice(background.id()), ours.max(10));
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat >/dev/null"]).stdin(Stdio::piped());
+        configure_user_child(&mut command);
+        let mut user = spawn_user(&mut command).unwrap();
+        assert_eq!(nice(user.id()), ours);
+        for child in [&mut background, &mut user] {
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        }
+    }
+    #[test]
+    fn a_bare_program_resolves_on_the_childs_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a"), dir.path().join("b"));
+        for folder in [&first, &second] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        // Not executable in the first folder, so the second one's is used.
+        std::fs::write(first.join("tool"), "").unwrap();
+        let tool = second.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            "relative",
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(program_on_path("tool", &path), tool);
+        assert_eq!(program_on_path("/bin/sh", &path), PathBuf::from("/bin/sh"));
+        assert_eq!(program_on_path("missing", &path), PathBuf::from("missing"));
+
+        let mut command = Command::new(program_on_path("tool", &path));
+        command.env("PATH", &path);
+        assert!(spawns_without_fork(&command));
+        assert_eq!(output(&mut command).unwrap().stdout, b"ran\n");
+        // Cached, and looked up again once it is gone.
+        std::fs::remove_file(&tool).unwrap();
+        assert_eq!(program_on_path("tool", &path), PathBuf::from("tool"));
+    }
+    #[test]
+    fn a_bare_program_with_a_changed_path_is_not_spawned() {
+        let mut command = Command::new("sh");
+        command.env("PATH", "/bin");
+        assert!(!spawns_without_fork(&command));
+        assert!(spawns_without_fork(&Command::new("sh")));
+        // Missing on that PATH: NotFound, without starting anything.
+        let mut missing = Command::new("monocode-no-such-tool");
+        missing.env("PATH", "/bin");
+        let error = output(&mut missing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+    #[test]
+    fn commands_monocode_builds_with_a_path_name_their_program() {
+        for command in [crate::scm::git_cmd(), crate::scm::shell::gui_command("sh")] {
+            assert!(spawns_without_fork(&command), "{command:?}");
         }
     }
 }

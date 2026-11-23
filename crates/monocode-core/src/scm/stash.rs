@@ -48,14 +48,15 @@ fn work_tree(cwd: &Path) -> Result<PathBuf, String> {
 }
 
 fn run(root: &Path, args: &[&str]) -> Result<Output, String> {
-    git_cmd()
-        .arg("--no-pager")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(|e| e.to_string())
+    crate::process::output(
+        git_cmd()
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0"),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn failure(output: &Output) -> String {

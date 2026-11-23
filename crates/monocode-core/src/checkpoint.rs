@@ -885,7 +885,8 @@ fn resolve_edit_path(workspace: &Path, root: &Path, path: &str) -> Result<String
 }
 
 fn git_command(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
+    let path = crate::scm::shell::cached_gui_search_path();
+    let mut command = Command::new(crate::process::program_on_path("git", &path));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -899,7 +900,7 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LITERAL_PATHSPECS", "1")
-        .env("PATH", crate::scm::shell::cached_gui_search_path());
+        .env("PATH", path);
     for name in [
         "GIT_DIR",
         "GIT_WORK_TREE",

@@ -926,3 +926,9 @@ fn checkpoints_scope_nested_workspaces_and_repositories_without_head() {
     f.store.undo("unborn", cwd, None).unwrap();
     assert!(!unborn.join("new.txt").exists());
 }
+
+#[test]
+fn git_commands_start_without_a_fork() {
+    let command = git_command(Path::new("/"), &["status"]);
+    assert!(crate::process::spawns_without_fork(&command), "{command:?}");
+}

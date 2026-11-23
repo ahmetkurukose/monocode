@@ -153,14 +153,22 @@ fn codex_error(error: &Value, fallback: &str) -> String {
 /// An explicit override wins and errors at launch rather than silently falling back.
 pub fn resolve(kind: Kind) -> Option<PathBuf> {
     if let Some(path) = crate::cli::configured(kind) {
-        return Some(path);
+        return Some(on_gui_path(path));
     }
     resolve_auto(kind)
+}
+/// A bare name, from a setting or the environment, as found on the PATH the
+/// CLI is given, so it still starts without a fork (`process`).
+fn on_gui_path(path: PathBuf) -> PathBuf {
+    if path.components().count() > 1 || path.is_absolute() {
+        return path;
+    }
+    process::program_on_path(&path, crate::scm::shell::gui_search_path())
 }
 pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
     let key = format!("MONOCODE_{}_BINARY", kind.id().to_uppercase());
     if let Some(path) = std::env::var_os(key).filter(|s| !s.is_empty()) {
-        return Some(path.into());
+        return Some(on_gui_path(path.into()));
     }
     let mut candidates: Vec<PathBuf> = Some(std::ffi::OsString::from(
         crate::scm::shell::gui_search_path(),

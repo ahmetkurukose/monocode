@@ -132,9 +132,20 @@ impl Registry {
             true => toolchain.tool(None, &spawn.command),
             false => None,
         };
-        let mut command = match &program {
-            Some(program) => Command::new(program),
-            None => Command::new(&spawn.command),
+        // Else on the PATH the run gets, which also keeps it a posix_spawn.
+        let child_path = spawn
+            .env
+            .iter()
+            .rev()
+            .chain(toolchain.environment.iter().rev())
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_str());
+        let mut command = match (&program, child_path) {
+            (Some(program), _) => Command::new(program),
+            (None, Some(path)) => {
+                Command::new(crate::process::program_on_path(&spawn.command, path))
+            }
+            (None, None) => Command::new(&spawn.command),
         };
         command
             .args(&spawn.args)
@@ -155,7 +166,7 @@ impl Registry {
         // The user's own program: not throttled like background work.
         crate::process::configure_user_child(&mut command);
         lead_group(&mut command);
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = crate::process::spawn_user(&mut command).map_err(|error| {
             if !spawn.cwd.is_dir() {
                 format!("The folder {} does not exist.", spawn.cwd.display())
             } else if error.kind() == std::io::ErrorKind::NotFound {

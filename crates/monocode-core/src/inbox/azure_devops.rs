@@ -2,7 +2,6 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -1197,43 +1196,42 @@ fn git_unified_hunks(old: Option<&[u8]>, new: Option<&[u8]>) -> Option<(i64, i64
     // replace the unified output this parser expects.
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let null_file: &Path = Path::new(null_device);
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::scm::shell::gui_command("git");
     crate::process::configure_child(&mut cmd);
     crate::scm::shell::apply_gui_env(&mut cmd);
-    let output = cmd
-        .args([
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.safecrlf=false",
-            "-c",
-            "core.quotepath=false",
-        ])
-        .arg("-c")
-        .arg(format!("core.attributesFile={null_device}"))
-        .args([
-            "diff",
-            "--no-index",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--unified=3",
-            "--no-color",
-            "--",
-        ])
-        .arg(if old.is_some() {
-            old_path.as_path()
-        } else {
-            null_file
-        })
-        .arg(if new.is_some() {
-            new_path.as_path()
-        } else {
-            null_file
-        })
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", null_device)
-        .current_dir(&dir)
-        .output();
+    cmd.args([
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.safecrlf=false",
+        "-c",
+        "core.quotepath=false",
+    ])
+    .arg("-c")
+    .arg(format!("core.attributesFile={null_device}"))
+    .args([
+        "diff",
+        "--no-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=3",
+        "--no-color",
+        "--",
+    ])
+    .arg(if old.is_some() {
+        old_path.as_path()
+    } else {
+        null_file
+    })
+    .arg(if new.is_some() {
+        new_path.as_path()
+    } else {
+        null_file
+    })
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", null_device)
+    .current_dir(&dir);
+    let output = crate::process::output(&mut cmd);
     cleanup();
     let output = output.ok()?;
     // Exit 0 means identical; 1 means differences; anything else is a failure.
@@ -1791,14 +1789,12 @@ fn encode_segment(value: &str) -> String {
 }
 
 fn azure_devops_repo_for(root: &Path, organization_url: &str) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::scm::shell::gui_command("git");
     crate::process::configure_child(&mut cmd);
     crate::scm::shell::apply_gui_env(&mut cmd);
-    let output = cmd
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .current_dir(root)
-        .output()
-        .map_err(|_| "Could not run git".to_string())?;
+    cmd.args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .current_dir(root);
+    let output = crate::process::output(&mut cmd).map_err(|_| "Could not run git".to_string())?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err("Could not read git remotes".into());
     }

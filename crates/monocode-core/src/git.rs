@@ -42,9 +42,8 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
     crate::process::configure_child(&mut command);
-    let out = command
-        .output()
-        .map_err(|e| format!("Could not run Git: {e}"))?;
+    let out =
+        crate::process::output(&mut command).map_err(|e| format!("Could not run Git: {e}"))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }

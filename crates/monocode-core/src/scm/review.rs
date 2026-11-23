@@ -621,8 +621,7 @@ fn hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<String, S
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::process::configure_child(&mut command);
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = crate::process::spawn(&mut command).map_err(|e| e.to_string())?;
     let mut stdin = child
         .stdin
         .take()

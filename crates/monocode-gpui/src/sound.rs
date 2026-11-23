@@ -28,7 +28,7 @@ pub(crate) fn play(cue: Cue) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         monocode_core::process::configure_child(&mut command);
-        let _ = command.status();
+        let _ = monocode_core::process::status(&mut command);
     });
     #[cfg(any(not(target_os = "macos"), test))]
     let _ = cue;

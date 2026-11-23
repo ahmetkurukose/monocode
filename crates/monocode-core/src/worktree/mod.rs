@@ -143,8 +143,7 @@ fn failure(out: &std::process::Output) -> String {
 /// Run Git and return stdout, or stderr as the error.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     ensure_local(cwd)?;
-    let out = command(cwd, args)
-        .output()
+    let out = crate::process::output(&mut command(cwd, args))
         .map_err(|e| format!("Could not run Git: {e}"))?;
     if !out.status.success() {
         return Err(failure(&out));
@@ -155,22 +154,24 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 /// Whether Git exits successfully (used for `--quiet`/`--verify` probes).
 pub(crate) fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     !crate::files::remote::is_remote(cwd)
-        && command(cwd, args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        && crate::process::status(
+            command(cwd, args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .is_ok_and(|s| s.success())
 }
 
 /// Run Git with `input` on stdin; returns `(exit code, stdout)`.
 pub(crate) fn git_input(cwd: &Path, args: &[&str], input: &[u8]) -> Result<(i32, String), String> {
     ensure_local(cwd)?;
-    let mut child = command(cwd, args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Could not run Git: {e}"))?;
+    let mut child = crate::process::spawn(
+        command(cwd, args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| format!("Could not run Git: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let input = input.to_vec();
     let writer = std::thread::spawn(move || {
@@ -244,11 +245,9 @@ pub(crate) fn git_live(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Could not run Git: {e}"))?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child =
+        crate::process::spawn(&mut command).map_err(|e| format!("Could not run Git: {e}"))?;
     let (tx, rx) = std::sync::mpsc::channel::<Chunk>();
     reader(
         child.stdout.take().expect("piped stdout"),

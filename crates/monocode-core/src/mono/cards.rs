@@ -101,7 +101,7 @@ pub fn pull_request(cwd: &str, repo: Option<&str>, number: u64) -> Result<Value,
     crate::scm::shell::apply_gui_env(&mut cmd);
     crate::scm::shell::apply_gh_env(&mut cmd, std::path::Path::new(cwd));
     crate::process::configure_child(&mut cmd);
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = crate::process::output(&mut cmd).map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr)
             .chars()

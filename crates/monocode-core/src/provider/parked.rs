@@ -52,19 +52,19 @@ pub(super) struct Wire {
 fn spawn_process(command: &mut Command) -> std::io::Result<std::process::Child> {
     const ATTEMPTS: u32 = 5;
     for attempt in 1..ATTEMPTS {
-        match command.spawn() {
+        match process::spawn(command) {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                 thread::sleep(Duration::from_millis(25 * attempt as u64));
             }
             settled => return settled,
         }
     }
-    command.spawn()
+    process::spawn(command)
 }
 
 #[cfg(not(unix))]
 fn spawn_process(command: &mut Command) -> std::io::Result<std::process::Child> {
-    command.spawn()
+    process::spawn(command)
 }
 
 impl Wire {
