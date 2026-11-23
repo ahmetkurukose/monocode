@@ -550,3 +550,35 @@ fn attached_images_get_markers_that_follow_their_thumbnails(cx: &mut TestAppCont
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_quick_stop_puts_the_prompt_back_and_a_late_one_does_not(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.set_text("Try again".into(), cx));
+            view.send(cx);
+            assert!(view.input.read(cx).content.is_empty());
+            view.stop_by_user(cx);
+            assert!(!view.busy);
+            assert_eq!(view.input.read(cx).content, "Try again");
+            assert_eq!(crate::prompt_history::entries(cx)[0], "Try again");
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.input
+                .update(cx, |input, cx| input.set_text("Keep going".into(), cx));
+            view.send(cx);
+            if let Some((_, at)) = view.last_launch.as_mut() {
+                *at -= super::QUICK_STOP;
+            }
+            view.stop_by_user(cx);
+            assert!(view.input.read(cx).content.is_empty());
+        })
+        .unwrap();
+    cx.run_until_parked();
+}

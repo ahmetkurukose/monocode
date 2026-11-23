@@ -8340,7 +8340,7 @@ impl Render for Shell {
                 if this.menu.is_none()
                     && let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id))
                 {
-                    view.update(cx, |v, cx| v.stop_if_busy(cx));
+                    view.update(cx, |v, cx| v.stop_by_user(cx));
                 }
                 this.close_menu(cx);
                 this.strips.drag = None;
