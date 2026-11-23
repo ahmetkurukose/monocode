@@ -112,6 +112,13 @@ impl Shared {
         Instant::now()
     }
 
+    /// Asks the page to repaint (and its tab), from outside GPUI.
+    pub(super) fn repaint(&self) {
+        if let Some(changed) = self.presence.changed.borrow().as_ref() {
+            let _ = changed.try_send(());
+        }
+    }
+
     /// The user gave the page input (the app's input watcher).
     pub(super) fn user_input(&self, input: UserInput, now: Instant) {
         self.last_input.set(Some(now));

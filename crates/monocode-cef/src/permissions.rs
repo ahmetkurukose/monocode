@@ -289,7 +289,9 @@ wrap_permission_handler! {
                 // An agent's downloads in a row (crate::download); the
                 // user's, as CEF decides.
                 let expecting =
-                    browser.is_some_and(|b| crate::download::expects_download(b.identifier()));
+                    browser.is_some_and(|b| {
+                        crate::download::lineage_expects(&self.state, b.identifier())
+                    });
                 if crate::download::accept_permission(requested_permissions, expecting) {
                     callback.cont(PermissionRequestResult::ACCEPT);
                     return 1;

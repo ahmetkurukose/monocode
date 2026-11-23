@@ -8,7 +8,7 @@
 //! The picking and the description are `monocode_core::browser::grab`'s.
 
 use super::*;
-use monocode_core::browser::grab::{Grab, Picker, grab_at};
+use monocode_core::browser::grab::{Grab, Picker, grab_at, grab_inspected};
 
 actions!(
     browser,
@@ -108,6 +108,24 @@ impl BrowserPage {
         cx.spawn(async move |this, cx| {
             let result = grab_at(cdp, x, y).await.map(Rc::new);
             let _ = this.update(cx, |_, cx| cx.emit(PageRequest::Grab(result)));
+        })
+        .detach();
+    }
+
+    /// The docked DevTools' "Send Selected Element to Agent": the element
+    /// selected in their Elements panel, which is `$0` in their own session
+    /// on the page.
+    pub(crate) fn grab_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(cdp) = self.cdp() else {
+            return;
+        };
+        let session = monocode_core::browser::proxy::devtools_session(&cdp);
+        cx.spawn(async move |this, cx| {
+            let result = match session {
+                Some(session) => grab_inspected(cdp, &session).await,
+                None => Err("DevTools are not connected to the page".to_owned()),
+            };
+            let _ = this.update(cx, |_, cx| cx.emit(PageRequest::Grab(result.map(Rc::new))));
         })
         .detach();
     }

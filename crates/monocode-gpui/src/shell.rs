@@ -4,6 +4,7 @@ mod app_commands;
 mod app_views;
 mod automation_runs;
 pub(crate) mod browser_agent;
+mod browser_audio;
 mod browser_grab;
 mod browser_lifecycle;
 pub(crate) mod browser_links;

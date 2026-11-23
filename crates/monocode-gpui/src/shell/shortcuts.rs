@@ -347,6 +347,16 @@ mod tests {
                 Some("browser::FocusAddress")
             );
             assert_eq!(first(&format!("{m}-f"), true), Some("browser::Find"));
+            // ⌘P prints the page; the command palette stays on ⇧⌘P there.
+            assert_eq!(first(&format!("{m}-p"), true), Some("browser::Print"));
+            assert_eq!(
+                first(&format!("{m}-p"), false),
+                Some("workspace::OpenCommandPalette")
+            );
+            assert_eq!(
+                first(&format!("{m}-shift-p"), true),
+                Some("workspace::OpenCommandPalette")
+            );
             assert_eq!(first(&format!("{m}-r"), false), None);
             // Workspace shortcuts keep working from a page.
             assert_eq!(first(&format!("{m}-w"), true), Some("workspace::CloseTab"));

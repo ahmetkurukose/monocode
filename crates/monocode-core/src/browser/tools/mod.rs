@@ -559,7 +559,7 @@ fn tabs(host: &dyn Host, scope: &Scope) -> ToolOutput {
             ));
         }
         if info.discarded {
-            notes.push("discarded to save memory; loads again when used");
+            notes.push("discarded to save memory; loads again when used".into());
         }
         out.push_str(&format!(
             "{} {} {} {}{}\n",

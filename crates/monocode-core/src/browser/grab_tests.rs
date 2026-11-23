@@ -348,3 +348,60 @@ fn the_picker_arms_then_yields_the_pick_or_nothing_when_left() {
     let last = script.calls("Runtime.evaluate").pop().unwrap();
     assert!(last["expression"].as_str().unwrap().contains("cancel()"));
 }
+
+#[test]
+fn the_element_selected_in_devtools_is_read_in_their_session_and_grabbed_in_ours() {
+    let (cdp, script) = page();
+    // `$0` lives only in the DevTools frontend's own session.
+    script.on("Runtime.evaluate", |params, session| {
+        let expression = params["expression"].as_str().unwrap_or("");
+        Ok(match (expression, session) {
+            ("$0", Some("DT")) => {
+                json!({"result": {"type": "object", "subtype": "node", "objectId": "sel-1"}})
+            }
+            ("$0", _) => json!({"result": {"type": "undefined"}}),
+            (e, None) if e.ends_with(".picked") => {
+                json!({"result": {"type": "object", "objectId": "picked-1"}})
+            }
+            _ => json!({"result": {"type": "boolean", "value": true}}),
+        })
+    });
+    script.on("DOM.describeNode", |params, session| {
+        let selected = params["objectId"] == "sel-1" && session == Some("DT");
+        let picked = params["objectId"] == "picked-1" && session.is_none();
+        assert!(selected || picked, "{params} in {session:?}");
+        Ok(json!({"node": {"backendNodeId": 42, "nodeType": 1}}))
+    });
+    let grab = grab_inspected(cdp, "DT")
+        .now_or_never()
+        .expect("answered at once")
+        .expect("grabbed");
+    assert_eq!(grab.element.selector, "button.primary");
+    assert_eq!(grab.element.ax_role, "button");
+    let selected = &script.calls("Runtime.evaluate")[0];
+    assert_eq!(selected["expression"], "$0");
+    assert_eq!(selected["includeCommandLineAPI"], true);
+    // Resolved in the picker's world, scrolled into view first.
+    let resolve = &script.calls("DOM.resolveNode")[0];
+    assert_eq!(resolve["backendNodeId"], 42);
+    assert_eq!(resolve["executionContextId"], 7);
+    let scrolled = script.calls("DOM.scrollIntoViewIfNeeded");
+    assert_eq!(scrolled[0]["backendNodeId"], 42);
+
+    // Nothing selected, or a text node: why, not a grab.
+    let (cdp, script) = page();
+    script.reply("Runtime.evaluate", json!({"result": {"type": "undefined"}}));
+    let none = grab_inspected(cdp, "DT").now_or_never().unwrap();
+    assert!(none.is_err_and(|e| e.contains("no element is selected")));
+    let (cdp, script) = page();
+    script.reply(
+        "Runtime.evaluate",
+        json!({"result": {"type": "object", "subtype": "node", "objectId": "t"}}),
+    );
+    script.reply(
+        "DOM.describeNode",
+        json!({"node": {"backendNodeId": 5, "nodeType": 3}}),
+    );
+    let text = grab_inspected(cdp, "DT").now_or_never().unwrap();
+    assert!(text.is_err_and(|e| e.contains("not an element")));
+}

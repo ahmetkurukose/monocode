@@ -122,6 +122,9 @@ impl Shell {
     /// grabs at a point of the view as the context menu's "Send to Agent"
     /// does, `pick <pane>` starts or stops the picker as ⌥⌘G does, and
     /// `zoom <pane> <percent>` zooms the page. Where a grab went is logged.
+    /// Also `selected <pane>` (the docked DevTools' "Send Selected Element
+    /// to Agent"), `print <pane>` (⌘P), `mute <pane> <0|1>` and `audio
+    /// <pane>`, which logs whether the page plays sound and is muted.
     pub(super) fn start_browser_grab_dev_hook(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(file) = std::env::var_os("MONOCODE_BROWSER_GRAB_DEV").filter(|f| !f.is_empty())
         else {
@@ -152,10 +155,21 @@ impl Shell {
                         command.trim(),
                         this.browser_grab_target(pane)
                     );
+                    if let ("mute", [_, on]) = (verb.as_str(), words.as_slice()) {
+                        return this.set_browser_muted(pane, *on != 0, cx);
+                    }
                     page.update(cx, |page, cx| match (verb.as_str(), &words[1..]) {
                         ("grab", [x, y]) => page.grab_at(*x as i32, *y as i32, cx),
                         ("pick", []) => page.toggle_grab(window, cx),
                         ("zoom", [percent]) => page.set_zoom(*percent as u16, cx),
+                        ("selected", []) => page.grab_selected(cx),
+                        ("print", []) => page.print(),
+                        ("audio", []) => eprintln!(
+                            "MONOCODE_BROWSER_GRAB_DEV: audible {} muted {} (Chromium: {:?})",
+                            page.audible(),
+                            page.muted(),
+                            page.view_muted()
+                        ),
                         _ => eprintln!("MONOCODE_BROWSER_GRAB_DEV: unknown command"),
                     });
                 });

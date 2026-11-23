@@ -1103,7 +1103,13 @@ fn a_page_connection_speaks_without_session_ids() {
 #[test]
 fn the_apps_devtools_reach_only_page_sockets_and_outlive_the_setting() {
     let h = Harness::new();
-    let (_, target) = h.add(PROJECT, "http://localhost:3000/", "Shop");
+    let (id, target) = h.add(PROJECT, "http://localhost:3000/", "Shop");
+    let frontend_session = move |h: &Harness| {
+        h.with(move |host| {
+            let cdp = host.page(id).cdp.borrow().clone().unwrap();
+            super::devtools_session(&cdp)
+        })
+    };
     let port = h.port();
     let base = h.server.endpoint(&scope(), true);
     assert_ne!(base, h.base);
@@ -1123,9 +1129,13 @@ fn the_apps_devtools_reach_only_page_sockets_and_outlive_the_setting() {
     let external = format!("{}/devtools/page/{target}", h.prefix());
     assert_eq!(Client::connect(port, &external, &frontend).err(), Some(403));
 
+    assert_eq!(frontend_session(&h), None);
     let mut client = Client::connect(port, &page, &frontend).unwrap();
     let answer = client.call("Runtime.evaluate", json!({"expression": "1+1"}), None);
     assert_eq!(answer["result"]["result"]["value"], 2);
+    // Its own session on the page, where its `$0` is.
+    let own = frontend_session(&h).expect("the frontend's session");
+    assert!(own.starts_with("OWN-"), "{own}");
     // External connections turned off: the app's DevTools carry on.
     let mut outside = h.browser();
     h.server.close_all();

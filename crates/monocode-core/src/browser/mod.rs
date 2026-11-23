@@ -5,6 +5,7 @@
 //! - [`host`]: what the app gives: pages of a scope, opening, closing, timers.
 //! - [`log`]: a page's console and network log (K36).
 //! - [`grab`]: the element grab, a picked element for an agent (K49).
+//! - [`audio`]: whether a page plays sound, for its tab.
 //! - [`tools`]: the tool set and its implementation over [`host`].
 //! - [`bridge`]: the MCP server: loopback listener, session tokens, the
 //!   `browser-mcp` stdio subcommand, provider wiring.
@@ -14,6 +15,7 @@
 //! piece of work reaches the app's main thread as a [`Job`] through
 //! [`submit`], and the app runs each with its [`Host`] (see [`jobs`]).
 
+pub mod audio;
 pub mod bridge;
 pub mod cdp;
 pub mod control;

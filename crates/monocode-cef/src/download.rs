@@ -119,6 +119,19 @@ pub(crate) fn accept_permission(requested: u32, expecting: bool) -> bool {
     expecting && requested == multiple as u32
 }
 
+/// Whether a download browser `browser` (with `state`) starts now goes into
+/// a caller's folder, its own or an opener's.
+pub(crate) fn lineage_expects(state: &PageState, browser: i32) -> bool {
+    (state.lineage(browser).iter()).any(|(id, _)| expects_download(*id))
+}
+
+/// Where a download a page starts goes, and which page hears of it: the
+/// first in its `lineage` (itself, then its openers) that waits for one,
+/// as a popup an agent's click opened downloads for its opener (K50).
+fn route<'a>(lineage: &[(i32, &'a PageState)]) -> Option<(PathBuf, &'a PageState)> {
+    (lineage.iter()).find_map(|(id, state)| take_into(*id).map(|dir| (dir, *state)))
+}
+
 /// The folder browser `browser`'s download starting now goes into, taken.
 fn take_into(browser: i32) -> Option<PathBuf> {
     NEXT_INTO
@@ -128,6 +141,9 @@ fn take_into(browser: i32) -> Option<PathBuf> {
 
 struct Active {
     path: PathBuf,
+    /// The page that hears of it: the one whose folder it went into (a
+    /// popup's opener, K50), else the one that started it.
+    report: PageState,
     /// The latest one CEF handed over; it cancels the download.
     callback: Option<DownloadItemCallback>,
 }
@@ -250,16 +266,23 @@ wrap_download_handler! {
                 return 0;
             };
             let suggested = suggested_name.map(|s| s.to_string()).unwrap_or_default();
-            let dir = (browser.map(|b| b.identifier()).and_then(take_into))
-                .filter(|dir| std::fs::create_dir_all(dir).is_ok())
-                .unwrap_or_else(downloads_dir);
+            let lineage = browser.map_or_else(Vec::new, |b| self.state.lineage(b.identifier()));
+            let (dir, report) = match route(&lineage) {
+                Some((dir, report)) if std::fs::create_dir_all(&dir).is_ok() => {
+                    (dir, report.clone())
+                }
+                _ => (downloads_dir(), self.state.clone()),
+            };
             let path = unique_path(&dir, &safe_name(&suggested));
             let id = item.id();
-            ACTIVE.with(|a| {
-                a.borrow_mut().insert(id, Active { path: path.clone(), callback: None })
-            });
+            let active = Active {
+                path: path.clone(),
+                report: report.clone(),
+                callback: None,
+            };
+            ACTIVE.with(|a| a.borrow_mut().insert(id, active));
             callback.cont(Some(&path.to_string_lossy().as_ref().into()), 0);
-            self.state.send(BrowserEvent::Download(Download {
+            report.send(BrowserEvent::Download(Download {
                 id,
                 path,
                 received: 0,
@@ -278,13 +301,13 @@ wrap_download_handler! {
             let Some(item) = download_item else { return };
             let id = item.id();
             // Before its path is chosen a download is not reported.
-            let Some(path) = ACTIVE.with(|a| {
+            let Some((path, report)) = ACTIVE.with(|a| {
                 let mut active = a.borrow_mut();
                 let entry = active.get_mut(&id)?;
                 if let Some(callback) = callback {
                     entry.callback = Some(callback.clone());
                 }
-                Some(entry.path.clone())
+                Some((entry.path.clone(), entry.report.clone()))
             }) else {
                 return;
             };
@@ -292,7 +315,7 @@ wrap_download_handler! {
             if download.state != DownloadState::InProgress {
                 ACTIVE.with(|a| a.borrow_mut().remove(&id));
             }
-            self.state.send(BrowserEvent::Download(download));
+            report.send(BrowserEvent::Download(download));
         }
     }
 }
@@ -360,12 +383,48 @@ mod tests {
                 7,
                 Active {
                     path: dir.join("f (1).txt"),
+                    report: PageState::new(None).0,
                     callback: None,
                 },
             )
         });
         assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_popups_download_goes_where_its_opener_waits_for_one() {
+        // Page 30 opened popup 31, which opened popup 32.
+        let (page, page_events) = PageState::new(None);
+        let (popup, _) = PageState::new(Some((30, 1)));
+        let popup = popup.opened_by(&page);
+        let (inner, inner_events) = PageState::new(Some((31, 1)));
+        let inner = inner.opened_by(&popup);
+        let ids: Vec<i32> = inner.lineage(32).iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [32, 31, 30]);
+
+        // Nobody waits: the popup's own, to ~/Downloads.
+        assert!(route(&inner.lineage(32)).is_none());
+        assert!(!lineage_expects(&inner, 32));
+        // The opener waits (an agent's `browser_download`): its folder, and
+        // the opener hears of it; the wish is used up.
+        let wish = download_into(30, "/p/out".into());
+        assert!(lineage_expects(&inner, 32));
+        let (dir, report) = route(&inner.lineage(32)).expect("the opener's folder");
+        assert_eq!(dir, PathBuf::from("/p/out"));
+        report.send(BrowserEvent::Closed);
+        assert_eq!(page_events.try_recv(), Ok(BrowserEvent::Closed));
+        assert!(inner_events.try_recv().is_err());
+        assert!(route(&inner.lineage(32)).is_none());
+        drop(wish);
+        // The nearest page that waits wins.
+        let (_far, _near) = (
+            download_into(30, "/p/a".into()),
+            download_into(31, "/p/b".into()),
+        );
+        assert_eq!(route(&inner.lineage(32)).unwrap().0, PathBuf::from("/p/b"));
+        // A page that is no popup has only itself.
+        assert_eq!(page.lineage(30).len(), 1);
     }
 
     #[test]
