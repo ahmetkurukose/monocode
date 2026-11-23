@@ -290,13 +290,16 @@ fn expired_app_bound_google_and_partitioned_cookies_are_skipped() {
 }
 
 #[test]
-fn google_domains_are_a_fixed_list() {
+fn google_domains_and_their_country_domains_are_skipped() {
     for host in [
         ".google.com",
         "mail.google.com",
         "google.com",
         ".youtube.com",
         "accounts.google.de",
+        "google.de",
+        "www.google.com.tr",
+        ".youtube.co.uk",
     ] {
         assert!(is_non_transplantable(host), "{host}");
     }
@@ -305,6 +308,8 @@ fn google_domains_are_a_fixed_list() {
         ".example.com",
         "google.com.evil.example",
         "youtube.co",
+        "google.example.com",
+        "mygoogle.de",
     ] {
         assert!(!is_non_transplantable(host), "{host}");
     }

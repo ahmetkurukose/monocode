@@ -16,12 +16,29 @@ pub const NON_TRANSPLANTABLE_COOKIE_DOMAINS: &[&str] =
 /// [`NON_TRANSPLANTABLE_COOKIE_DOMAINS`].
 pub fn is_non_transplantable(host_key: &str) -> bool {
     let host = host_key.trim_start_matches('.').to_ascii_lowercase();
-    NON_TRANSPLANTABLE_COOKIE_DOMAINS.iter().any(|entry| {
-        if let Some(prefix) = entry.strip_suffix('*') {
-            host.starts_with(prefix) || host.contains(&format!(".{prefix}"))
-        } else {
-            host == *entry || host.ends_with(&format!(".{entry}"))
-        }
+    google_country_domain(&host)
+        || NON_TRANSPLANTABLE_COOKIE_DOMAINS.iter().any(|entry| {
+            if let Some(prefix) = entry.strip_suffix('*') {
+                host.starts_with(prefix) || host.contains(&format!(".{prefix}"))
+            } else {
+                host == *entry || host.ends_with(&format!(".{entry}"))
+            }
+        })
+}
+
+/// Google's and YouTube's country domains too (`google.de`,
+/// `www.google.com.tr`, `youtube.co.uk`): the name, then `com`, a country
+/// code, or `co`/`com` and a country code.
+fn google_country_domain(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let country = |l: &str| l.len() == 2 && l != "co";
+    labels.iter().enumerate().any(|(i, label)| {
+        matches!(*label, "google" | "youtube")
+            && match &labels[i + 1..] {
+                [tld] => *tld == "com" || country(tld),
+                [second, cc] => matches!(*second, "co" | "com") && cc.len() == 2,
+                _ => false,
+            }
     })
 }
 
