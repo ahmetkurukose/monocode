@@ -38,6 +38,10 @@ use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
 mod grab;
 pub(crate) use grab::ToggleGrab;
+pub(crate) mod history;
+pub(crate) mod history_view;
+pub(crate) mod new_tab;
+mod suggest;
 
 use crate::{
     input::{self, Input},
@@ -485,6 +489,8 @@ pub(crate) enum PageRequest {
     Close,
     /// An element the user grabbed for an agent (K49), or why it failed.
     Grab(grab::GrabResult),
+    /// The address bar's "Switch to tab": show the tab of this pane.
+    ShowTab(i64),
 }
 
 /// Something the page waits on the user for, shown as a modal over it.
@@ -559,6 +565,13 @@ pub(crate) struct BrowserPage {
     /// An agent waits for the page's next download (K50).
     download_wait: Option<download_into::DownloadWait>,
     grab: grab::GrabMode,
+    /// Where the page's visits go (K55).
+    history: history::Recorder,
+    /// The shell's other tabs and the project's processes; the shell sets it.
+    pub(crate) links: Option<new_tab::ShellLinks>,
+    /// A blank tab's page (K66).
+    new_tab: new_tab::NewTab,
+    suggest: suggest::Suggestions,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -592,6 +605,9 @@ impl BrowserPage {
                 if let Some(url) = address(&typed) {
                     this.load(url, cx);
                 }
+            }),
+            cx.subscribe(&field, |this, _, _: &input::Changed, cx| {
+                this.address_changed(cx)
             }),
             // Snapshots sit in GPU atlases until given back.
             cx.on_release(|page, cx| {
@@ -640,6 +656,10 @@ impl BrowserPage {
             presence_timer: None,
             download_wait: None,
             grab: Default::default(),
+            history: Default::default(),
+            links: None,
+            new_tab: Default::default(),
+            suggest: Default::default(),
         }
         .watch_presence(cx)
     }
@@ -669,7 +689,11 @@ impl BrowserPage {
         }
     }
 
+    /// Opens what the user typed or picked (the address bar, its
+    /// suggestions, the new tab page).
     fn load(&mut self, url: String, cx: &mut Context<Self>) {
+        self.next_transition(history::Transition::Typed);
+        self.close_suggestions(cx);
         self.url = url.clone();
         self.failure = None;
         if !self.host.with_view(|view| view.load_url(&url)) {
@@ -683,6 +707,7 @@ impl BrowserPage {
         match event {
             BrowserEvent::Address(url) => {
                 self.sync_zoom(cx);
+                self.record_visit(&url, cx);
                 if url != self.url {
                     self.url = url.clone();
                     self.address.update(cx, |field, cx| field.set_text(url, cx));
@@ -692,9 +717,11 @@ impl BrowserPage {
             BrowserEvent::Title(title) => {
                 if title != self.title {
                     self.title = title;
+                    self.record_title(cx);
                     cx.emit(PageChanged);
                 }
             }
+            BrowserEvent::Favicon(favicon) => self.record_favicon(&favicon, cx),
             BrowserEvent::Loading {
                 loading,
                 can_go_back,
@@ -711,6 +738,7 @@ impl BrowserPage {
                 } else {
                     self.sync_zoom(cx);
                     self.snapshot_when_settled(cx);
+                    self.load_ended(cx);
                 }
             }
             BrowserEvent::Progress(progress) => self.progress = progress,
@@ -812,6 +840,7 @@ impl BrowserPage {
     }
 
     fn reload(&mut self, ignore_cache: bool) {
+        self.next_transition(history::Transition::Reload);
         self.host.with_view(|view| {
             if ignore_cache {
                 view.reload_ignore_cache();
@@ -979,6 +1008,7 @@ impl BrowserPage {
             .child(
                 icon_button_enabled("browser-back", "Back", "arrow-left-2", self.can_go_back)
                     .on_click(cx.listener(|this, _, _, _| {
+                        this.next_transition(history::Transition::BackForward);
                         this.host.with_view(|view| view.go_back());
                     })),
             )
@@ -990,6 +1020,7 @@ impl BrowserPage {
                     self.can_go_forward,
                 )
                 .on_click(cx.listener(|this, _, _, _| {
+                    this.next_transition(history::Transition::BackForward);
                     this.host.with_view(|view| view.go_forward());
                 })),
             )
@@ -1001,13 +1032,16 @@ impl BrowserPage {
                     ready,
                 )
                 .on_click(cx.listener(|this, _, _, _| {
-                    let loading = this.loading;
-                    this.host
-                        .with_view(|view| if loading { view.stop() } else { view.reload() });
+                    if this.loading {
+                        this.host.with_view(|view| view.stop());
+                    } else {
+                        this.reload(false);
+                    }
                 })),
             )
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .h(px(24.))
@@ -1016,7 +1050,35 @@ impl BrowserPage {
                     .items_center()
                     .rounded_md()
                     .bg(content(0.05))
+                    .child(self.suggest.anchor.probe())
+                    .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
+                        if this.step_address(-1, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &input::Down, _, cx| {
+                        if this.step_address(1, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &input::Submit, _, cx| {
+                        if this.submit_address(cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &crate::shell::DismissMenu, _, cx| {
+                        if this.close_suggestions(cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(self.address.clone()),
+            )
+            .child(
+                icon_button("browser-history", "History", "clock").on_click(cx.listener(
+                    |_, _, window, cx| {
+                        window.dispatch_action(Box::new(history_view::ShowBrowserHistory), cx)
+                    },
+                )),
             )
             .children(self.presence_bar(cx))
             .when(self.zoom != 100, |d| {
@@ -1530,15 +1592,23 @@ impl Render for BrowserPage {
         if self.address_keyboard.is_none() {
             let address = self.address.focus_handle(cx);
             self.address_keyboard = Some(cx.on_focus_in(&address, window, |this, window, _| {
+                this.suggest.focused = true;
                 this.take_keyboard(window)
             }));
+            self.suggest._focus_out = Some(cx.on_focus_out(&address, window, |this, _, _, cx| {
+                this.suggest.focused = false;
+                this.close_suggestions(cx);
+            }));
         }
-        if self.engine.read(cx).state == EngineState::Idle {
+        // A blank tab is GPUI's new tab page: Chromium waits for a navigation.
+        let new_tab = self.showing_new_tab();
+        if !new_tab && self.engine.read(cx).state == EngineState::Idle {
             self.start_engine(cx);
         }
         self.focus_prompt_now(window, cx);
         self.restore_dev_tools_now(cx);
         let (body, docked) = match self.status(cx) {
+            _ if new_tab => (self.new_tab_page(cx), false),
             Some(status) => (status, false),
             None => (self.surface(cx), self.devtools.is_some()),
         };
@@ -1592,6 +1662,7 @@ impl Render for BrowserPage {
             .child(self.body(body, docked, cx))
             .relative()
             .children(self.downloads_popover(cx))
+            .children(self.suggestions_popover(cx))
             .children(self.prompt_overlay(cx))
     }
 }
@@ -3289,6 +3360,7 @@ mod monocode_cef {
     pub enum BrowserEvent {
         Address(String),
         Title(String),
+        Favicon(String),
         Loading {
             loading: bool,
             can_go_back: bool,

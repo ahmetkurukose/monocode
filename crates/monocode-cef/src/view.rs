@@ -33,6 +33,8 @@ pub enum BrowserEvent {
     /// The main frame's URL changed (navigation, history, fragment).
     Address(String),
     Title(String),
+    /// The page's icon changed: the first icon URL it names.
+    Favicon(String),
     Loading {
         loading: bool,
         can_go_back: bool,
@@ -235,6 +237,21 @@ wrap_display_handler! {
 
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             self.state.send(BrowserEvent::Title(string(title)));
+        }
+
+        fn on_favicon_urlchange(
+            &self,
+            _browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            // The list is CEF's; a borrowed copy of the handle reads it.
+            let first = icon_urls.and_then(|list| {
+                let raw: *mut sys::_cef_string_list_t = list.into();
+                CefStringList::from(raw).into_iter().next()
+            });
+            if let Some(url) = first.filter(|url| !url.is_empty()) {
+                self.state.send(BrowserEvent::Favicon(url));
+            }
         }
 
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {

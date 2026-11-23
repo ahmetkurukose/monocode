@@ -317,6 +317,20 @@ impl Host for AppHost {
         let timer = self.cx.background_executor().timer(duration);
         Box::pin(timer)
     }
+
+    /// The scope's project's visits only (K65): the store decides the
+    /// project from the scope, whatever the query says.
+    fn history(
+        &self,
+        scope: &Scope,
+        query: &monocode_core::browser::history::Query,
+    ) -> Result<Vec<monocode_core::browser::history::Visit>, String> {
+        self.cx.update(|cx| {
+            let stores = crate::browser::history::stores(cx);
+            let now = crate::browser::history::now_ms();
+            Ok(stores.borrow_mut().of_project(&scope.project, query, now))
+        })
+    }
 }
 
 /// A browser pane of a window's shell, as an agent sees it.
@@ -393,6 +407,10 @@ impl Page for AppPage {
                 let page = page.read(cx);
                 (info.url, info.title) = (page.url.clone(), page.title.clone());
                 info.loading = page.loading();
+            }
+            // A new tab page (K66) has no web page: to agents it is blank.
+            if info.url.is_empty() {
+                info.url = "about:blank".into();
             }
             info.shown = shell.agent_page_shown(pane);
             info.by_agent = state.opened_by.is_some();

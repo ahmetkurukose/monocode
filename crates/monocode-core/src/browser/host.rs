@@ -140,4 +140,15 @@ pub trait Host {
 
     /// A timer on the app's executor.
     fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()>;
+
+    /// Visits of `scope`'s project matching `query`, newest first (K65).
+    /// The host fills in the project: an agent never sees another one's.
+    fn history(
+        &self,
+        scope: &Scope,
+        query: &super::history::Query,
+    ) -> Result<Vec<super::history::Visit>, String> {
+        let _ = (scope, query);
+        Err("there is no browsing history here".to_owned())
+    }
 }

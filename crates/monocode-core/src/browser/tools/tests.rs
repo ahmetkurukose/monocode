@@ -75,6 +75,7 @@ fn definitions_and_instructions() {
         "browser_console",
         "browser_network",
         "browser_dialog",
+        "browser_history",
     ] {
         assert!(names.contains(&name), "{name} is missing");
     }
@@ -1661,5 +1662,94 @@ fn scrolling_a_ref_reports_its_scroll_container() {
     assert_eq!(
         out,
         "Scrolled @e3 (button \"Log in\") into view by (0, 300); its scroll container is scrolled to x=0, y=300 of 2000 px (400 px are shown)."
+    );
+}
+
+#[test]
+fn history_lists_only_the_sessions_projects_visits() {
+    use crate::browser::history::{DEFAULT_PROFILE, Transition};
+    let host = Rc::new(FakeHost::default());
+    let now = crate::time::now_ms() as i64;
+    {
+        let mut stores = host.history.borrow_mut();
+        let store = stores.store(DEFAULT_PROFILE, now).unwrap();
+        // The scope's project is /tmp/project.
+        let visits = [
+            (
+                "/tmp/project",
+                "http://localhost:5173/",
+                "Vite \"app\"",
+                Transition::Typed,
+                now - 60_000,
+            ),
+            (
+                "/tmp/project",
+                "http://localhost:5173/login",
+                "Log in",
+                Transition::Agent,
+                now - 30_000,
+            ),
+            (
+                "/tmp/project",
+                "https://old.test/",
+                "Old",
+                Transition::Link,
+                now - 3 * 86_400_000,
+            ),
+            (
+                "/tmp/other",
+                "https://secret.test/",
+                "Other project",
+                Transition::Link,
+                now,
+            ),
+        ];
+        for (project, url, title, transition, at) in visits {
+            store.record(project, url, title, transition, at).unwrap();
+        }
+    }
+    let mut driver = Driver::new(&host);
+    let all = text(&driver.run("browser_history", json!({})));
+    assert!(all.contains("3 visits"), "{all}");
+    assert!(!all.contains("secret.test"), "{all}");
+    let lines: Vec<&str> = all.lines().skip(1).collect();
+    assert!(
+        lines[0].contains(r#""Log in" http://localhost:5173/login  (agent)"#),
+        "{all}"
+    );
+    assert!(
+        lines[1].contains(r#""Vite \"app\"" http://localhost:5173/  (typed)"#),
+        "{all}"
+    );
+
+    let found = text(&driver.run("browser_history", json!({"query": "LOGIN"})));
+    assert!(
+        found.contains("localhost:5173/login") && !found.contains("Vite"),
+        "{found}"
+    );
+    // Even a query naming the other project's page finds nothing of it.
+    let other = text(&driver.run("browser_history", json!({"query": "secret"})));
+    assert!(
+        other.starts_with("No page in this project's history matches"),
+        "{other}"
+    );
+
+    let recent = text(&driver.run("browser_history", json!({"since": "1d"})));
+    assert!(!recent.contains("old.test"), "{recent}");
+    let one = text(&driver.run("browser_history", json!({"limit": 1})));
+    assert!(one.contains("There may be more"), "{one}");
+    assert!(driver.run("browser_history", json!({"limit": 0})).is_error);
+    assert!(
+        driver
+            .run("browser_history", json!({"since": "soon"}))
+            .is_error
+    );
+
+    // Another project's session sees its own.
+    *host.project.borrow_mut() = Some("/tmp/other/".into());
+    let theirs = text(&driver.run("browser_history", json!({})));
+    assert!(
+        theirs.contains("secret.test") && !theirs.contains("localhost"),
+        "{theirs}"
     );
 }

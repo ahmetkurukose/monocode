@@ -32,9 +32,22 @@ impl Shell {
                 session: state.owner,
                 project: owner.cwd.clone(),
             });
+        // Visits go to the project's history in the profile's store (K55);
+        // a throwaway profile keeps none.
+        crate::browser::history::init(self.browser_history_dir(), cx);
+        let history = crate::browser::history::store_name(&profile).and_then(|store| {
+            let owner = self.session_summaries.get(&state.owner)?;
+            Some(crate::browser::history::PageHistory {
+                project: monocode_core::files::path_key(&owner.cwd),
+                store,
+            })
+        });
+        let links = self.browser_page_links(pane, cx);
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
+            page.set_history(history, !state.fresh, state.opened_by.is_some());
+            page.links = Some(links);
             page.devtools_scope = devtools_scope;
             page.restore_dev_tools(
                 state.docked_devtools,
@@ -280,6 +293,11 @@ impl Shell {
             } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
             PageRequest::Close => self.close_pane(pane, window, cx),
             PageRequest::Grab(result) => self.deliver_browser_grab(pane, result, cx),
+            PageRequest::ShowTab(other) => {
+                if self.workspace.browser_panes.contains_key(&other) {
+                    self.open_browser_pane(other, window, cx);
+                }
+            }
         }
     }
 

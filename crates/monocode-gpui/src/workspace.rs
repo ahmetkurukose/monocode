@@ -368,6 +368,10 @@ pub(crate) struct BrowserPane {
     /// opens. Such a page is never saved: it goes with the app.
     #[serde(skip)]
     pub ephemeral: Option<String>,
+    /// Opened in this run, not restored: its first load is a new visit of
+    /// the history (K55); not saved.
+    #[serde(skip)]
+    pub fresh: bool,
 }
 
 /// `browser_panes` as saved: without the pages of throwaway profiles, whose
