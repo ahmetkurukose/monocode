@@ -179,6 +179,7 @@ actions!(
         OpenInbox,
         OpenNotes,
         GitCommit,
+        GitNewPullRequest,
         GitUpdate,
         GitUpdateRebase,
         GitFetch,
@@ -2269,6 +2270,8 @@ impl Shell {
             window,
             |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
                 crate::changes::ChangesEvent::Overlays => cx.notify(),
+                // The Inbox will reveal it; the Changes panel already shows "View PR".
+                crate::changes::ChangesEvent::PullRequestCreated(_) => cx.notify(),
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review_tab(
                         crate::review::ReviewTab::Changes {
@@ -8080,6 +8083,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &GitCommit, window, cx| {
                 this.git_tool(window, cx, |changes, window, cx| {
                     changes.open_commit_dialog(window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &GitNewPullRequest, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.new_pull_request(window, cx)
                 })
             }))
             .on_action(cx.listener(|this, _: &GitUpdate, window, cx| {

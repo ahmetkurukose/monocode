@@ -57,8 +57,13 @@ pub(crate) enum CommitFormEvent {
     /// "Jump to Source" opened a file in the editor.
     Jumped(Surface),
     /// A commit went through. `pushed` when a push followed it; `error`
-    /// carries a failure after the commit (the push or the pull request).
-    Committed { pushed: bool, error: bool },
+    /// carries a failure after the commit (the push). `open_pr` when the
+    /// New Pull Request dialog should follow.
+    Committed {
+        pushed: bool,
+        error: bool,
+        open_pr: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,8 +116,8 @@ pub(crate) struct OpenMenu {
 }
 
 enum Outcome {
-    /// Committed; a failure after the commit, and the new pull request.
-    Committed(Option<String>, Option<String>),
+    /// Committed; a failure after the commit.
+    Committed(Option<String>),
     Failed(String),
 }
 
@@ -396,9 +401,9 @@ impl CommitForm {
     }
     pub(crate) fn pr_label(&self) -> &'static str {
         if self.busy == Some("pr") {
-            "Creating Pull Request…"
+            "Pushing…"
         } else {
-            "Commit, Push and Create PR"
+            "Commit, Push and Create PR…"
         }
     }
 
@@ -410,7 +415,8 @@ impl CommitForm {
         crate::changes::pick_text_harness(self.text_provider, chosen)
     }
 
-    /// Commits the checked files; then pushes, then opens a pull request.
+    /// Commits the checked files; then pushes, then asks for the New Pull
+    /// Request dialog.
     pub(crate) fn commit(
         &mut self,
         push: bool,
@@ -447,7 +453,6 @@ impl CommitForm {
         let mut paths: Vec<String> = self.checked.iter().cloned().collect();
         paths.sort();
         let amend = self.amend.is_some();
-        let harness = create_pr.then(|| self.text_harness(cx)).flatten();
         self.error = None;
         self.menu = None;
         cx.spawn_in(window, async move |this, cx| {
@@ -485,25 +490,13 @@ impl CommitForm {
                         return Outcome::Failed(error);
                     }
                     if !push {
-                        return Outcome::Committed(None, None);
+                        return Outcome::Committed(None);
                     }
-                    if let Err(error) = scm::push(&cwd) {
-                        return Outcome::Committed(
-                            Some(format!("Committed, but the push failed: {error}")),
-                            None,
-                        );
-                    }
-                    if !create_pr {
-                        return Outcome::Committed(None, None);
-                    }
-                    match crate::changes::create_pr_blocking(harness, &cwd) {
-                        Ok(url) => Outcome::Committed(None, Some(url)),
-                        Err(error) => Outcome::Committed(
-                            Some(format!(
-                                "Committed and pushed, but the pull request failed: {error}"
-                            )),
-                            None,
-                        ),
+                    match scm::push(&cwd) {
+                        Ok(()) => Outcome::Committed(None),
+                        Err(error) => Outcome::Committed(Some(format!(
+                            "Committed, but the push failed: {error}"
+                        ))),
                     }
                 })
             }) else {
@@ -513,18 +506,16 @@ impl CommitForm {
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
                 match outcome {
-                    Outcome::Committed(error, url) => {
+                    Outcome::Committed(error) => {
                         this.amend = None;
                         this.set_message(String::new(), cx);
                         this.sync_placeholder(cx);
-                        if let Some(url) = url {
-                            cx.open_url(url.trim());
-                        }
                         let failed = error.is_some();
                         this.error = error;
                         cx.emit(CommitFormEvent::Committed {
                             pushed: push && !failed,
                             error: failed,
+                            open_pr: create_pr && !failed,
                         });
                     }
                     Outcome::Failed(error) => this.error = Some(error),
