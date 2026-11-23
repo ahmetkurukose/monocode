@@ -21,6 +21,7 @@ pub mod grab;
 pub mod host;
 pub mod log;
 pub mod proxy;
+pub mod sites;
 pub mod tools;
 
 pub use cdp::{CdpClient, CdpError, CdpEvent, Subscription};

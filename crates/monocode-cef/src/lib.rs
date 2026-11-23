@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod view;
 
 mod capture;
+mod certs;
 mod context_menu;
 mod devtools;
 
@@ -17,15 +18,17 @@ mod dialogs;
 mod download;
 #[cfg(target_os = "macos")]
 mod mac;
+mod permissions;
 mod popup;
 mod profile;
 
 pub use devtools::{DevToolsAttachment, DevToolsSink};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{
-    AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CreateError, CreateOptions, DialogKind,
-    Download, DownloadInto, DownloadState, Frame, JsDialog, Profile, cancel_download,
-    forget_profile, profile_id, take_popup,
+    AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CertificateRequest, CreateError,
+    CreateOptions, DialogKind, Download, DownloadInto, DownloadState, Frame, JsDialog,
+    PermissionAnswer, PermissionRequest, Profile, cancel_download, forget_profile, profile_id,
+    reset_site_permission, take_popup,
 };
 
 /// `OnScheduleMessagePumpWork`, from any CEF thread.

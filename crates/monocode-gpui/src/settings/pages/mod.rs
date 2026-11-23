@@ -10,6 +10,7 @@ mod mcp;
 mod mobile;
 mod monos;
 mod providers;
+mod site_permissions;
 mod skills;
 mod terminal;
 mod worktrees;

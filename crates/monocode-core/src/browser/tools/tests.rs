@@ -1663,3 +1663,90 @@ fn scrolling_a_ref_reports_its_scroll_container() {
         "Scrolled @e3 (button \"Log in\") into view by (0, 300); its scroll container is scrolled to x=0, y=300 of 2000 px (400 px are shown)."
     );
 }
+
+#[test]
+fn a_permission_the_page_asks_for_during_an_action_is_reported() {
+    use crate::browser::sites::{Outcome, PermissionNote};
+    let host = FakeHost::with_pages(&[1]);
+    let page = page_with(&host, 1);
+    page.permission_notes.borrow_mut().push(PermissionNote {
+        seq: 3,
+        permissions: vec!["notifications".into()],
+        origin: "https://example.com".into(),
+        outcome: Outcome::BlockedBySetting,
+    });
+    let mut driver = Driver::new(&host);
+    driver.run("browser_snapshot", json!({}));
+    let asked = Rc::downgrade(&page);
+    page.script.on("Input.dispatchMouseEvent", move |p, _| {
+        if p["type"] == "mouseReleased" {
+            let page = asked.upgrade().unwrap();
+            page.permission_notes.borrow_mut().push(PermissionNote {
+                seq: 4,
+                permissions: vec!["camera".into(), "microphone".into()],
+                origin: "https://example.com".into(),
+                outcome: Outcome::DeniedBackground,
+            });
+        }
+        Ok(json!({}))
+    });
+    let click = text(&driver.run("browser_click", json!({"ref": "@e3"})));
+    // Only what the action brought, not the earlier note.
+    assert!(
+        click.contains(
+            r#"permissionRequest {"kind":"camera,microphone","origin":"https://example.com","outcome":"denied_background"}"#
+        ),
+        "{click}"
+    );
+    assert!(!click.contains("blocked_by_setting"), "{click}");
+    assert!(click.contains("agents cannot grant permissions"), "{click}");
+
+    *page.waiting_permission.borrow_mut() = Some(PermissionNote {
+        seq: 5,
+        permissions: vec!["geolocation".into()],
+        origin: "https://example.com".into(),
+        outcome: Outcome::WaitingForUser,
+    });
+    let tabs = text(&driver.run("browser_tabs", json!({})));
+    assert!(
+        tabs.contains("a permission prompt for geolocation waits for the user"),
+        "{tabs}"
+    );
+}
+
+#[test]
+fn an_untrusted_certificate_stops_an_agents_navigation() {
+    use crate::browser::sites::CertBlock;
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    page.script.reply(
+        "Page.navigate",
+        json!({"frameId": "F", "errorText": "net::ERR_CERT_AUTHORITY_INVALID"}),
+    );
+    let mut driver = Driver::new(&host);
+    let out = driver.run(
+        "browser_goto",
+        json!({"url": "https://self-signed.badssl.com/"}),
+    );
+    assert_eq!(code(&out), "browser_cert_error");
+    let said = text(&out);
+    assert!(said.contains("self-signed.badssl.com"), "{said}");
+    assert!(said.contains("ERR_CERT_AUTHORITY_INVALID"), "{said}");
+    assert!(said.contains("only the user"), "{said}");
+
+    // The page's own record names it too, in the list and on a reload.
+    *page.cert_error.borrow_mut() = Some(CertBlock {
+        url: "https://expired.badssl.com/".into(),
+        host: "expired.badssl.com".into(),
+        error: "ERR_CERT_DATE_INVALID".into(),
+        seq: 1,
+    });
+    let tabs = text(&driver.run("browser_tabs", json!({})));
+    assert!(
+        tabs.contains("browser_cert_error: expired.badssl.com has no trusted certificate"),
+        "{tabs}"
+    );
+    let reload = driver.run("browser_reload", json!({}));
+    assert_eq!(code(&reload), "browser_cert_error");
+    assert!(text(&reload).contains("ERR_CERT_DATE_INVALID"));
+}

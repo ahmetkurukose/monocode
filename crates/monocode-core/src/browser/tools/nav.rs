@@ -7,7 +7,7 @@ use futures_util::future::{Either, select};
 use serde_json::{Value, json};
 
 use super::{Ctx, MAX_WAIT_MS, Reply, invalid, quote};
-use crate::browser::{CdpError, ToolOutput};
+use crate::browser::{CdpError, ToolOutput, sites::CertBlock};
 
 /// Polling step of every wait.
 const STEP_MS: u64 = 100;
@@ -229,6 +229,9 @@ pub async fn report(ctx: &Ctx, done: bool) -> Result<String, ToolOutput> {
         }
     };
     if url.starts_with("chrome-error://") {
+        if let Some(block) = ctx.page.cert_error() {
+            return Ok(cert_refusal(ctx.id, &block));
+        }
         // Chromium's own error page: the title names the host, the page the error.
         let error = probe(ctx, ERROR_TEXT).await?.ok();
         let error = error.as_ref().and_then(Value::as_str).unwrap_or("").trim();
@@ -255,12 +258,29 @@ pub async fn goto(ctx: &Ctx, args: &Value) -> Reply {
         return Err(invalid("url is required"));
     };
     let url = normalize(raw)?;
+    let mark = super::effects::permission_mark(&*ctx.page);
     // `Page.navigate` answers once the server does: a host whose name never
     // resolves keeps it waiting for as long as DNS does.
     let navigate = ctx.act("Page.navigate", json!({"url": url}));
-    let result = match select(pin!(navigate), pin!(ctx.sleep(NAVIGATE_MS))).await {
+    // A certificate that stops the navigation ends the wait at once:
+    // navigating away from an error page, Chromium may never answer.
+    let earlier = ctx.page.cert_error().map(|b| b.seq);
+    let page = ctx.page.clone();
+    let host = ctx.host.clone();
+    let stopped = async move {
+        loop {
+            host.sleep(std::time::Duration::from_millis(STEP_MS)).await;
+            if let Some(block) = page.cert_error().filter(|b| Some(b.seq) != earlier) {
+                return block;
+            }
+        }
+    };
+    let stopped = pin!(stopped);
+    let limit = pin!(ctx.sleep(NAVIGATE_MS));
+    let result = match select(pin!(navigate), select(stopped, limit)).await {
         Either::Left((result, _)) => result?,
-        Either::Right(_) => {
+        Either::Right((Either::Left((block, _)), _)) => return Err(cert_error(&block)),
+        Either::Right((Either::Right(_), _)) => {
             return Ok(ToolOutput::text(format!(
                 "{} {url} has not answered in {} s.",
                 report(ctx, false).await?,
@@ -269,11 +289,49 @@ pub async fn goto(ctx: &Ctx, args: &Value) -> Reply {
         }
     };
     if let Some(error) = result["errorText"].as_str().filter(|e| !e.is_empty()) {
+        if is_cert_error(error) {
+            let block = ctx.page.cert_error().unwrap_or_else(|| CertBlock {
+                url: url.clone(),
+                host: crate::browser::sites::host_of(&url),
+                error: error.trim_start_matches("net::").to_owned(),
+                seq: 0,
+            });
+            return Err(cert_error(&block));
+        }
         return Err(invalid(format!("could not open {url}: {error}")));
     }
     let expect = result["loaderId"].as_str().map(str::to_owned);
     let done = settle(ctx, None, expect, Load::Loaded, 20_000).await?;
-    Ok(ToolOutput::text(report(ctx, done).await?))
+    if let Some(block) = ctx.page.cert_error() {
+        return Err(cert_error(&block));
+    }
+    let mut out = report(ctx, done).await?;
+    out.push_str(&super::effects::permission_facts(&*ctx.page, mark));
+    Ok(ToolOutput::text(out))
+}
+
+/// Chromium's certificate errors: `net::ERR_CERT_*` and
+/// `net::ERR_CERTIFICATE_*`.
+fn is_cert_error(error: &str) -> bool {
+    error.trim_start_matches("net::").starts_with("ERR_CERT")
+}
+
+/// Why an agent cannot go on: a certificate the user did not accept (K62).
+/// Only the user may proceed, on the page's warning.
+fn cert_message(block: &CertBlock) -> String {
+    format!(
+        "{} does not have a trusted certificate ({}), so {} did not load. Agents cannot proceed past a certificate error; the page shows a warning where only the user can choose to go on. Local and private addresses (localhost, *.local, 127.0.0.1, 192.168.x.x, …) are accepted without one",
+        block.host, block.error, block.url
+    )
+}
+
+fn cert_error(block: &CertBlock) -> ToolOutput {
+    ToolOutput::error("browser_cert_error", cert_message(block))
+}
+
+/// [`report`]'s words for a page a certificate stopped.
+fn cert_refusal(id: crate::browser::PageId, block: &CertBlock) -> String {
+    format!("Page {id}: browser_cert_error: {}.", cert_message(block))
 }
 
 pub async fn history(ctx: &Ctx, step: i64) -> Reply {
@@ -294,13 +352,22 @@ pub async fn history(ctx: &Ctx, step: i64) -> Reply {
     )
     .await?;
     let done = settle(ctx, before, None, Load::Loaded, 20_000).await?;
-    Ok(ToolOutput::text(report(ctx, done).await?))
+    landed(ctx, done).await
 }
 
 pub async fn reload(ctx: &Ctx) -> Reply {
     let before = loader(ctx).await?;
     ctx.act("Page.reload", json!({})).await?;
     let done = settle(ctx, before, None, Load::Loaded, 20_000).await?;
+    landed(ctx, done).await
+}
+
+/// Where a history step or reload ended: [`report`], or the certificate
+/// error that stopped it.
+async fn landed(ctx: &Ctx, done: bool) -> Reply {
+    if let Some(block) = ctx.page.cert_error() {
+        return Err(cert_error(&block));
+    }
     Ok(ToolOutput::text(report(ctx, done).await?))
 }
 

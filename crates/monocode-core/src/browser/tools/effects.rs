@@ -92,6 +92,8 @@ pub struct Before {
     title: String,
     pages: HashSet<PageId>,
     console: Option<u64>,
+    /// The page's last permission note then (K63).
+    permissions: u64,
     /// The isolated world and its change count.
     counter: Option<(i64, f64)>,
     watch: Rc<RefCell<Watch>>,
@@ -210,6 +212,7 @@ pub async fn before(ctx: &Ctx) -> Result<Before, ToolOutput> {
         .map(|p| p.info().id)
         .collect();
     let console = ctx.page.log().map(|log| log.console_mark());
+    let permissions = permission_mark(&*ctx.page);
     let watch: Rc<RefCell<Watch>> = Rc::default();
     let seen = watch.clone();
     let main = frame.clone();
@@ -273,6 +276,7 @@ pub async fn before(ctx: &Ctx) -> Result<Before, ToolOutput> {
         title,
         pages,
         console,
+        permissions,
         counter,
         watch,
         _events: events,
@@ -450,8 +454,28 @@ fn new_pages(ctx: &Ctx, before: &Before) -> Vec<(PageId, String)> {
         .collect()
 }
 
-/// New tabs, downloads and console errors.
+/// The seq of the page's last permission note; 0 without one.
+pub(crate) fn permission_mark(page: &dyn crate::browser::Page) -> u64 {
+    page.permission_notes().last().map_or(0, |n| n.seq)
+}
+
+/// The page's permission requests since `mark` (K63), as sentences each
+/// starting with a space.
+pub(crate) fn permission_facts(page: &dyn crate::browser::Page, mark: u64) -> String {
+    let mut facts = String::new();
+    let notes: Vec<_> = (page.permission_notes().into_iter())
+        .filter(|n| n.seq > mark)
+        .collect();
+    for note in notes.iter().rev().take(LIST_ITEMS).rev() {
+        facts.push(' ');
+        facts.push_str(&note.describe());
+    }
+    facts
+}
+
+/// New tabs, downloads, console errors and permission requests.
 fn others(ctx: &Ctx, before: &Before, facts: &mut String) {
+    facts.push_str(&permission_facts(&*ctx.page, before.permissions));
     let pages = new_pages(ctx, before);
     for (id, url) in pages.iter().take(LIST_ITEMS) {
         facts.push_str(&format!(" It opened page {id} ({}).", short(url)));

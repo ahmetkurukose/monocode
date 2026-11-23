@@ -21,8 +21,10 @@ use std::{
 use cef::*;
 
 pub use crate::{
+    certs::CertificateRequest,
     dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
     download::{Download, DownloadInto, DownloadState, cancel_download},
+    permissions::{PermissionAnswer, PermissionRequest, reset_site_permission},
     popup::take_popup,
     profile::{Profile, forget_profile, profile_id},
 };
@@ -92,6 +94,14 @@ pub enum BrowserEvent {
         x: i32,
         y: i32,
     },
+    /// The page asks for permissions (crate::permissions).
+    PermissionRequested(PermissionRequest),
+    /// A permission prompt is answered or void (the page navigated); the
+    /// host drops it from its queue.
+    PermissionGone(u64),
+    /// A navigation waits on a certificate Chromium does not trust
+    /// (crate::certs).
+    CertificateError(CertificateRequest),
 }
 
 /// How a page is created.
@@ -422,7 +432,7 @@ mod client {
             dialogs: cef::JsdialogHandler,
             // "Send to Agent" (context.md K49).
             context_menu: cef::ContextMenuHandler,
-            // An agent's downloads in a row (K50).
+            // Site permissions (K63), and an agent's downloads in a row (K50).
             permission: cef::PermissionHandler,
         }
 
@@ -482,8 +492,8 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
         crate::download::PageDownloadHandler::new(state.clone()),
         crate::dialogs::PageRequestHandler::new(state.clone()),
         crate::dialogs::PageDialogHandler::new(state.clone()),
-        crate::context_menu::PageContextMenuHandler::new(state),
-        crate::download::PagePermissionHandler::new(),
+        crate::context_menu::PageContextMenuHandler::new(state.clone()),
+        crate::permissions::PagePermissionHandler::new(state),
     )
 }
 

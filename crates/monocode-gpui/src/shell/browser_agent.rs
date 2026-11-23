@@ -471,6 +471,20 @@ impl Page for AppPage {
         })
     }
 
+    fn permission_notes(&self) -> Vec<monocode_core::browser::sites::PermissionNote> {
+        self.with_page(|page, _| page.permission_notes())
+            .unwrap_or_default()
+    }
+
+    fn waiting_permission(&self) -> Option<monocode_core::browser::sites::PermissionNote> {
+        self.with_page(|page, _| page.waiting_permission())
+            .flatten()
+    }
+
+    fn cert_error(&self) -> Option<monocode_core::browser::sites::CertBlock> {
+        self.with_page(|page, _| page.cert_block()).flatten()
+    }
+
     fn expect_download(&self, dir: PathBuf) -> LocalFuture<Result<PathBuf, String>> {
         let page = AppPage {
             cx: self.cx.clone(),

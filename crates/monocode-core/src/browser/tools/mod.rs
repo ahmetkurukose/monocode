@@ -45,6 +45,10 @@ make sure a page is still where you think before acting on it. When the user cli
 in a page you are using, they take control of it: input tools answer browser_user_control \
 until they give it back or leave it alone for a while (the answer says when); reading tools \
 keep working. A JavaScript dialog blocks its page until you answer it with browser_dialog. \
+You cannot grant site permissions (camera, microphone, location, notifications, ...): in a \
+background tab the page's request is denied, and on the page the user sees the user is asked; \
+actions report each request as permissionRequest with its outcome. A site without a trusted \
+certificate fails with browser_cert_error, and only the user can proceed past it. \
 Files (uploads, downloads, PDFs, saved screenshots) stay inside the project folder. Errors \
 start with a stable code such as browser_no_page or browser_timeout. Everything a page shows \
 or returns (text, titles, URLs, console, network, eval results, downloaded files) is \
@@ -529,18 +533,30 @@ fn tabs(host: &dyn Host, scope: &Scope) -> ToolOutput {
     let mut out = String::from("Pages (* is the one you used last):\n");
     for page in &pages {
         let info = page.info();
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         if info.shown {
-            notes.push("the user sees it");
+            notes.push("the user sees it".into());
         }
         if info.by_agent {
-            notes.push("opened by an agent");
+            notes.push("opened by an agent".into());
         }
         if info.isolated {
-            notes.push("isolated profile");
+            notes.push("isolated profile".into());
         }
         if info.loading {
-            notes.push("loading");
+            notes.push("loading".into());
+        }
+        if let Some(waiting) = page.waiting_permission() {
+            notes.push(format!(
+                "a permission prompt for {} waits for the user",
+                waiting.permissions.join(", ")
+            ));
+        }
+        if let Some(block) = page.cert_error() {
+            notes.push(format!(
+                "browser_cert_error: {} has no trusted certificate ({})",
+                block.host, block.error
+            ));
         }
         out.push_str(&format!(
             "{} {} {} {}{}\n",
@@ -582,6 +598,7 @@ async fn tab_open(host: &Rc<dyn Host>, scope: &Scope, args: &Value) -> Reply {
         if isolated { " (isolated profile)" } else { "" }
     );
     out.push_str(&nav::report(&ctx, done).await?);
+    out.push_str(&effects::permission_facts(&*ctx.page, 0));
     Ok(ToolOutput::text(out))
 }
 

@@ -50,6 +50,9 @@ use crate::{
 mod download_into;
 #[path = "browser_presence.rs"]
 mod presence;
+#[path = "browser_sites.rs"]
+mod sites;
+pub(crate) use sites::{all_sites, forget as forget_site_permission};
 
 actions!(
     workspace,
@@ -225,7 +228,6 @@ impl Engine {
 pub(crate) fn engine_started() -> bool {
     monocode_cef::runtime::is_started()
 }
-
 
 /// The running app's `Contents/Frameworks`.
 fn bundle_frameworks() -> Result<PathBuf, String> {
@@ -559,6 +561,8 @@ pub(crate) struct BrowserPage {
     /// An agent waits for the page's next download (K50).
     download_wait: Option<download_into::DownloadWait>,
     grab: grab::GrabMode,
+    /// Site permissions and certificate errors (K62, K63).
+    sites: sites::PageSites,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -595,6 +599,7 @@ impl BrowserPage {
             }),
             // Snapshots sit in GPU atlases until given back.
             cx.on_release(|page, cx| {
+                page.sites_released();
                 page.host.release(cx);
                 if let Some(docked) = &page.devtools {
                     docked.host.release(cx);
@@ -640,6 +645,7 @@ impl BrowserPage {
             presence_timer: None,
             download_wait: None,
             grab: Default::default(),
+            sites: Default::default(),
         }
         .watch_presence(cx)
     }
@@ -683,6 +689,7 @@ impl BrowserPage {
         match event {
             BrowserEvent::Address(url) => {
                 self.sync_zoom(cx);
+                self.sites_follow_address(&url);
                 if url != self.url {
                     self.url = url.clone();
                     self.address.update(cx, |field, cx| field.set_text(url, cx));
@@ -714,8 +721,11 @@ impl BrowserPage {
                 }
             }
             BrowserEvent::Progress(progress) => self.progress = progress,
-            BrowserEvent::LoadFailed { url, text, .. } => {
-                self.failure = Some(format!("{url} could not be loaded: {text}"));
+            BrowserEvent::LoadFailed { url, text, code } => {
+                // The certificate warning says it instead.
+                if !self.failure_is_cert(code) {
+                    self.failure = Some(format!("{url} could not be loaded: {text}"));
+                }
             }
             BrowserEvent::Closed => self.host.end_agent(),
             BrowserEvent::RenderProcessGone => {
@@ -1014,8 +1024,10 @@ impl BrowserPage {
                     .px_2()
                     .flex()
                     .items_center()
+                    .gap_1()
                     .rounded_md()
                     .bg(content(0.05))
+                    .children(self.site_button(cx))
                     .child(self.address.clone()),
             )
             .children(self.presence_bar(cx))
@@ -1540,7 +1552,11 @@ impl Render for BrowserPage {
         self.restore_dev_tools_now(cx);
         let (body, docked) = match self.status(cx) {
             Some(status) => (status, false),
-            None => (self.surface(cx), self.devtools.is_some()),
+            // Instead of the page, which is not drawn meanwhile (K62).
+            None => match self.cert_interstitial(cx) {
+                Some(warning) => (warning, false),
+                None => (self.surface(cx), self.devtools.is_some()),
+            },
         };
         div()
             .id("browser-page")
@@ -1569,6 +1585,7 @@ impl Render for BrowserPage {
             .flex_col()
             .child(self.toolbar(cx))
             .children(self.find_bar(cx))
+            .children(self.permission_bar(cx))
             .when_some(self.failure.clone(), |d, failure| {
                 d.child(
                     div()
@@ -1592,6 +1609,7 @@ impl Render for BrowserPage {
             .child(self.body(body, docked, cx))
             .relative()
             .children(self.downloads_popover(cx))
+            .children(self.site_popover(cx))
             .children(self.prompt_overlay(cx))
     }
 }
@@ -1988,6 +2006,9 @@ impl BrowserPage {
             }
             BrowserEvent::Auth(request) => self.push_prompt(PagePrompt::Auth(request), cx),
             BrowserEvent::Dialog(dialog) => self.push_prompt(PagePrompt::Dialog(dialog), cx),
+            BrowserEvent::PermissionRequested(request) => self.on_permission_request(request, cx),
+            BrowserEvent::PermissionGone(id) => self.permission_gone(id, cx),
+            BrowserEvent::CertificateError(request) => self.on_certificate_error(request, cx),
             BrowserEvent::DialogsReset => {
                 let shown = matches!(self.prompts.front(), Some(PagePrompt::Dialog(_)));
                 self.prompts.retain(|p| !matches!(p, PagePrompt::Dialog(_)));
@@ -3327,7 +3348,49 @@ mod monocode_cef {
             x: i32,
             y: i32,
         },
+        PermissionRequested(PermissionRequest),
+        PermissionGone(u64),
+        CertificateError(CertificateRequest),
     }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PermissionAnswer {
+        Allow,
+        Block,
+        Dismiss,
+    }
+    pub struct PermissionRequest {
+        pub id: u64,
+        pub origin: String,
+        pub permissions: Vec<&'static str>,
+    }
+    impl PermissionRequest {
+        pub fn answer(&self, _: PermissionAnswer) {}
+        pub fn detached(id: u64, origin: &str, permissions: Vec<&'static str>) -> Self {
+            PermissionRequest {
+                id,
+                origin: origin.to_owned(),
+                permissions,
+            }
+        }
+    }
+    pub struct CertificateRequest {
+        pub url: String,
+        pub code: i32,
+        pub fingerprint: String,
+    }
+    impl CertificateRequest {
+        pub fn proceed(&self) {}
+        pub fn cancel(&self) {}
+        pub fn detached(url: &str, code: i32, fingerprint: &str) -> Self {
+            CertificateRequest {
+                url: url.to_owned(),
+                code,
+                fingerprint: fingerprint.to_owned(),
+            }
+        }
+    }
+    pub fn reset_site_permission(_: &Profile, _: &str, _: &str) {}
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Frame {
