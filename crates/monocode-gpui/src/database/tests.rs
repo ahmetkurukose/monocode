@@ -1399,3 +1399,31 @@ fn imported_sources_are_saved_with_their_passwords_and_agent_access_changes(
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_closed_tunnel_is_asked_about_before_it_opens(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = open(cx, dir.path());
+    window
+        .update(cx, |view, _, cx| {
+            view.save_source(local_source("a"), None, cx);
+            let source = view.selected.clone().unwrap();
+            // Declining folds the source back up and connects nothing.
+            view.expanded.insert(format!("s:{source}"));
+            view.confirm_tunnel = Some(source.clone());
+            view.answer_tunnel(false, cx);
+            assert!(view.confirm_tunnel.is_none());
+            assert!(!view.expanded.contains(&format!("s:{source}")));
+            assert!(view.nodes.get(&source).is_none());
+            // Accepting connects (which opens the tunnel).
+            view.expanded.insert(format!("s:{source}"));
+            view.confirm_tunnel = Some(source.clone());
+            view.answer_tunnel(true, cx);
+            assert!(view.confirm_tunnel.is_none());
+            assert!(view.nodes.contains_key(&source));
+        })
+        .unwrap();
+    cx.refresh().unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+}

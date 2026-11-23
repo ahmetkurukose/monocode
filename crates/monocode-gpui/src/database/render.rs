@@ -1851,6 +1851,50 @@ impl DatabaseView {
         }
     }
 
+    fn tunnel_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.confirm_tunnel.as_ref()?;
+        let source = self.source(id)?;
+        let kind = source.tunnel.as_ref()?.kind.label();
+        let card = modal::card().child(
+            modal::card_body()
+                .gap(px(10.))
+                .child(modal::title(format!(
+                    "Open the tunnel of “{}”?",
+                    source.name
+                )))
+                .child(modal::body(format!(
+                    "Its tunnel ({kind}) is not running. Opening it listens on port {}.",
+                    source.port
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            crate::project_settings::button("database-tunnel-cancel", "Cancel")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.answer_tunnel(false, cx)),
+                                ),
+                        )
+                        .child(
+                            modal::primary_button("database-tunnel-open", "Open tunnel").on_click(
+                                cx.listener(|this, _, _, cx| this.answer_tunnel(true, cx)),
+                            ),
+                        ),
+                ),
+        );
+        Some(
+            modal::overlay("database-tunnel", card, {
+                let weak = cx.weak_entity();
+                move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| this.answer_tunnel(false, cx));
+                }
+            })
+            .into_any_element(),
+        )
+    }
+
     fn remove_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.confirm_remove.clone()?;
         let name = self.source(&id)?.name.clone();
@@ -2140,6 +2184,7 @@ impl Render for DatabaseView {
             })
             .children(self.preview_overlay(cx))
             .children(self.remove_overlay(cx))
+            .children(self.tunnel_overlay(cx))
             .children(self.history_overlay(cx))
             .children(self.rename_overlay(cx))
             .children(
