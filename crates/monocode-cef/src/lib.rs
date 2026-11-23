@@ -2,10 +2,13 @@
 //!
 //! - [`runtime`]: loads and initializes CEF inside the app.
 //! - [`view`]: a page shown as a native child view of the host window.
+//! - [`extensions`]: the `mcext` scheme and fetch proxy of the app's own
+//!   extension layer (K69).
 //!
 //! Nothing here depends on the UI toolkit; the app hands in native view
 //! pointers and receives page events.
 
+pub mod extensions;
 pub mod runtime;
 pub mod view;
 
@@ -19,6 +22,9 @@ mod dialogs;
 mod download;
 #[cfg(target_os = "macos")]
 mod mac;
+/// An extension popup's window (K69).
+#[cfg(target_os = "macos")]
+pub use mac::ext_window::{Anchor as PopupAnchor, ExtWindow};
 mod permissions;
 mod popup;
 mod profile;

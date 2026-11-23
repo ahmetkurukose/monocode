@@ -307,6 +307,7 @@ pub(crate) struct SettingsView {
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
     passwords: pages::PasswordsState,
+    extensions: pages::ExtensionsState,
     /// What "Copy endpoint" last said: copied, or why not.
     browser_endpoint: Option<Result<(), String>>,
     /// "Import from another browser" (K61).
@@ -463,6 +464,7 @@ impl SettingsView {
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
             passwords: pages::PasswordsState::default(),
+            extensions: pages::ExtensionsState::default(),
             browser_endpoint: None,
             browser_import: pages::ImportPanel::default(),
             _subscriptions: subscriptions,

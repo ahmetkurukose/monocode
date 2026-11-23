@@ -14,11 +14,13 @@
 //! - [`scripts`]: the scripts the layer runs in pages and extension
 //!   contexts: the `chrome.*` shim (`shim.js`), content script programs.
 //! - [`api`]: which call needs which permission, and the error texts.
+//! - [`access`]: who may load which file (web_accessible_resources).
 //!
 //! The app (`monocode-gpui`, `browser/extensions`) runs the extension:
 //! the `mcext://` scheme, the background host, content scripts over CDP,
 //! the toolbar and popup.
 
+pub mod access;
 pub mod api;
 pub mod crx;
 pub mod manifest;
@@ -48,6 +50,11 @@ pub const PASSWORD_MANAGERS: &[&str] = &[
     "aeblfdkhhhdcdjpifhhbdiojplfjncoa",
     "nngceckbapebfimnlniiiahkandclblb",
 ];
+
+/// A random token, for secrets of the app's run (the bridge token).
+pub fn random_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
 
 /// An extension's origin: `mcext://<id>`.
 pub fn origin(id: &str) -> String {

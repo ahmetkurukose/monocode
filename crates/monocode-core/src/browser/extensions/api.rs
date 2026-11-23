@@ -87,3 +87,24 @@ mod tests {
         assert!(missing_permission("alarms.create", "alarms").contains("\"alarms\""));
     }
 }
+
+/// `action.setIcon({imageData})`: RGBA pixels as a PNG for the toolbar.
+pub fn icon_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || width > 512 || height > 512 {
+        return None;
+    }
+    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn image_data_becomes_a_png() {
+        let png = super::icon_png(2, 1, &[255, 0, 0, 255, 0, 255, 0, 128]).unwrap();
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert!(super::icon_png(2, 2, &[0; 4]).is_none());
+    }
+}

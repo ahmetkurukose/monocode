@@ -82,6 +82,42 @@
         }
       }
     })();
+    // Host permissions: a cross-origin http(s) fetch goes through the app
+    // (no CORS, the profile's cookies when asked), streamed and abortable.
+    // Where the extension has no access the app says so, and the browser's
+    // own fetch (with CORS) runs instead.
+    const ownOrigin = BASE.replace(/\/$/, "");
+    const proxied = async (input, init) => {
+      const req = new Request(input, init);
+      let u;
+      try { u = new URL(req.url); } catch (_) { return nativeFetch(input, init); }
+      if (!/^https?:$/.test(u.protocol) || u.origin === ownOrigin) return nativeFetch(input, init);
+      const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();
+      const list = [];
+      req.headers.forEach((v, k) => list.push([k, v]));
+      const spec = { url: req.url, method: req.method, headers: list, credentials: req.credentials, redirect: req.redirect, cache: req.cache };
+      const res = await nativeFetch(BASE + "__mcext/fetch", {
+        method: "POST",
+        body,
+        signal: req.signal,
+        headers: { "x-mcext-token": CFG.token, "x-mcext-fetch": encodeURIComponent(JSON.stringify(spec)) },
+      });
+      if (res.headers.get("x-mcext-fallback")) return nativeFetch(input, init);
+      if (res.status !== 200 || !res.headers.get("x-mcext-status")) throw new TypeError("Failed to fetch");
+      const status = Number(res.headers.get("x-mcext-status"));
+      const headers = JSON.parse(decodeURIComponent(res.headers.get("x-mcext-headers") || "%5B%5D"));
+      const empty = [101, 103, 204, 205, 304].includes(status) || req.method === "HEAD";
+      const out = new Response(empty ? null : res.body, {
+        status: status >= 200 && status <= 599 ? status : 200,
+        statusText: decodeURIComponent(res.headers.get("x-mcext-status-text") || ""),
+        headers,
+      });
+      const finalUrl = decodeURIComponent(res.headers.get("x-mcext-url") || "") || req.url;
+      Object.defineProperty(out, "url", { value: finalUrl });
+      Object.defineProperty(out, "redirected", { value: finalUrl !== req.url });
+      return out;
+    };
+    globalThis.fetch = function fetch(input, init) { return proxied(input, init); };
     if (!isWorker && typeof addEventListener === "function") {
       addEventListener("pagehide", () => {
         try { nativeFetch(BASE + "__mcext/api", { method: "POST", keepalive: true, headers, body: JSON.stringify({ ctx: CTX, api: "ctx.bye", args: [] }) }); } catch (_) {}

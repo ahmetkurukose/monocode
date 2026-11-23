@@ -13,6 +13,7 @@ pub(crate) enum Section {
     Terminal,
     Keybindings,
     Passwords,
+    Extensions,
     Chat,
     Providers,
     Mcp,
@@ -34,6 +35,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
             Section::Terminal,
             Section::Keybindings,
             Section::Passwords,
+            Section::Extensions,
         ],
     ),
     (
@@ -53,7 +55,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 15] = [
+    pub(crate) const ALL: [Section; 16] = [
         Section::General,
         Section::Connections,
         Section::Integrations,
@@ -61,6 +63,7 @@ impl Section {
         Section::Terminal,
         Section::Keybindings,
         Section::Passwords,
+        Section::Extensions,
         Section::Chat,
         Section::Providers,
         Section::Mcp,
@@ -79,6 +82,7 @@ impl Section {
             Section::Terminal => "terminal",
             Section::Keybindings => "keybindings",
             Section::Passwords => "passwords",
+            Section::Extensions => "extensions",
             Section::Chat => "chat",
             Section::Providers => "providers",
             Section::Mcp => "mcp",
@@ -98,6 +102,7 @@ impl Section {
             Section::Terminal => "Terminal",
             Section::Keybindings => "Keybindings",
             Section::Passwords => "Passwords",
+            Section::Extensions => "Extensions",
             Section::Chat => "Chat",
             Section::Providers => "Providers",
             Section::Mcp => "MCP",
@@ -128,6 +133,9 @@ impl Section {
             }
             Section::Passwords => {
                 "Passwords the browser saved when you signed in, and sites it never saves for."
+            }
+            Section::Extensions => {
+                "Chrome Web Store extensions in the browser: add, turn on or off, update, and remove."
             }
             Section::Chat => {
                 "How transcripts read, what the composer does with a follow-up, how files save, and how diffs open."
@@ -160,6 +168,9 @@ impl Section {
             Section::Passwords => {
                 "browser password login sign in credentials vault keychain touch id autofill saved never"
             }
+            Section::Extensions => {
+                "browser extension add-on plugin chrome web store proton pass password manager install update"
+            }
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
             }
@@ -186,6 +197,7 @@ impl Section {
             Section::Terminal => "terminal",
             Section::Keybindings => "keyboard",
             Section::Passwords => "key",
+            Section::Extensions => "package",
             Section::Chat => "message-square",
             Section::Providers => "bot",
             Section::Mcp => "globe",

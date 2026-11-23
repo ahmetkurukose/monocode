@@ -34,6 +34,10 @@ pub struct ShimConfig<'a> {
     pub id: &'a str,
     pub manifest: &'a Manifest,
     pub locale: &'a str,
+    /// Development hook: the context's `chrome` also as `__mcextChrome`
+    /// (extensions such as Proton Pass hide `chrome` from code they did not
+    /// load, scripts that inspect them included).
+    pub expose: bool,
 }
 
 impl ShimConfig<'_> {
@@ -45,6 +49,7 @@ impl ShimConfig<'_> {
             "messages": self.manifest.messages,
             "locale": self.locale,
             "mode": mode,
+            "expose": self.expose,
         })
     }
 }
@@ -96,7 +101,8 @@ pub struct Names {
 impl Names {
     pub fn new(id: &str, secret: &str) -> Self {
         Names {
-            binding: "__monocodeExt".into(),
+            // One per extension: a session keeps one world per binding name.
+            binding: format!("__monocodeExt_{}", &id[..id.len().min(12)]),
             recv: format!("__monocodeExtRecv_{secret}"),
             channel: format!("mcext-{id}-{secret}"),
             registry: format!("__mcextExternal_{secret}"),
@@ -130,8 +136,9 @@ fn entry_json(script: &ContentScript, dir: &Path) -> Value {
     })
 }
 
-/// The scheduler both programs share: `__ENTRIES__` each with `run(i)`.
-const SCHEDULE: &str = r#"
+/// What both programs share: which entries a document wants (`WANTED`),
+/// and how they run by `run_at` (`SCHEDULE`), over `ENTRIES` and `RUN`.
+const HELPERS: &str = r#"
   const href = () => String(location.href);
   const test = (list, url) => list.some((r) => new RegExp(r, "i").test(url));
   // about:blank/srcdoc frames go by their parent's URL when asked.
@@ -148,6 +155,10 @@ const SCHEDULE: &str = r#"
     return test(e.matches, u) && !test(e.exclude, u)
       && (!e.include_globs.length || test(e.include_globs, u)) && !test(e.exclude_globs, u);
   };
+  const WANTED = ENTRIES.map(wants);
+"#;
+
+const SCHEDULE: &str = r#"
   const css = (text) => {
     if (!text) return;
     const add = () => {
@@ -169,7 +180,7 @@ const SCHEDULE: &str = r#"
     else setTimeout(run, 0);
   };
   ENTRIES.forEach((e, i) => {
-    if (!wants(e)) return;
+    if (!WANTED[i]) return;
     css(e.css);
     at(e.run_at, () => RUN[i]());
   });
@@ -231,8 +242,10 @@ pub fn content_programs(
         if !isolated.is_empty() {
             let mut cfg = config.base("content");
             cfg["recv"] = names.recv.clone().into();
+            // The shim only where a script runs.
             out.push_str(&format!(
-                "globalThis.__MCEXT_CFG = {cfg}; globalThis.__MCEXT_CFG.send = bind;\n{SHIM}\n{{ {entries}\n{runs}\n{SCHEDULE} }}\n"
+                "{{ {entries}\n{runs}\n{HELPERS}\n\
+                 if (WANTED.some(Boolean)) {{ globalThis.__MCEXT_CFG = {cfg}; globalThis.__MCEXT_CFG.send = bind;\n{SHIM}\n{SCHEDULE} }} }}\n"
             ));
         }
         if let Some(matches) = &external {
@@ -262,7 +275,7 @@ pub fn content_programs(
             ));
         }
         if !main.is_empty() {
-            out.push_str(&format!("{{ {entries}\n{runs}\n{SCHEDULE} }}\n"));
+            out.push_str(&format!("{{ {entries}\n{runs}\n{HELPERS}\n{SCHEDULE} }}\n"));
         }
         out.push_str("})();\n");
         out

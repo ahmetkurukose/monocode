@@ -266,6 +266,7 @@ fn content_programs_parse_and_carry_the_right_scripts() {
         id: super::PROTON_PASS_ID,
         manifest: &m,
         locale: "en-US",
+        expose: false,
     };
     let names = super::scripts::Names::new(super::PROTON_PASS_ID, "s3cr3t");
     let (isolated, main) = super::scripts::content_programs(&config, dir.path(), &names);

@@ -104,12 +104,21 @@ pub enum BrowserEvent {
     /// A navigation waits on a certificate Chromium does not trust
     /// (crate::certs).
     CertificateError(CertificateRequest),
+    /// The page's preferred size, while [`BrowserView::set_auto_resize`]
+    /// is on (an extension's popup), in points.
+    AutoResize {
+        width: i32,
+        height: i32,
+    },
 }
 
 /// How a page is created.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CreateOptions {
     pub profile: Profile,
+    /// Scripts may use the clipboard without a gesture (an extension's
+    /// offscreen document, which clears what it copied).
+    pub clipboard: bool,
 }
 
 /// A rectangle in the parent view's coordinates, in points, origin top-left.
@@ -155,6 +164,9 @@ pub(crate) struct PageState {
     popup: Option<crate::popup::PopupKey>,
     /// A popup's opener: its downloads may be the opener's (crate::download).
     opener: Option<Arc<PageState>>,
+    /// In a top-level window CEF owns ([`BrowserView::create_hidden`]):
+    /// CEF closes the window itself.
+    top_level: bool,
 }
 
 impl PageState {
@@ -168,6 +180,7 @@ impl PageState {
             popups: Arc::default(),
             popup,
             opener: None,
+            top_level: false,
         };
         (state, rx)
     }
@@ -288,6 +301,19 @@ wrap_display_handler! {
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
             self.state.send(BrowserEvent::Progress(progress));
         }
+
+        fn on_auto_resize(
+            &self,
+            _browser: Option<&mut Browser>,
+            new_size: Option<&cef::Size>,
+        ) -> ::std::os::raw::c_int {
+            let Some(size) = new_size else { return 0 };
+            self.state.send(BrowserEvent::AutoResize {
+                width: size.width,
+                height: size.height,
+            });
+            1
+        }
     }
 }
 
@@ -398,6 +424,10 @@ wrap_life_span_handler! {
             // host tears the page down instead, when it closes the tab.
             if !self.state.closing.load(Ordering::SeqCst) {
                 self.state.send(BrowserEvent::CloseRequested);
+            }
+            // CEF's own window: CEF closes it, and the browser with it.
+            if self.state.top_level {
+                return 0;
             }
             1
         }
@@ -519,6 +549,14 @@ mod client {
 }
 use client::PageClient;
 
+fn browser_settings(options: &CreateOptions) -> cef::BrowserSettings {
+    let mut settings = cef::BrowserSettings::default();
+    if options.clipboard {
+        settings.javascript_access_clipboard = cef::State::ENABLED;
+    }
+    settings
+}
+
 /// A page's client, for a new page or a popup CEF creates.
 pub(crate) fn page_client(state: PageState) -> cef::Client {
     PageClient::new(
@@ -589,7 +627,7 @@ impl BrowserView {
             ..Default::default()
         }
         .set_as_child(parent as _, &bounds);
-        let settings = cef::BrowserSettings::default();
+        let settings = browser_settings(options);
         let browser = cef::browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
@@ -602,6 +640,73 @@ impl BrowserView {
         let view = Self::from_browser(browser, &state);
         view.set_frame(frame);
         Ok((view, rx))
+    }
+
+    /// A page no one sees: in a top-level window of CEF's own that never
+    /// shows (an extension's background or offscreen document, K69). It
+    /// runs like any page, with CDP; [`BrowserView::set_frame`] and
+    /// visibility do nothing.
+    pub fn create_hidden(
+        url: &str,
+        options: &CreateOptions,
+    ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), CreateError> {
+        if !crate::runtime::is_started() {
+            return Err(CreateError::NotStarted);
+        }
+        let (mut state, rx) = PageState::new(None);
+        state.top_level = true;
+        let mut client = page_client(state.clone());
+        let mut context = crate::profile::request_context(&options.profile);
+        let window_info = cef::WindowInfo {
+            runtime_style: cef::RuntimeStyle::ALLOY,
+            bounds: cef::Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            hidden: 1,
+            window_name: "Monocode extension".into(),
+            ..Default::default()
+        };
+        let settings = browser_settings(options);
+        let browser = cef::browser_host_create_browser_sync(
+            Some(&window_info),
+            Some(&mut client),
+            Some(&url.into()),
+            Some(&settings),
+            None,
+            context.as_mut(),
+        )
+        .ok_or(CreateError::Failed)?;
+        let mut view = Self::from_browser(browser, &state);
+        // Not ours to place: CEF owns the window.
+        view.native = std::ptr::null_mut();
+        Ok((view, rx))
+    }
+
+    /// Reports the page's preferred size between `min` and `max` points as
+    /// [`BrowserEvent::AutoResize`] (Chrome's popups size to their page).
+    pub fn set_auto_resize(&self, min: (i32, i32), max: (i32, i32)) {
+        if let Some(host) = self.browser.host() {
+            let min = cef::Size {
+                width: min.0,
+                height: min.1,
+            };
+            let max = cef::Size {
+                width: max.0,
+                height: max.1,
+            };
+            host.set_auto_resize_enabled(1, Some(&min), Some(&max));
+        }
+    }
+
+    /// The URL of the page's main frame now.
+    pub fn url(&self) -> String {
+        self.browser
+            .main_frame()
+            .map(|f| CefString::from(&f.url()).to_string())
+            .unwrap_or_default()
     }
 
     /// The view of a browser CEF created, with its page's state.

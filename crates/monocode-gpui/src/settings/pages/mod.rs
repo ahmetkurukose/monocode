@@ -4,6 +4,7 @@ mod archive;
 mod browser_import;
 mod chat;
 mod connections;
+mod extensions;
 mod general;
 mod inbox;
 mod integrations;
@@ -22,6 +23,7 @@ pub(super) use appearance::parse_hex;
 pub(crate) use browser_import::ImportPanel;
 pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use connections::ConnectionsState;
+pub(super) use extensions::ExtensionsState;
 pub(super) use integrations::IntegrationsState;
 pub(crate) use keybindings::{command_shortcut, shortcut_label};
 pub(super) use mobile::MobileState;
@@ -46,6 +48,7 @@ impl SettingsView {
             Section::Terminal => self.terminal_page(cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Passwords => self.passwords_page(window, cx),
+            Section::Extensions => self.extensions_page(cx),
             Section::Chat => self.chat_page(cx),
             Section::Providers => self.providers_page(cx),
             Section::Mcp => self.mcp_page(cx),

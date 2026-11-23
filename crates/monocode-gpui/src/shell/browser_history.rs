@@ -29,6 +29,13 @@ impl Shell {
 
     /// `<data>/Browser Passwords`, beside Chromium's `Browser` folder: the
     /// password vaults (K56); none (memory) without a data folder.
+    /// The data mode's folder, for the browser's extensions (K69).
+    pub(super) fn browser_data_dir(&self) -> Option<std::path::PathBuf> {
+        locked(&self.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf))
+    }
+
     pub(super) fn browser_passwords_dir(&self) -> Option<std::path::PathBuf> {
         locked(&self.store)
             .ok()

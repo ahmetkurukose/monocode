@@ -49,9 +49,11 @@ fn main() {
         std::process::exit(1);
     }
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+    // The extension layer's scheme is registered in every process (K69).
+    let mut app = monocode_cef::extensions::helper_app();
     let code = cef::execute_process(
         Some(args.as_main_args()),
-        None::<&mut cef::App>,
+        Some(&mut app),
         std::ptr::null_mut(),
     );
     std::process::exit(code);

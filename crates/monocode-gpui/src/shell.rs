@@ -5,6 +5,7 @@ mod app_views;
 mod automation_runs;
 pub(crate) mod browser_agent;
 mod browser_audio;
+pub(crate) mod browser_extensions;
 mod browser_grab;
 mod browser_lifecycle;
 mod browser_history;
@@ -7722,6 +7723,7 @@ impl Render for Shell {
             // Before an agent's browser_history or any page asks for it.
             crate::browser::history::init(self.browser_history_dir(), cx);
             crate::browser::passwords::init(self.browser_passwords_dir(), cx);
+            crate::browser::extensions::init(self.browser_data_dir(), cx);
             self.start_database_footer(window, cx);
             #[cfg(feature = "selftest")]
             self.start_code_selftest(window, cx);

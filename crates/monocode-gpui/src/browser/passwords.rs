@@ -63,8 +63,9 @@ fn global(cx: &mut App) -> Rc<RefCell<Passwords>> {
 }
 
 /// Whether the browser's own password manager runs (K60): the user's
-/// "Offer to save passwords" setting. Phase 5 turns it off while the
-/// 1Password extension is installed (the setting turns it back on).
+/// "Offer to save passwords" setting, and no password manager extension
+/// (Proton Pass) enabled: then the extension saves and fills, and ours
+/// offers neither (disabling the extension brings ours back).
 pub(crate) fn password_manager_enabled(cx: &App) -> bool {
     let offered = cx
         .try_global::<crate::settings::Preferences>()
@@ -72,10 +73,10 @@ pub(crate) fn password_manager_enabled(cx: &App) -> bool {
     offered && !password_extension_installed()
 }
 
-/// A password manager extension (1Password) runs in the browser: ours
-/// steps aside (K60). Extensions come in phase 5.
+/// A password manager extension (Proton Pass) is enabled: ours steps
+/// aside (K60).
 fn password_extension_installed() -> bool {
-    false
+    super::extensions::password_manager_enabled()
 }
 
 /// The vault a profile's pages use; `None` for a throwaway one (K22).

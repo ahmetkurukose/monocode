@@ -2,7 +2,10 @@
 //! display link restarts through the `log` crate, and without a logger those
 //! reports were dropped, so a window that stopped repainting left no trace.
 //! Warnings from every crate, plus the macOS window's info lines, go to
-//! `~/Library/Logs/Monocode Native/gpui.log`.
+//! `~/Library/Logs/Monocode Native/gpui.log`. A run with a data folder of
+//! its own (`MONOCODE_NATIVE_DATA_DIR`, tests and development runs) logs
+//! into `<that folder>/Logs` instead, and `MONOCODE_NATIVE_LOG_DIR` names
+//! the folder outright: such runs never write the user's log.
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -26,11 +29,21 @@ struct State {
     recent: HashMap<String, (Instant, u32)>,
 }
 
+/// Where the log goes (see the module's documentation).
+fn directory() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MONOCODE_NATIVE_LOG_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(data) = std::env::var_os("MONOCODE_NATIVE_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(data).join("Logs"));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Logs/Monocode Native"))
+}
+
 pub(crate) fn init() {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(directory) = directory() else {
         return;
     };
-    let directory = PathBuf::from(home).join("Library/Logs/Monocode Native");
     if std::fs::create_dir_all(&directory).is_err() {
         return;
     }

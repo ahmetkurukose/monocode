@@ -91,6 +91,7 @@ pub(crate) fn request_context(profile: &Profile) -> Option<cef::RequestContext> 
             // An empty cache path keeps everything in memory.
             let settings = cef::RequestContextSettings::default();
             let context = cef::request_context_create_context(Some(&settings), None)?;
+            crate::extensions::register_on(&context, profile);
             CONTEXTS.with(|c| c.borrow_mut().insert(key, context.clone()));
             return Some(context);
         }
@@ -109,6 +110,7 @@ pub(crate) fn request_context(profile: &Profile) -> Option<cef::RequestContext> 
         ..Default::default()
     };
     let context = cef::request_context_create_context(Some(&settings), None)?;
+    crate::extensions::register_on(&context, profile);
     CONTEXTS.with(|c| c.borrow_mut().insert(key, context.clone()));
     Some(context)
 }

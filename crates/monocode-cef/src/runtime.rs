@@ -143,6 +143,10 @@ wrap_app! {
             }
         }
 
+        fn on_register_custom_schemes(&self, registrar: Option<&mut cef::SchemeRegistrar>) {
+            crate::extensions::register_scheme(registrar);
+        }
+
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             Some(MonocodeBrowserProcessHandler::new(self.config.clone()))
         }
@@ -170,6 +174,7 @@ wrap_browser_process_handler! {
 
         fn on_context_initialized(&self) {
             apply_battery_saver();
+            crate::extensions::on_context_initialized();
         }
     }
 }

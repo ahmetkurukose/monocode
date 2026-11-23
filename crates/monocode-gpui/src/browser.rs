@@ -37,6 +37,12 @@ use gpui::{
 use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
 mod discard;
+/// The browser's own extension layer (K69).
+#[cfg(target_os = "macos")]
+pub(crate) mod extensions;
+#[cfg(not(target_os = "macos"))]
+#[path = "browser/extensions_stub.rs"]
+pub(crate) mod extensions;
 mod grab;
 pub(crate) mod lifecycle;
 pub(crate) use grab::ToggleGrab;
@@ -734,6 +740,40 @@ impl BrowserPage {
         }
     }
 
+    /// The page's tab id for extensions (K69).
+    pub(crate) fn extension_tab_id(&self) -> i64 {
+        self.host.shared.tab_id.0
+    }
+
+    /// The profile the page browses with.
+    pub(crate) fn profile(&self) -> monocode_cef::Profile {
+        self.host.options.borrow().profile.clone()
+    }
+
+    /// The user's last mouse or key input in the page.
+    pub(crate) fn last_input(&self) -> Option<Instant> {
+        self.host.shared.last_input.get()
+    }
+
+    /// The page's browser id while it has a view.
+    pub(crate) fn browser_id(&self) -> Option<i32> {
+        #[cfg(target_os = "macos")]
+        return (self.host.view.borrow().as_ref()).map(|hosted| hosted.view.browser_id());
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
+    /// `chrome.tabs.update({url})`: loads `url`, like a link.
+    pub(crate) fn navigate_for_extension(&mut self, url: String, cx: &mut Context<Self>) {
+        self.next_transition(history::Transition::Link);
+        self.url = url.clone();
+        self.failure = None;
+        if !self.host.with_view(|view| view.load_url(&url)) {
+            cx.notify();
+        }
+        cx.emit(PageChanged);
+    }
+
     /// Opens what the user typed or picked (the address bar, its
     /// suggestions, the new tab page).
     fn load(&mut self, url: String, cx: &mut Context<Self>) {
@@ -1172,6 +1212,10 @@ impl BrowserPage {
                         .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
                 )
             })
+            .children(extensions::toolbar::buttons(
+                &self.host.options.borrow().profile,
+                self.host.shared.tab_id.0,
+            ))
             .child(self.grab_button(ready, cx))
             .child(
                 icon_button_enabled("browser-devtools", "DevTools", "code", ready)
@@ -2802,6 +2846,19 @@ struct Shared {
     passkeys: passkeys::Passkeys,
     /// The page's held camera and microphone requests (`browser_sites.rs`).
     media: sites::MediaAsks,
+    /// The page's id as extensions' tab (K69): stays with the page across
+    /// its views and discards, never reused in the run.
+    tab_id: TabId,
+}
+
+/// A page's tab id for extensions.
+pub(crate) struct TabId(pub(crate) i64);
+
+impl Default for TabId {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        TabId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 impl Shared {
@@ -2893,10 +2950,17 @@ impl Host<monocode_cef::BrowserView> {
         let passwords = self.watch_passwords(&cdp);
         let passkeys = self.watch_passkeys(&cdp);
         let media = self.watch_media(&cdp);
+        // After the passkey watcher (K58): an extension's own WebAuthn
+        // wrapper sits over it, so what the extension declines still
+        // reaches Chromium's QR sign-in.
+        #[cfg(target_os = "macos")]
+        let extensions = extensions::attach(self, &cdp);
+        #[cfg(not(target_os = "macos"))]
+        let extensions: Option<Box<dyn Any>> = None;
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new((attachment, audio, passwords, passkeys, media)),
+            _attachment: Box::new((attachment, audio, passwords, passkeys, media, extensions)),
         });
     }
 }
