@@ -361,6 +361,10 @@ pub(crate) struct BrowserPane {
     /// The docked DevTools' height in points; `None` is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docked_devtools_height: Option<u32>,
+    /// The user muted the tab's sound; it stays muted when the page loads
+    /// again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
     /// The agent session that opened it (context.md K21); not saved.
     #[serde(skip)]
     pub opened_by: Option<i64>,

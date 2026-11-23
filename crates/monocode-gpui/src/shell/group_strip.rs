@@ -802,6 +802,9 @@ impl Shell {
                                 .when(preview, |d| d.italic())
                                 .child(label),
                         )
+                    })
+                    .when_some(self.browser_tab_sound(id, cx), |d, sound| {
+                        d.child(self.tab_sound_button(id, sound, cx))
                     }),
             )
             .when_some(t.flash, |d, glow| {
@@ -1464,6 +1467,7 @@ impl Shell {
         if self.workspace.preview_of_group(id) == Some(id) {
             items.push(MenuAction::new("keep", "Keep Open").into());
         }
+        items.extend(self.browser_mute_menu(id, cx));
         items.extend([
             MenuItem::Separator,
             MenuAction::new("split-right", "Split Right")
@@ -1560,6 +1564,7 @@ impl Shell {
                 self.workspace.set_pinned(id, action == "pin");
                 self.persist(cx);
             }
+            "mute" | "unmute" => self.set_browser_muted(id, action == "mute", cx),
             "keep" => {
                 self.keep_preview(id, cx);
                 self.persist(cx);

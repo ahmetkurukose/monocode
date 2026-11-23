@@ -329,6 +329,7 @@ fn adopt(
     });
     let parent = crate::mac::view::hidden_parent(f64::from(width), f64::from(height))?;
     let (state, events) = PageState::new(Some(key));
+    let state = state.opened_by(opener);
     let window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
         ..Default::default()

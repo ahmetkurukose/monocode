@@ -40,6 +40,7 @@ impl Shell {
                 state.docked_devtools,
                 state.docked_devtools_height.unwrap_or(0),
             );
+            page.restore_muted(state.muted);
             page
         });
         // Asked from inside a page's event: handled once that is over, with
@@ -55,25 +56,35 @@ impl Shell {
         })
         .detach();
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let (url, title, zoom, devtools, devtools_height) = {
+            let (url, title, zoom, devtools, devtools_height, muted) = {
                 let page = page.read(cx);
                 let zoom = (page.zoom != 100).then_some(page.zoom);
                 let (devtools, height) = page.dev_tools_saved();
                 let height = (height != 0).then_some(height);
-                (page.url.clone(), page.title.clone(), zoom, devtools, height)
+                let muted = page.muted();
+                (
+                    page.url.clone(),
+                    page.title.clone(),
+                    zoom,
+                    devtools,
+                    height,
+                    muted,
+                )
             };
             if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
                 && (state.url != url
                     || state.title != title
                     || state.zoom != zoom
                     || state.docked_devtools != devtools
-                    || state.docked_devtools_height != devtools_height)
+                    || state.docked_devtools_height != devtools_height
+                    || state.muted != muted)
             {
                 state.url = url;
                 state.title = title;
                 state.zoom = zoom;
                 state.docked_devtools = devtools;
                 state.docked_devtools_height = devtools_height;
+                state.muted = muted;
                 this.persist(cx);
             }
             this.invalidate_chrome(cx);

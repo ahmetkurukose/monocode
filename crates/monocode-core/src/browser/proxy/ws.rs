@@ -122,14 +122,15 @@ pub(super) fn run(
     }
     server.add_client(id, closer, grant.internal);
 
-    let (scope, context, browser_id, out) = (
+    let (scope, context, browser_id, out, internal) = (
         grant.scope,
         grant.context,
         server.browser_id.clone(),
         tx.clone(),
+        grant.internal,
     );
-    let opened =
-        server.on_main(move |host| hub::open(host, id, scope, context, browser_id, kind, out));
+    let opened = server
+        .on_main(move |host| hub::open(host, id, scope, context, browser_id, kind, internal, out));
 
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))

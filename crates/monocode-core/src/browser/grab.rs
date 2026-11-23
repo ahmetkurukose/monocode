@@ -819,6 +819,81 @@ pub async fn grab_at(cdp: Rc<CdpClient>, x: f64, y: f64) -> Result<Grab, String>
     describe(&cdp, context).await
 }
 
+/// The element a DevTools frontend selected in its Elements panel (`$0`),
+/// read in that frontend's own `session` on the page and described in ours:
+/// the docked DevTools' "Send to Agent". It scrolls into view for its crop.
+pub async fn grab_inspected(cdp: Rc<CdpClient>, session: &str) -> Result<Grab, String> {
+    let none = || "no element is selected in DevTools' Elements panel".to_owned();
+    let selected = cdp
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": "$0",
+                "includeCommandLineAPI": true,
+                "objectGroup": OBJECT_GROUP,
+                "silent": true,
+            }),
+            Some(session),
+        )
+        .await
+        .map_err(|e| format!("DevTools did not answer ({e})"))?;
+    let object = selected["result"]["objectId"]
+        .as_str()
+        .filter(|_| selected["result"]["subtype"] == "node")
+        .ok_or_else(none)?
+        .to_owned();
+    let node = cdp
+        .call(
+            "DOM.describeNode",
+            json!({"objectId": object}),
+            Some(session),
+        )
+        .await;
+    drop(cdp.call(
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup": OBJECT_GROUP}),
+        Some(session),
+    ));
+    let node = node.map_err(|e| format!("DevTools did not answer ({e})"))?;
+    // Text and comment nodes have no box: their element stands in.
+    if node["node"]["nodeType"].as_i64() != Some(1) {
+        return Err("the node selected in DevTools is not an element".into());
+    }
+    let backend = node["node"]["backendNodeId"].as_i64().ok_or_else(none)?;
+    grab_node(cdp, backend).await
+}
+
+/// The element Chromium knows as `backend` (`backendNodeId`), described as
+/// a pick would be.
+pub async fn grab_node(cdp: Rc<CdpClient>, backend: i64) -> Result<Grab, String> {
+    let context = install(&cdp).await?;
+    let _ = call(
+        &cdp,
+        "DOM.scrollIntoViewIfNeeded",
+        json!({"backendNodeId": backend}),
+    )
+    .await;
+    let resolved = call(
+        &cdp,
+        "DOM.resolveNode",
+        json!({"backendNodeId": backend, "executionContextId": context, "objectGroup": OBJECT_GROUP}),
+    )
+    .await?;
+    let object = resolved["object"]["objectId"]
+        .as_str()
+        .ok_or("the element is gone")?;
+    call(
+        &cdp,
+        "Runtime.callFunctionOn",
+        json!({
+            "functionDeclaration": "function () { window.__monocodeGrab.picked = this; }",
+            "objectId": object,
+        }),
+    )
+    .await?;
+    describe(&cdp, context).await
+}
+
 #[cfg(test)]
 #[path = "grab_tests.rs"]
 mod tests;

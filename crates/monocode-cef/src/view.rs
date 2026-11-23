@@ -141,6 +141,8 @@ pub(crate) struct PageState {
     pub(crate) popups: Arc<Mutex<crate::popup::PopupLimiter>>,
     /// Set on a popup CEF creates for the host to adopt.
     popup: Option<crate::popup::PopupKey>,
+    /// A popup's opener: its downloads may be the opener's (crate::download).
+    opener: Option<Arc<PageState>>,
 }
 
 impl PageState {
@@ -153,8 +155,27 @@ impl PageState {
             closing: Arc::default(),
             popups: Arc::default(),
             popup,
+            opener: None,
         };
         (state, rx)
+    }
+
+    /// A popup's state, opened by `opener`.
+    pub(crate) fn opened_by(mut self, opener: &PageState) -> Self {
+        self.opener = Some(Arc::new(opener.clone()));
+        self
+    }
+
+    /// The page of browser `browser` with this state, then the pages that
+    /// opened it, nearest first: `(browser id, state)`.
+    pub(crate) fn lineage(&self, browser: i32) -> Vec<(i32, &PageState)> {
+        let mut pages = vec![(browser, self)];
+        let mut at = self;
+        while let (Some((opener_id, _)), Some(opener)) = (at.popup, at.opener.as_deref()) {
+            pages.push((opener_id, opener));
+            at = opener;
+        }
+        pages
     }
 
     pub(crate) fn send(&self, event: BrowserEvent) {
@@ -482,8 +503,8 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
         crate::download::PageDownloadHandler::new(state.clone()),
         crate::dialogs::PageRequestHandler::new(state.clone()),
         crate::dialogs::PageDialogHandler::new(state.clone()),
-        crate::context_menu::PageContextMenuHandler::new(state),
-        crate::download::PagePermissionHandler::new(),
+        crate::context_menu::PageContextMenuHandler::new(state.clone()),
+        crate::download::PagePermissionHandler::new(state),
     )
 }
 
@@ -707,6 +728,28 @@ impl BrowserView {
         self.browser
             .host()
             .is_some_and(|host| host.has_dev_tools() != 0)
+    }
+
+    /// Mutes the page's sound, or lets it play again. Chromium keeps it for
+    /// the page's life, across navigations.
+    pub fn set_audio_muted(&self, muted: bool) {
+        if let Some(host) = self.browser.host() {
+            host.set_audio_muted(muted as _);
+        }
+    }
+
+    pub fn is_audio_muted(&self) -> bool {
+        self.browser
+            .host()
+            .is_some_and(|host| host.is_audio_muted() != 0)
+    }
+
+    /// Prints the page: Chromium's print, which on macOS shows the system's
+    /// print panel as a sheet on the page's window.
+    pub fn print(&self) {
+        if let Some(host) = self.browser.host() {
+            host.print();
+        }
     }
 
     /// Asks for a PNG of what the page shows now, at the screen's scale.

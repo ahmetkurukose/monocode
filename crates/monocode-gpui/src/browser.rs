@@ -46,6 +46,8 @@ use crate::{
     theme::{content, icon, icon_button, icon_button_enabled},
 };
 
+#[path = "browser_audio.rs"]
+mod audio;
 #[path = "browser_download_into.rs"]
 mod download_into;
 #[path = "browser_presence.rs"]
@@ -108,6 +110,9 @@ enum DevToolsAsk {
     Download,
     /// HTTP authentication: refused.
     Refuse,
+    /// Their context menu's "Send Selected Element to Agent": the element
+    /// selected in their Elements panel (K49).
+    GrabSelected,
     Close,
     Focus,
     Ignore,
@@ -139,6 +144,7 @@ fn devtools_ask(event: &monocode_cef::BrowserEvent) -> DevToolsAsk {
         BrowserEvent::Dialog(_) => DevToolsAsk::Prompt,
         BrowserEvent::Download(_) => DevToolsAsk::Download,
         BrowserEvent::Auth(_) => DevToolsAsk::Refuse,
+        BrowserEvent::GrabAt { .. } => DevToolsAsk::GrabSelected,
         _ => DevToolsAsk::Ignore,
     }
 }
@@ -369,6 +375,8 @@ actions!(
         ZoomIn,
         ZoomOut,
         ResetZoom,
+        /// ⌘P: Chromium's print, the system's print panel.
+        Print,
     ]
 );
 
@@ -393,6 +401,9 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-+"), ZoomIn, page),
         KeyBinding::new(&format!("{m}--"), ZoomOut, page),
         KeyBinding::new(&format!("{m}-0"), ResetZoom, page),
+        // Over the workspace's ⌘P (the command palette; ⇧⌘P still opens it)
+        // while a page is focused, as in Chrome.
+        KeyBinding::new(&format!("{m}-p"), Print, page),
         // Not ⇧⌘G, which is Find Previous.
         KeyBinding::new(&format!("{m}-alt-g"), ToggleGrab, page),
         // The find field is a Composer, whose ⇧Enter would add a newline.
@@ -811,6 +822,11 @@ impl BrowserPage {
         cx.notify();
     }
 
+    /// ⌘P: Chromium prints the page, with the system's print panel.
+    pub(crate) fn print(&self) {
+        self.host.with_view(|view| view.print());
+    }
+
     fn reload(&mut self, ignore_cache: bool) {
         self.host.with_view(|view| {
             if ignore_cache {
@@ -1212,6 +1228,7 @@ impl BrowserPage {
             }
             (DevToolsAsk::Download, event) => self.on_page_event(event, cx),
             (DevToolsAsk::Refuse, BrowserEvent::Auth(request)) => request.cancel(),
+            (DevToolsAsk::GrabSelected, _) => self.grab_selected(cx),
             (_, BrowserEvent::PopupOpened { id, .. }) => drop(monocode_cef::take_popup(id)),
             _ => {}
         }
@@ -1562,6 +1579,7 @@ impl Render for BrowserPage {
                 cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(zoom_step(this.zoom, -1), cx)),
             )
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
+            .on_action(cx.listener(|this, _: &Print, _, _| this.print()))
             .on_action(cx.listener(|this, _: &ToggleGrab, window, cx| this.toggle_grab(window, cx)))
             .on_key_down(cx.listener(|this, event, _, cx| this.grab_key(event, cx)))
             .size_full()
@@ -2609,6 +2627,8 @@ struct Shared {
     last_input: Cell<Option<Instant>>,
     /// Who drives the page, and the agent last using it (K47, K48).
     presence: presence::Presence,
+    /// The page's sound, and whether the user muted it (`browser_audio.rs`).
+    audio: audio::Audio,
 }
 
 impl Shared {
@@ -2694,10 +2714,11 @@ impl Host<monocode_cef::BrowserView> {
         };
         // The old client, if any, is gone already.
         let log = PageLog::start(&cdp);
+        let audio = self.watch_audio(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new(attachment),
+            _attachment: Box::new((attachment, audio)),
         });
     }
 }
@@ -2706,6 +2727,8 @@ impl<V> Host<V> {
     /// The page's DevTools agent is gone (closed, crashed): calls waiting on
     /// it fail at once with "page gone", and no other is sent.
     fn end_agent(&self) {
+        // A page that went plays nothing.
+        self.shared.audio.set_audible(false, &self.shared);
         let link = self.agent.borrow_mut().take();
         if let Some(link) = link {
             link.cdp.on_message(None);
@@ -3034,10 +3057,7 @@ impl<V: NativeView> Host<V> {
         if clipped.size.width <= px(0.) || clipped.size.height <= px(0.) {
             return;
         }
-        // AppKit frames are in window points; GPUI's are divided by the
-        // interface zoom.
-        let zoom = window.content_zoom();
-        let (outer, inner) = (clipped.map(|v| v * zoom), bounds.map(|v| v * zoom));
+        let (outer, frame) = native_frame(bounds, clipped, window.content_zoom());
         let y = f64::from(outer.origin.y);
         let (width, height) = (f64::from(outer.size.width), f64::from(outer.size.height));
         let y = if parent.isFlipped() {
@@ -3049,13 +3069,6 @@ impl<V: NativeView> Host<V> {
             NSPoint::new(f64::from(outer.origin.x), y),
             NSSize::new(width, height),
         );
-        // The page keeps its full size while the clip follows GPUI's mask.
-        let frame = monocode_cef::Frame {
-            x: f64::from(inner.left() - outer.left()),
-            y: f64::from(inner.top() - outer.top()),
-            width: f64::from(inner.size.width),
-            height: f64::from(inner.size.height),
-        };
 
         let mut slot = self.view.borrow_mut();
         if slot.is_none() {
@@ -3094,6 +3107,29 @@ impl<V: NativeView> Host<V> {
         hosted.clip.setFrame(rect);
         hosted.view.set_frame(frame);
     }
+}
+
+/// Where a page laid out at `bounds`, shown within `clipped`, goes in
+/// AppKit: its clip in window points, and the page's frame inside the clip.
+/// AppKit counts points, GPUI's pixels are points divided by the interface
+/// scale (`content_zoom`, 90% by default): a page 482 px tall in GPUI's
+/// layout is 434 points, which Chromium takes as 434 CSS pixels at 100%
+/// page zoom. The page keeps its full size while the clip follows GPUI's
+/// mask.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn native_frame(
+    bounds: Bounds<Pixels>,
+    clipped: Bounds<Pixels>,
+    zoom: f32,
+) -> (Bounds<Pixels>, monocode_cef::Frame) {
+    let (outer, inner) = (clipped.map(|v| v * zoom), bounds.map(|v| v * zoom));
+    let frame = monocode_cef::Frame {
+        x: f64::from(inner.left() - outer.left()),
+        y: f64::from(inner.top() - outer.top()),
+        width: f64::from(inner.size.width),
+        height: f64::from(inner.size.height),
+    };
+    (outer, frame)
 }
 
 impl<V> Drop for Host<V> {
@@ -3476,6 +3512,11 @@ mod monocode_cef {
         pub fn zoom_level(&self) -> f64 {
             0.
         }
+        pub fn set_audio_muted(&self, _: bool) {}
+        pub fn is_audio_muted(&self) -> bool {
+            false
+        }
+        pub fn print(&self) {}
         pub fn close(&self) {}
     }
 }
@@ -3502,6 +3543,26 @@ mod tests {
         // Not measured yet.
         assert_eq!(devtools_height(300, 0.), 300.);
         assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
+    }
+
+    #[test]
+    fn a_page_is_placed_in_points_the_interface_scale_makes_of_its_layout() {
+        let at = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: gpui::point(px(x), px(y)),
+            size: gpui::size(px(w), px(h)),
+        };
+        // Docked DevTools' page, 482 px tall in GPUI's layout at the default
+        // 90% interface scale: 433.8 points, which is the 434 CSS pixels its
+        // `innerHeight` says. Not a gap (phase-3-done.md).
+        let page = at(200., 100., 1000., 482.);
+        let (clip, frame) = native_frame(page, page, 0.9);
+        assert!((f32::from(clip.size.height) - 433.8).abs() < 0.01);
+        assert!((frame.height - 433.8).abs() < 0.01);
+        assert_eq!((frame.x, frame.y), (0., 0.));
+        // Cut by a mask from above, the page keeps its size inside its clip.
+        let (clip, frame) = native_frame(page, at(200., 150., 1000., 432.), 1.);
+        assert_eq!(f32::from(clip.size.height), 432.);
+        assert_eq!((frame.y, frame.height), (-50., 482.));
     }
 
     #[test]
@@ -3856,6 +3917,12 @@ mod tests {
         assert_eq!(
             devtools_ask(&BrowserEvent::Title("DevTools".into())),
             DevToolsAsk::Ignore
+        );
+        // "Send to Agent" there sends what their Elements panel selected,
+        // not what is under the pointer in them.
+        assert_eq!(
+            devtools_ask(&BrowserEvent::GrabAt { x: 4, y: 9 }),
+            DevToolsAsk::GrabSelected
         );
         // No dock-side menu: the frontend is not told it can dock.
         assert!(!devtools_frontend_url("127.0.0.1:1/t", "A").contains("can_dock"));

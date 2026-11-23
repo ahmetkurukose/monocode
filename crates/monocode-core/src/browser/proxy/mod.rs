@@ -111,6 +111,14 @@ pub fn devtools_base(scope: &Scope) -> Result<String, String> {
     Ok(base.strip_prefix("http://").unwrap_or(&base).to_owned())
 }
 
+/// The app's docked DevTools frontend's own DevTools session on the page
+/// whose channel is `cdp`, the latest if several: what it selected in its
+/// Elements panel is `$0` there, and only there (`DOM.setInspectedNode` is
+/// per session). Main thread.
+pub fn devtools_session(cdp: &Rc<super::CdpClient>) -> Option<String> {
+    hub::internal_session(cdp)
+}
+
 /// The listener, started on first use.
 fn server() -> Result<Arc<Server>, String> {
     let mut slot = SERVER.lock().unwrap_or_else(PoisonError::into_inner);

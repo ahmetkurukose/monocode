@@ -162,6 +162,8 @@ impl AssetSource for Assets {
    "message-square"=>include_bytes!("../assets/hugeicons/message-square.svg"),
    "bot"=>include_bytes!("../assets/hugeicons/bot.svg"),
    "globe"=>include_bytes!("../assets/hugeicons/globe.svg"),
+   "volume-high"=>include_bytes!("../assets/hugeicons/volume-high.svg"),
+   "volume-off"=>include_bytes!("../assets/hugeicons/volume-off.svg"),
    "ghost"=>include_bytes!("../assets/hugeicons/ghost.svg"),
    "arrow-left"=>include_bytes!("../assets/hugeicons/arrow-left.svg"),
    "rotate-ccw"=>include_bytes!("../assets/hugeicons/rotate-ccw.svg"),

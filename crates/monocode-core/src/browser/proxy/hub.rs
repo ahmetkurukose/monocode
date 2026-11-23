@@ -211,6 +211,8 @@ struct State {
 struct Client {
     host: Rc<dyn Host>,
     scope: Scope,
+    /// The app's own DevTools frontend (`super::devtools_base`).
+    internal: bool,
     context: String,
     browser_id: String,
     kind: Kind,
@@ -639,7 +641,9 @@ pub(super) fn close_page(
 // WebSocket clients.
 
 /// A client connected: from now on its messages come to [`message`]. The
-/// future runs while the client is connected.
+/// future runs while the client is connected. `internal`: the app's own
+/// DevTools frontend.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn open(
     host: Rc<dyn Host>,
     id: u64,
@@ -647,11 +651,13 @@ pub(super) fn open(
     context: String,
     browser_id: String,
     kind: Kind,
+    internal: bool,
     out: mpsc::Sender<Input>,
 ) -> LocalBoxFuture<'static, ()> {
     let client = Rc::new(Client {
         host,
         scope,
+        internal,
         context,
         browser_id,
         state: RefCell::new(State {
@@ -695,6 +701,25 @@ pub(super) fn open(
         future::join(future::join_all(started), watch(client)).await;
     }
     .boxed_local()
+}
+
+/// The own session of the latest internal page client (the app's docked
+/// DevTools) on the page whose channel is `cdp`.
+pub(super) fn internal_session(cdp: &Rc<CdpClient>) -> Option<String> {
+    CLIENTS.with_borrow(|clients| {
+        (clients.iter())
+            .filter(|(_, client)| client.internal && matches!(client.kind, Kind::Page(_)))
+            .filter_map(|(id, client)| {
+                let state = client.state.borrow();
+                let root = state.root.as_ref()?;
+                (Rc::ptr_eq(&root.cdp, cdp) && !state.closed)
+                    .then(|| root.own.clone())
+                    .flatten()
+                    .map(|own| (*id, own))
+            })
+            .max_by_key(|(id, _)| *id)
+            .map(|(_, own)| own)
+    })
 }
 
 /// One message of client `id`.
