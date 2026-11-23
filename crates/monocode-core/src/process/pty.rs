@@ -10,14 +10,16 @@
 //! `posix_spawn` can start the session (`POSIX_SPAWN_SETSID`) but runs its
 //! file actions before it, so no file action can make the PTY controlling
 //! (a `dup2` never does, and an `open` happens while the child is still in
-//! this process's session). So the child is this executable in a trampoline
-//! mode: [`TRAMPOLINE`] runs as an image initializer, before `main`, takes
-//! the PTY on fd 0 as its controlling terminal and `execve`s the program in
-//! place. Nothing forks: posix_spawn, then two execs in the same process, so
-//! the pid callers get is the program's.
+//! this process's session; with either, `tcgetpgrp` fails in the child). So
+//! the child is this executable in a trampoline mode: [`TRAMPOLINE`] runs as
+//! an image initializer, before `main`, takes the PTY on fd 0 as its
+//! controlling terminal and `execve`s the program in place. Nothing forks:
+//! posix_spawn, then one more exec in the same process, so the pid callers
+//! get is the program's. (node-pty's `spawn-helper` does the same with a
+//! separate executable.)
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -38,6 +40,47 @@ extern "C" {
     ) -> c_int;
 }
 
+/// A new PTY sized `size`: its controller side and its user side, both
+/// close-on-exec, and neither this process's controlling terminal (opened
+/// with `O_NOCTTY`: an app that leads a session without one, as launchd
+/// starts it, would otherwise take the user side, and then the child could
+/// not).
+pub fn openpty(size: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
+    // SAFETY: plain calls on the fds opened here, owned right after; the
+    // name buffer is the 128 bytes TIOCPTYGNAME writes.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if master < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let master = OwnedFd::from_raw_fd(master);
+        let fd = master.as_raw_fd();
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == -1
+            || libc::grantpt(fd) == -1
+            || libc::unlockpt(fd) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // ptsname's buffer is shared by every thread; this is its ioctl.
+        let mut name = [0 as c_char; 128];
+        if libc::ioctl(fd, libc::TIOCPTYGNAME as _, name.as_mut_ptr()) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
+        if slave < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slave = OwnedFd::from_raw_fd(slave);
+        if libc::ioctl(fd, libc::TIOCSWINSZ, size as *const libc::winsize) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((master, slave))
+    }
+}
+
 /// Start `program` with `args` on the PTY whose user side is `tty`: fds 0, 1
 /// and 2 are the PTY and no other descriptor is inherited, in a session of
 /// its own with the PTY as controlling terminal, with an empty signal mask
@@ -56,7 +99,16 @@ pub fn spawn(
         .find(|(key, _)| key == "PATH")
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
+    let cwd = cwd.filter(|dir| dir.is_dir());
     let resolved = super::program_on_path(program, &path);
+    // A relative path (`./gradlew`) names a file in the child's directory,
+    // as it did when the child changed directory before its exec.
+    let resolved = match cwd {
+        Some(dir) if resolved.is_relative() && program.as_bytes().contains(&b'/') => {
+            dir.join(resolved)
+        }
+        _ => resolved,
+    };
     // The trampoline could only report a missing program inside the
     // terminal; fail here like a direct spawn would.
     if !super::is_executable(&resolved) {
@@ -65,6 +117,9 @@ pub fn spawn(
             format!("{} was not found", resolved.display()),
         ));
     }
+    // A user side on 0, 1 or 2 would be replaced by its own first dup2;
+    // a duplicate is above them (and close-on-exec, like every fd here).
+    let tty = tty.try_clone_to_owned()?;
     let trampoline = trampoline_executable();
     let mut argv = Vec::with_capacity(args.len() + 4);
     if let Some(exe) = &trampoline {
@@ -85,10 +140,7 @@ pub fn spawn(
             c_string(&pair)
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let cwd = cwd
-        .filter(|dir| dir.is_dir())
-        .map(|dir| c_string(dir.as_os_str()))
-        .transpose()?;
+    let cwd = cwd.map(|dir| c_string(dir.as_os_str())).transpose()?;
     let image = match &trampoline {
         Some(exe) => c_string(exe.as_os_str())?,
         None => c_string(resolved.as_os_str())?,
@@ -155,7 +207,8 @@ fn trampoline_executable() -> Option<PathBuf> {
     // The initializer lives in this object file; using it keeps the linker
     // from leaving it out of a binary that only calls `spawn`.
     std::hint::black_box(&TRAMPOLINE);
-    match std::env::current_exe() {
+    // Absolute: the child changes directory before it execs.
+    match std::env::current_exe().and_then(std::fs::canonicalize) {
         Ok(exe) if super::is_executable(&exe) => Some(exe),
         other => {
             eprintln!("pty: no trampoline ({other:?}); the child has no controlling terminal");
@@ -182,9 +235,11 @@ fn check(code: c_int) -> io::Result<()> {
 }
 
 /// dyld calls the initializers in `__mod_init_func` with argc, argv and
-/// envp before `main`, in the app and in test binaries alike.
+/// envp before `main`, in the app and in test binaries alike. The section
+/// type `mod_init_funcs` is what makes dyld call them (std's own
+/// initializer is declared the same way).
 #[used]
-#[link_section = "__DATA,__mod_init_func"]
+#[link_section = "__DATA,__mod_init_func,mod_init_funcs"]
 static TRAMPOLINE: extern "C" fn(c_int, *const *const c_char, *const *const c_char) = trampoline;
 
 /// Runs before `main` in every process of this executable; does nothing
@@ -238,7 +293,7 @@ unsafe fn report(message: &[u8]) {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
     /// A PTY's controller side and, until a child is started, its user side.
@@ -249,32 +304,22 @@ mod tests {
     }
 
     fn open() -> Pty {
-        let (mut master, mut slave) = (-1, -1);
-        let mut size = libc::winsize {
+        let size = libc::winsize {
             ws_row: 24,
             ws_col: 80,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: valid out-pointers; the fds are owned right after.
+        let (master, slave) = openpty(&size).expect("a PTY");
+        // SAFETY: flags of our own fd.
         unsafe {
-            let opened = libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut size,
-            );
-            assert_eq!(opened, 0);
-            for fd in [master, slave] {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
-            Pty {
-                master: std::fs::File::from_raw_fd(master),
-                slave: Some(OwnedFd::from_raw_fd(slave)),
-                out: String::new(),
-            }
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Pty {
+            master: std::fs::File::from(master),
+            slave: Some(slave),
+            out: String::new(),
         }
     }
 
@@ -372,12 +417,19 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_tty_cwd_env_and_exit_status() {
+    fn pty_spawn_round_trip_tty_cwd_env_and_exit_status() {
         let mut pty = open();
         let script = "tty; pwd; echo \"env:$MONO_PTY_TEST\"; \
                       echo \"tpgid:$(ps -o tpgid= -p $$ | tr -d ' ')\"; \
                       read line; echo \"got:$line\"; exit 7";
         let pid = pty.spawn("/bin/sh", &["-c", script], &[("MONO_PTY_TEST", "yes")]);
+        // It leads a session and a process group of its own, as callers
+        // that signal the group rely on.
+        // SAFETY: plain queries about our own child, not yet reaped.
+        unsafe {
+            assert_eq!(libc::getsid(pid as libc::pid_t), pid as libc::pid_t);
+            assert_eq!(libc::getpgid(pid as libc::pid_t), pid as libc::pid_t);
+        }
         assert!(pty.read_until(Some("tpgid:")), "{}", pty.out);
         pty.write(b"hello\n");
         assert!(pty.read_until(Some("got:hello")), "{}", pty.out);
@@ -391,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_name_is_found_on_the_childs_path_and_a_missing_one_fails() {
+    fn pty_spawn_a_bare_name_is_found_on_the_childs_path_and_a_missing_one_fails() {
         let pty = open();
         let missing = spawn(
             pty.slave.as_ref().unwrap().as_fd(),
@@ -408,7 +460,31 @@ mod tests {
     }
 
     #[test]
-    fn only_the_terminal_is_inherited() {
+    fn pty_spawn_a_relative_program_is_found_in_the_childs_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("monocode-pty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho relative-ok\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut pty = open();
+        let slave = pty.slave.take().unwrap();
+        let pid = spawn(
+            slave.as_fd(),
+            OsStr::new("./run.sh"),
+            &[],
+            &env(&[]),
+            Some(dir.as_path()),
+        )
+        .expect("spawned");
+        drop(slave);
+        assert!(pty.read_until(Some("relative-ok")), "{}", pty.out);
+        assert_eq!(wait(pid), Some(0), "{}", pty.out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pty_spawn_only_the_terminal_is_inherited() {
         let mut pty = open();
         // A descriptor without close-on-exec, as a careless library leaves.
         // SAFETY: duplicating our own fd.
@@ -430,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn signals_start_unblocked_even_from_a_masking_thread() {
+    fn pty_spawn_signals_start_unblocked_even_from_a_masking_thread() {
         // A GUI executor's thread may block signals; the child must not.
         let (pid, mut pty) = std::thread::spawn(|| {
             // SAFETY: this thread's own mask.
@@ -459,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_interrupts_the_foreground_job_of_an_interactive_shell() {
+    fn pty_spawn_ctrl_c_interrupts_the_foreground_job_of_an_interactive_shell() {
         let mut pty = open();
         let pid = pty.spawn("/bin/zsh", &["-f", "-i"], &[("PS1", "prompt> ")]);
         assert!(pty.read_until(Some("prompt> ")), "{}", pty.out);
@@ -467,7 +543,11 @@ mod tests {
         // Job control: sleep runs in a group of its own, in the foreground.
         let deadline = Instant::now() + Duration::from_secs(10);
         while pty.foreground() == pid as i32 || pty.foreground() <= 0 {
-            assert!(Instant::now() < deadline, "no foreground job: {:?}", pty.out);
+            assert!(
+                Instant::now() < deadline,
+                "no foreground job: {:?}",
+                pty.out
+            );
             pty.pump();
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -490,7 +570,26 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_sends_sigwinch() {
+    fn pty_spawn_a_signal_to_the_group_ends_the_child() {
+        let mut pty = open();
+        let pid = pty.spawn("/bin/sh", &["-c", "echo ready; /bin/sleep 30"], &[]);
+        assert!(pty.read_until(Some("ready")), "{}", pty.out);
+        // SAFETY: our own child's group.
+        assert_eq!(
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        // `wait` reports a signal as None, and also kills a child still
+        // there after 10 seconds; the time tells the two apart.
+        let started = Instant::now();
+        assert_eq!(wait(pid), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The sleep was in the group too: nothing holds the terminal open.
+        assert!(pty.read_until(None), "{}", pty.out);
+    }
+
+    #[test]
+    fn pty_spawn_a_resize_sends_sigwinch() {
         let mut pty = open();
         let script = "trap 'echo \"winch:$(stty size)\"; exit 0' WINCH; \
                       echo ready; while :; do /bin/sleep 0.05; done";
@@ -508,4 +607,3 @@ mod tests {
         assert_eq!(wait(pid), Some(0), "{}", pty.out);
     }
 }
-

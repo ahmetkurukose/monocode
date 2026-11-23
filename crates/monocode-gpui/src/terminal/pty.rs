@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -145,28 +145,9 @@ pub(crate) fn new(
 }
 
 /// Both sides of a new PTY, close-on-exec (the child gets the user side
-/// through its file actions only).
+/// through its file actions only), neither this app's controlling terminal.
 fn openpty(window_size: WindowSize) -> io::Result<(OwnedFd, OwnedFd)> {
-    let (mut master, mut slave) = (-1, -1);
-    let mut size = to_winsize(window_size);
-    // SAFETY: valid out-pointers; the fds are owned right after.
-    unsafe {
-        if libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let (master, slave) = (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave));
-        for fd in [&master, &slave] {
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        Ok((master, slave))
-    }
+    monocode_core::process::pty::openpty(&to_winsize(window_size))
 }
 
 /// USER and HOME from the environment, else from the password database.
@@ -192,9 +173,8 @@ fn user_and_home() -> (String, String) {
         if found.is_null() {
             (String::new(), String::new())
         } else {
-            let text = |p: *const libc::c_char| {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            };
+            let text =
+                |p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
             (text(entry.pw_name), text(entry.pw_dir))
         }
     };
@@ -313,30 +293,32 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn the_terminal_child_gets_its_pty_environment_and_exit_status() {
-        let env = HashMap::from([("MONO_PTY_TEST".to_owned(), "yes".to_owned())]);
-        let size = WindowSize {
-            num_lines: 24,
-            num_cols: 80,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        let script = "tty; pwd; echo \"env:$MONO_PTY_TEST window:$WINDOWID\"; \
-                      echo \"size:$(stty size)\"; exit 5";
-        let mut pty = new(
+    const SIZE: WindowSize = WindowSize {
+        num_lines: 24,
+        num_cols: 80,
+        cell_width: 8,
+        cell_height: 16,
+    };
+
+    fn sh(script: &str, env: &HashMap<String, String>) -> Pty {
+        new(
             "/bin/sh",
             &["-c".to_owned(), script.to_owned()],
-            &env,
+            env,
             Path::new("/private/tmp"),
-            size,
+            SIZE,
             42,
         )
-        .expect("spawned");
+        .expect("spawned")
+    }
+
+    /// Output until `needle` was seen, or until the child hung up when
+    /// `needle` is None, for at most 10 seconds.
+    fn read(pty: &mut Pty, needle: Option<&str>) -> String {
         let mut out = String::new();
         let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
+        while Instant::now() < deadline && !needle.is_some_and(|n| out.contains(n)) {
             match pty.reader().read(&mut buf) {
                 Ok(n) if n > 0 => out.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -346,11 +328,59 @@ mod tests {
                 _ => break,
             }
         }
+        out
+    }
+
+    #[test]
+    fn pty_spawn_terminal_child_gets_its_pty_environment_and_exit_status() {
+        let env = HashMap::from([("MONO_PTY_TEST".to_owned(), "yes".to_owned())]);
+        let script = "tty; pwd; echo \"env:$MONO_PTY_TEST window:$WINDOWID\"; \
+                      echo \"size:$(stty size)\"; exit 5";
+        let mut pty = sh(script, &env);
+        let out = read(&mut pty, None);
         assert!(out.contains("/dev/ttys"), "{out}");
         assert!(out.contains("/private/tmp"), "{out}");
         assert!(out.contains("env:yes window:42"), "{out}");
         assert!(out.contains("size:24 80"), "{out}");
-        pty.child.wait();
-        assert_eq!(pty.child.status.and_then(|s| s.code()), Some(5));
+        // alacritty's event loop learns of the exit through the SIGCHLD pipe.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let event = loop {
+            if let Some(event) = pty.next_child_event() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "no child event");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let ChildEvent::Exited(status) = event;
+        assert_eq!(status.and_then(|s| s.code()), Some(5));
+    }
+
+    #[test]
+    fn pty_spawn_terminal_resize_reaches_the_child() {
+        let script = "trap 'echo \"winch:$(stty size)\"; exit 0' WINCH; \
+                      echo ready; while :; do /bin/sleep 0.05; done";
+        let mut pty = sh(script, &HashMap::new());
+        assert!(read(&mut pty, Some("ready")).contains("ready"));
+        pty.on_resize(WindowSize {
+            num_lines: 30,
+            num_cols: 90,
+            ..SIZE
+        });
+        let out = read(&mut pty, Some("winch:30 90"));
+        assert!(out.contains("winch:30 90"), "{out}");
+    }
+
+    #[test]
+    fn pty_spawn_closing_the_terminal_hangs_up_on_the_child() {
+        let mut pty = sh("echo ready; /bin/sleep 30", &HashMap::new());
+        assert!(read(&mut pty, Some("ready")).contains("ready"));
+        let pid = pty.child().id() as libc::pid_t;
+        let started = Instant::now();
+        // SIGHUP, then reaped.
+        drop(pty);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // SAFETY: probing a pid; it was reaped, so nothing of ours is hit.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the shell outlived its terminal");
     }
 }
