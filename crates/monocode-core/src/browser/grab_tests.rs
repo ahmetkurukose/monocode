@@ -405,3 +405,25 @@ fn the_element_selected_in_devtools_is_read_in_their_session_and_grabbed_in_ours
     let text = grab_inspected(cdp, "DT").now_or_never().unwrap();
     assert!(text.is_err_and(|e| e.contains("not an element")));
 }
+
+#[test]
+fn a_grab_masks_the_sites_saved_passwords() {
+    let element = Element {
+        text: "Your password is hunter22".into(),
+        nearby: vec!["copy hunter22".into()],
+        html: "<p>hunter22</p>".into(),
+        attributes: vec![("title".into(), "hunter22".into())],
+        ..Default::default()
+    };
+    let grab = Grab {
+        element,
+        image: None,
+    }
+    .masked(&["hunter22".to_owned()]);
+    let markdown = grab.markdown();
+    assert!(!markdown.contains("hunter22"), "{markdown}");
+    assert!(markdown.contains("••••"));
+    // And values of fields never leave the page at all.
+    assert_eq!(redact_attribute("value", "hunter22"), "[redacted]");
+    assert!(!redact_html(r#"<input type="password" value="hunter22">"#).contains("hunter22"));
+}

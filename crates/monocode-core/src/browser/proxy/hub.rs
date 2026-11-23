@@ -960,6 +960,13 @@ async fn attach(
     Ok(session)
 }
 
+/// A call of one of the app's bindings (`__monocode…`), which only the
+/// app's own session hears.
+fn is_own_binding(event: &CdpEvent) -> bool {
+    event.method == "Runtime.bindingCalled"
+        && (event.params["name"].as_str()).is_some_and(|n| n.starts_with("__monocode"))
+}
+
 /// A page event, as the client of one session should see it, if at all.
 fn route_event(
     event: &CdpEvent,
@@ -974,6 +981,11 @@ fn route_event(
         let about_self =
             event.params["targetInfo"]["targetId"] == target || event.params["targetId"] == target;
         if own.is_none() && event.method.starts_with("Target.") && about_self {
+            return None;
+        }
+        // Nor the app's own bindings: the password watcher reports what
+        // the user signs in with (K57).
+        if own.is_none() && is_own_binding(event) {
             return None;
         }
         visible.map(str::to_owned)
@@ -1735,5 +1747,25 @@ fn forward(
     );
     if !sent {
         client.reply(request, Err(failed("Target closed")));
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_session_never_hears_the_apps_bindings() {
+        let event = |name: &str| CdpEvent {
+            method: "Runtime.bindingCalled".into(),
+            params: json!({"name": name, "payload": "{\"password\":\"pw\"}"}),
+            session_id: None,
+        };
+        let children = RefCell::new(HashSet::new());
+        let ours = event("__monocodePasswordsReport");
+        assert!(route_event(&ours, &None, Some("S"), &children, "T").is_none());
+        // The client's own bindings it hears.
+        let theirs = event("clientBinding");
+        assert!(route_event(&theirs, &None, Some("S"), &children, "T").is_some());
     }
 }

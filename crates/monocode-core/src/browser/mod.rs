@@ -8,6 +8,7 @@
 //! - [`audio`]: whether a page plays sound, for its tab.
 //! - [`history`]: browsing history, kept per project (K55, K65).
 //! - [`dev_servers`]: a project's running dev servers, for the new tab page (K66).
+//! - [`passwords`]: the password vault, sign-in capture and autofill (K56, K57).
 //! - [`tools`]: the tool set and its implementation over [`host`].
 //! - [`bridge`]: the MCP server: loopback listener, session tokens, the
 //!   `browser-mcp` stdio subcommand, provider wiring.
@@ -26,6 +27,7 @@ pub mod grab;
 pub mod history;
 pub mod host;
 pub mod log;
+pub mod passwords;
 pub mod proxy;
 pub mod sites;
 pub mod tools;

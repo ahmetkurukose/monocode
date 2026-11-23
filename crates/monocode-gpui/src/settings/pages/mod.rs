@@ -9,6 +9,7 @@ mod keybindings;
 mod mcp;
 mod mobile;
 mod monos;
+mod passwords;
 mod providers;
 mod site_permissions;
 mod skills;
@@ -20,6 +21,7 @@ pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::{command_shortcut, shortcut_label};
 pub(super) use mobile::MobileState;
+pub(super) use passwords::PasswordsState;
 
 use super::{Section, SettingsView};
 use gpui::{AnyElement, Context, Window};
@@ -38,6 +40,7 @@ impl SettingsView {
             Section::Appearance => self.appearance_page(window, cx),
             Section::Terminal => self.terminal_page(cx),
             Section::Keybindings => self.keybindings_page(cx),
+            Section::Passwords => self.passwords_page(window, cx),
             Section::Chat => self.chat_page(cx),
             Section::Providers => self.providers_page(cx),
             Section::Mcp => self.mcp_page(cx),

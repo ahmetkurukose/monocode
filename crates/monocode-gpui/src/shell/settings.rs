@@ -681,6 +681,7 @@ mod tests {
             "settings-nav-appearance",
             "settings-nav-terminal",
             "settings-nav-keybindings",
+            "settings-nav-passwords",
             "settings-nav-chat",
             "settings-nav-providers",
             "settings-nav-mcp",
