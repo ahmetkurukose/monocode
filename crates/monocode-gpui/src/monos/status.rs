@@ -72,7 +72,10 @@ impl Status {
         awake: crate::keep_awake::Status,
         run: Rc<dyn Fn(&str)>,
     ) {
-        let signature = format!("{monos:?} {:?} {}", awake.mode, awake.active);
+        let signature = format!(
+            "{monos:?} {:?} {} {}",
+            awake.mode, awake.active, awake.on_battery
+        );
         if self.signature == signature {
             return;
         }
@@ -135,6 +138,13 @@ fn keep_awake_item(
             let _: () = msg_send![&*choice, setState: state];
         }
         menu.addItem(&choice);
+    }
+    if let Some(warning) = awake.lid_warning() {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let note = NSMenuItem::new(mtm);
+        note.setTitle(&NSString::from_str(warning));
+        note.setEnabled(false);
+        menu.addItem(&note);
     }
     item.setSubmenu(Some(&menu));
     item
