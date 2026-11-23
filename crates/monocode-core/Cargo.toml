@@ -51,6 +51,10 @@ mongodb = "3"
 # handshake is ours, so no `handshake` feature.
 tungstenite = { version = "0.30", default-features = false }
 sha1 = "0.10"
+# Importing cookies and passwords from Chrome, Arc and Brave (browser::import, K61).
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }

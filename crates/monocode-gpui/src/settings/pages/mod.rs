@@ -1,6 +1,7 @@
 //! One file per Settings page, each a port of its SettingsView.tsx function.
 mod appearance;
 mod archive;
+mod browser_import;
 mod chat;
 mod connections;
 mod general;
@@ -16,6 +17,7 @@ mod terminal;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
+pub(crate) use browser_import::ImportPanel;
 pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use connections::ConnectionsState;
 pub(crate) use keybindings::{command_shortcut, shortcut_label};

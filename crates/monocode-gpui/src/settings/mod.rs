@@ -60,6 +60,9 @@ pub(crate) struct SettingsContext {
     pub cwd: String,
     /// Whose external CDP endpoint "Copy endpoint" copies (K27).
     pub browser_scope: Option<monocode_core::browser::Scope>,
+    /// The project browses with its own profile (K15), which an import
+    /// may go into.
+    pub browser_project_isolated: bool,
     pub project_label: String,
     pub archived: Vec<ArchivedSession>,
     /// Projects archived from the rail, as (path, label).
@@ -102,6 +105,7 @@ impl PartialEq for SettingsContext {
             && self.new_layout_boxy == other.new_layout_boxy
             && self.cwd == other.cwd
             && self.browser_scope == other.browser_scope
+            && self.browser_project_isolated == other.browser_project_isolated
             && self.project_label == other.project_label
             && self.archived == other.archived
             && self.archived_projects == other.archived_projects
@@ -296,6 +300,8 @@ pub(crate) struct SettingsView {
     mobile: pages::MobileState,
     /// What "Copy endpoint" last said: copied, or why not.
     browser_endpoint: Option<Result<(), String>>,
+    /// "Import from another browser" (K61).
+    browser_import: pages::ImportPanel,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -447,6 +453,7 @@ impl SettingsView {
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
             browser_endpoint: None,
+            browser_import: pages::ImportPanel::default(),
             _subscriptions: subscriptions,
         };
         this.watch_mobile(cx);

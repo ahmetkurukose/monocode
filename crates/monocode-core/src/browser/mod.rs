@@ -7,6 +7,7 @@
 //! - [`grab`]: the element grab, a picked element for an agent (K49).
 //! - [`audio`]: whether a page plays sound, for its tab.
 //! - [`history`]: browsing history, kept per project (K55, K65).
+//! - [`import`]: cookies and passwords from Chrome, Arc and Brave (K61).
 //! - [`dev_servers`]: a project's running dev servers, for the new tab page (K66).
 //! - [`tools`]: the tool set and its implementation over [`host`].
 //! - [`bridge`]: the MCP server: loopback listener, session tokens, the
@@ -25,6 +26,7 @@ pub mod dev_servers;
 pub mod grab;
 pub mod history;
 pub mod host;
+pub mod import;
 pub mod log;
 pub mod proxy;
 pub mod sites;

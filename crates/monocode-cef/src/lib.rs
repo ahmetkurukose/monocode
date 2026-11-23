@@ -12,6 +12,7 @@ pub mod view;
 mod capture;
 mod certs;
 mod context_menu;
+mod cookies;
 mod devtools;
 
 mod dialogs;
@@ -22,6 +23,7 @@ mod permissions;
 mod popup;
 mod profile;
 
+pub use cookies::{CookieWrite, NewCookie, SameSite as CookieSameSite, set_cookies};
 pub use devtools::{DevToolsAttachment, DevToolsSink};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{

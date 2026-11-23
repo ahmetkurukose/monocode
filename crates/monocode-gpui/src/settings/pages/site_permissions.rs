@@ -7,7 +7,7 @@ use monocode_core::browser::sites::{self, Setting};
 
 impl SettingsView {
     /// Where the browser keeps its profiles in this data mode.
-    fn browser_root(&self) -> Option<std::path::PathBuf> {
+    pub(in crate::settings) fn browser_root(&self) -> Option<std::path::PathBuf> {
         let store = self.ctx.store.as_ref()?;
         let store = crate::runtime::locked(&store.0).ok()?;
         Some(store.data_dir()?.join("Browser"))

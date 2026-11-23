@@ -349,6 +349,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser website camera microphone location geolocation notifications clipboard midi allow block reset privacy",
     ),
     (
+        "browser-import",
+        Section::General,
+        "Import from another browser",
+        "browser chrome arc brave import cookies passwords logins sign in migrate bring",
+    ),
+    (
         "file-word-wrap",
         Section::General,
         "Word wrap",

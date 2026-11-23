@@ -129,6 +129,9 @@ impl Shell {
             classic: self.workspace.classic_layout,
             new_layout_boxy: self.workspace.new_layout_boxy,
             browser_scope: self.browser_endpoint_scope(),
+            browser_project_isolated: !self.workspace.project.is_empty()
+                && (self.workspace.browser_isolated_projects)
+                    .contains(&monocode_core::files::path_key(&self.workspace.project)),
             cwd: self.workspace.project.clone(),
             project_label: self.project_label(&self.workspace.project),
             archived,

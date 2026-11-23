@@ -255,6 +255,7 @@ impl SettingsView {
                 )],
             ));
             workspace.extend(self.site_permission_rows(cx));
+            workspace.extend(self.browser_import_rows(cx));
             let memory_saver = p.browser_memory_saver.to_string();
             workspace.push(self.row(
                 Some("browser-memory-saver"),

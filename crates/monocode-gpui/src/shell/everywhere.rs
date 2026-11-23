@@ -297,6 +297,26 @@ impl Shell {
                 }),
             });
         }
+        // Settings' import rows, opened and in view (K61).
+        if cfg!(target_os = "macos") {
+            let weak = weak.clone();
+            items.push(ActionItem {
+                id: "Browser: Import from Another Browser…".into(),
+                group: "Browser".into(),
+                title: "Import from Another Browser…".into(),
+                keys: None,
+                note: Some("Chrome, Arc or Brave: cookies and passwords".into()),
+                glyph: "globe",
+                run: Rc::new(move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.open_settings(crate::settings::Section::General, window, cx);
+                        if let Some(settings) = this.settings.clone() {
+                            settings.update(cx, |view, cx| view.open_browser_import(cx));
+                        }
+                    });
+                }),
+            });
+        }
         // What the code features offer right now (run configurations…).
         let scope = crate::code_shell::context::scope(self.working_copy(), cx);
         for command in crate::code_shell::commands::commands(&scope, cx) {

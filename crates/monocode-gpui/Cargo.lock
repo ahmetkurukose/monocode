@@ -4417,8 +4417,10 @@ dependencies = [
 name = "monocode-core"
 version = "0.16.0"
 dependencies = [
+ "aes",
  "async-channel",
  "base64 0.22.1",
+ "cbc",
  "chrono",
  "flate2",
  "futures-executor",
@@ -4433,6 +4435,7 @@ dependencies = [
  "mongodb",
  "monocode-mobile-link",
  "natpmp",
+ "pbkdf2 0.12.2",
  "quinn",
  "rand 0.9.5",
  "regex",

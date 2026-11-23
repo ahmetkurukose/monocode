@@ -42,6 +42,7 @@ pub(crate) mod lifecycle;
 pub(crate) use grab::ToggleGrab;
 pub(crate) mod history;
 pub(crate) mod history_view;
+pub(crate) mod import;
 pub(crate) mod new_tab;
 mod suggest;
 
