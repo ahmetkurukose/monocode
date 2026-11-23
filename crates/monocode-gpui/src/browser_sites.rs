@@ -37,14 +37,10 @@ thread_local! {
     /// Hosts whose untrusted certificate was taken this run, local ones
     /// included: their address bar says "Not secure".
     static INSECURE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    static NOTE_SEQ: Cell<u64> = const { Cell::new(0) };
 }
 
 fn next_seq() -> u64 {
-    NOTE_SEQ.with(|s| {
-        s.set(s.get() + 1);
-        s.get()
-    })
+    sites::next_note_seq()
 }
 
 /// The folder of `profile` under the browser root `root`; a throwaway
@@ -867,8 +863,8 @@ impl BrowserPage {
     }
 }
 
-/// The bar's frame.
-fn bar() -> gpui::Stateful<gpui::Div> {
+/// The bar's frame (also the passkey bar's).
+pub(super) fn bar() -> gpui::Stateful<gpui::Div> {
     div()
         .id("browser-site-bar")
         .flex()

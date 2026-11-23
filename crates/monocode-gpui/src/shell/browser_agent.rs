@@ -520,6 +520,22 @@ impl Page for AppPage {
         self.with_page(|page, _| page.cert_block()).flatten()
     }
 
+    fn passkey_notes(&self) -> Vec<monocode_core::browser::passkeys::PasskeyNote> {
+        self.with_page(|page, _| page.passkey_notes())
+            .unwrap_or_default()
+    }
+
+    fn pending_passkey(&self) -> Option<monocode_core::browser::passkeys::PasskeyNote> {
+        self.with_page(|page, _| page.pending_passkey()).flatten()
+    }
+
+    fn cancel_passkey(&self) -> LocalFuture<bool> {
+        match self.with_page(|page, _| page.cancel_passkey()) {
+            Some(cancel) => cancel,
+            None => Box::pin(async { false }),
+        }
+    }
+
     fn expect_download(&self, dir: PathBuf) -> LocalFuture<Result<PathBuf, String>> {
         let page = AppPage {
             cx: self.cx.clone(),

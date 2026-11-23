@@ -309,6 +309,18 @@ Monocode.app (GPUI, Rust)               ← CEF browser process burada (UI threa
   uygulama. Framework de bizim kimliğimizle imzalandığı için
   `disable-library-validation` **gerekmez**.
 - **Lokal build** (ad-hoc veya `MONOCODE_NATIVE_LOCAL_SIGNING`): hardened runtime yok.
+- **Sabit yerel imza (K59, 2026-11-23):** `scripts/bundle-native-macos.sh`,
+  `MONOCODE_NATIVE_SIGNING_IDENTITY` verilmemişse anahtarlıkta "Monocode Local Signing"
+  (`MONOCODE_NATIVE_LOCAL_IDENTITY`) kimliğini arar ve bulursa onunla (SHA-1 hash'iyle) imzalar;
+  yoksa ad-hoc imzalar ve TCC izinlerinin ve "Always Allow"un her build'de düştüğünü yazar.
+  Sertifikayı bir kez `scripts/native-dev-signing-cert.sh` yapar (kendinden imzalı, 10 yıl,
+  yalnız codeSign; `security add-trusted-cert -p codeSign` için macOS şifre sorar). TCC kaydı
+  designated requirement'a (`identifier "dev.usemono.gpui" and certificate leaf = H"…"`) bağlanır,
+  build'den build'e değişmez. Takım kimliği olmadığı için anahtarlık hâlâ `use-mock-keychain`.
+- **TCC sorumluluğu:** terminalden başlatılan uygulama (dev-native dahil) TCC'de *başlatan
+  uygulamaya* yazılır: tccd günlüğünde dev build'lerin bütün mikrofon/kamera sorguları
+  `responsible=/Applications/SOCode.app` idi (bundle id aynı, `dev.usemono.gpui`). İzin testleri
+  Finder/`open` ile açılan bundle'da yapılmalı.
 - **Dağıtım build'i** (Developer ID, `--options runtime`): uygulama
   `crates/monocode-gpui/macos/Entitlements.plist`, helper'lar
   `crates/monocode-cef/macos/Helper.entitlements` (`allow-jit`,
@@ -417,7 +429,8 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 | DevTools yapışması | **Çözüldü (Faz 2, K28):** frontend kendi Alloy view'umuzda, CDP proxy'si üzerinden. |
 | Battery Saver | **Çözüldü (K52, Faz 4'te revize):** Chromium'unki kapalı, arka plan sekmeleri düşük pilde donuyor. Ölçüm: Chromium'un Battery Saver'ı zorlanınca (`state` 3) görünen ve agent sekmesi 30,3 fps; kapalıyken 120 fps. Pil %7'deyken arka plan sekmesinin 1 sn'lik `setInterval`'ı 65 sn durdu (donma), görünen sekme 119,6 fps. Geliştirici kancaları: `MONOCODE_BROWSER_DISCARD_AFTER_SECS`, `MONOCODE_BROWSER_BATTERY_LOW=1`, `MONOCODE_BROWSER_CHROMIUM_BATTERY_SAVER=<0-3>`. |
 | Memory Saver | Ölçüm (K64): 10 sekme (görünen + 7 Wikipedia + form + yerel sayfa), helper'lar 1507 MB / 14 süreç; 8'i discard edilince 461 MB / 6 süreç. Ana süreç 245 → 249 MB. |
-| Passkey QR (hybrid) | **Faz 4 bulgusu:** Gmail'de QR telefonla okutuluyor ama bağlanmıyor. Şüphe: Mac BLE yakınlık sinyalini duyamıyor (ad-hoc imzada TCC Bluetooth izni her build'de düşüyor / bundle'sız çalıştırma). K58, K59. |
+| Passkey QR (hybrid) | **Faz 4b teşhisi (2026-11-23):** BLE taraması Chromium'un *browser* sürecinde (ana uygulama, `device/bluetooth` CoreBluetooth `CBCentralManager`); TCC öznesi ve Info.plist anahtarı ana uygulamanınki, helper'larınki değil. Hybrid için API anahtarı veya özellik bayrağı gerekmez (tünel `cable.ua5v.com`/`cable.auth.com`, telefon seçer). Chromium `v2_discovery.cc`: istek başladığında izin "belirsiz" ise tarama başlamaz; kullanıcı telefonu seçince izin istenir, verilse bile o istekte tarama, klasik Bluetooth gücü değişmediği için hiç başlamaz → QR görünür, telefon okur, bağlanmaz. Ad-hoc imzada izin her build'de (tccd: "Failed to match existing code requirement for subject dev.usemono.gpui") belirsize döndüğü için bu ilk istek hep böyle. Çare: sabit imza (K59) + izin verildikten sonra yeniden denemek. Bant/agent: `browser_passkeys.rs`, `passkeys.rs`; tanı için `MONOCODE_BROWSER_FIDO_LOG=1` (Chromium'un device-log'u `chromium.log`'a). |
+| Mikrofon "takılması" | **Faz 4b teşhisi (2026-11-23):** `getUserMedia({audio})` önce Chromium'un ses servisini (helper) mikrofona dokundurur; macOS izni belirsizse `coreaudiod` TCC sorusunu *o an* açar (tccd: `AUTHREQ_PROMPTING service=kTCCServiceMicrophone`, sorumlu süreç ana uygulama) ve Chromium soru cevaplanana kadar bekler: CEF'in izin callback'i (`permissions.rs`) hiç çağrılmaz, sonraki kamera isteği de kuyrukta bekler. Kod hatası değil: cevapsız macOS sorusu. Önceki denemede uygulama SOCode'un terminalinden açıldığı için soru "SOCode" adına çıkmıştı. Ad-hoc imzada her build'de yeniden sorulur; sabit imza (K59) ile bir kez. |
 | Platform passkey | Apple'ın tarayıcı entitlement'ı olmadan Touch ID / iCloud Keychain ve macOS sistem passkey sağlayıcıları (1Password dahil) kullanılamaz; kapsam dışı. |
 | Başlangıç kilitlenmesi | **Çözüldü (Faz 3):** `setlocale` ↔ `fork()` kilit sırası çakışması; `main`'in başında tek thread'liyken `setlocale`. |
 | Çıkıştan sonra kalan süreç | **Faz 3 bulgusu:** ağır fork yükünde `exec` öncesi takılan fork çocuğu profili tutuyor. Çözüm uygulama geneli: `process.rs`'te `posix_spawn` (ayrı iş). |

@@ -6,6 +6,7 @@
 //! - [`log`]: a page's console and network log (K36).
 //! - [`grab`]: the element grab, a picked element for an agent (K49).
 //! - [`audio`]: whether a page plays sound, for its tab.
+//! - [`passkeys`]: a page's passkey requests (K58).
 //! - [`history`]: browsing history, kept per project (K55, K65).
 //! - [`dev_servers`]: a project's running dev servers, for the new tab page (K66).
 //! - [`tools`]: the tool set and its implementation over [`host`].
@@ -26,6 +27,7 @@ pub mod grab;
 pub mod history;
 pub mod host;
 pub mod log;
+pub mod passkeys;
 pub mod proxy;
 pub mod sites;
 pub mod tools;

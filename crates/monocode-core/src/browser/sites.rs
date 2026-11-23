@@ -229,6 +229,20 @@ pub fn origin_of(url: &str) -> Option<String> {
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
+thread_local! {
+    static NOTE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The next number for a page's notes to agents: permission requests,
+/// certificate stops and passkey requests ([`super::passkeys`]) count
+/// together, so one mark tells which of them are new. Main thread.
+pub fn next_note_seq() -> u64 {
+    NOTE_SEQ.with(|s| {
+        s.set(s.get() + 1);
+        s.get()
+    })
+}
+
 /// A request's record, for the agent that drives the page (K45, K63).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PermissionNote {

@@ -230,6 +230,9 @@ pub struct FakePage {
     pub permission_notes: RefCell<Vec<crate::browser::sites::PermissionNote>>,
     pub waiting_permission: RefCell<Option<crate::browser::sites::PermissionNote>>,
     pub cert_error: RefCell<Option<crate::browser::sites::CertBlock>>,
+    pub passkey_notes: RefCell<Vec<crate::browser::passkeys::PasskeyNote>>,
+    /// The pending passkey request; `cancel_passkey` takes it.
+    pub pending_passkey: Rc<RefCell<Option<crate::browser::passkeys::PasskeyNote>>>,
 }
 
 impl FakePage {
@@ -298,6 +301,8 @@ impl FakePage {
             cold: RefCell::default(),
             permission_notes: RefCell::default(),
             waiting_permission: RefCell::default(),
+            passkey_notes: RefCell::default(),
+            pending_passkey: Rc::default(),
             cert_error: RefCell::default(),
         })
     }
@@ -378,6 +383,19 @@ impl Page for FakePage {
 
     fn cert_error(&self) -> Option<crate::browser::sites::CertBlock> {
         self.cert_error.borrow().clone()
+    }
+
+    fn passkey_notes(&self) -> Vec<crate::browser::passkeys::PasskeyNote> {
+        self.passkey_notes.borrow().clone()
+    }
+
+    fn pending_passkey(&self) -> Option<crate::browser::passkeys::PasskeyNote> {
+        self.pending_passkey.borrow().clone()
+    }
+
+    fn cancel_passkey(&self) -> LocalBoxFuture<'static, bool> {
+        let pending = self.pending_passkey.clone();
+        Box::pin(async move { pending.borrow_mut().take().is_some() })
     }
 
     fn expect_download(&self, dir: PathBuf) -> LocalBoxFuture<'static, Result<PathBuf, String>> {

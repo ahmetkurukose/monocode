@@ -769,7 +769,7 @@ fn short_url(url: &str) -> String {
     format!("{cut}… ({} characters)", url.chars().count())
 }
 
-pub fn dialog(page: &dyn Page, args: &Value) -> Reply {
+pub async fn dialog(page: &dyn Page, args: &Value) -> Reply {
     let accept = match args.get("action").and_then(Value::as_str) {
         Some("accept") => true,
         Some("dismiss") => false,
@@ -777,6 +777,21 @@ pub fn dialog(page: &dyn Page, args: &Value) -> Reply {
     };
     let id = page.info().id;
     let Some(dialog) = page.dialog() else {
+        // A passkey request's dialog is Chromium's: it can only be cancelled.
+        if let Some(passkey) = page.pending_passkey() {
+            if accept {
+                return Err(invalid(format!(
+                    "page {id} waits for a passkey ({}): only the user can finish it on their phone; dismiss cancels it",
+                    passkey.origin
+                )));
+            }
+            if page.cancel_passkey().await {
+                return Ok(ToolOutput::text(format!(
+                    "Cancelled the passkey request of {} on page {id}; the page sees it as cancelled by the user.",
+                    passkey.origin
+                )));
+            }
+        }
         return Err(invalid(format!("page {id} has no dialog open")));
     };
     let text = args.get("text").and_then(Value::as_str);

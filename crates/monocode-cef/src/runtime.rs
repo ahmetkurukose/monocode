@@ -103,6 +103,16 @@ impl std::error::Error for StartError {}
 struct AppConfig {
     framework_dir: String,
     mock_keychain: bool,
+    /// Chromium's WebAuthn and Bluetooth log ([`fido_log`]).
+    fido_log: bool,
+}
+
+/// `MONOCODE_BROWSER_FIDO_LOG=1` (development hook): Chromium's own log of
+/// passkey requests and Bluetooth (its `chrome://device-log` entries, such
+/// as "Bluetooth authorized: 3" or "Discovery session started.") goes to
+/// the log file too, for telling why a phone does not connect (K58).
+fn fido_log() -> bool {
+    std::env::var("MONOCODE_BROWSER_FIDO_LOG").is_ok_and(|v| v == "1")
 }
 
 wrap_app! {
@@ -123,6 +133,13 @@ wrap_app! {
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             if self.config.mock_keychain {
                 command_line.append_switch(Some(&"use-mock-keychain".into()));
+            }
+            if self.config.fido_log {
+                // Its device log writes debug entries as VLOG(1).
+                command_line.append_switch_with_value(
+                    Some(&"vmodule".into()),
+                    Some(&"device_event_log_impl=1".into()),
+                );
             }
         }
 
@@ -317,7 +334,9 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
         keychain_account_name: KEYCHAIN_ACCOUNT.into(),
         locale: config.locale.as_str().into(),
         log_file: config.log_file.as_deref().map(path).unwrap_or_default(),
-        log_severity: if config.log_file.is_some() {
+        log_severity: if config.log_file.is_some() && fido_log() {
+            cef::LogSeverity::VERBOSE
+        } else if config.log_file.is_some() {
             cef::LogSeverity::WARNING
         } else {
             cef::LogSeverity::DISABLE
@@ -328,6 +347,7 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
     let mut app = MonocodeApp::new(AppConfig {
         framework_dir: framework_dir.to_string_lossy().into_owned(),
         mock_keychain: config.mock_keychain,
+        fido_log: fido_log(),
     });
     let args = cef::args::Args::new();
     if cef::initialize(

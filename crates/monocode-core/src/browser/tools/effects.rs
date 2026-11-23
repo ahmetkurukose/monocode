@@ -454,21 +454,30 @@ fn new_pages(ctx: &Ctx, before: &Before) -> Vec<(PageId, String)> {
         .collect()
 }
 
-/// The seq of the page's last permission note; 0 without one.
+/// The seq of the page's last permission or passkey note; 0 without one.
 pub(crate) fn permission_mark(page: &dyn crate::browser::Page) -> u64 {
-    page.permission_notes().last().map_or(0, |n| n.seq)
+    let permission = page.permission_notes().last().map_or(0, |n| n.seq);
+    let passkey = page.passkey_notes().last().map_or(0, |n| n.seq);
+    permission.max(passkey)
 }
 
-/// The page's permission requests since `mark` (K63), as sentences each
-/// starting with a space.
+/// The page's permission and passkey requests since `mark` (K58, K63), as
+/// sentences each starting with a space, in the order they happened.
 pub(crate) fn permission_facts(page: &dyn crate::browser::Page, mark: u64) -> String {
-    let mut facts = String::new();
-    let notes: Vec<_> = (page.permission_notes().into_iter())
+    let mut notes: Vec<(u64, String)> = (page.permission_notes().into_iter())
         .filter(|n| n.seq > mark)
+        .map(|n| (n.seq, n.describe()))
+        .chain(
+            (page.passkey_notes().into_iter())
+                .filter(|n| n.seq > mark)
+                .map(|n| (n.seq, n.describe())),
+        )
         .collect();
-    for note in notes.iter().rev().take(LIST_ITEMS).rev() {
+    notes.sort_by_key(|(seq, _)| *seq);
+    let mut facts = String::new();
+    for (_, line) in notes.iter().rev().take(LIST_ITEMS).rev() {
         facts.push(' ');
-        facts.push_str(&note.describe());
+        facts.push_str(line);
     }
     facts
 }
