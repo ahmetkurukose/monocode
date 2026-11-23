@@ -109,14 +109,13 @@ sayfaları: form, upload, download, grab, React dev build, efektler.
   - Üçüncü indirmeden sonra indirme yoktu; Chromium'un çoklu indirme izni engelliyordu.
   - Gizli file input'a upload yapılamıyordu.
   - %150 zoom'da screenshot ve kırpma yanlış yerden alınıyordu.
-- **Gözle doğrulanmadı.** Bu makinede ekran kaydı ve input gönderme izni yok. Uygulama
-  kullanıcıya elle deneme için açıldı, sonuç bildirilmedi:
-  - rozet ve etiketin görünüşü,
-  - gerçek tıklamanın kontrolü alması,
-  - "Give back to agent",
+- **Kullanıcının elle doğrulaması (2026-11-23).** `native-dev` uygulaması ayrı bir veri
+  klasörüyle açıldı. Kullanıcı Faz 3'ün görünen kısımlarını denedi ve "düzgün çalışıyor" dedi:
+  - rozet ve etiket,
+  - gerçek tıklamanın kontrolü alması ve "Give back to agent",
   - overlay'in son kareye geçmesi,
-  - Grab seçicisinin görünüşü,
-  - DevTools'ta ⌘F/⌘P.
+  - Grab seçicisi,
+  - yapışık DevTools.
 
 ## Ölçümler
 - **Tıklama süresi, etkilerle birlikte.** Sayfayı değiştirmeyen ya da tek öğe ekleyen tıklama
@@ -132,7 +131,6 @@ sayfaları: form, upload, download, grab, React dev build, efektler.
     kilidinde takılıyor ve profili tutuyor.
   - Çözüm: `monocode-core/src/process.rs`'te `fork` yerine `posix_spawn`. Bunun için
     `pre_exec` kaldırılmalı ve `PATH` + çıplak program adı kullanılmamalı.
-- **Grab teslimi.** "Sekmeyi açan agent'ın chat'ine" teslim canlıda denenmedi; birim testli.
 - **DevTools.** Yapışık DevTools açıkken sayfa görünüm alanı yerleşimin verdiğinden ~48 px kısa
   ölçüldü (434 / 482). Gerçek bir boşluk mu, doğrulanmadı.
 - **Yapışık DevTools'un sağ tık menüsü.** "Send to Agent" orada da görünüyor ama bir şey yapmıyor.
