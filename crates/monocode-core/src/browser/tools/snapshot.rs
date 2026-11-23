@@ -596,10 +596,107 @@ fn quoted(text: &str, max: usize) -> String {
     )
 }
 
+/// The ref a snapshot line starts with, like `@e3`.
+fn line_ref(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let end = rest.find(']')?;
+    rest[..end].starts_with("@e").then(|| &rest[..end])
+}
+
+/// What changed between two snapshots of a document (K45, K46): first the
+/// `- ` removed lines, then in the new one's order `+ ` added lines and
+/// `~ ` lines of an element whose ref stayed but whose line changed (its
+/// new line). The lines keep their indent after the mark.
+pub fn delta(old: &[String], new: &[String]) -> Vec<String> {
+    use similar::{Algorithm, DiffOp, capture_diff_slices};
+    let ops = capture_diff_slices(Algorithm::Myers, old, new);
+    let mut removed: Vec<&str> = Vec::new();
+    let mut added: Vec<&str> = Vec::new();
+    for op in &ops {
+        match *op {
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => removed.extend(
+                old[old_index..old_index + old_len]
+                    .iter()
+                    .map(String::as_str),
+            ),
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => added.extend(
+                new[new_index..new_index + new_len]
+                    .iter()
+                    .map(String::as_str),
+            ),
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                removed.extend(
+                    old[old_index..old_index + old_len]
+                        .iter()
+                        .map(String::as_str),
+                );
+                added.extend(
+                    new[new_index..new_index + new_len]
+                        .iter()
+                        .map(String::as_str),
+                );
+            }
+            DiffOp::Equal { .. } => {}
+        }
+    }
+    let added_refs: HashSet<&str> = added.iter().filter_map(|l| line_ref(l)).collect();
+    let removed_refs: HashSet<&str> = removed.iter().filter_map(|l| line_ref(l)).collect();
+    let mut out: Vec<String> = removed
+        .iter()
+        .filter(|l| line_ref(l).is_none_or(|r| !added_refs.contains(r)))
+        .map(|l| format!("- {l}"))
+        .collect();
+    for line in added {
+        let mark = match line_ref(line) {
+            Some(r) if removed_refs.contains(r) => '~',
+            _ => '+',
+        };
+        out.push(format!("{mark} {line}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn deltas_mark_added_removed_and_changed_lines() {
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let old = lines(&[
+            "[Main Content]",
+            "  heading \"Cart\"",
+            "  [@e1] textbox \"Qty\" value=\"1\"",
+            "  [@e2] button \"Add\"",
+            "  text \"Empty\"",
+        ]);
+        let new = lines(&[
+            "[Main Content]",
+            "  heading \"Cart\"",
+            "  [@e1] textbox \"Qty\" value=\"2\"",
+            "  [@e2] button \"Add\"",
+            "  [@e7] button \"Remove\"",
+        ]);
+        assert_eq!(
+            delta(&old, &new),
+            [
+                "-   text \"Empty\"",
+                "~   [@e1] textbox \"Qty\" value=\"2\"",
+                "+   [@e7] button \"Remove\"",
+            ]
+        );
+        assert!(delta(&new, &new).is_empty());
+    }
 
     fn node(id: &str, role: &str, name: &str, backend: i64, children: &[&str]) -> Value {
         json!({

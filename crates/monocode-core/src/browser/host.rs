@@ -9,7 +9,7 @@ use std::{any::Any, rc::Rc, time::Duration};
 
 use futures_util::future::LocalBoxFuture;
 
-use super::{cdp::CdpClient, log::PageLog};
+use super::{cdp::CdpClient, control::UserControl, log::PageLog};
 
 /// A page's id: the app's pane id, stable for the page's life and never
 /// given to another page during the app's run (context.md §3.1 item 1).
@@ -79,8 +79,34 @@ pub trait Page {
     /// Answers [`Page::dialog`]; false when there is none.
     fn answer_dialog(&self, accept: bool, text: Option<&str>) -> bool;
 
-    /// The user gave the page input in the last 2 seconds (K34).
+    /// The user gave the page input in the last 2 seconds (K34). Superseded
+    /// by [`Page::user_control`] (K48); kept until the tools move over.
     fn user_active(&self) -> bool;
+
+    /// Whether the user holds control of the page (K48, [`super::ControlState`]);
+    /// the agent's input tools then answer `browser_user_control`.
+    fn user_control(&self) -> Option<UserControl> {
+        None
+    }
+
+    /// `scope`'s agent sent the page a command now (K47): the app shows its
+    /// badge and label until [`super::control::AGENT_ACTIVE`] after the last.
+    fn agent_used(&self, scope: &Scope) {
+        let _ = scope;
+    }
+
+    /// The next download this page starts goes into `dir` (inside the
+    /// project, K51) instead of `~/Downloads`, without the user's download
+    /// list asking anything. Resolves with the finished file's path, or why
+    /// it failed or was cancelled; waits as long as the download takes, so
+    /// callers bound it with a timer (`browser_download`, K50).
+    fn expect_download(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> LocalBoxFuture<'static, Result<std::path::PathBuf, String>> {
+        let _ = dir;
+        Box::pin(async { Err("this page cannot take downloads into a folder".to_owned()) })
+    }
 }
 
 pub trait Host {

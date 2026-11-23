@@ -249,6 +249,10 @@ fn icon_body(path: &str) -> Option<&'static str> {
             "<path d='M14 4H6a2 2 0 0 0-2 2v8'/><rect x='8' y='8' width='12' height='12' rx='2'/>"
         }
         "code" => "<path d='m8 7-5 5 5 5m8-10 5 5-5 5m-3-14-2 18'/>",
+        // lucide's SquareDashedMousePointer: the browser's element grab.
+        "grab" => {
+            "<path d='M12.03 12.68a.5.5 0 0 1 .65-.65l9 3.5a.5.5 0 0 1-.03.94l-3.45 1.07a1 1 0 0 0-.66.66l-1.07 3.44a.5.5 0 0 1-.94.03zM5 3a2 2 0 0 0-2 2m16-2a2 2 0 0 1 2 2M5 21a2 2 0 0 1-2-2M9 3h1m-1 18h2m3-18h1M3 9v1m18-1v2M3 14v1'/>"
+        }
         "minus" => "<path d='M6 12h12'/>",
         "pencil-line" => "<path d='M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L9 17l-4 1 1-4Z'/>",
         "circle-dashed" => {

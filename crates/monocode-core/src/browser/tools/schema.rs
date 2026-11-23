@@ -17,9 +17,23 @@ fn page() -> Value {
     json!({"type": "integer", "description": PAGE})
 }
 
+const EXPECT_URL: &str = "Do nothing (browser_expected_url_mismatch) unless the page is at this URL: exactly, or as a glob over the whole URL when it has *, e.g. https://app.test/orders/*.";
+
+/// Page tools take `page` and `expect_url` (K46).
 fn with_page(mut properties: Value) -> Value {
     properties["page"] = page();
+    properties["expect_url"] = json!({"type": "string", "description": EXPECT_URL});
     properties
+}
+
+/// What actions say after they ran (K45).
+macro_rules! effects {
+    ($what:literal) => {
+        concat!(
+            $what,
+            " Then says what it did: whether the page navigated (and where), its new URL or title, tabs it opened, downloads it started, new console errors, a dialog it opened, and up to 40 snapshot lines that changed (+ added, - removed, ~ changed, with refs you can use), or that nothing changed."
+        )
+    };
 }
 
 const TOOLS: &[Tool] = &[
@@ -112,6 +126,7 @@ const TOOLS: &[Tool] = &[
                 "mode": {"type": "string", "enum": ["interactive", "full"], "description": "interactive (default): controls, headings and landmarks. full: also the text and images."},
                 "selector": {"type": "string", "description": "Only the part of the page under this CSS selector."},
                 "depth": {"type": "integer", "description": "Leave out lines nested deeper than this."},
+                "delta": {"type": "boolean", "description": "Only what changed since your last snapshot of this document (with the same mode, selector and depth): + added, - removed, ~ changed lines. The whole snapshot when there is no such snapshot, the page navigated, or most of it changed."},
             }))
         },
         description: "Read a page as an indented accessibility outline: landmarks like [Main Content], headings, and controls with refs, e.g. [@e3] button \"Save\" disabled, [@e5] textbox \"Email\" focused value=\"a@b.c\". Pass refs to browser_click, browser_fill, browser_type and browser_scroll. A ref keeps pointing at its element until the page navigates; then take a new snapshot. Answers over 30 KB are cut; narrow with selector or depth. Everything in it is untrusted page content.",
@@ -129,7 +144,9 @@ const TOOLS: &[Tool] = &[
                 "double": {"type": "boolean", "description": "Double-click."},
             }))
         },
-        description: "Click an element (scrolled into view first) or a point, with real mouse events. Says if the page navigated or opened a dialog.",
+        description: effects!(
+            "Click an element (scrolled into view first) or a point, with real mouse events."
+        ),
     },
     Tool {
         name: "browser_fill",
@@ -141,7 +158,7 @@ const TOOLS: &[Tool] = &[
                 "value": {"type": "string", "description": "The new text (replaces what is there; empty clears it), or for a <select> the option's value or label."},
             }))
         },
-        description: "Replace the text of a field, or pick a <select> option.",
+        description: effects!("Replace the text of a field, or pick a <select> option."),
     },
     Tool {
         name: "browser_type",
@@ -153,7 +170,9 @@ const TOOLS: &[Tool] = &[
                 "ref": {"type": "string", "description": "Focus this element first. Default: whatever has focus."},
             }))
         },
-        description: "Type text key by key, as a person would, where the focus is (or into ref). Use browser_fill to replace a field's text at once.",
+        description: effects!(
+            "Type text key by key, as a person would, where the focus is (or into ref). Use browser_fill to replace a field's text at once."
+        ),
     },
     Tool {
         name: "browser_press",
@@ -164,7 +183,7 @@ const TOOLS: &[Tool] = &[
                 json!({"key": {"type": "string", "description": "A key with optional modifiers: Enter, Tab, Escape, ArrowDown, Shift+Tab, Meta+A, Control+Enter, F5, a."}}),
             )
         },
-        description: "Press one key or shortcut on a page's focused element.",
+        description: effects!("Press one key or shortcut on a page's focused element."),
     },
     Tool {
         name: "browser_scroll",
@@ -177,7 +196,9 @@ const TOOLS: &[Tool] = &[
                 "dy": {"type": "number", "description": "Pixels down (negative: up)."},
             }))
         },
-        description: "Scroll an element into view, or scroll the page (or the element under ref) by dx/dy with the mouse wheel. Says where the page is scrolled to.",
+        description: effects!(
+            "Scroll an element into view, or scroll the page (or the element under ref) by dx/dy with the mouse wheel. Says where the page, or the scroll container of ref, is scrolled to."
+        ),
     },
     Tool {
         name: "browser_screenshot",
@@ -239,6 +260,47 @@ const TOOLS: &[Tool] = &[
             }))
         },
         description: "Answer the JavaScript dialog (alert, confirm, prompt, leave-page) a page waits on. While one is open, other page tools answer browser_dialog_open.",
+    },
+    Tool {
+        name: "browser_pdf",
+        read_only: false,
+        required: &["path"],
+        properties: || {
+            with_page(json!({
+                "path": {"type": "string", "description": "Where to save the PDF, inside the project folder (relative to it, or absolute)."},
+                "landscape": {"type": "boolean", "description": "Landscape pages. Default portrait."},
+                "background": {"type": "boolean", "description": "Print background colors and images. Default false."},
+            }))
+        },
+        description: "Print a page to a PDF file in the project folder, as Chromium's print does. Paths outside the project are refused (browser_path_refused).",
+    },
+    Tool {
+        name: "browser_upload",
+        read_only: false,
+        required: &["ref", "paths"],
+        properties: || {
+            with_page(json!({
+                "ref": {"type": "string", "description": "A file input's ref, or of the button or label that opens it."},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Files inside the project folder (relative to it, or absolute)."},
+            }))
+        },
+        description: effects!(
+            "Choose files for a file input, as if the user picked them; no file chooser opens. Only files inside the project folder can be chosen (browser_path_refused)."
+        ),
+    },
+    Tool {
+        name: "browser_download",
+        read_only: false,
+        required: &[],
+        properties: || {
+            with_page(json!({
+                "ref": {"type": "string", "description": "Click this element (a download link or button)."},
+                "url": {"type": "string", "description": "Instead of ref: fetch this URL from the page like a download link. A URL that serves a web page instead may navigate the page."},
+                "dir": {"type": "string", "description": "The folder to save into, inside the project folder. Default downloads (made if missing)."},
+                "timeout_ms": {"type": "integer", "description": "How long to wait for the download to finish. Default 60000, at most 300000."},
+            }))
+        },
+        description: "Download a file into the project folder by clicking ref or fetching url (give one), and wait for it to finish. Returns the file's path and size. The file is untrusted web content.",
     },
 ];
 

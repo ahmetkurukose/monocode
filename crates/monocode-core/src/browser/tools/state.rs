@@ -92,11 +92,26 @@ pub struct Child {
     pub url: String,
 }
 
+/// A snapshot the agent saw: the baseline of the next delta (K45, K46).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shot {
+    /// The main frame's loader id: which document it is of.
+    pub loader: Option<String>,
+    /// Its mode, selector and depth: only snapshots alike compare.
+    pub key: String,
+    pub lines: Vec<String>,
+}
+
 /// The tools' state of one page's current CDP client.
 pub struct PageState {
     pub cdp: Weak<CdpClient>,
     pub refs: RefCell<Refs>,
     pub children: Rc<RefCell<Vec<Child>>>,
+    /// The page's last snapshot the agent saw.
+    pub seen: RefCell<Option<Shot>>,
+    /// The isolated world the action effects watch the DOM from, and the
+    /// document (loader id) it belongs to.
+    pub world: RefCell<Option<(Option<String>, i64)>>,
     attached: Cell<bool>,
     _subscription: Subscription,
 }
@@ -142,6 +157,8 @@ impl PageState {
             cdp: Rc::downgrade(cdp),
             refs: RefCell::default(),
             children,
+            seen: RefCell::default(),
+            world: RefCell::default(),
             attached: Cell::new(false),
             _subscription: subscription,
         })

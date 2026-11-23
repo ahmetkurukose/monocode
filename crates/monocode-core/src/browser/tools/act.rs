@@ -3,13 +3,12 @@
 //! Input goes to the page's own session even for out-of-process iframes:
 //! Chromium routes mouse events by point and key events to the focused
 //! frame. Points of such frames are offset by their `<iframe>`'s box.
+//! Every action says what it did ([`effects`], K45).
 
 use serde_json::{Value, json};
 
 use super::{
-    Ctx, Reply, invalid, keys,
-    nav::{self, Load},
-    quote,
+    Ctx, Reply, effects, invalid, keys, nav, quote,
     snapshot::{AxTree, RefEntry},
 };
 use crate::browser::{CdpError, ToolOutput};
@@ -25,7 +24,7 @@ fn stale(message: String) -> ToolOutput {
     ToolOutput::error("browser_stale_ref", message)
 }
 
-fn label(r: &str, entry: &RefEntry) -> String {
+pub fn label(r: &str, entry: &RefEntry) -> String {
     if entry.name.is_empty() {
         format!("{r} ({})", entry.role)
     } else {
@@ -33,7 +32,7 @@ fn label(r: &str, entry: &RefEntry) -> String {
     }
 }
 
-fn ref_arg(args: &Value) -> Option<String> {
+pub fn ref_arg(args: &Value) -> Option<String> {
     args.get("ref")
         .and_then(Value::as_str)
         .map(|r| r.trim().to_owned())
@@ -189,27 +188,6 @@ async fn point(ctx: &Ctx, r: &str, entry: &RefEntry) -> Result<(f64, f64), ToolO
     Ok((x, y))
 }
 
-/// Says what happened after an action: a navigation, a dialog.
-async fn effects(ctx: &Ctx, said: String, before: Option<String>) -> Reply {
-    ctx.sleep(150).await;
-    let mut out = said;
-    if let Some(dialog) = ctx.page.dialog() {
-        out.push_str(&format!(
-            " The page opened {} and waits until you answer it with browser_dialog.",
-            super::describe_dialog(&dialog)
-        ));
-        return Ok(ToolOutput::text(out));
-    }
-    let now = nav::loader(ctx).await?;
-    if now != before {
-        let done = nav::settle(ctx, None, None, Load::Loaded, 5_000).await?;
-        out.push_str(" The page navigated: ");
-        out.push_str(&nav::report(ctx, done).await?);
-        out.push_str(" Refs of earlier snapshots no longer work.");
-    }
-    Ok(ToolOutput::text(out))
-}
-
 async fn mouse(
     ctx: &Ctx,
     kind: &str,
@@ -238,32 +216,49 @@ pub async fn click(ctx: &Ctx, args: &Value) -> Reply {
         return Err(invalid("button is left, right or middle"));
     }
     let double = args.get("double").and_then(Value::as_bool).unwrap_or(false);
-    let before = nav::loader(ctx).await?;
-    let (x, y, what) = if let Some(r) = ref_arg(args) {
-        let entry = resolve(ctx, &r).await?;
-        let (x, y) = point(ctx, &r, &entry).await?;
-        (x, y, label(&r, &entry))
-    } else {
-        match (
-            args.get("x").and_then(Value::as_f64),
-            args.get("y").and_then(Value::as_f64),
-        ) {
-            (Some(x), Some(y)) => (x, y, format!("({x}, {y})")),
-            _ => return Err(invalid("give ref, or x and y")),
-        }
-    };
-    mouse(ctx, "mouseMoved", x, y, "none", 0).await?;
-    for count in 1..=if double { 2 } else { 1 } {
-        mouse(ctx, "mousePressed", x, y, button, count).await?;
-        mouse(ctx, "mouseReleased", x, y, button, count).await?;
-    }
+    let (x, y, what) = target(ctx, args).await?;
+    let before = effects::before(ctx).await?;
+    press_at(ctx, x, y, button, double).await?;
     let verb = match (double, button) {
         (true, _) => "Double-clicked",
         (false, "right") => "Right-clicked",
         (false, "middle") => "Middle-clicked",
         _ => "Clicked",
     };
-    effects(ctx, format!("{verb} {what}."), before).await
+    let effects = effects::settle(ctx, before).await?;
+    Ok(effects.with(format!("{verb} {what}."), true))
+}
+
+/// The point a click goes to, from `ref` or `x` and `y`, and what it is.
+pub async fn target(ctx: &Ctx, args: &Value) -> Result<(f64, f64, String), ToolOutput> {
+    if let Some(r) = ref_arg(args) {
+        let entry = resolve(ctx, &r).await?;
+        let (x, y) = point(ctx, &r, &entry).await?;
+        return Ok((x, y, label(&r, &entry)));
+    }
+    match (
+        args.get("x").and_then(Value::as_f64),
+        args.get("y").and_then(Value::as_f64),
+    ) {
+        (Some(x), Some(y)) => Ok((x, y, format!("({x}, {y})"))),
+        _ => Err(invalid("give ref, or x and y")),
+    }
+}
+
+/// Moves the mouse to a point and clicks there.
+pub async fn press_at(
+    ctx: &Ctx,
+    x: f64,
+    y: f64,
+    button: &str,
+    double: bool,
+) -> Result<(), ToolOutput> {
+    mouse(ctx, "mouseMoved", x, y, "none", 0).await?;
+    for count in 1..=if double { 2 } else { 1 } {
+        mouse(ctx, "mousePressed", x, y, button, count).await?;
+        mouse(ctx, "mouseReleased", x, y, button, count).await?;
+    }
+    Ok(())
 }
 
 /// Selects a field's text (or picks a `<select>` option): `{kind}`.
@@ -305,8 +300,8 @@ pub async fn fill(ctx: &Ctx, args: &Value) -> Reply {
         Some(Value::Bool(b)) => b.to_string(),
         _ => return Err(invalid("value is required")),
     };
-    let before = nav::loader(ctx).await?;
     let entry = resolve(ctx, &r).await?;
+    let before = effects::before(ctx).await?;
     let session = entry.session.as_deref();
     let node = json!({"backendNodeId": entry.backend});
     let _ = ctx
@@ -366,7 +361,8 @@ pub async fn fill(ctx: &Ctx, args: &Value) -> Reply {
             )));
         }
     };
-    effects(ctx, said, before).await
+    let effects = effects::settle(ctx, before).await?;
+    Ok(effects.with(said, true))
 }
 
 /// Presses and releases one key.
@@ -414,10 +410,13 @@ pub async fn type_text(ctx: &Ctx, args: &Value) -> Reply {
             "text has {count} characters, more than {MAX_TYPED}; use browser_fill for long text"
         )));
     }
-    let before = nav::loader(ctx).await?;
+    let entry = match ref_arg(args) {
+        Some(r) => Some((resolve(ctx, &r).await?, r)),
+        None => None,
+    };
+    let before = effects::before(ctx).await?;
     let mut into = String::new();
-    if let Some(r) = ref_arg(args) {
-        let entry = resolve(ctx, &r).await?;
+    if let Some((entry, r)) = entry {
         let session = entry.session.as_deref();
         let node = json!({"backendNodeId": entry.backend});
         let _ = ctx
@@ -443,7 +442,8 @@ pub async fn type_text(ctx: &Ctx, args: &Value) -> Reply {
         ctx.act("Input.insertText", json!({"text": pending}))
             .await?;
     }
-    effects(ctx, format!("Typed {count} characters{into}."), before).await
+    let effects = effects::settle(ctx, before).await?;
+    Ok(effects.with(format!("Typed {count} characters{into}."), true))
 }
 
 pub async fn press(ctx: &Ctx, args: &Value) -> Reply {
@@ -455,26 +455,43 @@ pub async fn press(ctx: &Ctx, args: &Value) -> Reply {
             "{name:?} is not a key; use names like Enter, Tab, Escape, ArrowDown, Backspace, F5, a, with modifiers like Shift+Tab or Meta+A"
         )));
     };
-    let before = nav::loader(ctx).await?;
+    let before = effects::before(ctx).await?;
     key(ctx, &press).await?;
-    effects(ctx, format!("Pressed {name}."), before).await
+    let effects = effects::settle(ctx, before).await?;
+    Ok(effects.with(format!("Pressed {name}."), true))
 }
+
+/// The scroll position of the element's nearest scroll container (itself
+/// included): `[x, y, height, shown, itself]`, or `null` when only the page
+/// scrolls it.
+const SCROLLER: &str = r#"function() {
+  const scrolls = v => v === 'auto' || v === 'scroll' || v === 'overlay';
+  let el = this.nodeType === 1 ? this : this.parentElement;
+  for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+    const style = getComputedStyle(el);
+    if ((scrolls(style.overflowY) && el.scrollHeight > el.clientHeight)
+      || (scrolls(style.overflowX) && el.scrollWidth > el.clientWidth))
+      return [Math.round(el.scrollLeft), Math.round(el.scrollTop), el.scrollHeight, el.clientHeight, el === this];
+  }
+  return null;
+}"#;
 
 pub async fn scroll(ctx: &Ctx, args: &Value) -> Reply {
     let dx = args.get("dx").and_then(Value::as_f64).unwrap_or(0.0);
     let dy = args.get("dy").and_then(Value::as_f64).unwrap_or(0.0);
     let by = dx != 0.0 || dy != 0.0;
-    let (at, mut said) = if let Some(r) = ref_arg(args) {
-        let entry = resolve(ctx, &r).await?;
-        let (x, y) = point(ctx, &r, &entry).await?;
-        (
-            Some((x, y)),
-            format!("Scrolled {} into view", label(&r, &entry)),
-        )
-    } else if by {
-        (None, String::from("Scrolled"))
-    } else {
-        return Err(invalid("give ref, or dx and dy"));
+    let entry = match ref_arg(args) {
+        Some(r) => Some((resolve(ctx, &r).await?, r)),
+        None if by => None,
+        None => return Err(invalid("give ref, or dx and dy")),
+    };
+    let before = effects::before(ctx).await?;
+    let (at, mut said) = match &entry {
+        Some((entry, r)) => (
+            Some(point(ctx, r, entry).await?),
+            format!("Scrolled {} into view", label(r, entry)),
+        ),
+        None => (None, String::from("Scrolled")),
     };
     if by {
         let (x, y) = match at {
@@ -494,23 +511,79 @@ pub async fn scroll(ctx: &Ctx, args: &Value) -> Reply {
         )
         .await?;
         said.push_str(&format!(" by ({dx}, {dy})"));
-        ctx.sleep(100).await;
     }
-    let position = nav::probe(
-        ctx,
-        "[Math.round(scrollX), Math.round(scrollY), document.documentElement.scrollHeight, innerHeight]",
-    )
-    .await?;
-    if let Ok(Value::Array(p)) = position {
-        let n = |i: usize| p.get(i).and_then(Value::as_i64).unwrap_or(0);
-        said.push_str(&format!(
-            "; the page is scrolled to x={}, y={} of {} px (the viewport is {} px high)",
-            n(0),
-            n(1),
-            n(2),
-            n(3)
-        ));
+    let effects = effects::settle(ctx, before).await?;
+    if !effects.navigated {
+        let container = match &entry {
+            Some((entry, _)) => scroller(ctx, entry).await?,
+            None => None,
+        };
+        if let Some(p) = container {
+            let n = |i: usize| p.get(i).and_then(Value::as_i64).unwrap_or(0);
+            let what = if p.get(4) == Some(&Value::Bool(true)) {
+                "it"
+            } else {
+                "its scroll container"
+            };
+            said.push_str(&format!(
+                "; {what} is scrolled to x={}, y={} of {} px ({} px are shown)",
+                n(0),
+                n(1),
+                n(2),
+                n(3)
+            ));
+        } else {
+            let position = nav::probe(
+                ctx,
+                "[Math.round(scrollX), Math.round(scrollY), document.documentElement.scrollHeight, innerHeight]",
+            )
+            .await?;
+            if let Ok(Value::Array(p)) = position {
+                let n = |i: usize| p.get(i).and_then(Value::as_i64).unwrap_or(0);
+                said.push_str(&format!(
+                    "; the page is scrolled to x={}, y={} of {} px (the viewport is {} px high)",
+                    n(0),
+                    n(1),
+                    n(2),
+                    n(3)
+                ));
+            }
+        }
     }
     said.push('.');
-    Ok(ToolOutput::text(said))
+    Ok(effects.with(said, false))
+}
+
+/// [`SCROLLER`] of a ref's element; `None` when the page scrolls it.
+async fn scroller(ctx: &Ctx, entry: &RefEntry) -> Result<Option<Vec<Value>>, ToolOutput> {
+    let session = entry.session.as_deref();
+    let resolved = ctx
+        .cdp
+        .call(
+            "DOM.resolveNode",
+            json!({"backendNodeId": entry.backend, "objectGroup": "monocode"}),
+            session,
+        )
+        .await;
+    let object = match resolved {
+        Ok(resolved) => resolved["object"]["objectId"].as_str().map(str::to_owned),
+        Err(CdpError::Gone) => return Err(super::page_gone(ctx.id)),
+        Err(_) => None,
+    };
+    let Some(object) = object else {
+        return Ok(None);
+    };
+    let answer = ctx
+        .cdp
+        .call(
+            "Runtime.callFunctionOn",
+            json!({"objectId": object, "functionDeclaration": SCROLLER, "returnByValue": true}),
+            session,
+        )
+        .await;
+    Ok(match answer {
+        Ok(answer) => answer["result"]["value"].as_array().cloned(),
+        Err(CdpError::Gone) => return Err(super::page_gone(ctx.id)),
+        Err(_) => None,
+    })
 }

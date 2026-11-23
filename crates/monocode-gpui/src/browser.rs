@@ -36,12 +36,20 @@ use gpui::{
 };
 use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
+mod grab;
+pub(crate) use grab::ToggleGrab;
+
 use crate::{
     input::{self, Input},
     modal,
     popover::{Align, Anchor, AnchorSlot, popover},
     theme::{content, icon, icon_button, icon_button_enabled},
 };
+
+#[path = "browser_download_into.rs"]
+mod download_into;
+#[path = "browser_presence.rs"]
+mod presence;
 
 actions!(
     workspace,
@@ -73,8 +81,66 @@ pub(crate) fn devtools_height(wanted: u32, available: f32) -> f32 {
 
 /// The DevTools frontend Chromium ships, for the page whose target is
 /// `target`, through the app's endpoint at `base` (`host:port/token`).
+///
+/// Without `can_dock` the frontend has no "Dock side" menu: Chromium's
+/// embedder half (DevToolsUIBindings) runs with its default delegate here,
+/// which ignores dock requests, so the menu could not work. The divider and
+/// the toolbar button are the dock controls.
 fn devtools_frontend_url(base: &str, target: &str) -> String {
     format!("devtools://devtools/bundled/devtools_app.html?ws={base}/devtools/page/{target}")
+}
+
+/// What becomes of something the docked DevTools ask for. They are not the
+/// page: their links open as ordinary tabs (never as popups that keep a
+/// `window.opener` into DevTools), their dialogs say they are DevTools' and
+/// are not the agent's to answer, and nothing signs them in anywhere.
+#[derive(Debug, PartialEq)]
+enum DevToolsAsk {
+    /// A web link: a new tab of its own.
+    OpenTab {
+        url: String,
+        foreground: bool,
+    },
+    /// A JavaScript dialog of the frontend.
+    Prompt,
+    /// A file DevTools save: it joins the pane's downloads, where the user
+    /// sees it.
+    Download,
+    /// HTTP authentication: refused.
+    Refuse,
+    Close,
+    Focus,
+    Ignore,
+}
+
+/// Whether a link the DevTools open may become a tab: web pages only, not
+/// `devtools://`, `chrome://` or scripts.
+fn devtools_link(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn devtools_ask(event: &monocode_cef::BrowserEvent) -> DevToolsAsk {
+    use monocode_cef::BrowserEvent;
+    match event {
+        BrowserEvent::Focused => DevToolsAsk::Focus,
+        BrowserEvent::Closed | BrowserEvent::CloseRequested | BrowserEvent::RenderProcessGone => {
+            DevToolsAsk::Close
+        }
+        BrowserEvent::PopupRequested {
+            url, foreground, ..
+        }
+        | BrowserEvent::PopupOpened {
+            url, foreground, ..
+        } if devtools_link(url) => DevToolsAsk::OpenTab {
+            url: url.clone(),
+            foreground: *foreground,
+        },
+        BrowserEvent::Dialog(_) => DevToolsAsk::Prompt,
+        BrowserEvent::Download(_) => DevToolsAsk::Download,
+        BrowserEvent::Auth(_) => DevToolsAsk::Refuse,
+        _ => DevToolsAsk::Ignore,
+    }
 }
 
 /// Whether Chromium runs, shared by every window.
@@ -159,6 +225,7 @@ impl Engine {
 pub(crate) fn engine_started() -> bool {
     monocode_cef::runtime::is_started()
 }
+
 
 /// The running app's `Contents/Frameworks`.
 fn bundle_frameworks() -> Result<PathBuf, String> {
@@ -284,6 +351,9 @@ pub(crate) struct PageChanged;
 /// ⌘+ zooms the page rather than the interface while a page is focused; the
 /// shell's shortcut forwarding adds it while Chromium has the keyboard.
 pub(crate) const KEY_CONTEXT: &str = "BrowserPage";
+/// The docked DevTools' key context, inside the page's. While they have the
+/// keyboard, only a few app shortcuts take keys from them (shell/shortcuts.rs).
+pub(crate) const DEVTOOLS_KEY_CONTEXT: &str = "BrowserDevTools";
 const FIND_CONTEXT: &str = "BrowserFind";
 
 actions!(
@@ -323,6 +393,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-+"), ZoomIn, page),
         KeyBinding::new(&format!("{m}--"), ZoomOut, page),
         KeyBinding::new(&format!("{m}-0"), ResetZoom, page),
+        // Not ⇧⌘G, which is Find Previous.
+        KeyBinding::new(&format!("{m}-alt-g"), ToggleGrab, page),
         // The find field is a Composer, whose ⇧Enter would add a newline.
         KeyBinding::new("shift-enter", FindPrevious, Some("BrowserFind > Composer")),
         KeyBinding::new("escape", CloseFind, Some(FIND_CONTEXT)),
@@ -411,12 +483,17 @@ pub(crate) enum PageRequest {
     },
     /// The page closed itself (`window.close()`).
     Close,
+    /// An element the user grabbed for an agent (K49), or why it failed.
+    Grab(grab::GrabResult),
 }
 
 /// Something the page waits on the user for, shown as a modal over it.
 enum PagePrompt {
     Auth(monocode_cef::AuthRequest),
     Dialog(monocode_cef::JsDialog),
+    /// The docked DevTools' own dialog: not the page's, so agents neither
+    /// see nor answer it.
+    DevTools(monocode_cef::JsDialog),
 }
 
 /// One browser page in a pane: its toolbar, and the Chromium view below.
@@ -453,8 +530,15 @@ pub(crate) struct BrowserPage {
     pub(crate) devtools_scope: Option<Scope>,
     /// The docked DevTools, while open.
     devtools: Option<DockedDevTools>,
-    /// DevTools' height in points (0: 40% of the body), for the app's run.
+    /// DevTools' height in points (0: 40% of the body); the pane saves it.
     devtools_height: u32,
+    /// The user keeps the docked DevTools open; the pane saves it.
+    devtools_wanted: bool,
+    /// Saved open: they open once the page can be inspected.
+    devtools_restore: bool,
+    /// GPUI focus while the DevTools have the keyboard, under
+    /// [`DEVTOOLS_KEY_CONTEXT`].
+    devtools_focus: FocusHandle,
     /// The divider being dragged: where the drag started, and the height then.
     devtools_drag: Option<(f32, f32)>,
     /// The body under the toolbar, as last laid out.
@@ -473,6 +557,12 @@ pub(crate) struct BrowserPage {
     /// The shown prompt takes the keyboard on the next frame.
     focus_prompt: bool,
     _prompt_subscriptions: Vec<Subscription>,
+    /// Repaints the agent's badge and label when they change on their own
+    /// (K47): the next expiry or countdown step.
+    presence_timer: Option<gpui::Task<()>>,
+    /// An agent waits for the page's next download (K50).
+    download_wait: Option<download_into::DownloadWait>,
+    grab: grab::GrabMode,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -537,6 +627,9 @@ impl BrowserPage {
             devtools_scope: None,
             devtools: None,
             devtools_height: 0,
+            devtools_wanted: false,
+            devtools_restore: false,
+            devtools_focus: cx.focus_handle(),
             devtools_drag: None,
             body_bounds: Rc::default(),
             focus: cx.focus_handle(),
@@ -549,7 +642,11 @@ impl BrowserPage {
             prompt_focus: cx.focus_handle(),
             focus_prompt: false,
             _prompt_subscriptions: Vec::new(),
+            presence_timer: None,
+            download_wait: None,
+            grab: Default::default(),
         }
+        .watch_presence(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
@@ -644,6 +741,7 @@ impl BrowserPage {
                     find.result = Some((count, active_ordinal));
                 }
             }
+            BrowserEvent::GrabAt { x, y } => self.grab_at(x, y, cx),
             BrowserEvent::Focused => self.follow_page_focus(cx),
             other => self.on_page_event(other, cx),
         }
@@ -702,7 +800,7 @@ impl BrowserPage {
         }
     }
 
-    fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
+    pub(crate) fn set_zoom(&mut self, percent: u16, cx: &mut Context<Self>) {
         if percent == self.zoom {
             return;
         }
@@ -936,6 +1034,7 @@ impl BrowserPage {
                     .bg(content(0.05))
                     .child(self.address.clone()),
             )
+            .children(self.presence_bar(cx))
             .when(self.zoom != 100, |d| {
                 d.child(
                     div()
@@ -956,6 +1055,7 @@ impl BrowserPage {
                         .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
                 )
             })
+            .child(self.grab_button(ready, cx))
             .child(
                 icon_button_enabled("browser-devtools", "DevTools", "code", ready)
                     .when(self.devtools.is_some(), |b| b.bg(content(0.1)))
@@ -973,14 +1073,55 @@ impl BrowserPage {
             .borrow()
             .as_ref()
             .map(|h| h.view.has_dev_tools());
+        self.devtools_restore = false;
         if detached == Some(true) {
             self.host.with_view(|view| view.close_dev_tools());
         } else if self.devtools.is_some() {
             self.close_docked_dev_tools(cx);
+            self.set_devtools_wanted(false, cx);
         } else if detached.is_some() {
-            self.open_docked_dev_tools(cx);
+            self.open_docked_dev_tools(true, cx);
+            self.set_devtools_wanted(self.devtools.is_some(), cx);
         }
         cx.notify();
+    }
+
+    fn set_devtools_wanted(&mut self, wanted: bool, cx: &mut Context<Self>) {
+        if self.devtools_wanted != wanted {
+            self.devtools_wanted = wanted;
+            cx.emit(PageChanged);
+        }
+    }
+
+    /// Whether the docked DevTools are open by the user's choice (or wait to
+    /// open again), and their height (0: the default), as the pane saves
+    /// them.
+    pub(crate) fn dev_tools_saved(&self) -> (bool, u32) {
+        (
+            self.devtools_wanted || self.devtools_restore,
+            self.devtools_height,
+        )
+    }
+
+    /// The saved docked DevTools: their height now, and, when `open`, they
+    /// open once the page shows and can be inspected.
+    pub(crate) fn restore_dev_tools(&mut self, open: bool, height: u32) {
+        self.devtools_height = height;
+        self.devtools_restore = open && self.devtools.is_none();
+    }
+
+    /// Opens the saved DevTools once the page has its DevTools agent.
+    fn restore_dev_tools_now(&mut self, cx: &mut Context<Self>) {
+        if !self.devtools_restore || self.cdp().is_none() || self.devtools_scope.is_none() {
+            return;
+        }
+        self.devtools_restore = false;
+        if self.devtools.is_none() {
+            // Where they cannot dock, they stay closed: no window of their
+            // own opens unasked.
+            self.open_docked_dev_tools(false, cx);
+            self.devtools_wanted = self.devtools.is_some();
+        }
     }
 
     /// DevTools in a window of their own (CEF's, Chrome style), when they
@@ -990,16 +1131,19 @@ impl BrowserPage {
     }
 
     /// Docks the DevTools frontend under the page. Its address needs the
-    /// page's target id, which Chromium tells.
-    fn open_docked_dev_tools(&mut self, cx: &mut Context<Self>) {
+    /// page's target id, which Chromium tells. Where they cannot dock, they
+    /// open in a window of their own when `detached`.
+    fn open_docked_dev_tools(&mut self, detached: bool, cx: &mut Context<Self>) {
         let base = (self.devtools_scope.as_ref())
             .ok_or_else(|| "the page has no project".to_owned())
             .and_then(monocode_core::browser::proxy::devtools_base);
         let (base, cdp) = match (base, self.cdp()) {
             (Ok(base), Some(cdp)) => (base, cdp),
             (base, _) => {
-                log::debug!("browser: DevTools open detached: {:?}", base.err());
-                self.open_detached_dev_tools();
+                log::debug!("browser: DevTools cannot dock: {:?}", base.err());
+                if detached {
+                    self.open_detached_dev_tools();
+                }
                 return;
             }
         };
@@ -1024,7 +1168,10 @@ impl BrowserPage {
                     Some(target) => docked.url = Some(devtools_frontend_url(&base, &target)),
                     None => {
                         page.close_docked_dev_tools(cx);
-                        page.open_detached_dev_tools();
+                        page.set_devtools_wanted(false, cx);
+                        if detached {
+                            page.open_detached_dev_tools();
+                        }
                     }
                 }
                 cx.notify();
@@ -1039,11 +1186,17 @@ impl BrowserPage {
             docked.host.release(cx);
             docked.host.close();
         }
+        // Their dialogs go with them.
+        let shown = matches!(self.prompts.front(), Some(PagePrompt::DevTools(_)));
+        self.prompts
+            .retain(|p| !matches!(p, PagePrompt::DevTools(_)));
+        if shown {
+            self.show_prompt_then(false, cx);
+        }
         cx.notify();
     }
 
-    /// The docked DevTools' own events: what concerns the page around them
-    /// (new pages, downloads, dialogs, the keyboard) is the page's.
+    /// The docked DevTools' own events ([`devtools_ask`]).
     fn on_dev_tools_event(
         &mut self,
         event: monocode_cef::BrowserEvent,
@@ -1056,18 +1209,43 @@ impl BrowserPage {
         if !current {
             return;
         }
-        match event {
-            BrowserEvent::Focused => self.follow_page_focus(cx),
-            BrowserEvent::Closed
-            | BrowserEvent::CloseRequested
-            | BrowserEvent::RenderProcessGone => self.close_docked_dev_tools(cx),
-            event @ (BrowserEvent::PopupRequested { .. }
-            | BrowserEvent::PopupOpened { .. }
-            | BrowserEvent::Download(_)
-            | BrowserEvent::Auth(_)
-            | BrowserEvent::Dialog(_)) => self.on_page_event(event, cx),
+        match (devtools_ask(&event), event) {
+            (DevToolsAsk::Focus, _) => self.follow_dev_tools_focus(cx),
+            (DevToolsAsk::Close, _) => self.close_docked_dev_tools(cx),
+            (DevToolsAsk::OpenTab { url, foreground }, event) => {
+                // A popup that would keep DevTools as its opener closes.
+                if let BrowserEvent::PopupOpened { id, .. } = event {
+                    drop(monocode_cef::take_popup(id));
+                }
+                cx.emit(PageRequest::Open {
+                    url,
+                    foreground,
+                    popup: None,
+                });
+            }
+            (DevToolsAsk::Prompt, BrowserEvent::Dialog(dialog)) => {
+                self.push_prompt(PagePrompt::DevTools(dialog), cx)
+            }
+            (DevToolsAsk::Download, event) => self.on_page_event(event, cx),
+            (DevToolsAsk::Refuse, BrowserEvent::Auth(request)) => request.cancel(),
+            (_, BrowserEvent::PopupOpened { id, .. }) => drop(monocode_cef::take_popup(id)),
             _ => {}
         }
+    }
+
+    /// A click in the docked DevTools gives them the keyboard without GPUI
+    /// seeing it; GPUI focus follows, so the app's shortcuts leave their
+    /// keys to them.
+    fn follow_dev_tools_focus(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else { return };
+        let focus = self.devtools_focus.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                if !focus.is_focused(window) {
+                    window.focus(&focus, cx);
+                }
+            });
+        });
     }
 
     /// A snapshot once a load has had a moment to paint, so an overlay has
@@ -1296,6 +1474,8 @@ impl BrowserPage {
             .child(divider)
             .child(
                 div()
+                    .key_context(DEVTOOLS_KEY_CONTEXT)
+                    .track_focus(&self.devtools_focus)
                     .h(px(height))
                     .flex_shrink_0()
                     .min_w_0()
@@ -1353,6 +1533,8 @@ impl BrowserPage {
 
     fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
         if self.devtools_drag.take().is_some() {
+            // The pane saves the new height.
+            cx.emit(PageChanged);
             cx.notify();
         }
     }
@@ -1379,6 +1561,7 @@ impl Render for BrowserPage {
             self.start_engine(cx);
         }
         self.focus_prompt_now(window, cx);
+        self.restore_dev_tools_now(cx);
         let (body, docked) = match self.status(cx) {
             Some(status) => (status, false),
             None => (self.surface(cx), self.devtools.is_some()),
@@ -1403,6 +1586,8 @@ impl Render for BrowserPage {
                 cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(zoom_step(this.zoom, -1), cx)),
             )
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
+            .on_action(cx.listener(|this, _: &ToggleGrab, window, cx| this.toggle_grab(window, cx)))
+            .on_key_down(cx.listener(|this, event, _, cx| this.grab_key(event, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -1684,7 +1869,7 @@ impl BrowserPage {
     pub(crate) fn js_dialog(&self) -> Option<DialogInfo> {
         self.prompts.iter().find_map(|prompt| match prompt {
             PagePrompt::Dialog(dialog) => Some(dialog_info(dialog)),
-            PagePrompt::Auth(_) => None,
+            PagePrompt::Auth(_) | PagePrompt::DevTools(_) => None,
         })
     }
 
@@ -1803,7 +1988,7 @@ impl BrowserPage {
                 url, foreground, ..
             } => cx.emit(PageRequest::Open {
                 url,
-                foreground,
+                foreground: self.popup_foreground(foreground),
                 popup: None,
             }),
             BrowserEvent::PopupOpened {
@@ -1812,13 +1997,14 @@ impl BrowserPage {
                 foreground,
             } => cx.emit(PageRequest::Open {
                 url,
-                foreground,
+                foreground: self.popup_foreground(foreground),
                 popup: Some(id),
             }),
             BrowserEvent::CloseRequested => cx.emit(PageRequest::Close),
             BrowserEvent::Download(download) => {
                 // The toolbar's indicator shows it; opening the list on its
                 // own would hide the page, which no overlay may cover.
+                self.route_download(&download);
                 match self.downloads.iter_mut().find(|d| d.id == download.id) {
                     Some(known) => *known = download,
                     None => self.downloads.push(download),
@@ -1828,7 +2014,7 @@ impl BrowserPage {
             BrowserEvent::Dialog(dialog) => self.push_prompt(PagePrompt::Dialog(dialog), cx),
             BrowserEvent::DialogsReset => {
                 let shown = matches!(self.prompts.front(), Some(PagePrompt::Dialog(_)));
-                self.prompts.retain(|p| matches!(p, PagePrompt::Auth(_)));
+                self.prompts.retain(|p| !matches!(p, PagePrompt::Dialog(_)));
                 if shown {
                     self.show_prompt(cx);
                 }
@@ -2096,7 +2282,7 @@ impl BrowserPage {
                 password.update(cx, |input, _| input.set_secret(true));
                 vec![user, password]
             }
-            Some(PagePrompt::Dialog(dialog)) => match &dialog.kind {
+            Some(PagePrompt::Dialog(dialog) | PagePrompt::DevTools(dialog)) => match &dialog.kind {
                 monocode_cef::DialogKind::Prompt(text) => {
                     let input = field("Answer", cx);
                     let text = text.clone();
@@ -2151,12 +2337,12 @@ impl BrowserPage {
                 request.sign_in(text(0, cx).trim(), &text(1, cx));
             }
             PagePrompt::Auth(request) => request.cancel(),
-            PagePrompt::Dialog(dialog) if accept => {
+            PagePrompt::Dialog(dialog) | PagePrompt::DevTools(dialog) if accept => {
                 let answer =
                     matches!(dialog.kind, monocode_cef::DialogKind::Prompt(_)).then(|| text(0, cx));
                 dialog.accept(answer.as_deref());
             }
-            PagePrompt::Dialog(dialog) => dialog.decline(),
+            PagePrompt::Dialog(dialog) | PagePrompt::DevTools(dialog) => dialog.decline(),
         }
         self.show_prompt(cx);
     }
@@ -2184,8 +2370,9 @@ impl BrowserPage {
                     Some("Cancel"),
                 )
             }
-            PagePrompt::Dialog(dialog) => {
+            PagePrompt::Dialog(dialog) | PagePrompt::DevTools(dialog) => {
                 let says = match origin_host(&dialog.origin) {
+                    _ if matches!(prompt, PagePrompt::DevTools(_)) => "DevTools says".to_owned(),
                     host if host.is_empty() => "This page says".to_owned(),
                     host => format!("{host} says"),
                 };
@@ -2210,7 +2397,7 @@ impl BrowserPage {
         };
         let labels: &[&str] = match prompt {
             PagePrompt::Auth(_) => &["User name", "Password"],
-            PagePrompt::Dialog(_) => &[""],
+            PagePrompt::Dialog(_) | PagePrompt::DevTools(_) => &[""],
         };
         let fields = self.prompt_fields.iter().zip(labels).map(|(field, label)| {
             div()
@@ -2444,6 +2631,8 @@ struct Shared {
     host: RefCell<Option<Weak<dyn Swept>>>,
     /// The user's last mouse or key input in the page (K34).
     last_input: Cell<Option<Instant>>,
+    /// Who drives the page, and the agent last using it (K47, K48).
+    presence: presence::Presence,
 }
 
 impl Shared {
@@ -2646,6 +2835,9 @@ impl<V: NativeView> Swept for Host<V> {
         if !std::ptr::eq(&*window, &*home) {
             return;
         }
+        let Some(input) = presence::input_of(event.r#type()) else {
+            return;
+        };
         let hit = if event.r#type() == NSEventType::KeyDown {
             window
                 .firstResponder()
@@ -2661,7 +2853,7 @@ impl<V: NativeView> Swept for Host<V> {
                 && at.y < rect.origin.y + rect.size.height
         };
         if hit {
-            self.shared.last_input.set(Some(now));
+            self.shared.user_input(input, now);
         }
     }
 
@@ -3005,16 +3197,30 @@ pub(crate) fn cover_element() -> impl IntoElement {
         .inset_0()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What the last sweep took as covered, for tests.
+    static SWEPT: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What the last sweep took as covered, taken.
+#[cfg(test)]
+pub(crate) fn take_swept() -> Vec<Bounds<Pixels>> {
+    SWEPT.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
 /// Painted after everything else in a window: hides the views that were not
 /// painted in this frame, moves away the ones an overlay covers, and starts
-/// the next frame.
+/// the next frame. Overlays are what called [`cover`], and every deferred
+/// draw (menus, popovers, modals) and tooltip GPUI painted in this frame
+/// (`Window::overlay_bounds`, K44).
 pub(crate) fn sweep() -> impl IntoElement {
     gpui::deferred(
         canvas(
             |_, _, _| {},
             |_, _, window, cx| {
                 let id = window.window_handle().window_id();
-                let (epoch, covers) = FRAMES.with(|f| {
+                let (epoch, mut covers) = FRAMES.with(|f| {
                     let mut frames = f.borrow_mut();
                     let frame = frames.entry(id).or_default();
                     let covers = std::mem::take(&mut frame.covers);
@@ -3022,6 +3228,9 @@ pub(crate) fn sweep() -> impl IntoElement {
                     frame.epoch += 1;
                     (epoch, covers)
                 });
+                covers.extend_from_slice(window.overlay_bounds());
+                #[cfg(test)]
+                SWEPT.with(|s| s.borrow_mut().clone_from(&covers));
                 let live: Vec<Rc<dyn Swept>> = HOSTS.with(|hosts| {
                     let mut hosts = hosts.borrow_mut();
                     hosts.retain(|host| host.strong_count() > 0);
@@ -3182,6 +3391,10 @@ mod monocode_cef {
             final_update: bool,
         },
         Focused,
+        GrabAt {
+            x: i32,
+            y: i32,
+        },
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -3241,6 +3454,10 @@ mod monocode_cef {
         }
     }
     pub fn cancel_download(_: u32) {}
+    pub fn take_popup(_: u64) -> Option<()> {
+        None
+    }
+    pub struct DownloadInto;
 
     pub struct AuthChallenge {
         pub host: String,
@@ -3297,6 +3514,9 @@ mod monocode_cef {
         ) -> Result<(Self, async_channel::Receiver<BrowserEvent>), &'static str> {
             Self::create(parent, frame, url)
         }
+        pub fn download_next_into(&self, _: std::path::PathBuf) -> DownloadInto {
+            DownloadInto
+        }
         pub fn devtools_attach(&self, _: DevToolsSink) -> Option<DevToolsAttachment> {
             None
         }
@@ -3327,6 +3547,9 @@ mod monocode_cef {
         pub fn close(&self) {}
     }
 }
+
+#[cfg(test)]
+mod overlay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3642,6 +3865,134 @@ mod tests {
             assert_eq!(page.js_dialog(), None);
             assert!(page.prompts.is_empty());
         });
+    }
+
+    #[test]
+    fn what_the_docked_devtools_ask_for_is_not_the_pages() {
+        use monocode_cef::{BrowserEvent, DialogKind, JsDialog};
+        let popup = |url: &str, opened: bool| {
+            let (url, foreground) = (url.to_owned(), true);
+            if opened {
+                BrowserEvent::PopupOpened {
+                    id: 7,
+                    url,
+                    foreground,
+                }
+            } else {
+                BrowserEvent::PopupRequested {
+                    url,
+                    user_gesture: true,
+                    foreground,
+                }
+            }
+        };
+        // Links open as tabs of their own, without the popup's opener.
+        for opened in [false, true] {
+            assert_eq!(
+                devtools_ask(&popup("https://developer.chrome.com/docs", opened)),
+                DevToolsAsk::OpenTab {
+                    url: "https://developer.chrome.com/docs".into(),
+                    foreground: true,
+                }
+            );
+            for url in [
+                "devtools://devtools/x",
+                "chrome://inspect",
+                "javascript:1",
+                "",
+            ] {
+                assert_eq!(
+                    devtools_ask(&popup(url, opened)),
+                    DevToolsAsk::Ignore,
+                    "{url}"
+                );
+            }
+        }
+        let dialog = JsDialog::detached(DialogKind::Confirm, "devtools://devtools", "Sure?");
+        assert_eq!(
+            devtools_ask(&BrowserEvent::Dialog(dialog)),
+            DevToolsAsk::Prompt
+        );
+        assert_eq!(devtools_ask(&BrowserEvent::Focused), DevToolsAsk::Focus);
+        for event in [
+            BrowserEvent::Closed,
+            BrowserEvent::CloseRequested,
+            BrowserEvent::RenderProcessGone,
+        ] {
+            assert_eq!(devtools_ask(&event), DevToolsAsk::Close);
+        }
+        assert_eq!(
+            devtools_ask(&BrowserEvent::Title("DevTools".into())),
+            DevToolsAsk::Ignore
+        );
+        // No dock-side menu: the frontend is not told it can dock.
+        assert!(!devtools_frontend_url("127.0.0.1:1/t", "A").contains("can_dock"));
+    }
+
+    #[gpui::test]
+    fn devtools_dialogs_are_neither_the_pages_nor_the_agents(cx: &mut gpui::TestAppContext) {
+        use monocode_cef::{DialogKind, JsDialog};
+        let page = cx.new(|cx| {
+            BrowserPage::new(
+                "https://a.test/".into(),
+                String::new(),
+                100,
+                "/tmp".into(),
+                cx,
+            )
+        });
+        page.update(cx, |page, cx| {
+            let dialog = JsDialog::detached(DialogKind::Confirm, "devtools://devtools", "Clear?");
+            page.push_prompt(PagePrompt::DevTools(dialog), cx);
+            assert_eq!(page.js_dialog(), None);
+            assert!(!page.answer_js_dialog(true, None, cx));
+            // The page navigating leaves them; DevTools closing takes them.
+            page.on_page_event(monocode_cef::BrowserEvent::DialogsReset, cx);
+            assert_eq!(page.prompts.len(), 1);
+            page.close_docked_dev_tools(cx);
+            assert!(page.prompts.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn the_docked_devtools_state_is_kept_for_the_pane(cx: &mut gpui::TestAppContext) {
+        let page = cx.new(|cx| {
+            BrowserPage::new(
+                "https://a.test/".into(),
+                String::new(),
+                100,
+                "/tmp".into(),
+                cx,
+            )
+        });
+        let changes = Rc::new(Cell::new(0));
+        let counted = changes.clone();
+        cx.update(|cx| {
+            cx.subscribe(&page, move |_, _: &PageChanged, _| {
+                counted.set(counted.get() + 1)
+            })
+            .detach()
+        });
+        page.update(cx, |page, cx| {
+            assert_eq!(page.dev_tools_saved(), (false, 0));
+            // Restored open: kept open until they can open, even before.
+            page.restore_dev_tools(true, 320);
+            assert_eq!(page.dev_tools_saved(), (true, 320));
+            // No DevTools agent yet: they wait.
+            page.restore_dev_tools_now(cx);
+            assert!(page.devtools.is_none());
+            assert_eq!(page.dev_tools_saved(), (true, 320));
+            // The user's toggle decides from then on, and is saved.
+            page.set_devtools_wanted(true, cx);
+            page.devtools_restore = false;
+            page.set_devtools_wanted(false, cx);
+            assert_eq!(page.dev_tools_saved(), (false, 320));
+            // A drag's end saves the height.
+            page.devtools_drag = Some((0., 320.));
+            page.end_divider_drag(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(changes.get(), 3);
     }
 
     struct NoView;

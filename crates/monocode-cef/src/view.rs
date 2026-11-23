@@ -22,7 +22,7 @@ use cef::*;
 
 pub use crate::{
     dialogs::{AuthChallenge, AuthRequest, DialogKind, JsDialog},
-    download::{Download, DownloadState, cancel_download},
+    download::{Download, DownloadInto, DownloadState, cancel_download},
     popup::take_popup,
     profile::{Profile, forget_profile, profile_id},
 };
@@ -86,6 +86,12 @@ pub enum BrowserEvent {
     },
     /// The page took the keyboard (a click in it, or [`BrowserView::set_focus`]).
     Focused,
+    /// The user chose "Send to Agent" in the page's context menu, right-
+    /// clicking at `(x, y)` in the view (points, page zoom not applied).
+    GrabAt {
+        x: i32,
+        y: i32,
+    },
 }
 
 /// How a page is created.
@@ -414,6 +420,10 @@ mod client {
             download: cef::DownloadHandler,
             request: cef::RequestHandler,
             dialogs: cef::JsdialogHandler,
+            // "Send to Agent" (context.md K49).
+            context_menu: cef::ContextMenuHandler,
+            // An agent's downloads in a row (K50).
+            permission: cef::PermissionHandler,
         }
 
         impl Client {
@@ -448,6 +458,14 @@ mod client {
             fn jsdialog_handler(&self) -> Option<cef::JsdialogHandler> {
                 Some(self.dialogs.clone())
             }
+
+            fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+                Some(self.context_menu.clone())
+            }
+
+            fn permission_handler(&self) -> Option<cef::PermissionHandler> {
+                Some(self.permission.clone())
+            }
         }
     }
 }
@@ -463,7 +481,9 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
         PageFocusHandler::new(state.clone()),
         crate::download::PageDownloadHandler::new(state.clone()),
         crate::dialogs::PageRequestHandler::new(state.clone()),
-        crate::dialogs::PageDialogHandler::new(state),
+        crate::dialogs::PageDialogHandler::new(state.clone()),
+        crate::context_menu::PageContextMenuHandler::new(state),
+        crate::download::PagePermissionHandler::new(),
     )
 }
 
@@ -694,6 +714,12 @@ impl BrowserView {
     /// page closes first.
     pub fn capture(&self, done: impl FnOnce(Result<Vec<u8>, String>) + 'static) {
         crate::capture::capture(&self.browser, Box::new(done));
+    }
+
+    /// The page's next download goes into `dir` (made if missing) instead
+    /// of `~/Downloads`, while the returned value lives.
+    pub fn download_next_into(&self, dir: std::path::PathBuf) -> DownloadInto {
+        crate::download::download_into(self.browser.identifier(), dir)
     }
 
     /// Chromium's id of the page's browser, unique for the app's run.

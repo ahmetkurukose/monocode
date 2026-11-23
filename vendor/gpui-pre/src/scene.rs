@@ -230,6 +230,25 @@ pub enum Primitive {
     Surface(PaintSurface),
 }
 
+impl Scene {
+    /// Monocode: the bounds of what the paint operations in `range` drew,
+    /// clipped to their content masks.
+    pub(crate) fn painted_bounds(&self, range: Range<usize>) -> Option<Bounds<ScaledPixels>> {
+        self.paint_operations[range]
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let bounds = primitive
+                        .bounds()
+                        .intersect(&primitive.content_mask().bounds);
+                    (!bounds.is_empty()).then_some(bounds)
+                }
+                _ => None,
+            })
+            .reduce(|all, bounds| all.union(&bounds))
+    }
+}
+
 #[expect(missing_docs)]
 impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {

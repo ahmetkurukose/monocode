@@ -344,7 +344,8 @@ pub(crate) struct TerminalPane {
     pub cwd: String,
 }
 /// A browser page in the pane tree (docs/native/browser/context.md §4.5).
-/// Its address, title and zoom are saved; the page loads again when shown.
+/// Its address, title, zoom and docked DevTools are saved; the page loads
+/// again when shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct BrowserPane {
@@ -354,6 +355,12 @@ pub(crate) struct BrowserPane {
     /// Page zoom in percent; `None` is 100%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<u16>,
+    /// Its docked DevTools are open; they open again when the page shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub docked_devtools: bool,
+    /// The docked DevTools' height in points; `None` is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docked_devtools_height: Option<u32>,
     /// The agent session that opened it (context.md K21); not saved.
     #[serde(skip)]
     pub opened_by: Option<i64>,

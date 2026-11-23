@@ -228,6 +228,9 @@ fn main() {
     // quits. `isolate` sets this app's own id on the processes it owns.
     // SAFETY: first statement of `main`; no other thread exists yet.
     unsafe { std::env::remove_var("MONOCODE_HARNESS_PARENT") };
+    // Before any thread: Chromium's start would set it later, and could
+    // hang against a fork in another thread then.
+    monocode_cef::runtime::prepare_process();
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }

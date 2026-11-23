@@ -260,6 +260,15 @@ impl Conversation {
         cx.notify();
         true
     }
+    /// Files the app made for the draft (a browser grab's text and crop):
+    /// chips like dropped files, images with their `[Image #N]` markers.
+    pub(crate) fn attach_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.add_attachments(paths, cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn draft_attachments(&self) -> &[PathBuf] {
+        &self.attachments
+    }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
             if !self.attachments.contains(&path) && !self.pending_attachments.contains(&path) {

@@ -22,6 +22,14 @@ impl NoticeKind {
         color: 0x34d399,
         title: "Sent to Database",
     };
+    /// A browser grab that reached no composer (context.md K49).
+    pub(crate) const BROWSER_GRAB: Self = Self {
+        id: "browser-grab",
+        close: "browser-grab-close",
+        icon: "grab",
+        color: 0xfbbf24,
+        title: "Element not sent",
+    };
     pub(crate) const PROJECT_SLEEP: Self = Self {
         id: "project-slept",
         close: "project-slept-close",

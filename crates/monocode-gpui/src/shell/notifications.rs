@@ -26,6 +26,8 @@ pub(super) struct State {
     pub updater: Entity<Updater>,
     pub file_error: Entity<FileActionError>,
     pub database_sent: Entity<SentNotice>,
+    /// A browser grab that reached no composer.
+    pub browser_grab: Entity<SentNotice>,
     /// What the last Sleep freed.
     pub project_slept: Entity<SentNotice>,
     pub reminder_error: Option<String>,
@@ -74,6 +76,7 @@ impl State {
             updater: updater::shared(store, cx),
             file_error: cx.new(|_| FileActionError::new()),
             database_sent: cx.new(|_| SentNotice::default()),
+            browser_grab: cx.new(|_| SentNotice::new(NoticeKind::BROWSER_GRAB)),
             project_slept: cx.new(|_| SentNotice::new(NoticeKind::PROJECT_SLEEP)),
             reminder_error: None,
             github: cx.new(|_| GithubActivity::new(HashMap::new())),
@@ -1086,6 +1089,9 @@ impl Shell {
             })
             .when(state.database_sent.read(cx).is_visible(), |stack| {
                 stack.child(state.database_sent.clone())
+            })
+            .when(state.browser_grab.read(cx).is_visible(), |stack| {
+                stack.child(state.browser_grab.clone())
             })
             .when(!state.reminders.read(cx).is_empty(), |d| {
                 d.child(

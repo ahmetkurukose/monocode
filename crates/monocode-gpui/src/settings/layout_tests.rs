@@ -362,7 +362,9 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
         .update(visual, |view, _, cx| {
             view.update(cx, |p| p.browser_external_cdp = false);
             view.update(cx, |p| p.browser_external_cdp = true);
-            // No shell turned the endpoint on here: the reason shows.
+            // The endpoint is process-wide and other tests' shells turn it
+            // on (it is on by default): off here, the reason shows.
+            monocode_core::browser::proxy::set_enabled(false);
             view.copy_cdp_endpoint(cx);
             assert!(matches!(&view.browser_endpoint, Some(Err(e)) if !e.is_empty()));
         })

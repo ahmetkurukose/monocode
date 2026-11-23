@@ -116,6 +116,9 @@ pub(crate) struct Preferences {
     /// preferences get the new default once and the user's choice after.
     #[serde(default)]
     pub browser_external_cdp_rev: u32,
+    /// Chromium's battery saver, as in Chrome: pages run at 30 fps on a low
+    /// battery (context.md K52). On by default.
+    pub browser_battery_saver: bool,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -223,6 +226,7 @@ impl Default for Preferences {
             browser_all_links: false,
             browser_external_cdp: true,
             browser_external_cdp_rev: BROWSER_EXTERNAL_CDP_REV,
+            browser_battery_saver: true,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),
@@ -488,6 +492,16 @@ mod decoration_tests {
             serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         again.migrate();
         assert!(!again.show_excluded_files);
+    }
+
+    #[test]
+    fn the_browser_battery_saver_is_on_unless_turned_off() {
+        assert!(Preferences::default().browser_battery_saver);
+        assert!(Preferences::fresh_install().browser_battery_saver);
+        let saved: Preferences = serde_json::from_str("{}").unwrap();
+        assert!(saved.browser_battery_saver);
+        let off: Preferences = serde_json::from_str(r#"{"browser_battery_saver":false}"#).unwrap();
+        assert!(!off.browser_battery_saver);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Downloads: straight into `~/Downloads` under a name that clashes with
 //! nothing there, without a dialog (docs/native/browser/context.md §3.3).
-//! Progress comes back as [`BrowserEvent::Download`]. Every callback here
+//! A page's next download can go into another folder instead
+//! ([`crate::BrowserView::download_next_into`], K50). Progress comes back as [`BrowserEvent::Download`]. Every callback here
 //! runs on CEF's UI thread, the main thread.
 
 use std::{
@@ -63,6 +64,66 @@ pub fn cancel_download(id: u32) {
 /// Before CEF shuts down: lets go of CEF's callbacks.
 pub(crate) fn forget_all() {
     ACTIVE.with(|a| a.borrow_mut().clear());
+    NEXT_INTO.with(|n| n.borrow_mut().clear());
+}
+
+/// While this lives, a page's next download goes into a folder of the
+/// caller's. Dropped before that download starts, the page's downloads go
+/// to `~/Downloads` again.
+#[must_use]
+pub struct DownloadInto {
+    browser: i32,
+    ticket: u64,
+}
+
+impl Drop for DownloadInto {
+    fn drop(&mut self) {
+        NEXT_INTO.with(|n| {
+            let mut next = n.borrow_mut();
+            if next
+                .get(&self.browser)
+                .is_some_and(|(t, _)| *t == self.ticket)
+            {
+                next.remove(&self.browser);
+            }
+        });
+    }
+}
+
+/// Sends browser `browser`'s next download into `dir`, replacing an earlier
+/// such wish of its.
+pub(crate) fn download_into(browser: i32, dir: PathBuf) -> DownloadInto {
+    thread_local!(static TICKETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+    let ticket = TICKETS.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    });
+    NEXT_INTO.with(|n| n.borrow_mut().insert(browser, (ticket, dir)));
+    DownloadInto { browser, ticket }
+}
+
+/// Whether a download browser `browser` starts now goes into a caller's
+/// folder.
+fn expects_download(browser: i32) -> bool {
+    NEXT_INTO.with(|n| n.borrow().contains_key(&browser))
+}
+
+/// Whether we accept a page's permission prompt ourselves; else CEF's
+/// default answers it. A page's second download in a row asks
+/// for "multiple downloads", which an Alloy page would ignore, so the
+/// download never starts. An agent's input does not count as the user's
+/// gesture that lifts the limit, so its downloads are allowed while it
+/// waits for one ([`download_into`]).
+pub(crate) fn accept_permission(requested: u32, expecting: bool) -> bool {
+    let multiple = sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS;
+    expecting && requested == multiple as u32
+}
+
+/// The folder browser `browser`'s download starting now goes into, taken.
+fn take_into(browser: i32) -> Option<PathBuf> {
+    NEXT_INTO
+        .with(|n| n.borrow_mut().remove(&browser))
+        .map(|(_, dir)| dir)
 }
 
 struct Active {
@@ -75,6 +136,9 @@ thread_local! {
     /// Downloads between their start and their end, by id. Their paths are
     /// taken even while nothing exists there yet.
     static ACTIVE: RefCell<HashMap<u32, Active>> = RefCell::new(HashMap::new());
+    /// Where a browser's next download goes, by browser id, with the ticket
+    /// of the [`DownloadInto`] that asked.
+    static NEXT_INTO: RefCell<HashMap<i32, (u64, PathBuf)>> = RefCell::new(HashMap::new());
 }
 
 /// `~/Downloads`, made if it is missing.
@@ -159,6 +223,30 @@ fn snapshot(item: &DownloadItem, path: PathBuf) -> Download {
     }
 }
 
+wrap_permission_handler! {
+    pub(crate) struct PagePermissionHandler {}
+
+    impl PermissionHandler {
+        fn on_show_permission_prompt(
+            &self,
+            browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            _requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            let expecting = browser.is_some_and(|b| expects_download(b.identifier()));
+            match callback {
+                Some(callback) if accept_permission(requested_permissions, expecting) => {
+                    callback.cont(PermissionRequestResult::ACCEPT);
+                    1
+                }
+                _ => 0,
+            }
+        }
+    }
+}
+
 wrap_download_handler! {
     pub(crate) struct PageDownloadHandler {
         state: PageState,
@@ -177,7 +265,7 @@ wrap_download_handler! {
 
         fn on_before_download(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             download_item: Option<&mut DownloadItem>,
             suggested_name: Option<&CefString>,
             callback: Option<&mut BeforeDownloadCallback>,
@@ -186,7 +274,10 @@ wrap_download_handler! {
                 return 0;
             };
             let suggested = suggested_name.map(|s| s.to_string()).unwrap_or_default();
-            let path = unique_path(&downloads_dir(), &safe_name(&suggested));
+            let dir = (browser.map(|b| b.identifier()).and_then(take_into))
+                .filter(|dir| std::fs::create_dir_all(dir).is_ok())
+                .unwrap_or_else(downloads_dir);
+            let path = unique_path(&dir, &safe_name(&suggested));
             let id = item.id();
             ACTIVE.with(|a| {
                 a.borrow_mut().insert(id, Active { path: path.clone(), callback: None })
@@ -233,6 +324,22 @@ wrap_download_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_waiting_for_a_download_may_download_again() {
+        let multiple =
+            sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_MULTIPLE_DOWNLOADS as u32;
+        let camera = sys::cef_permission_request_types_t::CEF_PERMISSION_TYPE_CAMERA_STREAM as u32;
+        assert!(accept_permission(multiple, true));
+        // The user's own downloads, and every other prompt, as CEF decides.
+        assert!(!accept_permission(multiple, false));
+        assert!(!accept_permission(camera, true));
+        assert!(!accept_permission(multiple | camera, true));
+        let _into = download_into(7, PathBuf::from("/tmp/x"));
+        assert!(expects_download(7));
+        drop(_into);
+        assert!(!expects_download(7));
+    }
 
     #[test]
     fn a_download_takes_the_first_free_name() {
@@ -283,5 +390,23 @@ mod tests {
         });
         assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_for_the_next_download_is_taken_once_or_given_back() {
+        let wish = download_into(4, "/p/a".into());
+        assert_eq!(take_into(5), None);
+        assert_eq!(take_into(4), Some("/p/a".into()));
+        assert_eq!(take_into(4), None);
+        drop(wish);
+        // Dropped before a download came: gone.
+        drop(download_into(4, "/p/b".into()));
+        assert_eq!(take_into(4), None);
+        // A later wish replaces an earlier one; the earlier's drop leaves it.
+        let first = download_into(4, "/p/c".into());
+        let second = download_into(4, "/p/d".into());
+        drop(first);
+        assert_eq!(take_into(4), Some("/p/d".into()));
+        drop(second);
     }
 }

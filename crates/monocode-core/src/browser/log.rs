@@ -7,8 +7,8 @@
 //! `Network.getResponseBody`. Events of child sessions (iframes) are left out.
 
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
     rc::{Rc, Weak},
 };
 
@@ -85,6 +85,48 @@ pub struct PageLog {
     console: RefCell<VecDeque<ConsoleEntry>>,
     network: RefCell<VecDeque<NetworkEntry>>,
     subscription: RefCell<Option<Subscription>>,
+    /// Console entries ever logged: marks for [`PageLog::console_since`].
+    console_total: Cell<u64>,
+    /// What unfinished requests received so far, for their size.
+    received: RefCell<HashMap<String, Received>>,
+    /// Methods from `Network.requestWillBeSentExtraInfo` of requests the log
+    /// has not seen start (a new page's first document).
+    extra_methods: RefCell<HashMap<String, String>>,
+    /// The method of the main frame's navigation the page asked for, when
+    /// its reason says it (a form's GET or POST).
+    asked_method: RefCell<Option<String>>,
+    /// The main frame's id, once a navigation of it was heard.
+    main_frame: RefCell<Option<String>>,
+}
+
+/// Bytes a request received, from `Network.dataReceived` and its answer.
+#[derive(Default)]
+struct Received {
+    /// The answer's headers, over the wire.
+    headers: f64,
+    encoded: f64,
+    decoded: f64,
+    content_length: Option<f64>,
+}
+
+/// The method of a request from what its answer says: HTTP/2's `:method`
+/// header, or HTTP/1's request line.
+fn method_of_response(response: &Value) -> Option<String> {
+    if let Some(method) = response["requestHeaders"][":method"].as_str() {
+        return Some(method.to_owned());
+    }
+    let line = response["requestHeadersText"].as_str()?.lines().next()?;
+    let method = line.split_whitespace().next()?;
+    (!method.is_empty() && method.chars().all(|c| c.is_ascii_uppercase())).then(|| method.into())
+}
+
+/// A header's value, matched without case.
+fn header(headers: &Value, name: &str) -> Option<String> {
+    headers.as_object()?.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.as_str().map(str::to_owned))
+            .flatten()
+    })
 }
 
 fn now_ms() -> f64 {
@@ -141,6 +183,11 @@ impl PageLog {
             console: RefCell::default(),
             network: RefCell::default(),
             subscription: RefCell::default(),
+            console_total: Cell::new(0),
+            received: RefCell::default(),
+            extra_methods: RefCell::default(),
+            asked_method: RefCell::default(),
+            main_frame: RefCell::default(),
         });
         let weak = Rc::downgrade(&log);
         *log.subscription.borrow_mut() = Some(cdp.subscribe(move |event| {
@@ -214,6 +261,7 @@ impl PageLog {
                 let frame = &p["frame"];
                 if frame.get("parentId").is_none() {
                     self.settle_before(frame["loaderId"].as_str().unwrap_or(""));
+                    *self.main_frame.borrow_mut() = str_of(frame, "id");
                 }
                 if frame.get("parentId").is_none()
                     && p["type"].as_str() != Some("BackForwardCacheRestore")
@@ -229,13 +277,19 @@ impl PageLog {
             "Network.requestWillBeSent" => {
                 let id = str_of(p, "requestId").unwrap_or_default();
                 if let Some(redirect) = p.get("redirectResponse") {
+                    self.received.borrow_mut().remove(&id);
                     self.update(&id, |e| {
                         e.status = redirect["status"].as_i64();
                         e.mime = str_of(redirect, "mimeType");
+                        e.size = redirect["encodedDataLength"].as_f64().filter(|s| *s > 0.0);
                         e.finished = true;
                     });
                 }
                 let request = &p["request"];
+                if p["type"] == "Document" {
+                    // Heard: what the page asked for is no longer needed.
+                    self.asked_method.borrow_mut().take();
+                }
                 self.push_network(NetworkEntry {
                     request_id: id,
                     method: str_of(request, "method").unwrap_or_else(|| "GET".into()),
@@ -255,12 +309,16 @@ impl PageLog {
                 if p["type"].as_str() == Some("Document") && !self.knows(id) {
                     // A new page's first document: Chromium starts its
                     // request with the page, before the log listens, and
-                    // only its answer reaches the log.
+                    // only its answer reaches the log. Its method is `?`
+                    // unless something says it: a page opened by URL is a
+                    // GET, a form posting into a new tab a POST.
+                    let method = method_of_response(response)
+                        .or_else(|| self.extra_methods.borrow_mut().remove(id))
+                        .or_else(|| self.asked_method.borrow_mut().take())
+                        .unwrap_or_else(|| "?".into());
                     self.push_network(NetworkEntry {
                         request_id: id.to_owned(),
-                        // A page opened by URL; a form posting into a new
-                        // tab would be a POST, which the answer does not say.
-                        method: "GET".into(),
+                        method,
                         url: str_of(response, "url").unwrap_or_default(),
                         kind: "Document".into(),
                         status: None,
@@ -275,15 +333,86 @@ impl PageLog {
                     e.status = response["status"].as_i64();
                     e.mime = str_of(response, "mimeType");
                 });
+                let mut received = self.received.borrow_mut();
+                if received.len() >= NETWORK_ENTRIES && !received.contains_key(id) {
+                    received.clear();
+                }
+                let bytes = received.entry(id.to_owned()).or_default();
+                bytes.headers = response["encodedDataLength"].as_f64().unwrap_or(0.0);
+                bytes.content_length = header(&response["headers"], "content-length")
+                    .and_then(|length| length.trim().parse().ok());
+            }
+            "Network.requestWillBeSentExtraInfo" => {
+                let id = p["requestId"].as_str().unwrap_or("");
+                let Some(method) = p["headers"][":method"].as_str() else {
+                    return;
+                };
+                if self.knows(id) {
+                    // A first document logged from its answer before this.
+                    self.update(id, |e| {
+                        if e.method == "?" {
+                            e.method = method.to_owned();
+                        }
+                    });
+                } else {
+                    let mut methods = self.extra_methods.borrow_mut();
+                    if methods.len() >= NETWORK_ENTRIES {
+                        methods.clear();
+                    }
+                    methods.insert(id.to_owned(), method.to_owned());
+                }
+            }
+            "Page.frameRequestedNavigation" => {
+                let main = self.main_frame.borrow();
+                let elsewhere = main.as_deref().is_some_and(|m| p["frameId"] != m)
+                    || p["disposition"].as_str().is_some_and(|d| d != "currentTab");
+                if elsewhere {
+                    return;
+                }
+                // Only a form says its method; other reasons may re-send a POST.
+                let method = match p["reason"].as_str() {
+                    Some("formSubmissionGet") => Some("GET"),
+                    Some("formSubmissionPost") => Some("POST"),
+                    _ => None,
+                };
+                *self.asked_method.borrow_mut() = method.map(str::to_owned);
+            }
+            "Network.dataReceived" => {
+                let id = p["requestId"].as_str().unwrap_or("");
+                let mut received = self.received.borrow_mut();
+                if received.len() >= NETWORK_ENTRIES && !received.contains_key(id) {
+                    received.clear();
+                }
+                let bytes = received.entry(id.to_owned()).or_default();
+                bytes.encoded += p["encodedDataLength"].as_f64().unwrap_or(0.0);
+                bytes.decoded += p["dataLength"].as_f64().unwrap_or(0.0);
             }
             "Network.loadingFinished" => {
-                self.update(p["requestId"].as_str().unwrap_or(""), |e| {
+                let id = p["requestId"].as_str().unwrap_or("");
+                let received = self.received.borrow_mut().remove(id).unwrap_or_default();
+                // CEF's documents and cached answers may say 0 here though
+                // their bytes came: then what arrived is the size.
+                let size = [
+                    p["encodedDataLength"].as_f64().unwrap_or(0.0),
+                    received.headers + received.encoded,
+                    received.decoded,
+                    received.content_length.unwrap_or(0.0),
+                ]
+                .into_iter()
+                .find(|&size| size > 0.0);
+                self.update(id, |e| {
                     e.finished = true;
-                    e.size = p["encodedDataLength"].as_f64();
+                    e.size = size.or_else(|| {
+                        // Nothing to say otherwise: no body, or unknown.
+                        (matches!(e.status, Some(204 | 205 | 304)) || e.method == "HEAD")
+                            .then_some(0.0)
+                    });
                 });
             }
             "Network.loadingFailed" => {
-                self.update(p["requestId"].as_str().unwrap_or(""), |e| {
+                let id = p["requestId"].as_str().unwrap_or("");
+                self.received.borrow_mut().remove(id);
+                self.update(id, |e| {
                     e.finished = true;
                     e.failed = Some(if p["canceled"].as_bool() == Some(true) {
                         "canceled".into()
@@ -316,6 +445,21 @@ impl PageLog {
             console.pop_front();
         }
         console.push_back(entry);
+        self.console_total.set(self.console_total.get() + 1);
+    }
+
+    /// A mark of the console as it is now, for [`PageLog::console_since`].
+    pub fn console_mark(&self) -> u64 {
+        self.console_total.get()
+    }
+
+    /// The console entries logged after `mark` (those still kept), oldest
+    /// first.
+    pub fn console_since(&self, mark: u64) -> Vec<ConsoleEntry> {
+        let new = self.console_total.get().saturating_sub(mark) as usize;
+        let console = self.console.borrow();
+        let skip = console.len().saturating_sub(new);
+        console.iter().skip(skip).cloned().collect()
     }
 
     /// The main frame moved to another document, whose request is
@@ -565,7 +709,8 @@ mod tests {
                 first.url.as_str(),
                 first.kind.as_str()
             ),
-            ("GET", "http://localhost:8765/", "Document")
+            // Nothing says how it was asked for.
+            ("?", "http://localhost:8765/", "Document")
         );
         assert_eq!(first.status, Some(200));
         assert_eq!(first.mime.as_deref(), Some("text/html"));
@@ -624,6 +769,123 @@ mod tests {
             (None, Some(200))
         );
         assert!(!of("L2").finished);
+    }
+
+    #[test]
+    fn a_first_documents_method_comes_from_what_says_it() {
+        let (cdp, script) = Script::client();
+        let log = PageLog::start(&cdp);
+        let answered = |id: &str, response: Value| {
+            let mut response = response;
+            response["url"] = "http://localhost/".into();
+            response["status"] = 200.into();
+            script.emit(
+                "Network.responseReceived",
+                json!({"requestId": id, "type": "Document", "response": response}),
+            );
+        };
+        // HTTP/2 headers, an HTTP/1 request line.
+        answered("A", json!({"requestHeaders": {":method": "POST"}}));
+        answered(
+            "B",
+            json!({"requestHeadersText": "PUT / HTTP/1.1\r\nHost: x\r\n"}),
+        );
+        // Extra info before the answer, and after it.
+        script.emit(
+            "Network.requestWillBeSentExtraInfo",
+            json!({"requestId": "C", "headers": {":method": "POST"}}),
+        );
+        answered("C", json!({}));
+        answered("D", json!({}));
+        script.emit(
+            "Network.requestWillBeSentExtraInfo",
+            json!({"requestId": "D", "headers": {":method": "GET"}}),
+        );
+        // A form the page itself submitted.
+        script.emit(
+            "Page.frameRequestedNavigation",
+            json!({"frameId": "F", "reason": "formSubmissionPost", "url": "http://localhost/"}),
+        );
+        answered("E", json!({}));
+        answered("F", json!({}));
+        let methods: Vec<String> = log
+            .network(10, None)
+            .into_iter()
+            .map(|e| e.method)
+            .collect();
+        assert_eq!(methods, ["POST", "PUT", "POST", "GET", "POST", "?"]);
+    }
+
+    #[test]
+    fn sizes_come_from_what_arrived_when_the_end_says_0() {
+        let (cdp, script) = Script::client();
+        let log = PageLog::start(&cdp);
+        for id in ["A", "B", "C", "D", "E"] {
+            script.emit(
+                "Network.requestWillBeSent",
+                json!({"requestId": id, "type": "Document",
+                    "request": {"url": "http://localhost/", "method": "GET"}}),
+            );
+        }
+        let answered = |id: &str, status: i64, response: Value| {
+            let mut response = response;
+            response["status"] = status.into();
+            script.emit(
+                "Network.responseReceived",
+                json!({"requestId": id, "response": response}),
+            );
+        };
+        let data = |id: &str, encoded: f64, decoded: f64| {
+            script.emit(
+                "Network.dataReceived",
+                json!({"requestId": id, "encodedDataLength": encoded, "dataLength": decoded}),
+            );
+        };
+        let finished = |id: &str| {
+            script.emit(
+                "Network.loadingFinished",
+                json!({"requestId": id, "encodedDataLength": 0}),
+            );
+        };
+        answered("A", 200, json!({"encodedDataLength": 200}));
+        data("A", 1000.0, 3000.0);
+        data("A", 500.0, 1000.0);
+        answered("B", 200, json!({}));
+        data("B", 0.0, 2048.0);
+        answered("C", 200, json!({"headers": {"Content-Length": "77"}}));
+        answered("D", 204, json!({}));
+        answered("E", 200, json!({}));
+        for id in ["A", "B", "C", "D", "E"] {
+            finished(id);
+        }
+        let sizes: Vec<Option<f64>> = log.network(10, None).into_iter().map(|e| e.size).collect();
+        assert_eq!(
+            sizes,
+            [Some(1700.0), Some(2048.0), Some(77.0), Some(0.0), None]
+        );
+    }
+
+    #[test]
+    fn console_marks_give_what_came_after() {
+        let (cdp, script) = Script::client();
+        let log = PageLog::start(&cdp);
+        let say = |text: &str| {
+            script.emit(
+                "Log.entryAdded",
+                json!({"entry": {"level": "error", "text": text}}),
+            );
+        };
+        say("old");
+        let mark = log.console_mark();
+        assert!(log.console_since(mark).is_empty());
+        say("new 1");
+        say("new 2");
+        let since: Vec<String> = log
+            .console_since(mark)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(since, ["new 1", "new 2"]);
     }
 
     #[test]

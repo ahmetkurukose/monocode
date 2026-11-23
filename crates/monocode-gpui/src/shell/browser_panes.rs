@@ -36,6 +36,10 @@ impl Shell {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
             page.set_profile(profile, cx);
             page.devtools_scope = devtools_scope;
+            page.restore_dev_tools(
+                state.docked_devtools,
+                state.docked_devtools_height.unwrap_or(0),
+            );
             page
         });
         // Asked from inside a page's event: handled once that is over, with
@@ -51,17 +55,25 @@ impl Shell {
         })
         .detach();
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let (url, title, zoom) = {
+            let (url, title, zoom, devtools, devtools_height) = {
                 let page = page.read(cx);
                 let zoom = (page.zoom != 100).then_some(page.zoom);
-                (page.url.clone(), page.title.clone(), zoom)
+                let (devtools, height) = page.dev_tools_saved();
+                let height = (height != 0).then_some(height);
+                (page.url.clone(), page.title.clone(), zoom, devtools, height)
             };
             if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
-                && (state.url != url || state.title != title || state.zoom != zoom)
+                && (state.url != url
+                    || state.title != title
+                    || state.zoom != zoom
+                    || state.docked_devtools != devtools
+                    || state.docked_devtools_height != devtools_height)
             {
                 state.url = url;
                 state.title = title;
                 state.zoom = zoom;
+                state.docked_devtools = devtools;
+                state.docked_devtools_height = devtools_height;
                 this.persist(cx);
             }
             this.invalidate_chrome(cx);
@@ -267,6 +279,7 @@ impl Shell {
                 popup,
             } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
             PageRequest::Close => self.close_pane(pane, window, cx),
+            PageRequest::Grab(result) => self.deliver_browser_grab(pane, result, cx),
         }
     }
 
@@ -361,6 +374,57 @@ mod tests {
         assert_eq!(page.url, "https://www.google.com/");
         let again = serde_json::to_string(&page).unwrap();
         assert!(!again.contains("devtools"), "{again}");
+    }
+
+    #[gpui::test]
+    fn a_page_keeps_its_docked_devtools_open_and_their_height(cx: &mut gpui::TestAppContext) {
+        let saved = BrowserPane {
+            owner: 1,
+            url: "http://localhost:5173/".into(),
+            docked_devtools: true,
+            docked_devtools_height: Some(320),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(serde_json::from_str::<BrowserPane>(&json).unwrap(), saved);
+
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.new_browser_pane(Some("http://localhost:5173/".into()), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (pane, page) = window
+            .update(cx, |shell, _, _| {
+                let (pane, (page, _)) = shell.browser_pages.iter().next().unwrap();
+                (*pane, page.clone())
+            })
+            .unwrap();
+        let saved = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |shell, _, _| {
+                    let state = &shell.workspace.browser_panes[&pane];
+                    (state.docked_devtools, state.docked_devtools_height)
+                })
+                .unwrap()
+        };
+        assert_eq!(saved(cx), (false, None));
+        // What the page reports is saved with the pane.
+        page.update(cx, |page, cx| {
+            page.restore_dev_tools(true, 280);
+            cx.emit(crate::browser::PageChanged);
+        });
+        cx.run_until_parked();
+        assert_eq!(saved(cx), (true, Some(280)));
+        // And a page made for the pane again starts from it.
+        window
+            .update(cx, |shell, _, cx| {
+                shell.browser_pages.remove(&pane);
+                let page = shell.browser_page(pane, cx).unwrap();
+                assert_eq!(page.read(cx).dev_tools_saved(), (true, 280));
+            })
+            .unwrap();
     }
 
     #[test]

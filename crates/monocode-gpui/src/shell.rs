@@ -4,8 +4,10 @@ mod app_commands;
 mod app_views;
 mod automation_runs;
 pub(crate) mod browser_agent;
+mod browser_grab;
 pub(crate) mod browser_links;
 mod browser_panes;
+mod browser_presence;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
@@ -7711,6 +7713,7 @@ impl Render for Shell {
             }
             // For testing the agent layer from outside (development only).
             self.start_browser_agent_dev_hook(cx);
+            self.start_browser_grab_dev_hook(window, cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
