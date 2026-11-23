@@ -101,6 +101,8 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K66 | Yeni sekme | Projenin çalışan dev sunucuları (açık portlar), son açılanlar, en sık ziyaret edilenler. |
 | K67 | Build yeri | Agent worktree'lerinde **hiç build yok** (cargo check/test dahil). Ortak `CARGO_TARGET_DIR` işe yaramadı: cargo workspace crate'lerini kaynak yoluna göre ayrı derliyor, her worktree kendi kopyalarını ekledi ve disk üç kez doldu. Paralel agent'lar worktree'de yalnız kod yazar; build ve testler birleşik dalda, ana worktree'de alınır. |
 | K68 | PTY başlatma | macOS'ta terminal çocukları `fork`'suz: `posix_spawn` (`SETSID`, `CLOEXEC_DEFAULT`) küçük `monocode-pty-exec`'i başlatır; o PTY'yi kontrol terminali yapar (`TIOCSCTTY`) ve programa `execve` eder. `posix_spawn` dosya işlemleri setsid'den önce çalıştığı için kontrol terminali doğrudan alınamıyor. Helper yoksa uygulamanın kendi image initializer trampoline'i yedek (~270 ms, helper <10 ms). Bundle'da `Contents/MacOS/monocode-pty-exec`. |
+| K69 | Eklenti mimarisi | **Kendi eklenti katmanımız (§8 b, Orca modeli).** Spike'lar (2026-11-23, Proton Pass): hibrit (`--load-extension`) content script/storage/mesajlaşmada çalıştı ama `tabs.query`/`windows` Alloy sekmeleri görmüyor, eklenti sayfaları Alloy'da üst düzey açılamıyor, kurulum/güncelleme API'si yok ve belgelenmemiş davranışa dayanıyor (`browser/ext-spike-hybrid`). Kendi katmanımız (`browser/ext-spike-own`): `mcext://` şeması, `chrome.*` shim, arka plan gizli sayfada worker, content script'ler CDP ile isolated/MAIN world'e, API'ler ana thread'de bizim sekme modelimizle; dört başarı maddesi geçti. Seçim: CEF yükseltmelerinden bağımsız, agent ve UI tamamen bizde; bedeli eklenti başına uyumluluk işi. |
+| K70 | Faz 5 sırası | Önce **Proton Pass** uçtan uca (kullanıcının gerçek girişi, kasa, alan içi doldurma, popup) doğrulanır; sonra diğer eklentiler. Fazın sonunda deneyimden bir **skill dosyası** yazılır: yeni bir eklentiyi bu katmana ekleme yöntemi (API envanteri, shim, testler, bilinen tuzaklar). |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -433,7 +435,7 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 ## 11. Riskler ve açık sorular
 | Konu | Not |
 |---|---|
-| Eklentiler | Gömülü (Alloy) sekmelerde Chrome eklenti API'si yok; hibrit modelin çalışıp çalışmadığı belirsiz. En büyük risk. |
+| Eklentiler | **Karar verildi (K69):** kendi katmanımız. Kalan risk eklenti başına API uyumluluğu (callback kilitleri, service worker yaşam döngüsü, CORS proxy). |
 | Overlay | Child view üstüne GPUI çizemez. Faz 1: son kare görüntüsü (K16); tooltip'ler ve ortak yardımcıları kullanmayan overlay'ler hâlâ sayfanın altında kalır. Kalıcı çözüm Faz 3 (OSR). |
 | Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır. Faz 2: agent'ın sürdüğü sekme gizlenmez, pencere dışında çizer (K23); pencere ekran dışındayken Chromium'un görünen sekmeyi de gizlediği görüldü ve aynı yolla çözüldü. |
 | DevTools yapışması | **Çözüldü (Faz 2, K28):** frontend kendi Alloy view'umuzda, CDP proxy'si üzerinden. |
@@ -507,7 +509,9 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   - Chrome/Arc/Brave'den cookie ve şifre import'u (K61, §3.3).
 
 ### Faz 5 — Eklentiler (seçilmiş 20–30)
-- **Önce (K60):** Proton Pass ile iki spike: (A) hibrit, Chrome-style CEF'in eklenti sistemi; (B) kendi eklenti katmanımız. Kazanan yol fazın mimarisi olur.
+- **Önce (K60):** ~~Proton Pass ile iki spike~~ → yapıldı, kazanan kendi katmanımız (K69).
+- **5a (K70):** Proton Pass'i kendi katmanımızda ürün kalitesinde çalıştırmak ve kullanıcının girişiyle doğrulamak.
+- **5b:** Diğer eklentiler; fazın sonunda eklenti ekleme skill'i.
 - Eklenti listesinin belirlenmesi ve gereken `chrome.*` API'lerinin çıkarılması.
 - Hibrit Chrome-style pencere modeli ile kendi eklenti katmanı arasında spike ile seçim (§8).
 - Web Store'dan kurulum, CRX3 doğrulama, otomatik güncelleme.
