@@ -15,7 +15,7 @@ use crate::view::{BrowserEvent, PageState};
 
 /// A CEF callback that may be answered from any thread, as CEF allows for
 /// these continuation callbacks.
-struct AnyThread<T>(T);
+pub(crate) struct AnyThread<T>(pub(crate) T);
 // SAFETY: CEF's continuation callbacks are reference counted atomically and
 // may be executed on any thread.
 unsafe impl<T> Send for AnyThread<T> {}
@@ -228,6 +228,24 @@ wrap_request_handler! {
             };
             self.state.send(BrowserEvent::Auth(request));
             1
+        }
+
+        // A certificate the network stack would not trust (crate::certs).
+        fn on_certificate_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            cert_error: Errorcode,
+            request_url: Option<&CefString>,
+            ssl_info: Option<&mut Sslinfo>,
+            callback: Option<&mut cef::Callback>,
+        ) -> ::std::os::raw::c_int {
+            crate::certs::certificate_error(
+                &self.state,
+                cert_error.get_raw(),
+                &string(request_url),
+                ssl_info,
+                callback,
+            )
         }
 
         fn on_render_process_terminated(

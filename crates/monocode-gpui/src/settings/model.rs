@@ -337,6 +337,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser chromium energy power battery low frame rate fps throttle",
     ),
     (
+        "browser-site-permissions",
+        Section::General,
+        "Site permissions",
+        "browser website camera microphone location geolocation notifications clipboard midi allow block reset privacy",
+    ),
+    (
         "file-word-wrap",
         Section::General,
         "Word wrap",

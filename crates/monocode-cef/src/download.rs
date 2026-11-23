@@ -104,7 +104,7 @@ pub(crate) fn download_into(browser: i32, dir: PathBuf) -> DownloadInto {
 
 /// Whether a download browser `browser` starts now goes into a caller's
 /// folder.
-fn expects_download(browser: i32) -> bool {
+pub(crate) fn expects_download(browser: i32) -> bool {
     NEXT_INTO.with(|n| n.borrow().contains_key(&browser))
 }
 
@@ -220,30 +220,6 @@ fn snapshot(item: &DownloadItem, path: PathBuf) -> Download {
         received: item.received_bytes().max(0),
         total: (total > 0).then_some(total),
         state,
-    }
-}
-
-wrap_permission_handler! {
-    pub(crate) struct PagePermissionHandler {}
-
-    impl PermissionHandler {
-        fn on_show_permission_prompt(
-            &self,
-            browser: Option<&mut Browser>,
-            _prompt_id: u64,
-            _requesting_origin: Option<&CefString>,
-            requested_permissions: u32,
-            callback: Option<&mut PermissionPromptCallback>,
-        ) -> ::std::os::raw::c_int {
-            let expecting = browser.is_some_and(|b| expects_download(b.identifier()));
-            match callback {
-                Some(callback) if accept_permission(requested_permissions, expecting) => {
-                    callback.cont(PermissionRequestResult::ACCEPT);
-                    1
-                }
-                _ => 0,
-            }
-        }
     }
 }
 

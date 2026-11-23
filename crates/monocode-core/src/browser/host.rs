@@ -107,6 +107,23 @@ pub trait Page {
         let _ = dir;
         Box::pin(async { Err("this page cannot take downloads into a folder".to_owned()) })
     }
+
+    /// What became of the page's recent permission requests, oldest first
+    /// (K63). Agents never answer them.
+    fn permission_notes(&self) -> Vec<super::sites::PermissionNote> {
+        Vec::new()
+    }
+
+    /// The permission prompt the page shows the user now, if any.
+    fn waiting_permission(&self) -> Option<super::sites::PermissionNote> {
+        None
+    }
+
+    /// The certificate error that stopped the page's last navigation, while
+    /// the page shows its warning (K62).
+    fn cert_error(&self) -> Option<super::sites::CertBlock> {
+        None
+    }
 }
 
 pub trait Host {

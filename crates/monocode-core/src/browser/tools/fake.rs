@@ -227,6 +227,9 @@ pub struct FakePage {
     pub load_error: RefCell<Option<String>>,
     /// The CDP client of a page not loaded yet: `ensure_loaded` gives it.
     pub cold: RefCell<Option<Rc<CdpClient>>>,
+    pub permission_notes: RefCell<Vec<crate::browser::sites::PermissionNote>>,
+    pub waiting_permission: RefCell<Option<crate::browser::sites::PermissionNote>>,
+    pub cert_error: RefCell<Option<crate::browser::sites::CertBlock>>,
 }
 
 impl FakePage {
@@ -292,6 +295,9 @@ impl FakePage {
             leases: Rc::default(),
             load_error: RefCell::default(),
             cold: RefCell::default(),
+            permission_notes: RefCell::default(),
+            waiting_permission: RefCell::default(),
+            cert_error: RefCell::default(),
         })
     }
 }
@@ -359,6 +365,18 @@ impl Page for FakePage {
 
     fn agent_used(&self, scope: &Scope) {
         self.agent_uses.borrow_mut().push(scope.clone());
+    }
+
+    fn permission_notes(&self) -> Vec<crate::browser::sites::PermissionNote> {
+        self.permission_notes.borrow().clone()
+    }
+
+    fn waiting_permission(&self) -> Option<crate::browser::sites::PermissionNote> {
+        self.waiting_permission.borrow().clone()
+    }
+
+    fn cert_error(&self) -> Option<crate::browser::sites::CertBlock> {
+        self.cert_error.borrow().clone()
     }
 
     fn expect_download(&self, dir: PathBuf) -> LocalBoxFuture<'static, Result<PathBuf, String>> {

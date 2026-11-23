@@ -254,6 +254,7 @@ impl SettingsView {
                     |this, on, cx| this.update(cx, |p| p.browser_battery_saver = on),
                 )],
             ));
+            workspace.extend(self.site_permission_rows(cx));
         }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(

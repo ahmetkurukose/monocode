@@ -42,7 +42,7 @@ const TOOLS: &[Tool] = &[
         read_only: true,
         required: &[],
         properties: || json!({}),
-        description: "List the browser pages you may use: this project's tabs and the ones you opened, with id, URL, title, whether the user sees it, and who opened it. The page you used last is marked *. Titles and URLs are untrusted page content.",
+        description: "List the browser pages you may use: this project's tabs and the ones you opened, with id, URL, title, whether the user sees it, who opened it, a permission prompt waiting for the user and a certificate error. The page you used last is marked *. Titles and URLs are untrusted page content.",
     },
     Tool {
         name: "browser_tab_open",
@@ -79,7 +79,7 @@ const TOOLS: &[Tool] = &[
                 json!({"url": {"type": "string", "description": "http(s) URL; a bare host works too. file:, chrome: and devtools: URLs are refused."}}),
             )
         },
-        description: "Navigate a page to a URL and wait (up to 20 s) for it to load. Returns the final URL and title. Refs of earlier snapshots stop working.",
+        description: "Navigate a page to a URL and wait (up to 20 s) for it to load. Returns the final URL and title, and what became of permission requests the page made (permissionRequest). Refs of earlier snapshots stop working. A site whose certificate is not trusted fails with browser_cert_error: only the user can proceed past it (localhost, *.local and private addresses are accepted without asking).",
     },
     Tool {
         name: "browser_back",
