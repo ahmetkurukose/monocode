@@ -730,13 +730,15 @@ impl Service {
             "azuredevops" => convert(azure_devops::azure_devops_status(self.data_dir.clone())?),
             _ => {
                 let installed = crate::scm::resolve_gui_binary("gh").is_some();
+                // github.com, or a GitHub Enterprise host the project's remotes use.
                 let authenticated = installed
-                    && run_gh(
+                    && (run_gh(
                         &self.cwd,
                         &["auth", "status", "--active", "--hostname", "github.com"],
                         true,
                     )
-                    .is_ok();
+                    .is_ok()
+                        || crate::scm::github_enterprise_authenticated(&self.cwd));
                 Ok(Status {
                     installed,
                     authenticated,

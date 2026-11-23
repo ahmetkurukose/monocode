@@ -75,6 +75,8 @@ mod phase_tile;
 mod pickers;
 mod prompt_history;
 mod popover;
+mod pr_dialog;
+mod pr_metadata;
 mod project_background;
 mod project_search;
 mod project_settings;

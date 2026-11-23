@@ -1783,3 +1783,446 @@ fn upstream_lookup_keeps_a_timeout_apart_from_a_missing_upstream() {
     assert_eq!(lookup("exit 128", limit), Ok(false));
     assert!(lookup("exec sleep 10", Duration::from_millis(50)).is_err());
 }
+
+mod pull_requests {
+    use super::*;
+    use crate::scm::pull_request::*;
+
+    fn remote(host: &str, owner: &str, name: &str) -> Option<RemoteUrl> {
+        Some(RemoteUrl {
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+        })
+    }
+
+    #[test]
+    fn remote_urls_parse_github_and_enterprise_hosts() {
+        let gh = remote("github.com", "octo", "app");
+        assert_eq!(parse_remote_url("https://github.com/octo/app.git"), gh);
+        assert_eq!(parse_remote_url("https://github.com/octo/app/"), gh);
+        assert_eq!(parse_remote_url("https://user:tok@github.com/octo/app"), gh);
+        assert_eq!(parse_remote_url("git@github.com:octo/app.git"), gh);
+        assert_eq!(
+            parse_remote_url("ssh://git@ssh.github.com:443/octo/app.git"),
+            gh
+        );
+        assert_eq!(parse_remote_url("git@GitHub.com:octo/app"), gh);
+        let ghe = remote("ghe.corp.example", "team", "svc");
+        assert_eq!(
+            parse_remote_url("https://ghe.corp.example/team/svc.git"),
+            ghe
+        );
+        assert_eq!(parse_remote_url("git@ghe.corp.example:team/svc.git"), ghe);
+        assert_eq!(
+            parse_remote_url("ssh://git@ghe.corp.example:2222/team/svc"),
+            ghe
+        );
+        assert_eq!(
+            parse_remote_url("https://ghe.corp.example:8443/team/svc"),
+            ghe
+        );
+        // Parsed but not GitHub: callers ask gh about the host.
+        assert_eq!(
+            parse_remote_url("git@gitlab.com:group/project.git"),
+            remote("gitlab.com", "group", "project")
+        );
+        assert_eq!(
+            parse_remote_url("https://gitlab.com/group/sub/project.git"),
+            None
+        );
+        assert_eq!(parse_remote_url("/tmp/origin.git"), None);
+        assert_eq!(parse_remote_url("C:\\repos\\origin.git"), None);
+        assert_eq!(parse_remote_url("file:///tmp/a/b"), None);
+        assert_eq!(parse_remote_url("https://github.com/octo"), None);
+    }
+
+    #[test]
+    fn gh_host_uses_hostname_for_api_and_gh_host_otherwise() {
+        let (args, env) = gh_host_args("ghe.corp", &["api", "graphql", "--input", "f"]);
+        assert_eq!(
+            args,
+            ["api", "--hostname", "ghe.corp", "graphql", "--input", "f"]
+        );
+        assert!(!env);
+        let (args, env) = gh_host_args("ghe.corp", &["pr", "list"]);
+        assert_eq!(args, ["pr", "list"]);
+        assert!(env);
+    }
+
+    fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+        assert!(git(dir, &["add", name]));
+        assert!(git(dir, &["commit", "-m", message]));
+    }
+
+    #[test]
+    fn range_lists_commits_files_and_merge_base() {
+        let dir = tmp();
+        let root = dir.path();
+        assert!(init_git_commit(root, &[("a.txt", "a\n")]));
+        let base = git_stdout(root, &["rev-parse", "HEAD"]).unwrap();
+        assert!(git(root, &["checkout", "-q", "-b", "feature"]));
+        commit_file(root, "b.txt", "b\n", "add b");
+        commit_file(root, "a.txt", "a\nmore\n", "grow a");
+        assert!(git(root, &["checkout", "-q", "main"]));
+        commit_file(root, "c.txt", "c\n", "main moves on");
+
+        let range = pr_range(root, "main", "feature").unwrap();
+        assert_eq!(range.merge_base, base);
+        assert_eq!(
+            range.base_sha,
+            git_stdout(root, &["rev-parse", "main"]).unwrap()
+        );
+        assert_eq!(
+            range.head_sha,
+            git_stdout(root, &["rev-parse", "feature"]).unwrap()
+        );
+        let subjects: Vec<&str> = range.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["grow a", "add b"]);
+        let files: Vec<(&str, &str, i64)> = range
+            .files
+            .iter()
+            .map(|f| (f.relative.as_str(), f.status.as_str(), f.additions))
+            .collect();
+        assert_eq!(files, [("a.txt", "modified", 1), ("b.txt", "added", 1)]);
+        let diff = pr_file_diff(root, &range.merge_base, &range.head_sha, "a.txt").unwrap();
+        assert_eq!(diff.relative, "a.txt");
+
+        assert!(pr_range(root, "feature", "feature")
+            .unwrap()
+            .commits
+            .is_empty());
+        assert!(pr_range(root, "main", "nope").is_err());
+        assert!(pr_range(root, "--all", "main").is_err());
+    }
+
+    #[test]
+    fn push_state_covers_all_four_states_and_push_creates_the_branch() {
+        let (repo, origin) = (tmp(), tmp());
+        let repo = repo.path();
+        assert!(init_git_commit(repo, &[("a.txt", "a\n")]));
+        with_origin(repo, origin.path());
+        assert_eq!(
+            pr_push_state(repo, "main", "origin", "main").unwrap(),
+            PrPush::UpToDate
+        );
+        assert!(git(repo, &["checkout", "-q", "-b", "topic"]));
+        commit_file(repo, "t.txt", "t\n", "topic");
+        let target = ("origin".to_string(), "remote-topic".to_string());
+        assert_eq!(
+            pr_push_state(repo, "topic", "origin", "remote-topic").unwrap(),
+            PrPush::Create {
+                remote: target.0.clone(),
+                branch: target.1.clone()
+            }
+        );
+
+        pr_push(repo, "topic", "origin", "remote-topic").unwrap();
+        assert!(git_ref_exists(origin.path(), "refs/heads/remote-topic"));
+        assert_eq!(
+            git_stdout(repo, &["config", "--get", "branch.topic.merge"]).as_deref(),
+            Some("refs/heads/remote-topic")
+        );
+        assert_eq!(
+            pr_push_state(repo, "topic", "origin", "remote-topic").unwrap(),
+            PrPush::UpToDate
+        );
+
+        commit_file(repo, "t.txt", "t2\n", "ahead");
+        assert_eq!(
+            pr_push_state(repo, "topic", "origin", "remote-topic").unwrap(),
+            PrPush::Sync {
+                remote: target.0.clone(),
+                branch: target.1.clone()
+            }
+        );
+        assert!(git(repo, &["reset", "-q", "--hard", "HEAD~2"]));
+        commit_file(repo, "other.txt", "o\n", "diverge");
+        assert_eq!(
+            pr_push_state(repo, "topic", "origin", "remote-topic").unwrap(),
+            PrPush::Diverged {
+                remote: target.0,
+                branch: target.1
+            }
+        );
+        assert!(
+            pr_push(repo, "topic", "origin", "remote-topic").is_err(),
+            "never forces"
+        );
+        assert!(pr_push_state(repo, "missing", "origin", "x").is_err());
+    }
+
+    #[test]
+    fn branch_lists_put_current_and_default_first() {
+        let (repo, origin) = (tmp(), tmp());
+        let repo = repo.path();
+        assert!(init_git_commit(repo, &[("a.txt", "a\n")]));
+        with_origin(repo, origin.path());
+        for branch in ["zeta", "alpha", "feature/x"] {
+            assert!(git(repo, &["branch", branch]));
+            assert!(git(repo, &["push", "-q", "origin", branch]));
+        }
+        assert!(git(repo, &["checkout", "-q", "zeta"]));
+        assert_eq!(
+            pr_local_branches(repo).unwrap(),
+            ["zeta", "alpha", "feature/x", "main"]
+        );
+        let origin_repo = PrRepo {
+            remote: "origin".into(),
+            host: "github.com".into(),
+            owner: "o".into(),
+            name: "n".into(),
+            default_branch: "main".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            pr_branches(repo, &origin_repo).unwrap(),
+            ["main", "alpha", "feature/x", "zeta"]
+        );
+        pr_fetch(repo, &["origin".into(), "origin".into()]).unwrap();
+        assert!(pr_fetch(repo, &["nope".into()]).is_err());
+        assert!(pr_fetch(repo, &[]).is_ok());
+    }
+
+    #[test]
+    fn graphql_bodies_parse_data_and_errors() {
+        let gql = parse_graphql(r#"{"data":{"a":1},"errors":[{"message":"boom"}]}"#).unwrap();
+        assert_eq!(gql.data["a"], 1);
+        assert_eq!(gql.errors, ["boom"]);
+        assert!(parse_graphql("gh: not json").is_none());
+        assert!(parse_graphql(r#"{"message":"Bad credentials"}"#).is_none());
+    }
+
+    #[test]
+    fn repos_query_and_answer_carry_fork_parent_and_templates() {
+        let query = repos_query(2, true);
+        assert!(query.starts_with("query($o0: String!, $n0: String!, $o1: String!, $n1: String!)"));
+        assert!(query.contains("r1: repository(owner: $o1, name: $n1)"));
+        assert!(query.contains("pullRequestTemplates"));
+        assert!(!repos_query(1, false).contains("pullRequestTemplates"));
+
+        let data = json!({
+            "viewer": {"login": "me"},
+            "r0": {
+                "id": "R_fork", "name": "app", "owner": {"login": "me"},
+                "nameWithOwner": "me/app", "defaultBranchRef": {"name": "main"},
+                "viewerPermission": "ADMIN", "isFork": true,
+                "pullRequestTemplates": [
+                    {"filename": "PULL_REQUEST_TEMPLATE/bug.md", "body": "bug"},
+                    {"filename": "pull_request_template.md", "body": "default"}
+                ],
+                "parent": {
+                    "id": "R_up", "name": "app", "owner": {"login": "octo"},
+                    "nameWithOwner": "octo/app", "defaultBranchRef": {"name": "develop"},
+                    "viewerPermission": "READ", "isFork": false
+                }
+            },
+            "r1": null
+        });
+        let (viewer, repos) = parse_repos(&data, 2);
+        assert_eq!(viewer, "me");
+        assert!(repos[1].is_none());
+        let fork = repos[0].as_ref().unwrap();
+        assert!(fork.is_fork);
+        let parent = fork.parent.as_ref().unwrap();
+        assert_eq!(parent.name_with_owner, "octo/app");
+        assert_eq!(parent.default_branch_ref.as_ref().unwrap().name, "develop");
+    }
+
+    #[test]
+    fn rest_pulls_and_created_pr_parse() {
+        let pr = parse_rest_pulls(
+            r#"[{"number":7,"title":"T","html_url":"https://ghe/x/y/pull/7","state":"OPEN"}]"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((pr.number, pr.state.as_str()), (7, "open"));
+        assert_eq!(parse_rest_pulls("[]").unwrap(), None);
+
+        let base = PrRepo {
+            host: "ghe.corp".into(),
+            owner: "o".into(),
+            name: "n".into(),
+            ..Default::default()
+        };
+        let data = json!({"createPullRequest": {"pullRequest": {
+            "id": "PR_1", "number": 3, "url": "https://ghe.corp/o/n/pull/3"}}});
+        let created = parse_created_pr(&data, &base).unwrap();
+        assert_eq!(created.node_id, "PR_1");
+        assert_eq!(
+            (created.repo.as_str(), created.host.as_str()),
+            ("o/n", "ghe.corp")
+        );
+        assert!(parse_created_pr(&json!({"createPullRequest": null}), &base).is_err());
+    }
+
+    #[test]
+    fn create_input_names_fork_heads_by_repository_or_owner() {
+        let repo = |owner: &str| PrRepo {
+            host: "github.com".into(),
+            owner: owner.into(),
+            name: "app".into(),
+            ..Default::default()
+        };
+        let mut submit = PrSubmit {
+            base: repo("octo"),
+            base_branch: "main".into(),
+            head: repo("octo"),
+            head_branch: "topic".into(),
+            title: " Title ".into(),
+            body: "Body".into(),
+            draft: true,
+        };
+        let input = create_pr_input(&submit, "R_base", Some("R_head"));
+        assert_eq!(input["headRefName"], "topic");
+        assert_eq!(input["title"], "Title");
+        assert_eq!(input["draft"], true);
+        assert!(input.get("headRepositoryId").is_none());
+
+        submit.head = repo("me");
+        let input = create_pr_input(&submit, "R_base", Some("R_head"));
+        assert_eq!(input["headRefName"], "topic");
+        assert_eq!(input["headRepositoryId"], "R_head");
+        let input = create_pr_input(&submit, "R_base", None);
+        assert_eq!(input["headRefName"], "me:topic");
+        assert!(input.get("headRepositoryId").is_none());
+    }
+
+    #[test]
+    fn ids_query_resolves_users_teams_and_labels() {
+        let users = vec!["alice".to_string()];
+        let teams = vec!["org/core".to_string()];
+        let labels = vec!["bug".to_string(), "needs review".to_string()];
+        let (query, variables) = ids_query("o", "n", &users, &teams, &labels)
+            .unwrap()
+            .unwrap();
+        assert!(query.contains("u0: user(login: $u0)"));
+        assert!(query.contains("t0: organization(login: $to0) { team(slug: $ts0)"));
+        assert!(query.contains("l1: label(name: $l1)"));
+        assert_eq!(variables["ts0"], "core");
+        assert_eq!(variables["l1"], "needs review");
+        assert!(ids_query("o", "n", &[], &[], &[]).unwrap().is_none());
+        assert!(ids_query("o", "n", &[], &["core".into()], &[]).is_err());
+
+        let data = json!({
+            "u0": {"id": "U_a"},
+            "t0": {"team": {"id": "T_c"}},
+            "repository": {"l0": {"id": "L_b"}, "l1": null}
+        });
+        let ids = parse_ids(&data, &users, &teams, &labels);
+        assert_eq!(ids.users["alice"], "U_a");
+        assert_eq!(ids.teams["org/core"], "T_c");
+        assert_eq!(ids.labels["bug"], "L_b");
+        assert!(!ids.labels.contains_key("needs review"));
+    }
+
+    #[test]
+    fn metadata_mutation_skips_empty_lists() {
+        let none = MetadataIds::default();
+        assert!(metadata_mutation("PR", &none, &none).is_none());
+        let add = MetadataIds {
+            teams: vec!["T".into()],
+            labels: vec!["L".into()],
+            ..Default::default()
+        };
+        let remove = MetadataIds {
+            assignees: vec!["U".into()],
+            ..Default::default()
+        };
+        let (query, variables) = metadata_mutation("PR", &add, &remove).unwrap();
+        assert!(query.contains("requestReviews(input: { pullRequestId: $pr, union: true"));
+        assert!(query.contains("addLabelsToLabelable"));
+        assert!(query.contains("removeAssigneesFromAssignable"));
+        assert!(!query.contains("addAssigneesToAssignable"));
+        assert!(!query.contains("removeLabelsFromLabelable"));
+        assert_eq!(variables["reviewers"], json!([]));
+        assert_eq!(variables["teams"], json!(["T"]));
+        assert_eq!(variables["pr"], "PR");
+    }
+
+    #[test]
+    fn metadata_parses_and_diffs_case_insensitively() {
+        let data = json!({"viewer": {"login": "me"}, "repository": {"pullRequest": {
+            "id": "PR_9",
+            "reviewRequests": {"nodes": [
+                {"requestedReviewer": {"__typename": "User", "login": "Alice"}},
+                {"requestedReviewer": {"__typename": "Team", "slug": "core",
+                    "organization": {"login": "org"}}}
+            ]},
+            "assignees": {"nodes": [{"id": "U_b", "login": "bob"}]},
+            "labels": {"nodes": [{"id": "L_bug", "name": "bug"}]}
+        }}});
+        let current = parse_pr_metadata(&data).unwrap();
+        assert_eq!(current.pr_id, "PR_9");
+        assert_eq!(current.viewer, "me");
+        assert_eq!(
+            current.metadata,
+            PrMetadata {
+                reviewers: vec!["Alice".into()],
+                team_reviewers: vec!["org/core".into()],
+                assignees: vec!["bob".into()],
+                labels: vec!["bug".into()],
+            }
+        );
+        assert_eq!(current.assignee_ids["bob"], "U_b");
+        assert!(parse_pr_metadata(&json!({"repository": {"pullRequest": null}})).is_err());
+
+        let wanted = PrMetadata {
+            reviewers: vec!["alice".into(), "carol".into()],
+            team_reviewers: vec![],
+            assignees: vec!["bob".into()],
+            labels: vec!["feature".into(), "feature".into()],
+        };
+        let (add, remove) = metadata_diff(&current.metadata, &wanted);
+        assert_eq!(
+            add,
+            PrMetadata {
+                reviewers: vec!["carol".into()],
+                labels: vec!["feature".into()],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            remove,
+            PrMetadata {
+                team_reviewers: vec!["org/core".into()],
+                labels: vec!["bug".into()],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            remove_reviewers_body(&remove),
+            json!({"reviewers": [], "team_reviewers": ["core"]})
+        );
+    }
+
+    #[test]
+    fn default_first_sorts_and_dedups() {
+        let branches = vec!["b".into(), "main".into(), "a".into(), "b".into()];
+        assert_eq!(default_first(branches, "main"), ["main", "a", "b"]);
+    }
+}
+
+#[test]
+fn pr_parent_fetch_url_keeps_the_main_remote_transport() {
+    use super::pull_request::swap_repo_in_url;
+    let parent = super::PrRepo {
+        host: "github.com".into(),
+        owner: "up".into(),
+        name: "proj".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        swap_repo_in_url("git@github.com:me/proj.git", &parent),
+        "git@github.com:up/proj.git"
+    );
+    assert_eq!(
+        swap_repo_in_url("https://github.com/me/proj", &parent),
+        "https://github.com/up/proj.git"
+    );
+    assert_eq!(
+        swap_repo_in_url("ssh://git@ghe.corp:2222/me/proj.git", &parent),
+        "ssh://git@ghe.corp:2222/up/proj.git"
+    );
+}

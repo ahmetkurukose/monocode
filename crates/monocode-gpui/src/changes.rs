@@ -12,6 +12,7 @@ use crate::{
         Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
         menu_popover, popover,
     },
+    pr_dialog::{Gh, PrDialog, PrDialogEvent, PrDraft},
     right_panel::*,
     stash_dialog::{Intent as StashIntent, StashDialog, StashDialogEvent},
     theme::*,
@@ -48,6 +49,9 @@ pub(crate) enum ChangesEvent {
         path: Option<String>,
         staged: Option<bool>,
     },
+    /// Show this pull request selected in the Inbox: the New Pull Request
+    /// dialog created it, or found the branch already has it.
+    ShowPullRequest(crate::inbox::RevealPr),
 }
 
 /// Where the branch switcher opens.
@@ -120,6 +124,10 @@ pub(crate) struct Changes {
     commit_dialog: Option<(Entity<CommitDialog>, Subscription)>,
     update_dialog: Option<(Entity<UpdateDialog>, Subscription)>,
     stash_dialog: Option<(Entity<StashDialog>, Subscription)>,
+    pr_dialog: Option<(Entity<PrDialog>, Subscription)>,
+    /// What the New Pull Request dialog held when it was cancelled, for the
+    /// same head branch next time.
+    pr_draft: Option<PrDraft>,
     branch_picker: Option<(Entity<BranchPopup>, Subscription)>,
     /// The switcher opened from the menu bar: a centred window, not a popover.
     branch_place: BranchPlace,
@@ -145,7 +153,7 @@ impl Changes {
             cx.observe(&git, |this, _, cx| this.index_changed(cx)),
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.index_changed(cx)),
             cx.observe(&form, |_, _, cx| cx.notify()),
-            cx.subscribe(&form, Self::form_event),
+            cx.subscribe_in(&form, window, Self::form_event),
         ];
         let mut this = Self {
             git,
@@ -167,6 +175,8 @@ impl Changes {
             commit_dialog: None,
             update_dialog: None,
             stash_dialog: None,
+            pr_dialog: None,
+            pr_draft: None,
             branch_picker: None,
             branch_place: BranchPlace::Header,
             blocked: None,
@@ -186,8 +196,9 @@ impl Changes {
     }
     fn form_event(
         &mut self,
-        _: Entity<CommitForm>,
+        _: &Entity<CommitForm>,
         event: &CommitFormEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -206,7 +217,11 @@ impl Changes {
                     staged: None,
                 });
             }
-            CommitFormEvent::Committed { pushed, error } => {
+            CommitFormEvent::Committed {
+                pushed,
+                error,
+                open_pr,
+            } => {
                 self.close_commit_dialog(cx);
                 if !error {
                     self.set_status(
@@ -219,6 +234,9 @@ impl Changes {
                     );
                 }
                 self.load_pr(cx);
+                if *open_pr {
+                    self.open_pr_dialog(window, cx);
+                }
                 cx.emit(ChangesEvent::Overlays);
             }
             _ => {}
@@ -760,34 +778,6 @@ impl Changes {
     fn on_default(index: Option<&DiffIndex>) -> bool {
         index.is_some_and(|i| i.branch.is_some() && i.branch == i.default_branch)
     }
-    /// generatePrContent, `gh pr create`, then the browser.
-    fn open_created_pr(
-        &mut self,
-        harness: Option<TextHarness>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.busy = Some("pr".into());
-        cx.notify();
-        let cwd = PathBuf::from(&self.cwd);
-        let work = cx
-            .background_executor()
-            .spawn(async move { create_pr_blocking(harness, &cwd) });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = None;
-                this.mutated(cx);
-                this.load_pr(cx);
-                match result {
-                    Ok(url) => cx.open_url(url.trim()),
-                    Err(error) => Self::fail(error, window, cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_git(
             "sync".into(),
@@ -797,10 +787,14 @@ impl Changes {
             cx,
         );
     }
-    fn create_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// New Pull Request…: asks first on the default branch, then opens the
+    /// dialog, which pushes when it needs to.
+    pub(crate) fn new_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pr_dialog.is_some() || self.cwd.is_empty() {
+            return;
+        }
         let index = self.index(cx);
-        let ahead = index.as_ref().is_some_and(|i| i.ahead > 0);
-        let question = Self::on_default(index.as_ref()).then(|| {
+        let Some(question) = Self::on_default(index.as_ref()).then(|| {
             format!(
                 "Create a pull request from default branch \"{}\"?",
                 index
@@ -808,34 +802,73 @@ impl Changes {
                     .and_then(|i| i.branch.clone())
                     .unwrap_or_default()
             )
-        });
-        let harness = self.form.read(cx).text_harness(cx);
+        }) else {
+            self.open_pr_dialog(window, cx);
+            return;
+        };
+        let ask = Self::confirm(question, "OK", window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if let Some(question) = question {
-                let Ok(ask) = this.update_in(cx, |_, window, cx| {
-                    Self::confirm(question, "OK", window, cx)
-                }) else {
-                    return;
-                };
-                if !ask.await {
+            if ask.await {
+                let _ = this.update_in(cx, |this, window, cx| this.open_pr_dialog(window, cx));
+            }
+        })
+        .detach();
+    }
+    /// The New Pull Request window, with what was typed last time for this
+    /// branch.
+    fn open_pr_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pr_dialog.is_some() || self.cwd.is_empty() {
+            return;
+        }
+        self.menu = None;
+        let branch = self.index(cx).and_then(|i| i.branch);
+        let draft = self
+            .pr_draft
+            .clone()
+            .filter(|d| Some(&d.head_branch) == branch.as_ref());
+        let harness = self.form.read(cx).text_harness(cx);
+        let cwd = self.cwd.clone();
+        let dialog =
+            cx.new(|cx| PrDialog::new(cwd, std::sync::Arc::new(Gh), draft, harness, window, cx));
+        let subscription = cx.subscribe(&dialog, |this, dialog, event: &PrDialogEvent, cx| {
+            match event {
+                PrDialogEvent::Close(draft) => {
+                    this.pr_dialog = None;
+                    this.pr_draft = Some(draft.clone());
+                }
+                PrDialogEvent::Created(pr) => {
+                    let title = dialog.read(cx).title.read(cx).content.to_string();
+                    this.pr_dialog = None;
+                    this.pr_draft = None;
+                    this.mutated(cx);
+                    this.load_pr(cx);
+                    this.set_status(&format!("Created pull request #{}", pr.number), cx);
+                    this.show_pull_request(&pr.url, &title, cx);
+                }
+                // The Inbox shows it; the dialog keeps what was typed.
+                PrDialogEvent::ViewExisting(pr) => {
+                    let pr = pr.clone();
+                    dialog.update(cx, |dialog, cx| dialog.close(cx));
+                    this.show_pull_request(&pr.url, &pr.title, cx);
                     return;
                 }
             }
-            let _ = this.update_in(cx, |this, window, cx| {
-                if ahead {
-                    this.run_git(
-                        "pr".into(),
-                        |path| scm::push(&path),
-                        move |this, window, cx| this.open_created_pr(harness, window, cx),
-                        window,
-                        cx,
-                    );
-                } else {
-                    this.open_created_pr(harness, window, cx);
-                }
-            });
-        })
-        .detach();
+            cx.emit(ChangesEvent::Overlays);
+            cx.notify();
+        });
+        self.pr_dialog = Some((dialog, subscription));
+        cx.emit(ChangesEvent::Overlays);
+        cx.notify();
+    }
+
+    /// Reveal a pull request in the Inbox, or open it in the browser when its
+    /// address is not one the Inbox can show.
+    fn show_pull_request(&mut self, url: &str, title: &str, cx: &mut Context<Self>) {
+        match crate::inbox::RevealPr::from_url(url, title, PathBuf::from(&self.cwd)) {
+            Some(pr) => cx.emit(ChangesEvent::ShowPullRequest(pr)),
+            None if !url.is_empty() => cx.open_url(url),
+            None => {}
+        }
     }
 
     fn open_menu(&mut self, kind: MenuKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -1350,18 +1383,16 @@ impl Changes {
                     .map_or("Create pull request".to_owned(), |b| {
                         format!("Create a pull request into {b}")
                     });
-                let enabled = can_create_pr && !busy;
+                let enabled = can_create_pr && !busy && self.pr_dialog.is_none();
                 d.child(
                     button("create-pr", title, enabled)
-                        .child(if self.busy.as_deref() == Some("pr") {
-                            spinner("pr-spin", "loader", 14.)
-                        } else {
-                            glyph("git-pull-request")
-                        })
+                        .child(glyph("git-pull-request"))
                         .child("Create PR")
                         .when(enabled, |d| {
                             d.on_click(
-                                cx.listener(|this, _, window, cx| this.create_pr(window, cx)),
+                                cx.listener(|this, _, window, cx| {
+                                    this.new_pull_request(window, cx)
+                                }),
                             )
                         }),
                 )
@@ -1481,8 +1512,8 @@ pub(crate) fn create_pr_blocking(
 }
 
 /// A read-only one-shot turn, as the React text harness runs: the final
-/// assistant message's text.
-fn text_prompt(
+/// assistant message's text. Blocking.
+pub(crate) fn text_prompt(
     (kind, binary, model): TextHarness,
     cwd: PathBuf,
     prompt: String,
@@ -1664,6 +1695,9 @@ impl Changes {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
         if let Some((dialog, _)) = &self.stash_dialog {
+            out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
+        }
+        if let Some((dialog, _)) = &self.pr_dialog {
             out.push(crate::modal::window_overlay(window, dialog.clone()).into_any_element());
         }
         let Some(picker) = self

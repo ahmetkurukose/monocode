@@ -28,9 +28,9 @@ mod file_panes;
 mod github_star;
 mod group_strip;
 mod idle_agents;
-mod keep_awake;
 #[cfg(test)]
 mod image_lightbox_tests;
+mod keep_awake;
 mod layout;
 mod live_agents;
 mod mobile_host;
@@ -179,6 +179,7 @@ actions!(
         OpenInbox,
         OpenNotes,
         GitCommit,
+        GitNewPullRequest,
         GitUpdate,
         GitUpdateRebase,
         GitFetch,
@@ -2269,6 +2270,9 @@ impl Shell {
             window,
             |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
                 crate::changes::ChangesEvent::Overlays => cx.notify(),
+                crate::changes::ChangesEvent::ShowPullRequest(pr) => {
+                    this.reveal_pull_request(pr.clone(), window, cx)
+                }
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review_tab(
                         crate::review::ReviewTab::Changes {
@@ -8082,6 +8086,11 @@ impl Render for Shell {
                     changes.open_commit_dialog(window, cx)
                 })
             }))
+            .on_action(cx.listener(|this, _: &GitNewPullRequest, window, cx| {
+                this.git_tool(window, cx, |changes, window, cx| {
+                    changes.new_pull_request(window, cx)
+                })
+            }))
             .on_action(cx.listener(|this, _: &GitUpdate, window, cx| {
                 this.git_tool(window, cx, |changes, window, cx| {
                     let source = crate::update_dialog::Source::Update(UpdateMethod::Merge);
@@ -8524,7 +8533,9 @@ impl Render for Shell {
                     .when(
                         matches!(
                             open.target,
-                            MenuTarget::Databases | MenuTarget::DatabaseImport | MenuTarget::KeepAwake
+                            MenuTarget::Databases
+                                | MenuTarget::DatabaseImport
+                                | MenuTarget::KeepAwake
                         ),
                         |p| {
                             p.side(Side::Top)
