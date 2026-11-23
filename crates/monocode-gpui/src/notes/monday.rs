@@ -17,6 +17,9 @@ use monocode_core::{
 };
 use std::path::PathBuf;
 
+// One event at a time, read and dropped at once: boxing the large
+// variant would cost more than its size does.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Event {
     /// The note's settings changed and want saving.
     Changed,

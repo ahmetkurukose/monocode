@@ -1505,6 +1505,19 @@ impl Shell {
                 .disabled(lone)
                 .into(),
         ]);
+        // A tab that is one file offers what the Explorer does for it.
+        if self.tab_file_place(id).is_some() {
+            items.extend([
+                MenuItem::Separator,
+                MenuAction::new("copy-path", "Copy Path").into(),
+                MenuAction::new("copy-relative-path", "Copy Relative Path").into(),
+                MenuAction::new("copy-name", "Copy File Name").into(),
+                MenuItem::Separator,
+                MenuAction::new("git-history", "Git History").into(),
+                MenuAction::new("show-in-explorer", "Show in Explorer").into(),
+                MenuAction::new("reveal", REVEAL_LABEL).into(),
+            ]);
+        }
         // A file tab can send the file to a data source's console.
         let sources = self
             .tab_file(id)
@@ -1562,6 +1575,16 @@ impl Shell {
         )
     }
 
+    /// The file a tab shows, with the checkout it belongs to: a file tab's
+    /// file, or the one file a changes tab is on.
+    fn tab_file_place(&self, pane: i64) -> Option<(String, String)> {
+        if !self.workspace.review_owners.contains_key(&pane) {
+            return None;
+        }
+        let state = self.workspace.reviews.get(&pane)?;
+        state.tabs.get(state.active)?.file()
+    }
+
     pub(super) fn run_group_tab_menu(
         &mut self,
         id: i64,
@@ -1608,6 +1631,34 @@ impl Shell {
             "copy-id" => cx.write_to_clipboard(ClipboardItem::new_string(id.to_string())),
             "archive" => self.toggle_archive(id, cx),
             "delete" => self.confirm_delete_session(id, window, cx),
+            "copy-path" | "copy-relative-path" | "copy-name" | "git-history"
+            | "show-in-explorer" | "reveal" => {
+                let Some((cwd, path)) = self.tab_file_place(id) else {
+                    return;
+                };
+                let copy = |text: String, cx: &mut Context<Self>| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text))
+                };
+                match action {
+                    "copy-path" => copy(path, cx),
+                    "copy-relative-path" => {
+                        copy(monocode_core::files::display_path(&path, Some(&cwd)), cx)
+                    }
+                    "copy-name" => copy(path.rsplit('/').next().unwrap_or(&path).to_owned(), cx),
+                    "git-history" => self.pending_file_history = Some((cwd, path)),
+                    "show-in-explorer" => self.pending_explorer_reveal = Some(path),
+                    _ => {
+                        let path = std::path::PathBuf::from(path);
+                        cx.background_executor()
+                            .spawn(async move {
+                                if let Err(error) = monocode_core::files::reveal_path(&path) {
+                                    crate::review::log_error(&error);
+                                }
+                            })
+                            .detach();
+                    }
+                }
+            }
             _ => {
                 if let Some(source) = action.strip_prefix("send-db:")
                     && let Some(path) = self.tab_file(id)

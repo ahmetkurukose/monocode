@@ -57,6 +57,9 @@ static REMEMBERED_SIZE: dialog_resize::Remembered = dialog_resize::remembered();
 /// Branch rows a picker lists before asking for a narrower search.
 const BRANCH_ROWS: usize = 200;
 
+// One event at a time, read and dropped at once: boxing the large
+// variant would cost more than its size does.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrDialogEvent {
     /// Closed without creating: what was typed, to start from next time.
     Close(PrDraft),

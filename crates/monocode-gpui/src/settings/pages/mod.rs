@@ -19,8 +19,8 @@ mod terminal;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
-pub(crate) use browser_import::ImportPanel;
 pub(crate) use appearance::{ACCENTS, swatch};
+pub(crate) use browser_import::ImportPanel;
 pub(super) use connections::ConnectionsState;
 pub(super) use integrations::IntegrationsState;
 pub(crate) use keybindings::{command_shortcut, shortcut_label};
