@@ -206,6 +206,9 @@ impl Shell {
                 }
                 notes::Event::OpenSource(id) => this.open(*id, window, cx),
                 notes::Event::AddToChat(note) => this.note_to_chat(note.clone(), window, cx),
+                notes::Event::OpenIntegrations => {
+                    this.open_settings(crate::settings::Section::Integrations, window, cx)
+                }
             },
         ));
         self.app_view_events

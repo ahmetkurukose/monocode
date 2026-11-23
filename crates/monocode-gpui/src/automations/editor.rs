@@ -46,6 +46,7 @@ pub(super) fn events(kind: &str) -> Vec<(String, String)> {
         ],
         "linear" => &[("issue_created", "Issue created")],
         "jira" => &[("issue_created", "Issue appeared")],
+        "monday" => &[("issue_created", "Item appeared")],
         "azuredevops" => &[
             ("pull_request_appeared", "Pull request appeared"),
             ("work_item_appeared", "Work item appeared"),

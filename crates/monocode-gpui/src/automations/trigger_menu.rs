@@ -4,11 +4,12 @@
 use super::*;
 use crate::popover::{Menu, MenuAction, MenuEvent, MenuItem, Popover, menu_popover};
 
-const CATEGORIES: [(&str, &str, &str); 6] = [
+const CATEGORIES: [(&str, &str, &str); 7] = [
     ("time", "Scheduled", "clock"),
     ("github", "GitHub", "inbox-github"),
     ("linear", "Linear", "inbox-linear"),
     ("jira", "Jira", "inbox-jira"),
+    ("monday", "monday.com", "inbox-monday"),
     ("gitlab", "GitLab", "inbox-gitlab"),
     ("azuredevops", "Azure DevOps", "inbox-azuredevops"),
 ];
@@ -66,6 +67,8 @@ impl TriggerMenu {
             let action = MenuAction::new(kind, label).icon(mark).icon_color(color);
             let action = if kind == "gitlab" {
                 action.icon_artwork("inbox-gitlab-color.svg")
+            } else if kind == "monday" {
+                action.icon_artwork("inbox-monday-color.svg")
             } else {
                 action
             };

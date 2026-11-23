@@ -85,6 +85,38 @@ pub struct Task {
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done_at: Option<i64>,
+    /// The tracker item the task was made from. Moving it never writes back:
+    /// the board is personal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TaskSource>,
+}
+
+/// Where a task came from: an item on a tracker's board.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSource {
+    /// `monday`.
+    pub provider: String,
+    pub item_id: String,
+    #[serde(default)]
+    pub board_id: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl TaskSource {
+    pub fn from_item(item: &crate::integrations::WorkItem) -> Self {
+        Self {
+            provider: item.provider.id().into(),
+            item_id: item.id.clone(),
+            board_id: item.board_id.clone(),
+            url: item.url.clone(),
+        }
+    }
+
+    pub fn same_item(&self, other: &TaskSource) -> bool {
+        self.provider == other.provider && self.item_id == other.item_id
+    }
 }
 
 impl Task {
@@ -250,8 +282,35 @@ impl Board {
             taken_min: 0,
             created_at: now,
             done_at: (column == Column::Done).then_some(now),
+            source: None,
         });
         id
+    }
+
+    /// The task made from a tracker item, added at the end of `column`. An
+    /// item already on the board is not added again: its task's id comes back.
+    pub fn add_from_source(
+        &mut self,
+        title: &str,
+        source: TaskSource,
+        column: Column,
+        now: i64,
+    ) -> String {
+        if let Some(task) = self.from_source(&source) {
+            return task.id.clone();
+        }
+        let id = self.add(title, 0, column, now);
+        if let Some(task) = self.task_mut(&id) {
+            task.source = Some(source);
+        }
+        id
+    }
+
+    /// The task made from the same tracker item as `source`.
+    pub fn from_source(&self, source: &TaskSource) -> Option<&Task> {
+        self.tasks
+            .iter()
+            .find(|task| task.source.as_ref().is_some_and(|s| s.same_item(source)))
     }
 
     /// Adds what the quick-add field holds: `@tag` and duration override
@@ -695,5 +754,46 @@ mod tests {
             ("Ship", Column::Today, 60)
         );
         assert!(board.quick_add("   ", "", Column::Backlog, 1).is_none());
+    }
+
+    fn source(item: &str) -> TaskSource {
+        TaskSource {
+            provider: "monday".into(),
+            item_id: item.into(),
+            board_id: "9".into(),
+            url: format!("https://t.monday.com/boards/9/pulses/{item}"),
+        }
+    }
+
+    #[test]
+    fn a_task_keeps_its_source_through_json_and_old_boards_still_read() {
+        let mut board = Board::default();
+        let id = board.add_from_source("Fix login", source("12"), Column::Backlog, 1);
+        board.add("plain", 0, Column::Today, 1);
+        let json = board.to_json();
+        assert!(json.contains("\"itemId\": \"12\""), "{json}");
+        let back = Board::parse(&json);
+        assert_eq!(back, board);
+        assert_eq!(back.task(&id).unwrap().source, Some(source("12")));
+        // A task without a source writes no `source` key.
+        assert_eq!(json.matches("\"source\"").count(), 1);
+        let old =
+            Board::parse(r#"{"tasks":[{"id":"t","title":"Old","column":"today","createdAt":1}]}"#);
+        assert_eq!(old.tasks.len(), 1);
+        assert_eq!(old.tasks[0].source, None);
+    }
+
+    #[test]
+    fn an_item_lands_on_a_board_once() {
+        let mut board = Board::default();
+        let first = board.add_from_source("Fix login", source("12"), Column::Backlog, 1);
+        board.move_task(&first, Column::Done, 0, 2);
+        let again = board.add_from_source("Fix login", source("12"), Column::Backlog, 3);
+        assert_eq!(again, first);
+        assert_eq!(board.tasks.len(), 1);
+        assert_eq!(board.task(&first).unwrap().column, Column::Done);
+        let other = board.add_from_source("Other", source("13"), Column::Backlog, 4);
+        assert_ne!(other, first);
+        assert_eq!(board.tasks.len(), 2);
     }
 }

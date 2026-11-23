@@ -31,12 +31,16 @@ mod trigger_menu;
 
 /// Event providers and schedules are separate from agent harness branding.
 fn trigger_mark(kind: &str, side: f32) -> AnyElement {
-    if kind == "gitlab" {
-        return gpui::img("inbox-gitlab-color.svg")
-            .size(px(side))
-            .flex_shrink_0()
-            .object_fit(gpui::ObjectFit::Contain)
-            .into_any_element();
+    if matches!(kind, "gitlab" | "monday") {
+        return gpui::img(if kind == "gitlab" {
+            "inbox-gitlab-color.svg"
+        } else {
+            "inbox-monday-color.svg"
+        })
+        .size(px(side))
+        .flex_shrink_0()
+        .object_fit(gpui::ObjectFit::Contain)
+        .into_any_element();
     }
     let (path, color) = match kind {
         "time" => ("clock", content(0.45)),

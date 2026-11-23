@@ -721,6 +721,21 @@ impl Inbox {
         statuses
     }
 
+    /// The monday.com boards this Inbox follows.
+    pub(crate) fn monday_boards(&self) -> Vec<String> {
+        self.state.monday_boards.clone()
+    }
+
+    /// Settings → Integrations chose the boards to follow. They go into this
+    /// view's state, which is what gets saved, so the next save keeps them.
+    pub(crate) fn set_monday_boards(&mut self, boards: Vec<String>, cx: &mut Context<Self>) {
+        if self.state.monday_boards != boards {
+            self.state.monday_boards = boards;
+            self.save();
+            self.refresh(cx);
+        }
+    }
+
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.loading {
             self.refresh_queued = true;

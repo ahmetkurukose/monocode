@@ -296,7 +296,7 @@ fn validate_upsert(input: &AutomationUpsert, now: i64) -> Result<(), String> {
     }
     if !matches!(
         input.trigger_kind.as_str(),
-        "time" | "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+        "time" | "github" | "linear" | "jira" | "monday" | "gitlab" | "azuredevops"
     ) {
         return Err("Invalid automation trigger.".into());
     }
@@ -335,7 +335,7 @@ fn validate_upsert(input: &AutomationUpsert, now: i64) -> Result<(), String> {
 fn validate_trigger(trigger: &AutomationTrigger) -> Result<(), String> {
     if !matches!(
         trigger.kind.as_str(),
-        "time" | "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+        "time" | "github" | "linear" | "jira" | "monday" | "gitlab" | "azuredevops"
     ) {
         return Err("Invalid automation trigger.".into());
     }
@@ -910,7 +910,7 @@ impl Service {
         validate_event_key(&claim.event_key)?;
         if !matches!(
             claim.event_kind.as_str(),
-            "github" | "linear" | "jira" | "gitlab" | "azuredevops"
+            "github" | "linear" | "jira" | "monday" | "gitlab" | "azuredevops"
         ) {
             return Err("Invalid automation trigger.".into());
         }
@@ -1120,6 +1120,7 @@ impl AutomationTrigger {
 pub fn event_label(kind: &str, event: &str) -> String {
     match (kind, event) {
         ("jira", "issue_created") => "Issue appeared",
+        ("monday", "issue_created") => "Item appeared",
         (_, "draft_opened") => "Draft opened",
         (_, "pull_request_opened") => "Pull request opened",
         (_, "issue_opened") => "Issue opened",
@@ -1307,7 +1308,7 @@ pub fn claim_inbox_events_retry(
             ("github", "pr", false) => "pull_request_opened",
             ("github" | "gitlab", "issue", _) => "issue_opened",
             ("gitlab", "pr", _) => "merge_request_opened",
-            ("linear" | "jira", _, _) => "issue_created",
+            ("linear" | "jira" | "monday", _, _) => "issue_created",
             ("azuredevops", "pr", _) => "pull_request_appeared",
             ("azuredevops", "issue", _) => "work_item_appeared",
             _ => continue,

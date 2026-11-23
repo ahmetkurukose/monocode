@@ -1,6 +1,7 @@
 //! A kanban note: Blitzit's four columns of task cards. Cards move by drag
 //! and drop or their arrows, carry an estimate and the time taken, and open
 //! in a dialog for their notes. The board lives in the note's body as JSON.
+use super::monday::DraggedWorkItem;
 use crate::{
     input::{self, Input},
     popover::{Anchor, AnchorSlot, popover},
@@ -11,7 +12,10 @@ use gpui::{
     Focusable, FontWeight, Hsla, MouseButton, Pixels, Point, Role, SharedString, Subscription,
     Window, div, prelude::*, px, relative, rgb,
 };
-use monocode_core::kanban::{self, Board, Column, Periods, Task};
+use monocode_core::{
+    integrations::WorkItem,
+    kanban::{self, Board, Column, Periods, Task, TaskSource},
+};
 use std::collections::HashMap;
 
 /// The board changed and wants saving.
@@ -96,6 +100,8 @@ pub(crate) struct KanbanBoard {
     hovered: Option<String>,
     dragging: Option<String>,
     target: Option<Target>,
+    /// The column a dragged monday card is over.
+    item_over: Option<Column>,
     cards: HashMap<String, AnchorSlot>,
     blur_bound: bool,
     _subscriptions: Vec<Subscription>,
@@ -196,6 +202,7 @@ impl KanbanBoard {
             hovered: None,
             dragging: None,
             target: None,
+            item_over: None,
             cards: HashMap::new(),
             blur_bound: false,
             _subscriptions: subscriptions,
@@ -217,6 +224,27 @@ impl KanbanBoard {
 
     pub(crate) fn board(&self) -> &Board {
         &self.board
+    }
+
+    /// Puts a tracker item on the board, once: false when it already was.
+    pub(crate) fn add_item(
+        &mut self,
+        item: &WorkItem,
+        column: Column,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let before = self.board.tasks.len();
+        self.board.add_from_source(
+            &item.title,
+            TaskSource::from_item(item),
+            column,
+            Self::now(),
+        );
+        let added = self.board.tasks.len() > before;
+        if added {
+            self.changed(cx);
+        }
+        added
     }
 
     /// Closes the innermost open thing; false when nothing was open, so
@@ -635,6 +663,9 @@ impl KanbanBoard {
                         )
                     }),
             )
+            .when_some(task.source.clone(), |d, source| {
+                d.child(source_badge(&id, source))
+            })
             .when(hovered && !done, |d| {
                 d.child(
                     div()
@@ -830,7 +861,8 @@ impl KanbanBoard {
             );
         }
         let empty = items.is_empty();
-        let over = self.dragging.is_some() && self.target.is_some_and(|t| t.column == column);
+        let over = (self.dragging.is_some() && self.target.is_some_and(|t| t.column == column))
+            || self.item_over == Some(column);
         let header = div()
             .flex()
             .items_center()
@@ -955,6 +987,28 @@ impl KanbanBoard {
                 },
             ))
             .on_drop(cx.listener(|this, task: &DraggedTask, _, cx| this.drop_task(&task.id, cx)))
+            // A monday card from a board beside this one; Done takes none.
+            .when(column != Column::Done, |d| {
+                d.on_drag_move::<DraggedWorkItem>(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedWorkItem>, _, cx| {
+                        let inside = event.bounds.contains(&event.event.position);
+                        if inside && this.item_over != Some(column) {
+                            this.item_over = Some(column);
+                            cx.notify();
+                        } else if !inside && this.item_over == Some(column) {
+                            this.item_over = None;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(
+                    move |this, dragged: &DraggedWorkItem, _, cx| {
+                        this.item_over = None;
+                        this.add_item(&dragged.item, column, cx);
+                        cx.notify();
+                    },
+                ))
+            })
             .child(header)
             .children(progress)
             .child(
@@ -1234,6 +1288,42 @@ impl KanbanBoard {
     }
 }
 
+/// The mark of a card made from a monday item; clicking it opens the item.
+fn source_badge(task: &str, source: TaskSource) -> AnyElement {
+    let task = task.to_owned();
+    let url = source.url.clone();
+    let badge = div()
+        .id("kanban-source")
+        .debug_selector(move || format!("kanban-source-{task}"))
+        .role(Role::Link)
+        .aria_label("Open in monday.com")
+        .h(px(18.))
+        .px_1p5()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .gap_1()
+        .bg(content(0.06))
+        .text_size(px(10.))
+        .text_color(content(0.6))
+        .hover(|s| s.bg(content(0.12)).text_color(content(1.)))
+        .cursor_pointer()
+        .child(icon("inbox-monday", 10.).text_color(content(0.7)))
+        .child(if source.provider == "monday" {
+            "monday".to_owned()
+        } else {
+            source.provider.clone()
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .when(!url.is_empty(), |d| {
+            d.on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.open_url(&url)
+            })
+        });
+    div().mt(px(6.)).flex().child(badge).into_any_element()
+}
+
 impl gpui::Render for KanbanBoard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.blur_bound {
@@ -1243,6 +1333,9 @@ impl gpui::Render for KanbanBoard {
                 window,
                 |this, _, cx| this.commit_time(cx),
             ));
+        }
+        if !cx.has_active_drag() {
+            self.item_over = None;
         }
         if !cx.has_active_drag() && self.dragging.is_some() {
             // A drop outside every column leaves the card where it was.

@@ -23,6 +23,10 @@ use gpui::{
 };
 use monocode_core::{
     agent::{AccessMode, Settings},
+    integrations::{
+        self, Provider,
+        writeback::{self, Outcome, PrEvent},
+    },
     provider::{self, Event, Kind, Request},
     scm::{self, DiffIndex, Pr, UpdateMethod},
 };
@@ -85,6 +89,12 @@ struct OpenMenu {
     _events: Subscription,
 }
 
+struct TrackerAsk {
+    project: PathBuf,
+    item: String,
+    branch: String,
+}
+
 pub(crate) struct Changes {
     git: Entity<ProjectGit>,
     cwd: String,
@@ -99,6 +109,11 @@ pub(crate) struct Changes {
     pr: Option<Pr>,
     pr_branch: Option<String>,
     pr_request: u64,
+    /// A PR on a branch named for a monday.com item, waiting for the team to
+    /// say whether Monocode may update the item.
+    tracker_ask: Option<TrackerAsk>,
+    /// Write-backs that failed this run, not retried until the app restarts.
+    tracker_failed: std::collections::HashSet<String>,
     menu: Option<OpenMenu>,
     branch_anchor: AnchorSlot,
     commit_anchor: AnchorSlot,
@@ -144,6 +159,8 @@ impl Changes {
             pr: None,
             pr_branch: None,
             pr_request: 0,
+            tracker_ask: None,
+            tracker_failed: Default::default(),
             menu: None,
             branch_anchor: AnchorSlot::default(),
             commit_anchor: AnchorSlot::default(),
@@ -275,12 +292,128 @@ impl Changes {
                 if this.pr_request == request {
                     let open = pr.as_ref().is_some_and(|p| p.state == "open");
                     this.form.update(cx, |form, _| form.has_open_pr = open);
+                    if let (Some(pr), Some(branch)) = (&pr, &branch) {
+                        this.update_tracker(branch.clone(), pr, cx);
+                    }
                     this.pr = pr;
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+    /// Tells monday.com that the PR of a branch named for one of its items
+    /// opened or merged. Free when the branch names no item.
+    fn update_tracker(&mut self, branch: String, pr: &Pr, cx: &mut Context<Self>) {
+        let Some(event) = PrEvent::from_state(&pr.state) else {
+            return;
+        };
+        let key = format!("{branch}:{}:{}", pr.state, pr.url);
+        if pr.url.is_empty()
+            || writeback::linked_item(&branch).is_none()
+            || self.tracker_ask.is_some()
+            || self.tracker_failed.contains(&key)
+        {
+            return;
+        }
+        let cwd = PathBuf::from(&self.cwd);
+        let url = pr.url.clone();
+        let work = cx.background_executor().spawn(async move {
+            let outcome = writeback::on_pr(&crate::data_dir(), &cwd, &branch, &url, event, || {
+                integrations::connect(Provider::Monday).map_err(|e| e.to_string())
+            });
+            let project = writeback::find_config(&cwd).map(|(root, _)| root);
+            (outcome, project, branch)
+        });
+        cx.spawn(async move |this, cx| {
+            let (outcome, project, branch) = work.await;
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(Outcome::NeedsDecision { item }) => {
+                    if let Some(project) = project {
+                        this.tracker_ask = Some(TrackerAsk {
+                            project,
+                            item,
+                            branch,
+                        });
+                        cx.notify();
+                    }
+                }
+                Ok(Outcome::Written { item, status }) => {
+                    let to = status.map(|s| format!(" → {s}")).unwrap_or_default();
+                    this.set_status(&format!("monday.com item #{item} updated{to}"), cx);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    this.tracker_failed.insert(key);
+                    this.set_status(&format!("monday.com: {error}"), cx);
+                }
+            });
+        })
+        .detach();
+    }
+    /// Saves the team's answer and, when it is yes, writes this PR's update.
+    fn answer_tracker(&mut self, write: bool, cx: &mut Context<Self>) {
+        let Some(ask) = self.tracker_ask.take() else {
+            return;
+        };
+        cx.notify();
+        let project = ask.project.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { writeback::decide(&project, write) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) if write => {
+                    if let Some(pr) = this.pr.clone() {
+                        this.update_tracker(ask.branch, &pr, cx);
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => this.set_status(&format!("monday.com: {error}"), cx),
+            });
+        })
+        .detach();
+    }
+    fn tracker_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ask = self.tracker_ask.as_ref()?;
+        let button =
+            |id: &'static str, label: &'static str, write: bool, cx: &mut Context<Self>| {
+                crate::settings::widgets::secondary_button(id, label, false, false)
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| this.answer_tracker(write, cx)))
+            };
+        Some(
+            div()
+                .id("tracker-writeback")
+                .mx_3()
+                .my_1()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(content(0.05))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_size(px(12.))
+                .child(div().text_color(content(0.8)).child(format!(
+                    "Update monday.com item #{} when its pull requests open and merge?",
+                    ask.item
+                )))
+                .child(
+                    div()
+                        .text_color(content(0.5))
+                        .child("Saved for the team in .monocode/integrations.json."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(button("tracker-writeback-yes", "Update items", true, cx))
+                        .child(button("tracker-writeback-no", "Don't update", false, cx)),
+                )
+                .into_any_element(),
+        )
     }
     fn set_status(&mut self, text: &str, cx: &mut Context<Self>) {
         self.status = Some(text.into());
@@ -1425,6 +1558,7 @@ impl Render for Changes {
             .overflow_hidden()
             .child(self.header(cx))
             .child(self.commit_box(window, cx))
+            .children(self.tracker_banner(cx))
             .map(|d| match empty {
                 Some(text) => d.child(
                     div().py_1().child(

@@ -88,6 +88,8 @@ impl AssetSource for Assets {
    "inbox-gitlab"=>include_bytes!("../assets/inbox-gitlab.svg"),
    "inbox-gitlab-color.svg"=>include_bytes!("../assets/inbox-gitlab-color.svg"),
    "inbox-azuredevops"=>include_bytes!("../assets/inbox-azuredevops.svg"),
+   "inbox-monday"=>include_bytes!("../assets/inbox-monday.svg"),
+   "inbox-monday-color.svg"=>include_bytes!("../assets/inbox-monday-color.svg"),
 
    "note"=>include_bytes!("../assets/note.svg"),
    "zap"=>include_bytes!("../assets/zap.svg"),
