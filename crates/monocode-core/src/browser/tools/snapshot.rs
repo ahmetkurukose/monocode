@@ -295,6 +295,9 @@ pub struct Options {
     pub root: Option<i64>,
     /// Lines deeper than this are left out.
     pub max_depth: Option<usize>,
+    /// Password fields of the main frame (backend ids): their value reads
+    /// as `••••` (K57), whatever the tree says.
+    pub secret: HashSet<i64>,
 }
 
 /// Nesting deeper than this is not walked (very deep trees).
@@ -485,7 +488,8 @@ impl Walker<'_> {
             text.push(' ');
             text.push_str(&quoted(&node.name, MAX_NAME));
         }
-        text.push_str(&states(node));
+        let secret = f == 0 && self.options.secret.contains(&backend);
+        text.push_str(&states(node, secret));
         self.line(depth, text);
     }
 
@@ -522,8 +526,10 @@ fn focusable(node: &AxNode) -> bool {
     !matches!(property(node, "focusable"), Some(Value::Bool(false)))
 }
 
-/// The state suffix: ` checked focused value="…"` (K31).
-fn states(node: &AxNode) -> String {
+/// The state suffix: ` checked focused value="…"` (K31). A password
+/// field's value (`secret`, or Chromium's row of bullets) is `••••`: not
+/// even its length shows (K57).
+fn states(node: &AxNode, secret: bool) -> String {
     let mut out = String::new();
     match property(node, "checked") {
         Some(Value::String(s)) if s == "mixed" => out.push_str(" mixed"),
@@ -550,7 +556,9 @@ fn states(node: &AxNode) -> String {
         out.push_str(" focused");
     }
     if let Some(value) = &node.value {
-        if value != &node.name {
+        if secret || crate::browser::passwords::mask::is_masked_value(value) {
+            out.push_str(&format!(" value=\"{}\"", crate::browser::passwords::MASK));
+        } else if value != &node.name {
             out.push_str(&format!(" value={}", quoted(value, MAX_NAME)));
         }
     }
@@ -752,6 +760,7 @@ mod tests {
             mode,
             root: None,
             max_depth: None,
+            secret: HashSet::new(),
         }
     }
 
@@ -834,6 +843,33 @@ mod tests {
         assert!(again.contains(&"  [@e5] button \"Save\" disabled".to_owned()));
         refs.reset(Some("L2".into()));
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn password_fields_never_show_their_value() {
+        let mut typed = node("2", "textbox", "Password", 202, &[]);
+        typed["value"] = json!({"type": "string", "value": "hunter2!"});
+        let mut bullets = node("3", "textbox", "Confirm", 203, &[]);
+        bullets["value"] = json!({"type": "string", "value": "••••••••••••"});
+        let mut user = node("4", "textbox", "User", 204, &[]);
+        user["value"] = json!({"type": "string", "value": "alice"});
+        let tree = json!({"nodes": [
+            node("1", "RootWebArea", "Sign in", 1, &["2", "3", "4"]),
+            typed, bullets, user,
+        ]});
+        let options = Options {
+            secret: [202].into_iter().collect(),
+            ..opts(Mode::Interactive)
+        };
+        let lines = render(&main_frame(tree), &[], &options, &mut Refs::default()).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "[@e1] textbox \"Password\" value=\"••••\"",
+                "[@e2] textbox \"Confirm\" value=\"••••\"",
+                "[@e3] textbox \"User\" value=\"alice\"",
+            ]
+        );
     }
 
     #[test]

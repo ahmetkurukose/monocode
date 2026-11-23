@@ -123,6 +123,40 @@ pub struct Grab {
 }
 
 impl Grab {
+    /// The grab with `secrets` (the site's saved passwords) masked in all
+    /// its text (K57): a page that shows a password in the clear does not
+    /// hand it to the agent.
+    pub fn masked(mut self, secrets: &[String]) -> Grab {
+        if secrets.is_empty() {
+            return self;
+        }
+        let m = |text: &mut String| *text = super::passwords::mask_text(text, secrets);
+        let e = &mut self.element;
+        for text in [
+            &mut e.url,
+            &mut e.title,
+            &mut e.selector,
+            &mut e.role,
+            &mut e.label,
+            &mut e.text,
+            &mut e.html,
+            &mut e.ax_role,
+            &mut e.ax_name,
+        ] {
+            m(text);
+        }
+        e.path.iter_mut().for_each(m);
+        e.nearby.iter_mut().for_each(m);
+        e.components.iter_mut().for_each(m);
+        for (_, value) in e.attributes.iter_mut() {
+            m(value);
+        }
+        if let Some(source) = &mut e.source {
+            m(source);
+        }
+        self
+    }
+
     pub fn markdown(&self) -> String {
         markdown(&self.element)
     }

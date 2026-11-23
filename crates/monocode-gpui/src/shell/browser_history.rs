@@ -27,6 +27,14 @@ impl Shell {
             .and_then(|store| store.data_dir().map(|dir| dir.join("Browser History")))
     }
 
+    /// `<data>/Browser Passwords`, beside Chromium's `Browser` folder: the
+    /// password vaults (K56); none (memory) without a data folder.
+    pub(super) fn browser_passwords_dir(&self) -> Option<std::path::PathBuf> {
+        locked(&self.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(|dir| dir.join("Browser Passwords")))
+    }
+
     /// What the page of `pane` learns from this shell.
     pub(super) fn browser_page_links(&self, pane: i64, cx: &mut Context<Self>) -> ShellLinks {
         let tabs = cx.weak_entity();

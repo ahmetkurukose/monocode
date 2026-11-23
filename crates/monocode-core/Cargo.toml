@@ -55,6 +55,8 @@ sha1 = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# The browser's password vault: AES-256-GCM per value (browser::passwords).
+ring = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }

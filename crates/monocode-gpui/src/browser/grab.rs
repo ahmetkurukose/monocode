@@ -92,9 +92,22 @@ impl BrowserPage {
         // Dropping the task from inside itself is fine: it is finishing.
         self.grab.task = None;
         if was_on && let Some(result) = result {
-            cx.emit(PageRequest::Grab(result));
+            self.emit_grab(result, cx);
         }
         cx.notify();
+    }
+
+    /// Hands a grab to the shell, the site's saved passwords masked (K57).
+    fn emit_grab(&mut self, result: GrabResult, cx: &mut Context<Self>) {
+        let secrets = self.agent_secrets(cx);
+        let result = result.map(|grab| {
+            if secrets.is_empty() {
+                grab
+            } else {
+                Rc::new((*grab).clone().masked(&secrets))
+            }
+        });
+        cx.emit(PageRequest::Grab(result));
     }
 
     /// The context menu's "Send to Agent", at `(x, y)` in the view.
@@ -107,7 +120,7 @@ impl BrowserPage {
         let (x, y) = (f64::from(x) / zoom, f64::from(y) / zoom);
         cx.spawn(async move |this, cx| {
             let result = grab_at(cdp, x, y).await.map(Rc::new);
-            let _ = this.update(cx, |_, cx| cx.emit(PageRequest::Grab(result)));
+            let _ = this.update(cx, |page, cx| page.emit_grab(result, cx));
         })
         .detach();
     }
@@ -125,7 +138,7 @@ impl BrowserPage {
                 Some(session) => grab_inspected(cdp, &session).await,
                 None => Err("DevTools are not connected to the page".to_owned()),
             };
-            let _ = this.update(cx, |_, cx| cx.emit(PageRequest::Grab(result.map(Rc::new))));
+            let _ = this.update(cx, |page, cx| page.emit_grab(result.map(Rc::new), cx));
         })
         .detach();
     }

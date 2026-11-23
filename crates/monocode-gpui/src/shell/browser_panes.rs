@@ -35,6 +35,7 @@ impl Shell {
         // Visits go to the project's history in the profile's store (K55);
         // a throwaway profile keeps none.
         crate::browser::history::init(self.browser_history_dir(), cx);
+        crate::browser::passwords::init(self.browser_passwords_dir(), cx);
         let history = crate::browser::history::store_name(&profile).and_then(|store| {
             let folder = (self.session_summaries.get(&state.owner))
                 .map(|owner| owner.cwd.clone())

@@ -127,6 +127,26 @@ pub trait Page {
     fn cert_error(&self) -> Option<super::sites::CertBlock> {
         None
     }
+
+    /// The saved logins of the page's site, with their passwords, for
+    /// `browser_fill_login` (K57): the tools fill them and never answer
+    /// with a password. `Err` says why there are none to use (a throwaway
+    /// profile, the vault locked, the password manager off).
+    fn saved_logins(&self) -> Result<Vec<super::passwords::Credential>, String> {
+        Err("this page has no saved passwords".to_owned())
+    }
+
+    /// The saved login of `username` was filled (its use is counted).
+    fn login_used(&self, username: &str) {
+        let _ = username;
+    }
+
+    /// Passwords no answer about this page may show (K57): the site's
+    /// saved ones, and those the user signed in with here. Every tool's
+    /// answer has them masked.
+    fn secrets(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub trait Host {

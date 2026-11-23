@@ -1849,3 +1849,124 @@ fn history_lists_only_the_sessions_projects_visits() {
         "{theirs}"
     );
 }
+
+fn credential(username: &str, password: &str) -> crate::browser::passwords::Credential {
+    crate::browser::passwords::Credential {
+        username: username.into(),
+        password: password.into(),
+    }
+}
+
+#[test]
+fn saved_passwords_are_masked_in_everything_an_agent_reads() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = host.page(1);
+    let secret = "Tr0ub4dor&3 x";
+    *page.logins.borrow_mut() = Ok(vec![credential("alice", secret)]);
+    page.script.emit(
+        "Runtime.consoleAPICalled",
+        json!({"type": "log", "timestamp": 0.0, "args": [{"type": "string", "value": format!("pw={secret}")}]}),
+    );
+    page.script.emit(
+        "Network.requestWillBeSent",
+        json!({"requestId": "r1", "type": "Fetch", "wallTime": 1.0,
+            "request": {"url": "https://example.com/login?pw=Tr0ub4dor%263+x", "method": "GET"}}),
+    );
+    page.script.on("Runtime.evaluate", move |p, _| {
+        Ok(match p["expression"].as_str().unwrap() {
+            "read" => json!({"result": {"type": "string", "value": "Tr0ub4dor&3 x"}}),
+            "throw" => json!({"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught",
+                "exception": {"description": "Error: bad Tr0ub4dor&3 x"}}}),
+            _ => json!({"result": {"type": "undefined"}}),
+        })
+    });
+    page.script.reply(
+        "Accessibility.getFullAXTree",
+        json!({"nodes": [
+            {"nodeId": "1", "backendDOMNodeId": 1, "role": {"value": "RootWebArea"}, "name": {"value": "Sign in"}, "childIds": ["2"]},
+            {"nodeId": "2", "backendDOMNodeId": 2, "role": {"value": "StaticText"}, "name": {"value": "Your password: Tr0ub4dor&3 x"}},
+        ]}),
+    );
+    let mut driver = Driver::new(&host);
+    let answers = [
+        driver.run("browser_console", json!({})),
+        driver.run("browser_network", json!({})),
+        driver.run("browser_eval", json!({"expression": "read"})),
+        driver.run("browser_eval", json!({"expression": "throw"})),
+        driver.run("browser_snapshot", json!({"mode": "full"})),
+    ];
+    for answer in &answers {
+        let said = text(answer);
+        assert!(!said.contains("Tr0ub4dor"), "{said}");
+    }
+    assert!(text(&answers[0]).contains("pw=••••"));
+    assert!(text(&answers[1]).contains("pw=••••"));
+    assert_eq!(text(&answers[2]), "\"••••\"");
+    assert!(text(&answers[4]).contains("Your password: ••••"));
+}
+
+/// A page whose sign-in form fills.
+fn login_page(host: &Rc<FakeHost>) -> Rc<FakePage> {
+    let page = host.page(1);
+    page.script.reply("Page.createIsolatedWorld", json!({"executionContextId": 30}));
+    page.script.on("Runtime.callFunctionOn", |p, _| {
+        let function = p["functionDeclaration"].as_str().unwrap_or("");
+        Ok(if function.contains("__monocodePasswords") {
+            json!({"result": {"type": "object", "value": {"ok": true, "username": true, "password": true}}})
+        } else if function.contains("isConnected") {
+            json!({"result": {"type": "boolean", "value": true}})
+        } else {
+            json!({"result": {"type": "undefined"}})
+        })
+    });
+    page
+}
+
+#[test]
+fn an_agent_fills_a_saved_login_without_seeing_it() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = login_page(&host);
+    *page.logins.borrow_mut() = Ok(vec![credential("alice", "s3cret-pw")]);
+    let mut driver = Driver::new(&host);
+    let filled = driver.run("browser_fill_login", json!({}));
+    assert!(!filled.is_error, "{}", text(&filled));
+    let said = text(&filled);
+    assert!(said.starts_with("Filled the saved login \"alice\" for https://example.com (user name and password)"), "{said}");
+    assert!(!said.contains("s3cret"));
+    // Filled in the watcher's world, the password an argument.
+    let fill = (page.script.calls("Runtime.callFunctionOn").into_iter())
+        .find(|c| c["functionDeclaration"].as_str().unwrap().contains("__monocodePasswords"))
+        .unwrap();
+    assert_eq!(fill["executionContextId"], 30);
+    assert_eq!(fill["arguments"][1]["value"], "s3cret-pw");
+    assert_eq!(*page.logins_used.borrow(), ["alice"]);
+}
+
+#[test]
+fn fill_login_says_which_logins_there_are_and_why_not() {
+    let host = FakeHost::with_pages(&[1]);
+    let page = login_page(&host);
+    let mut driver = Driver::new(&host);
+    // No vault for the page (throwaway profile, locked, off).
+    let none = driver.run("browser_fill_login", json!({}));
+    assert!(text(&none).starts_with("browser_no_login: no saved passwords here"));
+    *page.logins.borrow_mut() = Ok(vec![]);
+    let empty = driver.run("browser_fill_login", json!({}));
+    assert!(text(&empty).contains("no saved login for https://example.com"));
+    *page.logins.borrow_mut() = Ok(vec![credential("alice", "aaaa1"), credential("bob", "bbbb2")]);
+    let which = driver.run("browser_fill_login", json!({}));
+    assert!(which.is_error);
+    assert_eq!(
+        text(&which),
+        "https://example.com has 2 saved logins: \"alice\", \"bob\"; say which with username"
+    );
+    let unknown = driver.run("browser_fill_login", json!({"username": "carol"}));
+    assert!(text(&unknown).starts_with("browser_no_login: no saved login for \"carol\""));
+    let bob = driver.run("browser_fill_login", json!({"username": "bob"}));
+    assert!(!bob.is_error && !text(&bob).contains("bbbb2"));
+    assert_eq!(*page.logins_used.borrow(), ["bob"]);
+    // Off the web there is nothing to fill.
+    page.info.borrow_mut().url = "about:blank".into();
+    let blank = driver.run("browser_fill_login", json!({}));
+    assert!(text(&blank).starts_with("browser_no_login: page 1 is not a web site"));
+}
