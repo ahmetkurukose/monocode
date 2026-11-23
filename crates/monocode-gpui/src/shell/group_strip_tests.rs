@@ -762,6 +762,10 @@ fn an_overflowing_strip_scrolls_to_keep_the_shown_tab_in_view(cx: &mut TestAppCo
         "the newest tab is scrolled into view"
     );
     assert!(!inside(cx, b, last), "the strip overflows");
+    // Scrolling tabs: the one `+` stays put next to the `⋯`.
+    let plus = bounds(cx, format!("group-add-{last}")).unwrap();
+    let more = bounds(cx, format!("group-more-{last}")).unwrap();
+    assert!(plus.right() <= more.left() && more.left() - plus.right() < px(8.));
     window
         .update(cx, |shell, w, cx| shell.select_group_tab(b, w, cx))
         .unwrap();
@@ -771,16 +775,24 @@ fn an_overflowing_strip_scrolls_to_keep_the_shown_tab_in_view(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn the_plus_after_the_last_tab_starts_a_session_in_that_group(cx: &mut TestAppContext) {
+fn the_one_plus_follows_the_last_tab_and_opens_the_new_tab_menu(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_reduce_motion(true));
     let (window, b, c, d) = stacked(cx);
     let cx = &mut VisualTestContext::from_window(window.into(), cx);
     cx.run_until_parked();
     let last = bounds(cx, format!("group-tab-{d}")).unwrap();
-    let plus = bounds(cx, format!("group-new-tab-{d}")).unwrap();
-    // It rides right after the last tab, not at the strip's far end.
+    let plus = bounds(cx, format!("group-add-{d}")).unwrap();
+    // A few tabs: the one `+` rides right after the last tab.
     assert!(plus.left() >= last.right() && plus.left() - last.right() < px(8.));
     cx.simulate_click(plus.center(), Modifiers::default());
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, window, cx| {
+            let target = MenuTarget::GroupAdd(d);
+            assert!(shell.menu_open(&target), "the plus opens the New tab menu");
+            shell.run_menu(target, "session", None, window, cx);
+        })
+        .unwrap();
     cx.run_until_parked();
     window
         .update(cx, |shell, _, _| {

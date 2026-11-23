@@ -8,11 +8,12 @@ use crate::tab_tile::tab_tile_inset;
 
 /// Tabs share the strip down to this, then it scrolls.
 const STRIP_TAB_MIN_WIDTH: f32 = 96.;
-/// The `+` and `⋯` buttons at the strip's end, with their gaps.
+/// The `+` and `⋯` buttons, with their gaps. The `+` rides after the last
+/// tab or sits by the `⋯`; either way it takes the same room.
 const STRIP_BUTTON: f32 = 24.;
 const STRIP_BUTTONS: f32 = 2. * STRIP_BUTTON + 2. + 6.;
-/// The `+` riding right after the last tab, with its gap.
-const INLINE_NEW_TAB: f32 = STRIP_BUTTON + 2.;
+/// The empty room after the tabs never gets narrower than this.
+const STRIP_SPACE_MIN: f32 = 16.;
 /// How long a tab an open found already open glows.
 const FLASH_DURATION: f32 = 0.6;
 /// The inset layout's card floats this far below the window's top.
@@ -464,7 +465,7 @@ impl Shell {
             - trail
             - STRIP_PAD
             - STRIP_BUTTONS
-            - INLINE_NEW_TAB
+            - STRIP_SPACE_MIN
             - pinned.len() as f32 * (pin + 2.)
             - share * 2.)
             .max(0.);
@@ -491,6 +492,16 @@ impl Shell {
                 snap(tab_w)
             }
         };
+        // The `+` follows the last tab while the tabs fit; once they hit their
+        // floor and scroll, it stays put by the `⋯`. The room it takes is
+        // the same in both places, so the choice cannot flip back and forth.
+        let laid: f32 = (slots.iter())
+            .map(|s| match s {
+                Slot::Live { key, open } => width_of(*key) * open,
+                Slot::Closing { open, .. } => snap(tab_w) * open,
+            })
+            .sum();
+        let add_inline = laid <= avail + 0.5;
         // The shown tab (or the flashed one) scrolls into view.
         let flashed = self
             .tab_flash
@@ -694,10 +705,14 @@ impl Shell {
                     .gap(px(2.))
                     .pl(px(STRIP_LEAD))
                     .children(row)
-                    .child(self.inline_new_tab(visible, cx))
+                    .when(add_inline, |d| {
+                        d.child(self.strip_button(visible, false, cx))
+                    })
                     .child(self.strip_drag_area(visible, top, cx)),
             )
-            .child(self.strip_button(visible, false, cx))
+            .when(!add_inline, |d| {
+                d.child(self.strip_button(visible, false, cx))
+            })
             .child(self.strip_button(visible, true, cx).mr(px(STRIP_TRAIL)))
             .when(trail > 0., |d| {
                 d.child(titlebar_drag_area().w(px(trail)).flex_shrink_0())
@@ -950,7 +965,7 @@ impl Shell {
             .debug_selector(move || format!("group-strip-space-{visible}"))
             .relative()
             .flex_1()
-            .min_w(px(16.))
+            .min_w(px(STRIP_SPACE_MIN))
             .h_full()
             .child(bounds.probe())
             .when(top, |d| d.window_control_area(WindowControlArea::Drag))
@@ -981,32 +996,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// `+` (`more` false) or `⋯` at the strip's end.
-    /// The `+` right after the last tab, as in a browser: one click starts
-    /// a new chat in this group. The `+` at the strip's end keeps the menu.
-    fn inline_new_tab(&self, visible: i64, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(("group-new-tab", visible as usize))
-            .debug_selector(move || format!("group-new-tab-{visible}"))
-            .group("group-new-tab")
-            .role(Role::Button)
-            .aria_label("New session")
-            .cursor_pointer()
-            .size(px(STRIP_BUTTON))
-            .flex_shrink_0()
-            .rounded_md()
-            .flex()
-            .items_center()
-            .justify_center()
-            .opacity(0.6)
-            .hover(|s| s.opacity(1.).bg(content(0.07)))
-            .child(icon("plus", 14.).group_hover("group-new-tab", |s| s.text_color(content(1.))))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.new_session_in_group(visible, window, cx)
-            }))
-    }
-
+    /// `+` (`more` false) or `⋯`. Both open their menu; the `+` picks what
+    /// the new tab opens.
     fn strip_button(
         &self,
         visible: i64,
