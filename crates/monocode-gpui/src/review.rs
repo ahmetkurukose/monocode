@@ -1859,7 +1859,7 @@ impl ReviewPane {
     }
 }
 
-fn log_error(error: &str) {
+pub(crate) fn log_error(error: &str) {
     eprintln!("monocode: review action failed: {error}");
 }
 

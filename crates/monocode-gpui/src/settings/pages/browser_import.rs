@@ -338,13 +338,12 @@ impl SettingsView {
             )],
         ));
         let (cookies, passwords) = (panel.cookies, panel.passwords);
-        rows.push(
-            self.row(
-                None,
-                false,
-                "What to import",
-                None,
-                vec![
+        rows.push(self.row(
+            None,
+            false,
+            "What to import",
+            None,
+            vec![
                     div()
                         .flex()
                         .items_center()
@@ -384,8 +383,7 @@ impl SettingsView {
                         )
                         .into_any_element(),
                 ],
-            ),
-        );
+        ));
         if self.ctx.browser_project_isolated {
             let into = if self.browser_import.into_project {
                 "project"
@@ -435,17 +433,16 @@ impl SettingsView {
         rows.push(
             div()
                 .debug_selector(|| "settings-browser-import-status".into())
-                .child(
-                    self.row(
-                        None,
-                        false,
-                        match status {
-                            ImportStatus::Failed(_) => "Import failed",
-                            ImportStatus::Done { .. } => "Imported",
-                            _ => "",
-                        },
-                        text,
-                        vec![
+                .child(self.row(
+                    None,
+                    false,
+                    match status {
+                        ImportStatus::Failed(_) => "Import failed",
+                        ImportStatus::Done { .. } => "Imported",
+                        _ => "",
+                    },
+                    text,
+                    vec![
                             primary_button("browser-import-run", label, disabled)
                                 .debug_selector(|| "settings-browser-import-run".into())
                                 .child(label.to_owned())
@@ -456,8 +453,7 @@ impl SettingsView {
                                 })
                                 .into_any_element(),
                         ],
-                    ),
-                )
+                ))
                 .into_any_element(),
         );
         rows
