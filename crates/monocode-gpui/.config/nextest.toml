@@ -1,0 +1,7 @@
+# `cargo nextest run` runs every test in its own process, so tests that
+# needed `--test-threads=1` under `cargo test` (shared process state) can run
+# in parallel here.
+[profile.default]
+# Name a test that hangs instead of letting the whole run wait on it.
+slow-timeout = { period = "30s", terminate-after = 4 }
+fail-fast = false
