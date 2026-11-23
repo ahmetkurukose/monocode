@@ -19,6 +19,8 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 /// Terminal children, which need a session and a controlling terminal.
 #[cfg(target_os = "macos")]
 pub mod pty;
+#[cfg(target_os = "macos")]
+mod pty_exec;
 
 /// Mark a background child; start it with [`spawn`], [`output`] or
 /// [`status`], which give it the ordinary signal mask and a lower priority.

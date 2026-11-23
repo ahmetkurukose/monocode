@@ -24,13 +24,14 @@ use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// argv[1] of the trampoline; argv[2] is the program, argv[3..] its argv.
-const SENTINEL: &[u8] = b"--monocode-pty-exec";
+use super::pty_exec::SENTINEL;
+
+/// The small executable that does the trampoline's work without loading this
+/// one's image (`src/bin/monocode-pty-exec.rs`).
+pub const EXEC_HELPER: &str = "monocode-pty-exec";
 
 /// Darwin's `POSIX_SPAWN_SETSID` (sys/spawn.h); libc does not export it.
 const POSIX_SPAWN_SETSID: c_int = 0x0400;
-/// Darwin's `NSIG`: signals are 1 to 31.
-const NSIG: c_int = 32;
 
 extern "C" {
     // macOS 10.15+; the libc version in use does not declare it.
@@ -201,14 +202,26 @@ pub fn spawn(
     }
 }
 
-/// This executable, whose image initializer is the trampoline. None (the
-/// program then starts without a controlling terminal) if it is gone.
+/// What takes the terminal and execs the program: `monocode-pty-exec`
+/// beside this executable (the app bundle's `Contents/MacOS`, a cargo build's
+/// target folder), else this executable, whose image initializer is the
+/// trampoline (test binaries, a lone app binary). None (the program then
+/// starts without a controlling terminal) if neither is there.
 fn trampoline_executable() -> Option<PathBuf> {
     // The initializer lives in this object file; using it keeps the linker
     // from leaving it out of a binary that only calls `spawn`.
     std::hint::black_box(&TRAMPOLINE);
     // Absolute: the child changes directory before it execs.
-    match std::env::current_exe().and_then(std::fs::canonicalize) {
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize);
+    // MONOCODE_PTY_EXEC names it elsewhere (the integration test's build).
+    let helper = std::env::var_os("MONOCODE_PTY_EXEC")
+        .map(PathBuf::from)
+        .or_else(|| Some(exe.as_ref().ok()?.parent()?.join(EXEC_HELPER)))
+        .filter(|helper| super::is_executable(helper));
+    if helper.is_some() {
+        return helper;
+    }
+    match exe {
         Ok(exe) if super::is_executable(&exe) => Some(exe),
         other => {
             eprintln!("pty: no trampoline ({other:?}); the child has no controlling terminal");
@@ -243,50 +256,10 @@ fn check(code: c_int) -> io::Result<()> {
 static TRAMPOLINE: extern "C" fn(c_int, *const *const c_char, *const *const c_char) = trampoline;
 
 /// Runs before `main` in every process of this executable; does nothing
-/// unless started by [`spawn`]. Only plain syscalls: the Rust runtime is not
-/// set up yet.
+/// unless started by [`spawn`] without `monocode-pty-exec` beside it.
 extern "C" fn trampoline(argc: c_int, argv: *const *const c_char, envp: *const *const c_char) {
     // SAFETY: dyld passes argc valid argv entries and a NULL-terminated envp.
-    unsafe {
-        if argc < 4 || std::ffi::CStr::from_ptr(*argv.add(1)).to_bytes() != SENTINEL {
-            return;
-        }
-        // posix_spawn made this process a session leader with the PTY on
-        // fd 0; opening no terminal since, it can take it as controlling.
-        if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
-            report(b"monocode: the terminal is not the controlling one: ");
-        }
-        // Dispositions and mask were reset by posix_spawn; this image's own
-        // initializers may have changed them.
-        for signal in 1..NSIG {
-            if signal != libc::SIGKILL && signal != libc::SIGSTOP {
-                libc::signal(signal, libc::SIG_DFL);
-            }
-        }
-        let mut empty = std::mem::zeroed();
-        libc::sigemptyset(&mut empty);
-        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-        // Only 0, 1 and 2 came in; whatever the initializers opened stays here.
-        let max = libc::getdtablesize().min(4096);
-        for fd in 3..max {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        let program = *argv.add(2);
-        libc::execve(program, argv.add(3), envp);
-        report(b"monocode: could not start the program: ");
-        libc::_exit(127);
-    }
-}
-
-/// `message` and the last OS error on stderr, which is the terminal.
-unsafe fn report(message: &[u8]) {
-    // SAFETY: plain writes of valid buffers.
-    unsafe {
-        let error = std::ffi::CStr::from_ptr(libc::strerror(*libc::__error()));
-        libc::write(2, message.as_ptr().cast(), message.len());
-        libc::write(2, error.as_ptr().cast(), error.to_bytes().len());
-        libc::write(2, b"\r\n".as_ptr().cast(), 2);
-    }
+    unsafe { super::pty_exec::run(argc, argv, envp) }
 }
 
 #[cfg(test)]

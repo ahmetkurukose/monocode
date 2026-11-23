@@ -27,8 +27,11 @@ export async function startDev({
   const buildEnv = { ...env, CARGO_BUILD_JOBS: env.CARGO_BUILD_JOBS || "1" };
   // One Chromium SDK for every checkout instead of one per worktree.
   if (bundle && !buildEnv.CEF_PATH && env.HOME) buildEnv.CEF_PATH = join(env.HOME, "Library/Caches/Monocode/cef-sdk");
-  // The bundle carries Chromium's helper processes beside the app.
-  const helper = bundle ? ["-p", "monocode-cef", "--bin", "monocode-cef-helper"] : [];
+  // The bundle carries Chromium's helper processes and the terminal's
+  // exec step (monocode-pty-exec) beside the app.
+  const helper = bundle
+    ? ["-p", "monocode-cef", "--bin", "monocode-cef-helper", "-p", "monocode-core", "--bin", "monocode-pty-exec"]
+    : [];
   const launch = (command, argv, options = {}) => track(spawnProcess(command, argv, {
     cwd: root, env: buildEnv, stdio: "inherit", ...options,
   }));

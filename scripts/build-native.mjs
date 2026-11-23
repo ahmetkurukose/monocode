@@ -36,8 +36,12 @@ const metadata = JSON.parse(
 const app = metadata.packages.find((pkg) => pkg.name === "monocode-gpui");
 if (!app) throw new Error("The monocode-gpui package was not found.");
 
-// On macOS the bundle carries Chromium's helper processes beside the app.
-const helper = process.platform === "darwin" ? ["-p", "monocode-cef"] : [];
+// On macOS the bundle carries Chromium's helper processes and the terminal's
+// exec step (monocode-pty-exec) beside the app. Naming one --bin limits every
+// package to the named ones, so the app's is named too.
+const helper = process.platform === "darwin"
+  ? ["-p", "monocode-cef", "-p", "monocode-core", "--bin", app.name, "--bin", "monocode-cef-helper", "--bin", "monocode-pty-exec"]
+  : [];
 run("cargo", ["build", "--manifest-path", "crates/monocode-gpui/Cargo.toml", "--locked", "-p", app.name, ...helper, "--release"]);
 const target = process.env.CARGO_BUILD_TARGET
   ? join(metadata.target_directory, process.env.CARGO_BUILD_TARGET)

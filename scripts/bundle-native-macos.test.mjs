@@ -45,6 +45,9 @@ test("Finder launches use development data for dev bundles and installed data fo
       const helper = join(output, "monocode-cef-helper");
       await writeFile(helper, "#!/bin/sh\nexit 0\n");
       await chmod(helper, 0o755);
+      const ptyExec = join(output, "monocode-pty-exec");
+      await writeFile(ptyExec, "#!/bin/sh\nexit 0\n");
+      await chmod(ptyExec, 0o755);
       const args = ["scripts/bundle-native-macos.sh", profile, target, "0.16.0"];
       if (override) args.push(override);
       const packaged = spawnSync("bash", args, {

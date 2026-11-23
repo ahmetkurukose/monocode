@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- monocode-pty-exec (crates/monocode-core/src/bin): it only takes the
+     terminal and execs the user's program, so it needs nothing. -->
+<plist version="1.0">
+<dict/>
+</plist>

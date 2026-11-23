@@ -5,6 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Starts terminal children on macOS without loading the app's image
+# (process::pty); the app bundle carries it beside the app. A C main, so no
+# test harness.
+[[bin]]
+name = "monocode-pty-exec"
+path = "src/bin/monocode-pty-exec.rs"
+test = false
+bench = false
+
 [features]
 # Scripted peers for the tests of crates that call the code services.
 test-support = []

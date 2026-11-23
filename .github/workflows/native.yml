@@ -63,5 +63,5 @@ jobs:
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-cef -p monocode-gpui --all-targets --profile native-dev -- -D warnings
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core -p monocode-cef --profile native-dev
       - run: cargo test --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui --profile native-dev -- --test-threads=1
-      - run: cargo build --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui -p monocode-cef --profile native-dev
+      - run: cargo build --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-gpui -p monocode-cef -p monocode-core --bin monocode-gpui --bin monocode-cef-helper --bin monocode-pty-exec --profile native-dev
 
