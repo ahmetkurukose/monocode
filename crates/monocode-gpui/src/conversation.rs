@@ -1596,7 +1596,8 @@ impl Conversation {
 }
 
 /// How long a new worktree waits for its generated name before using the prompt's words.
-const WORKTREE_NAMING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Long enough for a cold provider CLI, so the folder and the branch share one name.
+const WORKTREE_NAMING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 impl EventEmitter<SessionChanged> for Conversation {}
 impl EventEmitter<MergeWorktree> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
