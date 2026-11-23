@@ -7,6 +7,7 @@
 //! - [`grab`]: the element grab, a picked element for an agent (K49).
 //! - [`audio`]: whether a page plays sound, for its tab.
 //! - [`passkeys`]: a page's passkey requests (K58).
+//! - [`media`]: a page's camera and microphone requests, held until macOS decides.
 //! - [`history`]: browsing history, kept per project (K55, K65).
 //! - [`import`]: cookies and passwords from Chrome, Arc and Brave (K61).
 //! - [`dev_servers`]: a project's running dev servers, for the new tab page (K66).
@@ -29,6 +30,7 @@ pub mod history;
 pub mod host;
 pub mod import;
 pub mod log;
+pub mod media;
 pub mod passkeys;
 pub mod proxy;
 pub mod sites;

@@ -5,8 +5,13 @@
 //! tells when a request starts and ends (`monocode_core::browser::passkeys`);
 //! when one starts, the app asks macOS whether it may use Bluetooth and
 //! whether Bluetooth is on. If not, a bar under the toolbar (never over the
-//! page) says so and opens System Settings. Before macOS has been asked
-//! there is nothing to say: Chromium asks it when the user picks the phone.
+//! page) says so and opens System Settings.
+//!
+//! Before macOS has asked the user at all, Chromium does not listen for the
+//! phone in that request: it asks macOS when the user picks the phone, and
+//! even when the user allows it, it listens only from the next request on
+//! (its scan starts when Bluetooth's power changes, which it does not). The
+//! bar says so then too: allow it, and start signing in again.
 //!
 //! Agents read every start and end (`passkeyRequest` in action effects and
 //! `browser_tabs`) and may cancel what waits (`browser_dialog` dismiss).
@@ -15,6 +20,23 @@ use monocode_core::browser::passkeys::{self, PasskeyBlock, PasskeyChange, Passke
 
 /// Notes a page keeps for agents.
 const NOTES: usize = 20;
+
+/// What macOS says about Bluetooth for signing in with a phone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bluetooth {
+    /// Allowed and on.
+    Ready,
+    /// macOS has not asked the user yet.
+    NotAsked,
+    Blocked(PasskeyBlock),
+}
+
+/// What the bar says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bar {
+    NotAsked,
+    Blocked(PasskeyBlock),
+}
 
 /// What a page's hosts share of its passkey requests.
 #[derive(Default)]
@@ -28,7 +50,7 @@ struct State {
     pending: Vec<PasskeyNote>,
     notes: VecDeque<PasskeyNote>,
     /// What the bar says; the user can close it.
-    bar: Option<PasskeyBlock>,
+    bar: Option<Bar>,
 }
 
 impl State {
@@ -39,12 +61,16 @@ impl State {
         }
     }
 
-    /// One change the page reported; `block` is what keeps a new request
-    /// from the phone.
-    fn on_change(&mut self, change: PasskeyChange, block: impl FnOnce() -> Option<PasskeyBlock>) {
+    /// One change the page reported; `bluetooth` tells whether a new
+    /// request can reach the phone.
+    fn on_change(&mut self, change: PasskeyChange, bluetooth: impl FnOnce() -> Bluetooth) {
         let seq = monocode_core::browser::sites::next_note_seq();
         if change.pending {
-            let reason = block();
+            let (reason, bar) = match bluetooth() {
+                Bluetooth::Ready => (None, None),
+                Bluetooth::NotAsked => (None, Some(Bar::NotAsked)),
+                Bluetooth::Blocked(block) => (Some(block), Some(Bar::Blocked(block))),
+            };
             let note = PasskeyNote {
                 seq,
                 kind: change.kind,
@@ -54,7 +80,7 @@ impl State {
             };
             self.pending.push(note.clone());
             self.note(note);
-            self.bar = reason;
+            self.bar = bar;
             return;
         }
         let ix = self
@@ -89,9 +115,7 @@ impl State {
 
 impl Passkeys {
     fn on_change(&self, change: PasskeyChange) {
-        self.state
-            .borrow_mut()
-            .on_change(change, bluetooth::blocks_phone);
+        self.state.borrow_mut().on_change(change, bluetooth::state);
     }
 
     /// The page's DevTools agent went: what waited ended with it.
@@ -145,13 +169,18 @@ impl BrowserPage {
     /// The bar under the toolbar while a passkey request cannot reach the
     /// phone. It takes room from the page instead of covering it.
     pub(super) fn passkey_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let block = self.host.shared.passkeys.state.borrow().bar?;
-        let (text, settings) = match block {
-            PasskeyBlock::BluetoothDenied => (
-                "To sign in with your phone, Monocode needs Bluetooth. Allow it in System Settings → Privacy & Security → Bluetooth, then try again (macOS may ask you to reopen Monocode).",
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth",
+        let bar = self.host.shared.passkeys.state.borrow().bar?;
+        let privacy = "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth";
+        let (text, settings) = match bar {
+            Bar::NotAsked => (
+                "To sign in with your phone, Monocode needs Bluetooth. If macOS asks, allow it, then cancel and start signing in again: this attempt cannot reach your phone.",
+                privacy,
             ),
-            PasskeyBlock::BluetoothOff => (
+            Bar::Blocked(PasskeyBlock::BluetoothDenied) => (
+                "To sign in with your phone, Monocode needs Bluetooth. Allow it in System Settings → Privacy & Security → Bluetooth, then try again (macOS may ask you to reopen Monocode).",
+                privacy,
+            ),
+            Bar::Blocked(PasskeyBlock::BluetoothOff) => (
                 "To sign in with your phone, turn on Bluetooth, then try again.",
                 "x-apple.systempreferences:com.apple.Bluetooth-Settings.extension",
             ),
@@ -182,53 +211,59 @@ impl BrowserPage {
 
 /// What macOS lets the app do with Bluetooth (CoreBluetooth).
 mod bluetooth {
-    use monocode_core::browser::passkeys::PasskeyBlock;
+    use super::Bluetooth;
 
-    /// What keeps a phone from reaching the Mac now: Bluetooth refused or
-    /// off. `None` when it is fine, or macOS has not asked the user yet
-    /// (Chromium asks when the user picks the phone).
+    /// Whether a phone can reach the Mac now. Never asks the user.
     #[cfg(target_os = "macos")]
-    pub(super) fn blocks_phone() -> Option<PasskeyBlock> {
+    pub(super) fn state() -> Bluetooth {
+        use super::PasskeyBlock;
         use objc2::{
             msg_send,
             runtime::{AnyClass, AnyObject},
         };
-        load("/System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth");
-        let manager = AnyClass::get(c"CBManager")?;
-        // CBManagerAuthorization: 0 not determined, 1 restricted, 2 denied,
-        // 3 allowed. Reading it never asks the user.
+        load(c"/System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth");
+        let Some(manager) = AnyClass::get(c"CBManager") else {
+            return Bluetooth::Ready;
+        };
+        // +[CBManager authorization] (CBManagerAuthorization, an NSInteger):
+        // 0 not determined, 1 restricted, 2 denied, 3 allowed.
         let authorization: isize = unsafe { msg_send![manager, authorization] };
         match authorization {
-            1 | 2 => return Some(PasskeyBlock::BluetoothDenied),
-            3 => {}
-            _ => return None,
+            0 => return Bluetooth::NotAsked,
+            1 | 2 => return Bluetooth::Blocked(PasskeyBlock::BluetoothDenied),
+            _ => {}
         }
-        load("/System/Library/Frameworks/IOBluetooth.framework/IOBluetooth");
-        let controller = AnyClass::get(c"IOBluetoothHostController")?;
+        load(c"/System/Library/Frameworks/IOBluetooth.framework/IOBluetooth");
+        let Some(controller) = AnyClass::get(c"IOBluetoothHostController") else {
+            return Bluetooth::Ready;
+        };
         let default: *mut AnyObject = unsafe { msg_send![controller, defaultController] };
         // SAFETY: null or the shared controller, which lives for the process.
-        let default = unsafe { default.as_ref() }?;
-        // BluetoothHCIPowerState (a C enum, encoded `i`): 0 off, 1 on, 0xFF
-        // not initialized.
+        let Some(default) = (unsafe { default.as_ref() }) else {
+            return Bluetooth::Ready;
+        };
+        // -[IOBluetoothHostController powerState] (BluetoothHCIPowerState, a
+        // C enum, encoded `i`): 0 off, 1 on, 0xFF not initialized.
         let power: i32 = unsafe { msg_send![default, powerState] };
-        (power == 0).then_some(PasskeyBlock::BluetoothOff)
+        if power == 0 {
+            Bluetooth::Blocked(PasskeyBlock::BluetoothOff)
+        } else {
+            Bluetooth::Ready
+        }
     }
 
-    /// Loads a system framework, so its classes exist (once each).
+    /// Loads a system framework, so its classes exist.
     #[cfg(target_os = "macos")]
-    fn load(path: &str) {
-        let Ok(path) = std::ffi::CString::new(path) else {
-            return;
-        };
-        // SAFETY: a valid C string; the handle stays loaded on purpose.
+    fn load(path: &std::ffi::CStr) {
+        // SAFETY: a valid C string; the framework stays loaded on purpose.
         unsafe {
             libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub(super) fn blocks_phone() -> Option<PasskeyBlock> {
-        None
+    pub(super) fn state() -> Bluetooth {
+        Bluetooth::Ready
     }
 }
 
@@ -249,9 +284,9 @@ mod tests {
     fn a_request_the_phone_cannot_reach_shows_the_bar_until_it_ends() {
         let mut state = State::default();
         state.on_change(change(PasskeyKind::Get, true), || {
-            Some(PasskeyBlock::BluetoothDenied)
+            Bluetooth::Blocked(PasskeyBlock::BluetoothDenied)
         });
-        assert_eq!(state.bar, Some(PasskeyBlock::BluetoothDenied));
+        assert_eq!(state.bar, Some(Bar::Blocked(PasskeyBlock::BluetoothDenied)));
         assert_eq!(state.pending.len(), 1);
         let waiting = state.notes.back().unwrap().clone();
         assert!(waiting.pending);
@@ -267,13 +302,21 @@ mod tests {
     }
 
     #[test]
+    fn before_macos_asked_the_bar_says_to_try_again_but_agents_get_no_reason() {
+        let mut state = State::default();
+        state.on_change(change(PasskeyKind::Get, true), || Bluetooth::NotAsked);
+        assert_eq!(state.bar, Some(Bar::NotAsked));
+        assert_eq!(state.notes.back().unwrap().reason, None);
+    }
+
+    #[test]
     fn a_request_bluetooth_allows_has_no_bar_and_navigation_ends_it() {
         let mut state = State::default();
-        state.on_change(change(PasskeyKind::Create, true), || None);
+        state.on_change(change(PasskeyKind::Create, true), || Bluetooth::Ready);
         assert_eq!(state.bar, None);
         assert_eq!(state.pending.len(), 1);
         // An end of a request never heard changes nothing.
-        state.on_change(change(PasskeyKind::Get, false), || None);
+        state.on_change(change(PasskeyKind::Get, false), || Bluetooth::Ready);
         assert_eq!(state.pending.len(), 1);
         state.clear();
         assert!(state.pending.is_empty());
@@ -285,8 +328,8 @@ mod tests {
     fn a_page_keeps_its_last_notes_only() {
         let mut state = State::default();
         for _ in 0..NOTES {
-            state.on_change(change(PasskeyKind::Get, true), || None);
-            state.on_change(change(PasskeyKind::Get, false), || None);
+            state.on_change(change(PasskeyKind::Get, true), || Bluetooth::Ready);
+            state.on_change(change(PasskeyKind::Get, false), || Bluetooth::Ready);
         }
         assert_eq!(state.notes.len(), NOTES);
     }

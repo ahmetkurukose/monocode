@@ -8,7 +8,10 @@
 //!   page (K44). Requests wait their turn there. Every answer is noted for
 //!   the agent tools (`permissionRequest` in action effects).
 //! - Camera and microphone also need macOS's consent: after the site is
-//!   allowed, the app asks the system before the page gets them.
+//!   allowed, the app asks the system before the page gets them. A page's
+//!   `getUserMedia` waits until macOS has decided at all
+//!   (`monocode_core::browser::media`): the app asks then, with a bar that
+//!   says so, instead of Chromium's audio service waiting on macOS unseen.
 //! - A certificate error on a local or private host is taken; elsewhere the
 //!   page shows a warning instead of the page, with "Back to safety" and
 //!   "Proceed (unsafe)", which holds for the host and certificate until the
@@ -16,6 +19,7 @@
 //! - The site-info button in the address bar lists the site's permissions,
 //!   each with a reset; Settings lists every site's ([`all_sites`]).
 use super::*;
+use monocode_core::browser::media::{self, MediaAsk};
 use monocode_core::browser::sites::{
     self, CertBlock, CertDecision, CertExceptions, Decision, Outcome, PermissionNote, Setting,
     SitePermissions,
@@ -168,6 +172,9 @@ pub(super) struct PageSites {
     temporary: Vec<(String, String)>,
     /// macOS refused what the user allowed: what the bar says.
     system_denied: Option<&'static str>,
+    /// macOS asks the user now whether the app may use this ("camera",
+    /// "microphone"); the page's request waits for the answer.
+    system_asking: Option<&'static str>,
     cert: Option<CertStop>,
     info_open: bool,
     info_anchor: AnchorSlot,
@@ -183,6 +190,7 @@ impl Default for PageSites {
             once: HashMap::new(),
             temporary: Vec::new(),
             system_denied: None,
+            system_asking: None,
             cert: None,
             info_open: false,
             info_anchor: AnchorSlot::default(),
@@ -514,6 +522,16 @@ impl BrowserPage {
     pub(super) fn permission_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if let Some(waiting) = self.sites.queue.front() {
             return Some(self.ask_bar(waiting, cx));
+        }
+        if let Some(what) = self.sites.system_asking {
+            return Some(
+                bar()
+                    .child(icon("alert-circle", 14.).text_color(content(0.6)))
+                    .child(div().flex_1().min_w_0().text_size(px(12.)).child(format!(
+                        "macOS asks whether Monocode may use the {what}: answer its dialog. The page waits until then."
+                    )))
+                    .into_any_element(),
+            );
         }
         let what = self.sites.system_denied?;
         let pane = if what == "camera" {
@@ -879,6 +897,88 @@ pub(super) fn bar() -> gpui::Stateful<gpui::Div> {
         .bg(content(0.03))
 }
 
+/// Where a page's held camera and microphone requests go: the page's
+/// [`BrowserPage::watch_media_asks`] loop.
+#[derive(Default)]
+pub(super) struct MediaAsks {
+    tx: RefCell<Option<async_channel::Sender<MediaAsk>>>,
+}
+
+impl Host<monocode_cef::BrowserView> {
+    /// Holds the page's `getUserMedia` calls until macOS has decided about
+    /// the camera and microphone, for as long as the returned value lives.
+    pub(super) fn watch_media(&self, cdp: &Rc<CdpClient>) -> media::MediaWatch {
+        let shared = Rc::downgrade(&self.shared);
+        media::watch(cdp, move |ask| {
+            let Some(shared) = shared.upgrade() else {
+                return Err(ask);
+            };
+            let tx = shared.media.tx.borrow().clone();
+            match tx {
+                Some(tx) => tx.try_send(ask).map_err(|e| e.into_inner()),
+                None => Err(ask),
+            }
+        })
+    }
+}
+
+impl BrowserPage {
+    /// Answers the page's held camera and microphone requests.
+    pub(super) fn watch_media_asks(self, cx: &mut Context<Self>) -> Self {
+        let (tx, rx) = async_channel::unbounded();
+        *self.host.shared.media.tx.borrow_mut() = Some(tx);
+        cx.spawn(async move |this, cx| {
+            while let Ok(ask) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_media_ask(ask, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        self
+    }
+
+    /// A `getUserMedia` call the page holds: it goes on once macOS has
+    /// decided. Undecided, the app asks macOS now, for the user to see,
+    /// instead of Chromium's audio service waiting on macOS unseen. A page
+    /// an agent drives out of the user's sight is refused instead (K63).
+    fn on_media_ask(&mut self, ask: MediaAsk, cx: &mut Context<Self>) {
+        let Some(cdp) = self.cdp() else { return };
+        let undecided: Vec<&'static str> = (ask.names().into_iter())
+            .filter(|name| tcc::undecided(name))
+            .collect();
+        if undecided.is_empty() {
+            media::answer(&cdp, &ask, true);
+            return;
+        }
+        if self.active_agent().is_some() && !self.seen_by_user() {
+            media::answer(&cdp, &ask, false);
+            self.sites
+                .note(&ask.names(), &ask.origin, Outcome::DeniedBackground);
+            cx.notify();
+            return;
+        }
+        self.sites.system_asking = undecided.first().copied();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            for name in undecided {
+                tcc::consent(name).await;
+            }
+            // Whatever macOS said: Chromium asks the app next (a refusal
+            // shows in the bar then).
+            media::answer(&cdp, &ask, true);
+            let _ = this.update(cx, |page, cx| {
+                page.sites.system_asking = None;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
 /// One permission in a list: its name, its answer, and a reset.
 pub(crate) fn permission_row(
     ix: usize,
@@ -911,38 +1011,82 @@ pub(crate) fn permission_row(
 
 /// macOS's own consent to the camera and microphone (TCC).
 mod tcc {
-    /// Whether macOS lets the app use `name` ("camera" or "microphone"),
-    /// asking the user the first time.
+    /// AVFoundation's media type and the Info.plist usage string of `name`
+    /// ("camera" or "microphone").
     #[cfg(target_os = "macos")]
-    pub(super) async fn consent(name: &str) -> bool {
-        use objc2::{msg_send, runtime::AnyClass};
-        use objc2_foundation::{NSBundle, NSString};
-
-        let (media, usage) = if name == "camera" {
+    fn media_of(name: &str) -> (&'static str, &'static str) {
+        if name == "camera" {
             ("vide", "NSCameraUsageDescription")
         } else {
             ("soun", "NSMicrophoneUsageDescription")
-        };
-        // Without a usage string (a binary run outside its bundle) macOS
-        // kills the app on asking: Chromium is left to fail on its own.
+        }
+    }
+
+    /// `AVCaptureDevice`, where the app may ask macOS: `None` without the
+    /// usage string `usage` (a binary run outside its bundle), where macOS
+    /// kills the app on asking.
+    #[cfg(target_os = "macos")]
+    fn capture_device(usage: &str) -> Option<&'static objc2::runtime::AnyClass> {
+        use objc2_foundation::{NSBundle, NSString};
+
         let described = NSBundle::mainBundle()
             .objectForInfoDictionaryKey(&NSString::from_str(usage))
             .is_some();
         if !described {
-            return true;
+            return None;
         }
-        let Some(class) = AnyClass::get(c"AVCaptureDevice") else {
+        // Chromium captures in its own processes: this one may not have
+        // loaded AVFoundation yet.
+        let path = c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
+        // SAFETY: a valid C string; the framework stays loaded on purpose.
+        unsafe {
+            libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
+        }
+        objc2::runtime::AnyClass::get(c"AVCaptureDevice")
+    }
+
+    /// AVAuthorizationStatus for `media`: 0 not determined, 1 restricted,
+    /// 2 denied, 3 authorized. Reading it never asks the user.
+    #[cfg(target_os = "macos")]
+    fn status(class: &objc2::runtime::AnyClass, media: &str) -> isize {
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+
+        let media = NSString::from_str(media);
+        unsafe { msg_send![class, authorizationStatusForMediaType: &*media] }
+    }
+
+    /// Whether macOS has not decided about `name` yet, so that using it
+    /// asks the user (only where the app may ask).
+    #[cfg(target_os = "macos")]
+    pub(super) fn undecided(name: &str) -> bool {
+        let (media, usage) = media_of(name);
+        capture_device(usage).is_some_and(|class| status(class, media) == 0)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn undecided(_: &str) -> bool {
+        false
+    }
+
+    /// Whether macOS lets the app use `name` ("camera" or "microphone"),
+    /// asking the user the first time.
+    #[cfg(target_os = "macos")]
+    pub(super) async fn consent(name: &str) -> bool {
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+
+        let (media, usage) = media_of(name);
+        // Where the app cannot ask, Chromium is left to fail on its own.
+        let Some(class) = capture_device(usage) else {
             return true;
         };
-        let media = NSString::from_str(media);
-        // AVAuthorizationStatus: 0 not determined, 1 restricted, 2 denied,
-        // 3 authorized.
-        let status: isize = unsafe { msg_send![class, authorizationStatusForMediaType: &*media] };
-        match status {
+        match status(class, media) {
             3 => return true,
             0 => {}
             _ => return false,
         }
+        let media = NSString::from_str(media);
         let (tx, rx) = async_channel::bounded::<bool>(1);
         let block = block2::RcBlock::new(move |granted: objc2::runtime::Bool| {
             let _ = tx.try_send(granted.as_bool());

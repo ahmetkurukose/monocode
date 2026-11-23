@@ -690,6 +690,7 @@ impl BrowserPage {
             suggest: Default::default(),
         }
         .watch_presence(cx)
+        .watch_media_asks(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
@@ -2756,6 +2757,8 @@ struct Shared {
     audio: audio::Audio,
     /// The page's passkey requests (`browser_passkeys.rs`).
     passkeys: passkeys::Passkeys,
+    /// The page's held camera and microphone requests (`browser_sites.rs`).
+    media: sites::MediaAsks,
 }
 
 impl Shared {
@@ -2845,10 +2848,11 @@ impl Host<monocode_cef::BrowserView> {
         discard::watch_edits(&cdp);
         let audio = self.watch_audio(&cdp);
         let passkeys = self.watch_passkeys(&cdp);
+        let media = self.watch_media(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
-            _attachment: Box::new((attachment, audio, passkeys)),
+            _attachment: Box::new((attachment, audio, passkeys, media)),
         });
     }
 }

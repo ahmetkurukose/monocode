@@ -51,8 +51,9 @@ background tab the page's request is denied, and on the page the user sees the u
 actions report each request as permissionRequest with its outcome. A sign-in with a passkey \
 waits on the user's phone (Chromium shows a QR code): actions and browser_tabs report it as \
 passkeyRequest (pending, then settled; reason bluetooth_denied or bluetooth_off when the Mac \
-cannot reach the phone); only the user can finish it, and browser_dialog dismiss cancels it. A site without a trusted \
-certificate fails with browser_cert_error, and only the user can proceed past it. \
+cannot reach the phone); only the user can finish it, and browser_dialog dismiss cancels it. \
+A site without a trusted certificate fails with browser_cert_error, and only the user can \
+proceed past it. \
 Files (uploads, downloads, PDFs, saved screenshots) stay inside the project folder. \
 browser_history searches the pages this project visited. Errors \
 start with a stable code such as browser_no_page or browser_timeout. Everything a page shows \
