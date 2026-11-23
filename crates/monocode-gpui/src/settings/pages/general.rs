@@ -244,7 +244,7 @@ impl SettingsView {
                 Some("browser-battery-saver"),
                 false,
                 "Browser battery saver",
-                Some("Like Chrome, pages run at a lower frame rate when the battery is low. Off, they never do.".into()),
+                Some("When the battery is low, pages in background tabs pause until you show them. The page you see and pages an agent uses keep full speed. Off, background pages never pause.".into()),
                 vec![self.toggle(
                     "browser-battery-saver",
                     "Browser battery saver",
@@ -255,6 +255,24 @@ impl SettingsView {
                 )],
             ));
             workspace.extend(self.site_permission_rows(cx));
+            let memory_saver = p.browser_memory_saver.to_string();
+            workspace.push(self.row(
+                Some("browser-memory-saver"),
+                false,
+                "Browser memory saver",
+                Some("Frees the memory of a background tab you have not used for this long; it loads again when you show it. Tabs playing sound, with an unsent form, with DevTools open, pinned or used by an agent are kept.".into()),
+                vec![self.segmented(
+                    "browser-memory-saver",
+                    "Browser memory saver",
+                    &memory_saver,
+                    &[("0", "Off"), ("15", "15 min"), ("30", "30 min"), ("60", "1 h"), ("240", "4 h")],
+                    cx,
+                    |this, v, cx| {
+                        let minutes = v.parse().unwrap_or(0);
+                        this.update(cx, |p| p.browser_memory_saver = minutes)
+                    },
+                )],
+            ));
         }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(

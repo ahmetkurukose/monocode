@@ -35,6 +35,9 @@ pub struct PageInfo {
     pub by_agent: bool,
     /// It browses with a throwaway in-memory profile (K22).
     pub isolated: bool,
+    /// Memory Saver closed it to free memory (K64); any command loads it
+    /// again first.
+    pub discarded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

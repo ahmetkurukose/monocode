@@ -786,6 +786,9 @@ impl Shell {
                     .child(
                         crate::tab_tile::mark_tile(&TAB_TILE, tile, mark)
                             .relative()
+                            // Discarded by Memory Saver (K64): it loads again
+                            // when shown.
+                            .when(self.browser_discarded(id, cx), |d| d.opacity(0.45))
                             .when(self.browser_agent_active(id, cx), |d| {
                                 d.child(super::browser_presence::agent_badge(id))
                             }),

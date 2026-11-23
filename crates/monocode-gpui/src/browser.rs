@@ -36,7 +36,9 @@ use gpui::{
 };
 use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
+mod discard;
 mod grab;
+pub(crate) mod lifecycle;
 pub(crate) use grab::ToggleGrab;
 
 use crate::{
@@ -563,6 +565,10 @@ pub(crate) struct BrowserPage {
     grab: grab::GrabMode,
     /// Site permissions and certificate errors (K62, K63).
     sites: sites::PageSites,
+    /// Memory Saver and Battery Saver's bookkeeping (K64, K52).
+    life: lifecycle::Life,
+    /// Discarded to save memory: it loads again when shown or used.
+    discarded: Option<discard::Discarded>,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -646,6 +652,8 @@ impl BrowserPage {
             download_wait: None,
             grab: Default::default(),
             sites: Default::default(),
+            life: Default::default(),
+            discarded: None,
         }
         .watch_presence(cx)
     }
@@ -718,6 +726,7 @@ impl BrowserPage {
                 } else {
                     self.sync_zoom(cx);
                     self.snapshot_when_settled(cx);
+                    self.restore_scroll();
                 }
             }
             BrowserEvent::Progress(progress) => self.progress = progress,
@@ -1336,8 +1345,9 @@ impl BrowserPage {
             move |bounds, _, window, cx| {
                 let options = host.options.borrow().clone();
                 let made = host.clone();
+                let generation = host.shared.generation.get();
                 host.paint(bounds, window, cx, |parent, frame, cx| {
-                    match make_view(page.clone(), parent, frame, &url, &options, cx) {
+                    match make_view(page.clone(), generation, parent, frame, &url, &options, cx) {
                         Ok(view) => {
                             // Once the view is in its slot, which paint holds.
                             cx.defer(move |_| made.attach_agent());
@@ -1617,6 +1627,7 @@ impl Render for BrowserPage {
 /// Makes a page's view inside `parent` and hands its events to `page`.
 fn make_view(
     page: WeakEntity<BrowserPage>,
+    generation: u64,
     parent: *mut std::ffi::c_void,
     frame: monocode_cef::Frame,
     url: &str,
@@ -1625,22 +1636,30 @@ fn make_view(
 ) -> Result<monocode_cef::BrowserView, String> {
     let (view, events) = monocode_cef::BrowserView::create_with(parent, frame, url, options)
         .map_err(|e| e.to_string())?;
-    listen(page, events, cx);
+    listen(page, generation, events, cx);
     #[cfg(target_os = "macos")]
     mac::watch_input();
     Ok(view)
 }
 
-/// Hands a view's events to its page for as long as both live.
+/// Hands a view's events to its page for as long as both live. A view the
+/// page let go of (discarded, or of another profile) still reports while
+/// it closes; only its downloads still count.
 fn listen(
     page: WeakEntity<BrowserPage>,
+    generation: u64,
     events: async_channel::Receiver<monocode_cef::BrowserEvent>,
     cx: &mut App,
 ) {
     cx.spawn(async move |cx| {
         while let Ok(event) = events.recv().await {
             if page
-                .update(cx, |page, cx| page.on_event(event, cx))
+                .update(cx, |page, cx| {
+                    let current = page.host.shared.generation.get() == generation;
+                    if current || matches!(event, monocode_cef::BrowserEvent::Download(_)) {
+                        page.on_event(event, cx);
+                    }
+                })
                 .is_err()
             {
                 break;
@@ -1816,7 +1835,8 @@ impl BrowserPage {
             height,
         };
         let raw = Retained::as_ptr(&clip) as *mut std::ffi::c_void;
-        let view = match make_view(cx.weak_entity(), raw, frame, &url, &options, cx) {
+        let generation = self.host.shared.generation.get();
+        let view = match make_view(cx.weak_entity(), generation, raw, frame, &url, &options, cx) {
             Ok(view) => view,
             Err(error) => {
                 clip.removeFromSuperview();
@@ -2065,7 +2085,12 @@ impl BrowserPage {
             // Hidden until its tab paints it.
             view.set_visible(false);
             *self.host.view.borrow_mut() = Some(Hosted { clip, view });
-            listen(cx.weak_entity(), events, cx);
+            listen(
+                cx.weak_entity(),
+                self.host.shared.generation.get(),
+                events,
+                cx,
+            );
             self.host.attach_agent();
             true
         }
@@ -2630,6 +2655,10 @@ struct Shared {
     last_input: Cell<Option<Instant>>,
     /// Who drives the page, and the agent last using it (K47, K48).
     presence: presence::Presence,
+    /// Battery Saver froze the page (K52); it thaws when it shows.
+    frozen: Cell<bool>,
+    /// Counts the page's hosts: events of an earlier host's view are stale.
+    generation: Cell<u64>,
 }
 
 impl Shared {
@@ -2659,6 +2688,7 @@ impl<V: NativeView> Host<V> {
     /// A host for a page whose earlier hosts shared `shared`.
     fn with_shared(shared: Rc<Shared>) -> Rc<Self> {
         let mut host = Host::default();
+        shared.generation.set(shared.generation.get() + 1);
         host.shared = shared.clone();
         let host = Rc::new(host);
         let swept: Weak<dyn Swept> = Rc::downgrade(&host) as Weak<dyn Swept>;
@@ -2715,6 +2745,7 @@ impl Host<monocode_cef::BrowserView> {
         };
         // The old client, if any, is gone already.
         let log = PageLog::start(&cdp);
+        discard::watch_edits(&cdp);
         *self.agent.borrow_mut() = Some(AgentLink {
             cdp,
             log,
@@ -2893,6 +2924,7 @@ impl<V: NativeView> Host<V> {
             }
             Placement::Covered | Placement::Shown | Placement::Away => {
                 if prev == Placement::Hidden {
+                    self.thaw();
                     #[cfg(target_os = "macos")]
                     hosted.clip.setHidden(false);
                     hosted.view.set_visible(true);

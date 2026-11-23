@@ -116,9 +116,14 @@ pub(crate) struct Preferences {
     /// preferences get the new default once and the user's choice after.
     #[serde(default)]
     pub browser_external_cdp_rev: u32,
-    /// Chromium's battery saver, as in Chrome: pages run at 30 fps on a low
-    /// battery (context.md K52). On by default.
+    /// Browser Battery Saver (context.md K52): on a low battery, pages out
+    /// of sight freeze; the shown page and agents' pages keep full speed.
+    /// On by default.
     pub browser_battery_saver: bool,
+    /// Memory Saver (context.md K64): a page out of sight and unused for
+    /// this many minutes is discarded, and loads again when shown. 0 is
+    /// off; 30 by default.
+    pub browser_memory_saver: u32,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -227,6 +232,7 @@ impl Default for Preferences {
             browser_external_cdp: true,
             browser_external_cdp_rev: BROWSER_EXTERNAL_CDP_REV,
             browser_battery_saver: true,
+            browser_memory_saver: crate::browser::lifecycle::DEFAULT_DISCARD_MINUTES,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),
@@ -502,6 +508,16 @@ mod decoration_tests {
         assert!(saved.browser_battery_saver);
         let off: Preferences = serde_json::from_str(r#"{"browser_battery_saver":false}"#).unwrap();
         assert!(!off.browser_battery_saver);
+    }
+
+    #[test]
+    fn memory_saver_discards_after_30_minutes_unless_changed() {
+        assert_eq!(Preferences::default().browser_memory_saver, 30);
+        assert_eq!(Preferences::fresh_install().browser_memory_saver, 30);
+        let saved: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(saved.browser_memory_saver, 30);
+        let off: Preferences = serde_json::from_str(r#"{"browser_memory_saver":0}"#).unwrap();
+        assert_eq!(off.browser_memory_saver, 0);
     }
 
     #[test]
