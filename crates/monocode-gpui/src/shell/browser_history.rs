@@ -19,13 +19,12 @@ pub(super) struct HistoryOpen {
 }
 
 impl Shell {
-    /// `<data>/Browser/History`; none (memory) without a data folder.
+    /// `<data>/Browser History`, beside Chromium's `Browser` folder (which
+    /// Chromium owns); none (memory) without a data folder.
     pub(super) fn browser_history_dir(&self) -> Option<std::path::PathBuf> {
-        locked(&self.store).ok().and_then(|store| {
-            store
-                .data_dir()
-                .map(|dir| dir.join("Browser").join("History"))
-        })
+        locked(&self.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(|dir| dir.join("Browser History")))
     }
 
     /// What the page of `pane` learns from this shell.

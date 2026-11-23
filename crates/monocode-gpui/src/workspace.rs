@@ -372,6 +372,10 @@ pub(crate) struct BrowserPane {
     /// the history (K55); not saved.
     #[serde(skip)]
     pub fresh: bool,
+    /// The project folder an agent opened it for, when its session is
+    /// not one of the window's; not saved.
+    #[serde(skip)]
+    pub project: Option<String>,
 }
 
 /// `browser_panes` as saved: without the pages of throwaway profiles, whose

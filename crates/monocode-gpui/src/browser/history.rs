@@ -3,8 +3,9 @@
 //! profile's store (`monocode_core::browser::history`). Throwaway profiles
 //! (K22) keep nothing, and a restored tab's first load is not a new visit.
 //!
-//! The stores are one app-wide [`HistoryGlobal`]: `<data>/Browser/History`,
-//! or memory when the data mode has no folder.
+//! The stores are one app-wide [`HistoryGlobal`]: `<data>/Browser History`,
+//! beside Chromium's own `Browser` folder rather than in it, or memory when
+//! the data mode has no folder.
 
 use super::*;
 use monocode_core::browser::history::Stores;

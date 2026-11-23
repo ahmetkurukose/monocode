@@ -36,9 +36,11 @@ impl Shell {
         // a throwaway profile keeps none.
         crate::browser::history::init(self.browser_history_dir(), cx);
         let history = crate::browser::history::store_name(&profile).and_then(|store| {
-            let owner = self.session_summaries.get(&state.owner)?;
+            let folder = (self.session_summaries.get(&state.owner))
+                .map(|owner| owner.cwd.clone())
+                .or_else(|| state.project.clone())?;
             Some(crate::browser::history::PageHistory {
-                project: monocode_core::files::path_key(&owner.cwd),
+                project: monocode_core::files::path_key(&folder),
                 store,
             })
         });
@@ -321,6 +323,7 @@ impl Shell {
         if let Some(state) = self.workspace.browser_panes.get_mut(&pane) {
             state.opened_by = opener_state.opened_by;
             state.ephemeral = opener_state.ephemeral;
+            state.project = opener_state.project;
         }
         let active = self.workspace.active;
         if self.workspace.tab_of(opener).is_some() {
