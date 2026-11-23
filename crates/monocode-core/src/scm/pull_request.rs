@@ -108,7 +108,9 @@ pub enum PrBranchCheck {
     /// Head has no commits that base lacks.
     NoChanges,
     /// An open pull request already exists for this head into this base.
-    AlreadyExists { pr: Pr },
+    AlreadyExists {
+        pr: Pr,
+    },
 }
 
 /// One user who can be a reviewer or assignee.
@@ -694,6 +696,20 @@ fn repo_key(host: &str, owner: &str, name: &str) -> String {
     format!("{host}/{owner}/{name}").to_lowercase()
 }
 
+/// The branch's recorded base (`branch.<b>.base`) when it is a branch of `repo`'s remote
+/// other than the default one.
+fn recorded_base(root: &Path, head_branch: &str, repo: &PrRepo) -> Option<String> {
+    if head_branch.is_empty() || repo.remote.is_empty() {
+        return None;
+    }
+    git_stdout(
+        root,
+        &["config", "--get", &format!("branch.{head_branch}.base")],
+    )?;
+    let (name, _) = git_pr_base(root, Some(head_branch), Some(&repo.remote))?;
+    (!name.is_empty() && name != repo.default_branch).then_some(name)
+}
+
 /// Load remotes, fork parent, default/suggested branches, viewer and templates.
 pub fn pr_setup(cwd: &Path) -> Result<PrSetup, String> {
     let root = local_root(cwd)?;
@@ -761,15 +777,24 @@ pub fn pr_setup(cwd: &Path) -> Result<PrSetup, String> {
 
     let main = 0;
     let mut base_repo = main;
+    let head_branch = git_head_branch(&root).unwrap_or_default();
+    let recorded_base = recorded_base(&root, &head_branch, &repos[main]);
+    // A fork's parent is always offered as a base. It is the suggested one unless the
+    // fork is run as its own mainline (its default branch differs from the parent's) or
+    // the branch was made from another branch of the fork (a recorded base other than
+    // its default).
     let parent = repo_infos_by_index[main]
         .as_ref()
         .filter(|info| info.is_fork)
         .and_then(|info| info.parent.as_deref())
+        .filter(|parent| !parent.name.is_empty())
         .cloned();
-    if let Some(parent) = parent.filter(|parent| !parent.name.is_empty()) {
+    if let Some(parent) = parent {
+        let suggest =
+            recorded_base.is_none() && parent.default_branch() == repos[main].default_branch;
         let host = repos[main].host.clone();
         let key = repo_key(&host, &parent.owner.login, &parent.name);
-        base_repo = match by_key.get(&key) {
+        let index = match by_key.get(&key) {
             Some(&index) => index,
             None => {
                 repos.push(PrRepo {
@@ -785,21 +810,24 @@ pub fn pr_setup(cwd: &Path) -> Result<PrSetup, String> {
                 repos.len() - 1
             }
         };
+        if suggest {
+            base_repo = index;
+        }
     }
 
-    let head_branch = git_head_branch(&root).unwrap_or_default();
     let head_repo = push_remote(&root, &head_branch)
         .and_then(|remote| by_remote.get(&remote).copied())
         .unwrap_or(main);
 
     let base = &repos[base_repo];
-    let recorded = !head_branch.is_empty()
-        && !base.remote.is_empty()
-        && git_stdout(
-            &root,
-            &["config", "--get", &format!("branch.{head_branch}.base")],
-        )
-        .is_some();
+    let recorded = recorded_base.is_some()
+        || !head_branch.is_empty()
+            && !base.remote.is_empty()
+            && git_stdout(
+                &root,
+                &["config", "--get", &format!("branch.{head_branch}.base")],
+            )
+            .is_some();
     let base_branch = recorded
         .then(|| git_pr_base(&root, Some(&head_branch), Some(&base.remote)))
         .flatten()
