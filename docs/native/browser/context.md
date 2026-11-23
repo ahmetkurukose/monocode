@@ -84,8 +84,21 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K49 | Grab | Araç çubuğu düğmesi + kısayol + sağ tık "Agent'a gönder". Seçilen öğe chat composer'ına **pill** olarak gider: sekmeyi bir agent açtıysa onun oturumuna, değilse odaktaki chat'e. İçerik: seçici, a11y rol/isim, yakın metin, computed style özeti, ≤4 KB HTML, React bileşen adı + kaynak dosya, kırpılmış görüntü. Sırlar (şifre alanı değerleri, token benzeri öznitelikler) temizlenir. |
 | K50 | Yeni araçlar | `browser_pdf`, `browser_upload`, `browser_download` yerel araç. HAR ve intercept yalnız dış CDP (Playwright) üzerinden. |
 | K51 | Dosya sınırı | Upload yalnız proje klasöründeki dosyalar; download ve PDF yalnız proje klasörüne yazar. |
-| K52 | Battery Saver | Chrome gibi açık (düşük pilde 30 fps); Settings → General'dan kapatılabilir. |
+| K52 | Battery Saver | **Revize (Faz 4 planı, 2026-11-23):** düşük pilde 30 fps yalnız **arka plan sekmelerine** uygulanır; görünür sekme ve agent'ın sürdüğü sekme tam hızda kalır. Settings → General'dan kapatılabilir. |
 | K53 | Faz 3 iş bölümü | Paralel agent'lar ayrı worktree'lerde düzenler ama **tek ortak `CARGO_TARGET_DIR`** ile build eder (disk). Doğrulama: birleşik dalda uçtan uca agent + kullanıcının uygulamasında araçlarla tur. |
+| K54 | Faz 4 bölünmesi | **4a**: Faz 3 artıkları, Memory Saver/throttle, temel özellikler (izinler, sertifika, geçmiş, yeni sekme, ses, yazdırma). **4b**: şifre yöneticisi, autofill, passkey (hybrid), import. İlk iş `posix_spawn` geçişi (§11 "Çıkıştan sonra kalan süreç"). |
+| K55 | Veri kapsamı | Şifreler ve site izinleri **global** (profil başına). Geçmiş **proje bazlı** kaydedilir, global aranabilir. |
+| K56 | Şifre kasası | Tek **şifreli SQLite** dosyası; anahtar Keychain'de, tek onay/Touch ID ile açılır (kayıt başına Keychain item'ı yok). |
+| K57 | Agent ↔ şifre | Agent kayıtlı girişi **doldurabilir ama göremez**: şifre değerleri snapshot, console, network, Grab ve `browser_eval` sonuçlarında maskelenir. |
+| K58 | Passkey | Yalnız **telefonla QR (hybrid/caBLE)**. USB anahtar ve platform passkey (Touch ID / iCloud Keychain, Apple'ın `web-browser.public-key-credential` entitlement'ı) kapsam dışı. QR öncesi `CBManager.authorization` kontrolü; izin yok/Bluetooth kapalı → sayfada "Ayarları aç" bandı; agent'a `passkeyRequest` içinde `bluetooth_denied`. Telefonda 1Password/iCloud passkey'leri bu yoldan çalışır. |
+| K59 | Dev imzası | Geliştirici build'lerinde sabit yerel sertifika (`MONOCODE_NATIVE_LOCAL_SIGNING`) varsayılan: ad-hoc imzada TCC izni (Bluetooth, kamera, mikrofon) ve Keychain "Always Allow" her build'de düşüyor. |
+| K60 | 1Password | Faz 5'in ilk hedef eklentisi; eklenti mimarisi seçiminde ölçüt (main-world WebAuthn override, content script, native messaging). Eklenti kuruluyken kendi şifre yöneticimiz kayıt/öneri göstermez (ayarla açılır). |
+| K61 | Import | **Chrome, Arc, Brave** birlikte; cookie + şifre. Elle başlatılır, tek seferlik; yeniden import birleştirir. Otomatik senkron yok. |
+| K62 | Sertifika | `localhost`, `*.local`, loopback ve özel IP'lerde self-signed otomatik kabul. Diğerlerinde kırmızı sayfa; istisna yalnız oturum boyunca. |
+| K63 | İzin ↔ agent | Agent'ın arka plan sekmesinde izin istekleri varsayılan **red** ve agent'a bildirilir; kullanıcının baktığı sekmede soru kullanıcıya gelir. Agent izin veremez. |
+| K64 | Memory Saver | Discard edilmez: ses çalan, aktif, agent'ın son kullandığı (lease), doldurulmamış formu olan, DevTools'u açık sekmeler. Agent ve görünürlük **throttle lease**'leri aynı mekanizma. |
+| K65 | Geçmiş ↔ agent | Agent yalnız **oturumun projesinin** geçmişini görür (`browser_history`). |
+| K66 | Yeni sekme | Projenin çalışan dev sunucuları (açık portlar), son açılanlar, en sık ziyaret edilenler. |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -402,7 +415,9 @@ Tam liste `research/01-orca-features.md` (181 özellik). Gruplar:
 | Overlay | Child view üstüne GPUI çizemez. Faz 1: son kare görüntüsü (K16); tooltip'ler ve ortak yardımcıları kullanmayan overlay'ler hâlâ sayfanın altında kalır. Kalıcı çözüm Faz 3 (OSR). |
 | Gizli sekme throttling | Arka plandaki sekmenin view'u gizlenir ve `WasHidden` çağrılır. Faz 2: agent'ın sürdüğü sekme gizlenmez, pencere dışında çizer (K23); pencere ekran dışındayken Chromium'un görünen sekmeyi de gizlediği görüldü ve aynı yolla çözüldü. |
 | DevTools yapışması | **Çözüldü (Faz 2, K28):** frontend kendi Alloy view'umuzda, CDP proxy'si üzerinden. |
-| Battery Saver | **Çözüldü (Faz 3, K52):** Chrome gibi açık, Settings'ten kapatılabilir. |
+| Battery Saver | **Çözüldü (K52, Faz 4 planında revize):** yalnız arka plan sekmeleri 30 fps. |
+| Passkey QR (hybrid) | **Faz 4 bulgusu:** Gmail'de QR telefonla okutuluyor ama bağlanmıyor. Şüphe: Mac BLE yakınlık sinyalini duyamıyor (ad-hoc imzada TCC Bluetooth izni her build'de düşüyor / bundle'sız çalıştırma). K58, K59. |
+| Platform passkey | Apple'ın tarayıcı entitlement'ı olmadan Touch ID / iCloud Keychain ve macOS sistem passkey sağlayıcıları (1Password dahil) kullanılamaz; kapsam dışı. |
 | Başlangıç kilitlenmesi | **Çözüldü (Faz 3):** `setlocale` ↔ `fork()` kilit sırası çakışması; `main`'in başında tek thread'liyken `setlocale`. |
 | Çıkıştan sonra kalan süreç | **Faz 3 bulgusu:** ağır fork yükünde `exec` öncesi takılan fork çocuğu profili tutuyor. Çözüm uygulama geneli: `process.rs`'te `posix_spawn` (ayrı iş). |
 | Bellek | Faz 2 ölçümü (`phase-2-done.md`): 1 sekmede helper'lar 482 MB, 5 sekmede 1077 MB (Chrome: 612 / 1063). Faz 0 ölçümü (Wikipedia/GitHub, bir sayfa): GPU 86–106 MB, ağ 64–66 MB, depolama ~50 MB, renderer 71–206 MB (Chromium bir yedek renderer da tutar). Ana süreç (GPUI dahil) 191–279 MB. |
@@ -455,12 +470,16 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
 - Overlay kancası (K44).
 - ~~OSR~~ → Faz 6 (K43, K44).
 
-### Faz 4 — Tam browser
-- Faz 3'ten devralınan: yapışık DevTools'ta ~48 px görünüm farkı, DevTools sağ tık menüsünde "Send to Agent", popup indirmelerinin klasör yönlendirmesi, programlı scroll (`phase-3-done.md`).
-- Memory Saver (discard) ve throttle lease'leri.
-- Site izinleri, sertifika istisnası, geçmiş, yeni sekme sayfası, ses kapatma, yazdırma.
-- Keychain tabanlı şifre yöneticisi, autofill, Touch ID, passkey (USB).
-- Chrome/Arc/Brave'den cookie ve şifre import'u (§3.3).
+### Faz 4 — Tam browser (kararlar K54–K66)
+- **Önce:** `monocode-core/src/process.rs`'te `fork` → `posix_spawn` (kapanıştan sonra kalan süreç).
+- **4a**
+  - Faz 3'ten devralınan: yapışık DevTools'ta ~48 px görünüm farkı, DevTools sağ tık menüsünde "Send to Agent", popup indirmelerinin klasör yönlendirmesi, programlı scroll (`phase-3-done.md`).
+  - Memory Saver (discard) ve throttle lease'leri (K64); Battery Saver yalnız arka planda (K52).
+  - Site izinleri (K63), sertifika istisnası (K62), geçmiş (K55, K65), yeni sekme sayfası (K66), ses kapatma, yazdırma.
+- **4b**
+  - Şifre yöneticisi (K56, K57), autofill, Touch ID ile kasa kilidi.
+  - Telefonla QR passkey (hybrid) düzeltmesi + Bluetooth izin akışı (K58, K59).
+  - Chrome/Arc/Brave'den cookie ve şifre import'u (K61, §3.3).
 
 ### Faz 5 — Eklentiler (seçilmiş 20–30)
 - Eklenti listesinin belirlenmesi ve gereken `chrome.*` API'lerinin çıkarılması.
@@ -500,7 +519,7 @@ Her faz bittiğinde:
 | 1 | Bitti | `phase-1-done.md` |
 | 2 | Bitti | `phase-2-done.md` |
 | 3 | Bitti | `phase-3-done.md` |
-| 4 | Başlamadı | — |
+| 4 | Başladı (2026-11-23) | — |
 | 5 | Başlamadı | — |
 | 6 | Başlamadı | — |
 | 7 | Başlamadı | — |
