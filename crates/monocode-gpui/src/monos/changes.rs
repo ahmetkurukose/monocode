@@ -355,7 +355,7 @@ impl Monos {
                 &changes,
                 move |this, _, event: &crate::changes::ChangesEvent, cx| match event {
                     crate::changes::ChangesEvent::Overlays
-                    | crate::changes::ChangesEvent::PullRequestCreated(_) => {}
+                    | crate::changes::ChangesEvent::ShowPullRequest(_) => {}
                     crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                         this.open_change_review(&event_key, cwd, path.as_deref(), *staged, cx)
                     }

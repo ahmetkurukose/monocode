@@ -25,7 +25,7 @@ use gpui::{
 use monocode_core::{
     agent::{AccessMode, Settings},
     provider::{self, Event, Kind, Request},
-    scm::{self, CreatedPr, DiffIndex, Pr, UpdateMethod},
+    scm::{self, DiffIndex, Pr, UpdateMethod},
 };
 use std::{
     path::PathBuf,
@@ -45,9 +45,9 @@ pub(crate) enum ChangesEvent {
         path: Option<String>,
         staged: Option<bool>,
     },
-    /// The New Pull Request dialog created one: the shell may reveal it.
-    #[allow(dead_code, reason = "the Inbox will reveal the new pull request")]
-    PullRequestCreated(CreatedPr),
+    /// Show this pull request selected in the Inbox: the New Pull Request
+    /// dialog created it, or found the branch already has it.
+    ShowPullRequest(crate::inbox::RevealPr),
 }
 
 /// Where the branch switcher opens.
@@ -697,25 +697,26 @@ impl Changes {
         let cwd = self.cwd.clone();
         let dialog =
             cx.new(|cx| PrDialog::new(cwd, std::sync::Arc::new(Gh), draft, harness, window, cx));
-        let subscription = cx.subscribe(&dialog, |this, _, event: &PrDialogEvent, cx| {
+        let subscription = cx.subscribe(&dialog, |this, dialog, event: &PrDialogEvent, cx| {
             match event {
                 PrDialogEvent::Close(draft) => {
                     this.pr_dialog = None;
                     this.pr_draft = Some(draft.clone());
                 }
                 PrDialogEvent::Created(pr) => {
+                    let title = dialog.read(cx).title.read(cx).content.to_string();
                     this.pr_dialog = None;
                     this.pr_draft = None;
                     this.mutated(cx);
                     this.load_pr(cx);
                     this.set_status(&format!("Created pull request #{}", pr.number), cx);
-                    cx.emit(ChangesEvent::PullRequestCreated(pr.clone()));
+                    this.show_pull_request(&pr.url, &title, cx);
                 }
-                // The Inbox will show it; the browser does for now.
+                // The Inbox shows it; the dialog keeps what was typed.
                 PrDialogEvent::ViewExisting(pr) => {
-                    if !pr.url.is_empty() {
-                        cx.open_url(&pr.url);
-                    }
+                    let pr = pr.clone();
+                    dialog.update(cx, |dialog, cx| dialog.close(cx));
+                    this.show_pull_request(&pr.url, &pr.title, cx);
                     return;
                 }
             }
@@ -725,6 +726,16 @@ impl Changes {
         self.pr_dialog = Some((dialog, subscription));
         cx.emit(ChangesEvent::Overlays);
         cx.notify();
+    }
+
+    /// Reveal a pull request in the Inbox, or open it in the browser when its
+    /// address is not one the Inbox can show.
+    fn show_pull_request(&mut self, url: &str, title: &str, cx: &mut Context<Self>) {
+        match crate::inbox::RevealPr::from_url(url, title, PathBuf::from(&self.cwd)) {
+            Some(pr) => cx.emit(ChangesEvent::ShowPullRequest(pr)),
+            None if !url.is_empty() => cx.open_url(url),
+            None => {}
+        }
     }
 
     fn open_menu(&mut self, kind: MenuKind, window: &mut Window, cx: &mut Context<Self>) {

@@ -1936,6 +1936,7 @@ impl Inbox {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let can_post = !self.posting && !self.comment.read(cx).content.trim().is_empty();
+        let pr_meta = self.pr_meta.as_ref().filter(|meta| meta.key == item.key());
         let body = if ix == 0 {
             div()
                 .pt(px(20.))
@@ -1943,7 +1944,19 @@ impl Inbox {
                 .flex()
                 .flex_col()
                 .gap(px(20.))
-                .when(!item.labels.is_empty(), |d| {
+                .when_some(pr_meta, |d, meta| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "inbox-pr-metadata".into())
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(meta.picker.clone())
+                            .when(meta.saving, |d| d.child(message("Saving…")))
+                            .when_some(meta.error.clone(), |d, text| d.child(error(text))),
+                    )
+                })
+                .when(pr_meta.is_none() && !item.labels.is_empty(), |d| {
                     d.child(
                         div()
                             .flex()

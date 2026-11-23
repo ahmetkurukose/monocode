@@ -28,9 +28,9 @@ mod file_panes;
 mod github_star;
 mod group_strip;
 mod idle_agents;
-mod keep_awake;
 #[cfg(test)]
 mod image_lightbox_tests;
+mod keep_awake;
 mod layout;
 mod live_agents;
 mod mobile_host;
@@ -2270,8 +2270,9 @@ impl Shell {
             window,
             |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
                 crate::changes::ChangesEvent::Overlays => cx.notify(),
-                // The Inbox will reveal it; the Changes panel already shows "View PR".
-                crate::changes::ChangesEvent::PullRequestCreated(_) => cx.notify(),
+                crate::changes::ChangesEvent::ShowPullRequest(pr) => {
+                    this.reveal_pull_request(pr.clone(), window, cx)
+                }
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review_tab(
                         crate::review::ReviewTab::Changes {
@@ -8532,7 +8533,9 @@ impl Render for Shell {
                     .when(
                         matches!(
                             open.target,
-                            MenuTarget::Databases | MenuTarget::DatabaseImport | MenuTarget::KeepAwake
+                            MenuTarget::Databases
+                                | MenuTarget::DatabaseImport
+                                | MenuTarget::KeepAwake
                         ),
                         |p| {
                             p.side(Side::Top)

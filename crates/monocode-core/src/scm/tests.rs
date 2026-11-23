@@ -2143,7 +2143,7 @@ mod pull_requests {
 
     #[test]
     fn metadata_parses_and_diffs_case_insensitively() {
-        let data = json!({"repository": {"pullRequest": {
+        let data = json!({"viewer": {"login": "me"}, "repository": {"pullRequest": {
             "id": "PR_9",
             "reviewRequests": {"nodes": [
                 {"requestedReviewer": {"__typename": "User", "login": "Alice"}},
@@ -2155,6 +2155,7 @@ mod pull_requests {
         }}});
         let current = parse_pr_metadata(&data).unwrap();
         assert_eq!(current.pr_id, "PR_9");
+        assert_eq!(current.viewer, "me");
         assert_eq!(
             current.metadata,
             PrMetadata {

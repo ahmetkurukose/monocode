@@ -1685,10 +1685,12 @@ pub(super) struct CurrentMetadata {
     pub metadata: PrMetadata,
     pub assignee_ids: HashMap<String, String>,
     pub label_ids: HashMap<String, String>,
+    /// The signed-in login.
+    pub viewer: String,
 }
 
 const PR_METADATA_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
-    repository(owner: $owner, name: $name) { pullRequest(number: $number) { id \
+    viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $number) { id \
     reviewRequests(first: 100) { nodes { requestedReviewer { __typename \
     ... on User { login } ... on Team { slug organization { login } } } } } \
     assignees(first: 100) { nodes { id login } } \
@@ -1714,6 +1716,7 @@ pub(super) fn parse_pr_metadata(data: &Value) -> Result<CurrentMetadata, String>
     };
     let mut current = CurrentMetadata {
         pr_id: text(pr, "/id"),
+        viewer: text(data, "/viewer/login"),
         ..Default::default()
     };
     for request in nodes("reviewRequests") {
@@ -1782,10 +1785,17 @@ fn current_metadata(
     parse_pr_metadata(&data)
 }
 
-/// Current reviewers/assignees/labels of an existing pull request (Inbox editing).
-pub fn pr_metadata(cwd: &Path, host: &str, repo: &str, number: i64) -> Result<PrMetadata, String> {
+/// Current reviewers/assignees/labels of an existing pull request (Inbox editing),
+/// and the signed-in login (never offered as a reviewer).
+pub fn pr_metadata(
+    cwd: &Path,
+    host: &str,
+    repo: &str,
+    number: i64,
+) -> Result<(PrMetadata, String), String> {
     let root = local_root(cwd)?;
-    Ok(current_metadata(&root, host, repo, number)?.metadata)
+    let current = current_metadata(&root, host, repo, number)?;
+    Ok((current.metadata, current.viewer))
 }
 
 fn minus(left: &[String], right: &[String]) -> Vec<String> {

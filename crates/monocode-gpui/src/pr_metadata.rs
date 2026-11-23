@@ -328,10 +328,6 @@ pub(crate) fn toggle(metadata: &mut PrMetadata, field: Field, key: &str) -> bool
 
 pub(crate) enum PrMetadataEvent {
     /// The user added or removed a value; the new set.
-    #[allow(
-        dead_code,
-        reason = "the Inbox saves it; the dialog reads the picker on Create"
-    )]
     Changed(PrMetadata),
     /// The choices failed to load and the user asked to try again.
     Retry,
@@ -372,7 +368,6 @@ impl PrMetadataPicker {
     pub(crate) fn metadata(&self) -> &PrMetadata {
         &self.metadata
     }
-    #[allow(dead_code, reason = "for the Inbox's metadata editor")]
     pub(crate) fn candidates(&self) -> &CandidateState {
         &self.candidates
     }
@@ -381,7 +376,6 @@ impl PrMetadataPicker {
         self.refresh_open(cx);
     }
     /// Replaces the chosen values without emitting `Changed`.
-    #[allow(dead_code, reason = "for the Inbox's metadata editor")]
     pub(crate) fn set_metadata(&mut self, metadata: PrMetadata, cx: &mut Context<Self>) {
         self.metadata = metadata;
         self.refresh_open(cx);

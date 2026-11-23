@@ -3,8 +3,10 @@
 mod avatar;
 mod diff;
 mod document;
+mod pr_meta;
 mod ui;
 pub(crate) use avatar::image as avatar_image;
+pub(crate) use pr_meta::RevealPr;
 pub(crate) use ui::{label_badge, relative_time};
 
 use crate::{
@@ -94,6 +96,13 @@ pub(crate) struct Inbox {
     full_loading: Option<(Option<String>, String)>,
     scope_shas: std::collections::HashMap<Option<String>, (String, String)>,
     checks: Option<Checks>,
+    /// Reviewers, assignees and labels of the selected GitHub pull request.
+    pr_meta: Option<pr_meta::PrMeta>,
+    meta_backend: std::sync::Arc<dyn pr_meta::MetaBackend>,
+    /// A pull request shown before the list fetches it, and the key to select
+    /// once (see `reveal_pull_request`).
+    pinned: Option<Item>,
+    reveal: Option<String>,
     tab: Tab,
     loading: bool,
     detail_loading: bool,
@@ -506,6 +515,7 @@ impl Inbox {
                                 && !this.acting
                             {
                                 this.load_detail(false, cx);
+                                this.load_pr_meta(cx);
                                 if this.tab == Tab::Checks && !this.extra_loading {
                                     this.checks = None;
                                     this.set_tab(Tab::Checks, cx);
@@ -561,6 +571,10 @@ impl Inbox {
             full_loading: None,
             scope_shas: Default::default(),
             checks: None,
+            pr_meta: None,
+            meta_backend: std::sync::Arc::new(pr_meta::Gh),
+            pinned: None,
+            reveal: None,
             tab: Tab::Summary,
             loading: false,
             detail_loading: false,
@@ -787,6 +801,7 @@ impl Inbox {
                     .sort_by_key(|item| std::cmp::Reverse(item.updated_ms()));
                 this.state.seen.seed(&snapshot.items);
                 this.snapshot = snapshot;
+                this.place_pinned(cx);
                 this.sessions = sessions;
                 if this.active
                     && let Some(item) = this.item()
@@ -881,6 +896,13 @@ impl Inbox {
         if self.selected.as_ref() == Some(&key) {
             return;
         }
+        if self
+            .pinned
+            .as_ref()
+            .is_some_and(|pinned| pinned.key() != key)
+        {
+            self.pinned = None;
+        }
         self.selected = Some(key);
         self.reset_detail(cx);
         if let Some(item) = self.item() {
@@ -893,6 +915,7 @@ impl Inbox {
             }
         }
         self.load_detail(true, cx);
+        self.open_pr_meta(cx);
         cx.notify();
     }
     fn deselect(&mut self, cx: &mut Context<Self>) {
@@ -928,6 +951,7 @@ impl Inbox {
         self.diff_view
             .update(cx, |view, cx| view.set_files(vec![], cx));
         self.checks = None;
+        self.pr_meta = None;
         self.extra_loading = false;
         self.extra_error = None;
         self.details = None;

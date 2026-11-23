@@ -249,6 +249,19 @@ impl Shell {
         self.show_app_view(AppView::Inbox, window, cx);
     }
 
+    /// Open the Inbox with `pr` selected.
+    pub(super) fn reveal_pull_request(
+        &mut self,
+        pr: inbox::RevealPr,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_inbox(window, cx);
+        if let Some(inbox) = &self.inbox {
+            inbox.update(cx, |inbox, cx| inbox.reveal_pull_request(pr, cx));
+        }
+    }
+
     pub(super) fn ensure_background_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.inbox.is_none() {
             let projects = self.workspace.projects.iter().map(Into::into).collect();
