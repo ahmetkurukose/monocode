@@ -24,6 +24,7 @@ pub mod inbox;
 pub mod integrations;
 pub mod kanban;
 pub mod mobile;
+pub mod monday_note;
 pub mod mono;
 pub mod notes;
 pub mod orphans;

@@ -338,6 +338,13 @@ mod tests {
     }
 
     #[test]
+    fn starting_work_names_the_branch_that_links_back() {
+        let row = inbox_item(&work("12", "Working on it"), &snapshot());
+        assert!(row.prompt("", false).ends_with("named `mon-12-item-12`."));
+        assert!(!row.prompt("", true).contains("branch"));
+    }
+
+    #[test]
     fn the_inbox_follows_chosen_boards_and_those_projects_bind() {
         let project = tempfile::tempdir().unwrap();
         ProjectIntegrations {

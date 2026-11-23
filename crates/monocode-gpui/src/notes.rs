@@ -1,5 +1,6 @@
 //! The desktop Notes split view, backed by the same notes and image assets.
 mod kanban;
+mod monday;
 mod preview;
 
 use crate::{
@@ -14,8 +15,11 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, MouseButton, Role, SharedString, Subscription, Task,
     Window, div, prelude::*, px,
 };
+use monday::DraggedWorkItem;
 use monocode_core::{
-    kanban::{Board, KANBAN},
+    integrations::WorkItem,
+    kanban::{Board, Column, KANBAN, TaskSource},
+    monday_note::{MONDAY, MondayNote},
     notes::{self, Note, NoteLanguage},
 };
 use std::{
@@ -24,6 +28,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+/// The name a new monday.com note has until a board is chosen.
+const MONDAY_TITLE: &str = "monday.com board";
 
 /// What the language list is choosing for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +45,8 @@ pub(crate) enum Event {
     Close,
     OpenSource(i64),
     AddToChat(Note),
+    /// Settings → Integrations, to connect monday.com.
+    OpenIntegrations,
 }
 
 pub(crate) struct Notes {
@@ -71,6 +80,14 @@ pub(crate) struct Notes {
     document: Option<Entity<preview::Preview>>,
     /// The open note's board, when it is a kanban note.
     kanban: Entity<kanban::KanbanBoard>,
+    /// The open note's board, when it is a monday.com note.
+    monday: Entity<monday::MondayBoard>,
+    /// Where integrations keep what they fetched.
+    data_dir: Option<PathBuf>,
+    /// A monday card is being dragged; kanban notes in the list take it.
+    item_drag: bool,
+    /// The kanban note a dragged monday card is over.
+    item_drop: Option<String>,
     dirty: bool,
     revision: u64,
     loading: bool,
@@ -119,6 +136,10 @@ impl Notes {
         let language_query =
             cx.new(|cx| Input::field("Filter languages", "Filter languages…", content(0.4), cx));
         let board = cx.new(kanban::KanbanBoard::new);
+        let monday = cx.new(monday::MondayBoard::new);
+        let data_dir = locked(&store)
+            .ok()
+            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf));
         let subscriptions = vec![
             cx.subscribe(&query, |_, _, _: &input::Changed, cx| cx.notify()),
             cx.subscribe(&title, |this, _, _: &input::Changed, cx| this.edited(cx)),
@@ -144,6 +165,31 @@ impl Notes {
                 let json = board.read(cx).board().to_json();
                 this.body.update(cx, |input, cx| input.set_text(json, cx));
             }),
+            cx.subscribe(
+                &monday,
+                |this, monday, event: &monday::Event, cx| match event {
+                    // A late fetch never writes into another note opened since.
+                    monday::Event::Changed if !this.selected_is_monday() => {}
+                    monday::Event::Changed => {
+                        let note = monday.read(cx).note().clone();
+                        this.body
+                            .update(cx, |input, cx| input.set_text(note.to_json(), cx));
+                        // A board under the default name takes the board's.
+                        let title = this.title.read(cx).content.to_string();
+                        if !note.board_name.is_empty()
+                            && (title.trim().is_empty() || title == MONDAY_TITLE)
+                        {
+                            this.title.update(cx, |input, cx| {
+                                input.set_text(note.board_name.clone(), cx)
+                            });
+                        }
+                    }
+                    monday::Event::AddToKanban { kanban, item } => {
+                        this.add_to_kanban(&kanban.clone(), &item.clone(), cx)
+                    }
+                    monday::Event::OpenIntegrations => cx.emit(Event::OpenIntegrations),
+                },
+            ),
         ];
         let mut this = Self {
             store,
@@ -172,6 +218,10 @@ impl Notes {
             modes: HashMap::new(),
             document: None,
             kanban: board,
+            monday,
+            data_dir,
+            item_drag: false,
+            item_drop: None,
             dirty: false,
             revision: 0,
             loading: true,
@@ -228,6 +278,66 @@ impl Notes {
             .is_some_and(|id| self.is_kanban(id))
     }
 
+    fn is_monday(&self, id: &str) -> bool {
+        self.languages
+            .get(id)
+            .is_some_and(|language| language == MONDAY)
+    }
+
+    fn selected_is_monday(&self) -> bool {
+        self.selected
+            .as_deref()
+            .is_some_and(|id| self.is_monday(id))
+    }
+
+    /// The kanban notes the list shows, as a card's menu offers them.
+    fn kanban_targets(&self) -> Vec<(String, String)> {
+        (self.notes.iter())
+            .filter(|note| self.is_kanban(&note.id) && self.shown(note))
+            .map(|note| (note.id.clone(), note.title.clone()))
+            .collect()
+    }
+
+    /// Puts a monday item in a kanban note's Backlog, once. The open board
+    /// takes it like any edit; another is read, changed and saved.
+    fn add_to_kanban(&mut self, id: &str, item: &WorkItem, cx: &mut Context<Self>) {
+        if !self.is_kanban(id) {
+            return;
+        }
+        if self.selected.as_deref() == Some(id) {
+            self.kanban
+                .update(cx, |board, cx| board.add_item(item, Column::Backlog, cx));
+            return;
+        }
+        let Some(note) = self.notes.iter().find(|note| note.id == id) else {
+            return;
+        };
+        let mut board = Board::parse(&note.body);
+        let before = board.tasks.len();
+        board.add_from_source(
+            &item.title,
+            TaskSource::from_item(item),
+            Column::Backlog,
+            monocode_core::time::now_ms() as i64,
+        );
+        if board.tasks.len() == before {
+            return;
+        }
+        let mut update = note.upsert(false);
+        update.body = board.to_json();
+        match locked(&self.store).and_then(|store| store.upsert_note(&update)) {
+            Ok(saved) => {
+                self.revision = self.revision.wrapping_add(1);
+                self.notes.retain(|note| note.id != saved.id);
+                self.notes.push(saved);
+                self.notes
+                    .sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+            }
+            Err(error) => self.error = Some(format!("Could not save note: {error}")),
+        }
+        cx.notify();
+    }
+
     fn language_of(&self, id: &str) -> &'static NoteLanguage {
         notes::language(self.languages.get(id).map_or("", String::as_str))
     }
@@ -235,7 +345,7 @@ impl Notes {
     /// Colours the editor for the note's language: Markdown headings here, any
     /// other type through the same analysis the file editor uses.
     fn highlight_source(&mut self, cx: &mut Context<Self>) {
-        if self.selected_is_kanban() {
+        if self.selected_is_kanban() || self.selected_is_monday() {
             // A board's body is its JSON, never shown as text.
             self.analysis = None;
             return;
@@ -461,6 +571,8 @@ impl Notes {
             draft.title = if finalize {
                 if self.is_kanban(&draft.id) {
                     "Untitled board".into()
+                } else if self.is_monday(&draft.id) {
+                    MONDAY_TITLE.into()
                 } else {
                     notes::title(&draft.body)
                 }
@@ -530,6 +642,11 @@ impl Notes {
             let body = note.body.clone();
             self.kanban.update(cx, |board, cx| board.load(&body, cx));
         }
+        if let Some(note) = note.as_ref().filter(|note| self.is_monday(&note.id)) {
+            let (body, dir) = (note.body.clone(), self.data_dir.clone());
+            self.monday
+                .update(cx, |board, cx| board.load(&body, dir, cx));
+        }
         self.body
             .update(cx, |input, cx| input.set_word_wrap(true, cx));
         self.tag
@@ -568,11 +685,16 @@ impl Notes {
         let result = locked(&self.store).and_then(|store| {
             let mut note = store.create_note(Some(self.cwd.clone()))?;
             store.set_note_language(&note.id, language)?;
-            if language == KANBAN {
+            if language == KANBAN || language == MONDAY {
                 // A board starts empty, under a name of its own.
                 let mut upsert = note.upsert(false);
-                upsert.title = "Untitled board".into();
-                upsert.body = Board::default().to_json();
+                if language == KANBAN {
+                    upsert.title = "Untitled board".into();
+                    upsert.body = Board::default().to_json();
+                } else {
+                    upsert.title = MONDAY_TITLE.into();
+                    upsert.body = MondayNote::default().to_json();
+                }
                 note = store.upsert_note(&upsert)?;
             }
             Ok(note)
@@ -589,7 +711,10 @@ impl Notes {
                 self.query
                     .update(cx, |input, cx| input.set_text(String::new(), cx));
                 self.load_selection(Some(id), cx);
-                if language == KANBAN {
+                if language == MONDAY {
+                    let focus = self.monday.read(cx).search_focus(cx);
+                    window.focus(&focus, cx);
+                } else if language == KANBAN {
                     window.focus(&self.title.focus_handle(cx), cx);
                 } else {
                     window.focus(&self.body.focus_handle(cx), cx);
@@ -898,6 +1023,43 @@ impl Notes {
                             .child(icon("search", 12.))
                             .child(div().flex_1().min_w_0().child(self.language_query.clone())),
                     )
+                    .children((picker == Picker::New).then(|| {
+                        div().flex().flex_col().children(
+                            notes::matching_board_types(&query)
+                                .into_iter()
+                                .map(|(id, label)| {
+                                    div()
+                                        .id(SharedString::from(format!("note-type-{id}")))
+                                        .debug_selector(move || format!("note-type-{id}"))
+                                        .role(Role::Button)
+                                        .aria_label(label)
+                                        .h(px(30.))
+                                        .px_2()
+                                        .rounded_md()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(13.))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(content(0.08)))
+                                        .child(
+                                            icon(
+                                                if id == KANBAN {
+                                                    "kanban"
+                                                } else {
+                                                    "inbox-monday"
+                                                },
+                                                16.,
+                                            )
+                                            .text_color(content(0.7)),
+                                        )
+                                        .child(div().flex_1().child(label))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.create(id, window, cx)
+                                        }))
+                                }),
+                        )
+                    }))
                     .child(
                         div()
                             .id("note-language-results")
@@ -1032,15 +1194,23 @@ impl Notes {
 
     fn detail(&mut self, note: Note, cx: &mut Context<Self>) -> AnyElement {
         let is_kanban = self.is_kanban(&note.id);
+        let is_monday = self.is_monday(&note.id);
+        let monday_markdown = is_monday
+            .then(|| self.monday.read(cx).to_markdown(&note.title))
+            .flatten();
         // A board reads as Markdown checklists everywhere outside its view.
         let body = if is_kanban {
             Board::parse(&note.body).to_markdown(&note.title)
+        } else if is_monday {
+            monday_markdown.clone().unwrap_or_default()
         } else {
             note.body.clone()
         };
         let source = note.source_session_id.clone();
         let can_add = if is_kanban {
             !Board::parse(&note.body).tasks.is_empty()
+        } else if is_monday {
+            monday_markdown.is_some()
         } else {
             !body.trim().is_empty()
         };
@@ -1098,6 +1268,9 @@ impl Notes {
                     // A board keeps its type: its body is no text to retype.
                     d.child(icon("kanban", 14.).text_color(content(0.7)))
                         .child("Kanban")
+                } else if is_monday {
+                    d.child(icon("inbox-monday", 14.).text_color(content(0.7)))
+                        .child("monday.com")
                 } else {
                     d.child(crate::activity::file_icon(
                         &format!("note.{}", language.extension),
@@ -1107,7 +1280,7 @@ impl Notes {
                     .child(icon("chevron-down", 11.))
                 }
             }))
-            .when(!is_kanban, |d| {
+            .when(!is_kanban && !is_monday, |d| {
                 d.on_click(
                     cx.listener(|this, _, window, cx| this.open_picker(Picker::Change, window, cx)),
                 )
@@ -1192,6 +1365,9 @@ impl Notes {
                                 let language = this.current_language();
                                 if this.is_kanban(&note.id) {
                                     note.body = Board::parse(&note.body).to_markdown(&note.title);
+                                } else if this.is_monday(&note.id) {
+                                    note.body = (this.monday.read(cx).to_markdown(&note.title))
+                                        .unwrap_or_default();
                                 } else if language.id != notes::DEFAULT_LANGUAGE {
                                     // A code note goes in as a code block, not as prose.
                                     note.body = format!(
@@ -1397,7 +1573,7 @@ impl Notes {
             )
             .child(tags)
             .child(actions);
-        if is_kanban {
+        if is_kanban || is_monday {
             // The board takes the whole pane, its columns scrolling inside it.
             return div()
                 .id("note-detail")
@@ -1422,7 +1598,13 @@ impl Notes {
                         .pb(px(20.))
                         .flex()
                         .flex_col()
-                        .child(self.kanban.clone()),
+                        .map(|d| {
+                            if is_monday {
+                                d.child(self.monday.clone())
+                            } else {
+                                d.child(self.kanban.clone())
+                            }
+                        }),
                 )
                 .into_any_element();
         }
@@ -1467,6 +1649,13 @@ impl gpui::Render for Notes {
         }
         if !cx.has_active_drag() {
             self.image_drag = false;
+            self.item_drag = false;
+            self.item_drop = None;
+        }
+        if self.selected_is_monday() {
+            let kanbans = self.kanban_targets();
+            self.monday
+                .update(cx, |board, _| board.set_kanbans(kanbans));
         }
         let query = self.query.read(cx).content.to_string();
         let visible: Vec<_> = self
@@ -1511,16 +1700,37 @@ impl gpui::Render for Notes {
                     let id = note.id.clone();
                     let active = self.selected.as_ref() == Some(&id);
                     let kanban = self.is_kanban(&note.id);
-                    let preview = if kanban { Board::parse(&note.body).summary() } else { note.preview() };
-                    div().id(("saved-note", ix)).role(Role::Button).aria_label(note.title.clone()).aria_selected(active).mb(px(2.)).px(px(10.)).py_2().rounded_md().text_color(content(0.8)).hover(|style| style.bg(content(0.05))).when(active, |d| d.bg(content(0.1)))
+                    let monday = self.is_monday(&note.id);
+                    let preview = if kanban { Board::parse(&note.body).summary() } else if monday { MondayNote::parse(&note.body).summary() } else { note.preview() };
+                    let drop_here = self.item_drop.as_ref() == Some(&id);
+                    let (drag_id, drop_id) = (id.clone(), id.clone());
+                    div().id(("saved-note", ix)).debug_selector({ let id = id.clone(); move || format!("saved-note-{id}") }).role(Role::Button).aria_label(note.title.clone()).aria_selected(active).mb(px(2.)).px(px(10.)).py_2().rounded_md().text_color(content(0.8)).hover(|style| style.bg(content(0.05))).when(active, |d| d.bg(content(0.1)))
                         .child(div().flex().items_center().gap_2().text_size(px(11.)).text_color(content(0.45))
                             .child(div().flex_1().truncate().when_some(note.project_name(), |d, name| d.child(div().flex().items_center().gap_1p5().child(self.project_mark(note.source_cwd.as_deref().unwrap_or(""), 12.)).child(name))))
                             .child(relative_time(note.updated_at)))
-                        .child(div().mt_1().flex().items_center().gap_1p5().child(if kanban { icon("kanban", 14.).text_color(content(0.7)).into_any_element() } else { crate::activity::file_icon(&format!("note.{}", self.language_of(&note.id).extension), 14.).into_any_element() }).child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone())))
+                        .child(div().mt_1().flex().items_center().gap_1p5().child(if kanban { icon("kanban", 14.).text_color(content(0.7)).into_any_element() } else if monday { icon("inbox-monday", 14.).text_color(content(0.7)).into_any_element() } else { crate::activity::file_icon(&format!("note.{}", self.language_of(&note.id).extension), 14.).into_any_element() }).child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(content(1.)).child(note.title.clone())))
                         .when(!preview.is_empty(), |d| d.child(div().mt_1().truncate().text_size(px(12.)).text_color(content(0.45)).child(preview)))
                         .when(!note.tags.is_empty(), |d| d.child(div().mt_1p5().flex().items_center().gap_1().overflow_hidden()
                             .children(note.tags.iter().take(3).map(|tag| div().max_w(px(96.)).truncate().rounded_sm().bg(content(0.08)).px_1p5().py(px(2.)).text_size(px(10.)).text_color(content(0.55)).child(format!("#{tag}"))))
                             .when(note.tags.len() > 3, |d| d.child(div().text_size(px(10.)).text_color(content(0.4)).child(format!("+{}", note.tags.len() - 3))))))
+                        // A monday card dropped here lands in this board's Backlog.
+                        .when(kanban, |d| d
+                            .border_1().border_color(if drop_here { accent_color() } else if self.item_drag { content(0.18) } else { content(0.) })
+                            .when(self.item_drag, |d| d.border_dashed())
+                            .when(drop_here, |d| d.bg(accent_color().opacity(0.12)))
+                            .on_drag_move::<DraggedWorkItem>(cx.listener(move |this, event: &gpui::DragMoveEvent<DraggedWorkItem>, _, cx| {
+                                let inside = event.bounds.contains(&event.event.position);
+                                let was = this.item_drop.as_ref() == Some(&drag_id);
+                                if !this.item_drag || inside != was {
+                                    this.item_drag = true;
+                                    if inside { this.item_drop = Some(drag_id.clone()); } else if was { this.item_drop = None; }
+                                    cx.notify();
+                                }
+                            }))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedWorkItem, _, cx| {
+                                this.item_drop = None;
+                                this.add_to_kanban(&drop_id, &dragged.item, cx);
+                            })))
                         .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
                 })))
             .child(div().id("resize-notes-list").role(Role::Splitter).aria_label("Resize notes list").absolute().top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor(CursorStyle::ResizeLeftRight).hover(|style| style.bg(content(0.1)))
@@ -1556,7 +1766,16 @@ impl gpui::Render for Notes {
                     && this.language_query.focus_handle(cx).is_focused(window)
                 {
                     let query = this.language_query.read(cx).content.to_string();
-                    if let Some(language) = notes::matching_languages(&query).first() {
+                    let board = (this.picker == Some(Picker::New) && !query.trim().is_empty())
+                        .then(|| {
+                            notes::matching_board_types(&query)
+                                .first()
+                                .map(|(id, _)| *id)
+                        })
+                        .flatten();
+                    if let Some(id) = board {
+                        this.create(id, window, cx);
+                    } else if let Some(language) = notes::matching_languages(&query).first() {
                         this.pick_language(language.id, window, cx);
                     }
                     cx.stop_propagation();
@@ -1568,7 +1787,9 @@ impl gpui::Render for Notes {
                     window.focus(&this.query.focus_handle(cx), cx);
                     cx.stop_propagation();
                 } else if key == "escape" {
-                    if this.kanban.update(cx, |board, cx| board.dismiss(cx)) {
+                    if this.kanban.update(cx, |board, cx| board.dismiss(cx))
+                        || this.monday.update(cx, |board, cx| board.dismiss(cx))
+                    {
                     } else if this.picker.is_some() {
                         this.picker = None;
                     } else if this.project_open {
@@ -2049,5 +2270,298 @@ mod tests {
             Column::Backlog
         );
         assert!(visual.debug_bounds("kanban-placeholder").is_none());
+    }
+
+    fn monday_snapshot() -> monocode_core::integrations::BoardSnapshot {
+        use monocode_core::integrations::{
+            BoardSchema, BoardSnapshot, Group, PeopleCell, Provider, StatusCell, StatusOption,
+        };
+        let item = |id: &str, status: &str| WorkItem {
+            provider: Provider::Monday,
+            id: id.into(),
+            board_id: "9".into(),
+            title: format!("Item {id}"),
+            url: format!("https://t.monday.com/boards/9/pulses/{id}"),
+            group: Some(Group {
+                id: "sprint".into(),
+                title: "Sprint 4".into(),
+                color: Some("#579bfc".into()),
+            }),
+            statuses: vec![StatusCell {
+                column: "status".into(),
+                label: status.into(),
+                color: Some("#fdab3d".into()),
+            }],
+            people: vec![PeopleCell {
+                column: "person".into(),
+                people: vec!["7".into()],
+                names: vec!["Ayşe".into()],
+            }],
+            updated_at: None,
+        };
+        let option = |label: &str| StatusOption {
+            label: label.into(),
+            color: Some("green".into()),
+            done: label == "Done",
+        };
+        BoardSnapshot {
+            schema: BoardSchema {
+                id: "9".into(),
+                name: "Sprint".into(),
+                url: Some("https://t.monday.com/boards/9".into()),
+                groups: vec![Group {
+                    id: "sprint".into(),
+                    title: "Sprint 4".into(),
+                    color: None,
+                }],
+                statuses: vec![(
+                    "status".into(),
+                    vec![option("Working on it"), option("Done")],
+                )],
+                ..Default::default()
+            },
+            items: vec![item("1", "Working on it"), item("2", "Done")],
+            // Fresh, so nothing would ask monday even with a token.
+            fetched_at: monocode_core::time::now_ms(),
+            truncated: false,
+        }
+    }
+
+    /// A kanban note and a monday note on a board cached in a temporary data
+    /// folder, with no token saved. The monday note is open.
+    fn monday_note(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Notes>,
+        VisualTestContext,
+        tempfile::TempDir,
+        String,
+    ) {
+        use monocode_core::integrations::{Cache, Provider};
+        let (window, mut visual) = new_board(cx);
+        let dir = tempfile::tempdir().unwrap();
+        Cache::new(dir.path(), Provider::Monday)
+            .save_board(&monday_snapshot())
+            .unwrap();
+        let path = dir.path().to_path_buf();
+        let kanban = window
+            .update(&mut visual, |notes, window, cx| {
+                let kanban = notes.selected.clone().unwrap();
+                notes.data_dir = Some(path);
+                notes.create(MONDAY, window, cx);
+                notes.monday.update(cx, |board, cx| {
+                    board.choose_board("9".into(), "Sprint".into(), cx)
+                });
+                kanban
+            })
+            .unwrap();
+        visual.run_until_parked();
+        (window, visual, dir, kanban)
+    }
+
+    fn saved_board(
+        window: gpui::WindowHandle<Notes>,
+        visual: &mut VisualTestContext,
+        id: &str,
+    ) -> Board {
+        window
+            .update(visual, |notes, _, cx| {
+                notes.flush(cx);
+                let body = locked(&notes.store)
+                    .unwrap()
+                    .list_notes()
+                    .unwrap()
+                    .into_iter()
+                    .find(|note| note.id == id)
+                    .unwrap()
+                    .body;
+                Board::parse(&body)
+            })
+            .unwrap()
+    }
+
+    fn drag_to(visual: &mut VisualTestContext, from: &str, to: &str) {
+        let from = visual
+            .debug_bounds(Box::leak(from.to_owned().into_boxed_str()))
+            .unwrap_or_else(|| panic!("{from} is on screen"));
+        let to = visual
+            .debug_bounds(Box::leak(to.to_owned().into_boxed_str()))
+            .unwrap_or_else(|| panic!("{to} is on screen"))
+            .center();
+        visual.simulate_mouse_down(from.center(), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            from.center() + gpui::point(px(12.), px(0.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_type_picker_starts_a_monday_note_that_asks_to_connect(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+        });
+        let window = open(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        window
+            .update(visual, |notes, _, _| notes.data_dir = Some(path))
+            .unwrap();
+        click(visual, "create-note-typed");
+        click(visual, "note-type-monday");
+        window
+            .update(visual, |notes, _, cx| {
+                let id = notes.selected.clone().unwrap();
+                assert!(notes.is_monday(&id), "error: {:?}", notes.error);
+                assert_eq!(
+                    locked(&notes.store).unwrap().note_languages().unwrap()[&id],
+                    MONDAY
+                );
+                assert_eq!(notes.title.read(cx).content.as_str(), MONDAY_TITLE);
+                assert!(!MondayNote::parse(&notes.body.read(cx).content).has_board());
+            })
+            .unwrap();
+        // No token: the picker says so and leads to Settings → Integrations.
+        let opened = Arc::new(Mutex::new(false));
+        let entity = window.root(visual).unwrap();
+        visual.update({
+            let opened = opened.clone();
+            move |_, cx| {
+                cx.subscribe(&entity, move |_, event: &Event, _| {
+                    if matches!(event, Event::OpenIntegrations) {
+                        *opened.lock().unwrap() = true;
+                    }
+                })
+                .detach()
+            }
+        });
+        assert!(visual.debug_bounds("monday-board-picker").is_none());
+        click(visual, "monday-connect");
+        assert!(*opened.lock().unwrap(), "the button opens Settings");
+    }
+
+    #[gpui::test]
+    fn a_monday_note_shows_the_cached_board_without_a_token(cx: &mut TestAppContext) {
+        let (window, mut visual, _dir, _) = monday_note(cx);
+        let visual = &mut visual;
+        window
+            .update(visual, |notes, _, cx| {
+                assert_eq!(notes.title.read(cx).content.as_str(), "Sprint");
+                let note = MondayNote::parse(&notes.body.read(cx).content);
+                assert_eq!(
+                    (note.board.as_str(), note.board_name.as_str()),
+                    ("9", "Sprint")
+                );
+            })
+            .unwrap();
+        assert!(
+            visual
+                .debug_bounds("monday-lane-status:Working on it")
+                .is_some()
+        );
+        assert!(visual.debug_bounds("monday-lane-status:Done").is_some());
+        assert!(visual.debug_bounds("monday-card-1").is_some());
+        assert!(
+            visual.debug_bounds("monday-offline").is_some(),
+            "a cached board says it cannot refresh"
+        );
+        click(visual, "monday-group-by-group");
+        assert!(visual.debug_bounds("monday-lane-group:sprint").is_some());
+        assert!(visual.debug_bounds("monday-lane-status:Done").is_none());
+        // No account is known yet, so nothing is "mine".
+        click(visual, "monday-mine");
+        assert!(visual.debug_bounds("monday-card-1").is_none());
+        assert!(visual.debug_bounds("monday-no-account").is_some());
+        window
+            .update(visual, |notes, _, cx| {
+                notes.flush(cx);
+                let id = notes.selected.clone().unwrap();
+                let saved = locked(&notes.store)
+                    .unwrap()
+                    .list_notes()
+                    .unwrap()
+                    .into_iter()
+                    .find(|note| note.id == id)
+                    .unwrap();
+                let note = MondayNote::parse(&saved.body);
+                assert_eq!(note.group_by, monocode_core::monday_note::GroupBy::Group);
+                assert!(note.mine);
+                assert_eq!(saved.title, "Sprint");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_monday_card_dropped_on_a_kanban_note_lands_in_its_backlog_once(cx: &mut TestAppContext) {
+        let (window, mut visual, _dir, kanban) = monday_note(cx);
+        let visual = &mut visual;
+        let row = format!("saved-note-{kanban}");
+        drag_to(visual, "monday-card-1", &row);
+        window
+            .update(visual, |notes, _, _| {
+                assert!(notes.item_drag, "kanban rows take the card");
+                assert_eq!(
+                    notes.item_drop.as_ref(),
+                    Some(&kanban),
+                    "the row is the target"
+                );
+            })
+            .unwrap();
+        let to = visual
+            .debug_bounds(Box::leak(row.clone().into_boxed_str()))
+            .unwrap();
+        visual.simulate_mouse_up(to.center(), MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        let board = saved_board(window, visual, &kanban);
+        assert_eq!(board.tasks.len(), 1, "{board:?}");
+        let task = &board.tasks[0];
+        assert_eq!(task.title, "Item 1");
+        assert_eq!(task.column, Column::Backlog);
+        let source = task.source.clone().expect("the task links its item");
+        assert_eq!(
+            (
+                source.provider.as_str(),
+                source.item_id.as_str(),
+                source.board_id.as_str()
+            ),
+            ("monday", "1", "9")
+        );
+        assert_eq!(source.url, "https://t.monday.com/boards/9/pulses/1");
+        window
+            .update(visual, |notes, _, _| assert!(notes.item_drop.is_none()))
+            .unwrap();
+
+        // The same card again changes nothing.
+        drag_to(visual, "monday-card-1", &row);
+        let to = visual
+            .debug_bounds(Box::leak(row.clone().into_boxed_str()))
+            .unwrap();
+        visual.simulate_mouse_up(to.center(), MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        assert_eq!(saved_board(window, visual, &kanban).tasks.len(), 1);
+
+        // A card's menu offers the kanban notes by title.
+        click(visual, "monday-card-2");
+        click(visual, "monday-menu-kanban-0");
+        let board = saved_board(window, visual, &kanban);
+        assert_eq!(board.tasks.len(), 2);
+        assert_eq!(board.tasks[1].source.as_ref().unwrap().item_id, "2");
+
+        // On the kanban board the card wears its monday mark.
+        window
+            .update(visual, |notes, _, cx| notes.select(kanban.clone(), cx))
+            .unwrap();
+        visual.run_until_parked();
+        let id = board.tasks[0].id.clone();
+        assert!(
+            visual
+                .debug_bounds(Box::leak(format!("kanban-source-{id}").into_boxed_str()))
+                .is_some()
+        );
     }
 }

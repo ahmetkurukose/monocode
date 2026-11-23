@@ -107,14 +107,31 @@ pub fn language(id: &str) -> &'static NoteLanguage {
         .unwrap_or(&LANGUAGES[0])
 }
 
-/// A saved note type: a language id, or a kanban board. Anything unknown is
-/// Markdown.
+/// Note types that are boards, not text: `(id, label)`.
+pub const BOARD_TYPES: [(&str, &str); 2] = [
+    (crate::kanban::KANBAN, "Kanban board"),
+    (crate::monday_note::MONDAY, "monday.com board"),
+];
+
+/// A saved note type: a language id, a kanban board or a monday.com board.
+/// Anything unknown is Markdown.
 pub fn note_type(id: &str) -> &'static str {
-    if id == crate::kanban::KANBAN {
-        crate::kanban::KANBAN
-    } else {
-        language(id).id
-    }
+    BOARD_TYPES
+        .iter()
+        .find(|(board, _)| *board == id)
+        .map_or_else(|| language(id).id, |(board, _)| board)
+}
+
+/// Board types whose label or id contains `query`, all for an empty one.
+pub fn matching_board_types(query: &str) -> Vec<(&'static str, &'static str)> {
+    let query = query.trim().to_lowercase();
+    BOARD_TYPES
+        .iter()
+        .filter(|(id, label)| {
+            query.is_empty() || label.to_lowercase().contains(&query) || id.contains(&query)
+        })
+        .copied()
+        .collect()
 }
 
 /// Languages whose label or id contains `query`, in catalogue order.

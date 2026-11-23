@@ -154,6 +154,28 @@ impl Item {
         }
     }
     pub fn prompt(&self, body: &str, ask: bool) -> String {
+        let mut prompt = self.base_prompt(body, ask);
+        // A PR from a branch named for the item updates it (integrations::writeback).
+        if self.provider == "monday" && !ask && self.number > 0 {
+            let item = crate::integrations::WorkItem {
+                provider: crate::integrations::Provider::Monday,
+                id: self.number.to_string(),
+                board_id: self.project_id.clone(),
+                title: self.title.clone(),
+                url: self.url.clone(),
+                group: None,
+                statuses: vec![],
+                people: vec![],
+                updated_at: None,
+            };
+            prompt.push_str(&format!(
+                "\n\nDo this work on a git branch named `{}`.",
+                item.branch_name()
+            ));
+        }
+        prompt
+    }
+    fn base_prompt(&self, body: &str, ask: bool) -> String {
         format!(
             "{}\n\n{} {}: {}\n{}\n\n{}",
             if ask {
