@@ -1,0 +1,141 @@
+{
+"update_url": "https://clients2.google.com/service/update2/crx",
+
+  "name": "Proton Pass: Free Password Manager",
+  "description": "Free and fully encrypted password manager to keep your logins and passwords safe.",
+  "version": "1.44.0",
+  "manifest_version": 3,
+  "minimum_chrome_version": "102",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ],
+      "js": [
+        "orchestrator.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_end"
+    },
+    {
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ],
+      "exclude_matches": [
+        "https://pass.proton.me/*",
+        "https://pass.proton.dev/*",
+        "https://pass.proton.black/*",
+        "https://pass.proton.pink/*",
+        "https://pass.protontech.ch/*"
+      ],
+      "js": [
+        "webauthn.js"
+      ],
+      "all_frames": false,
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://account.proton.me/*",
+      "https://pass.proton.me/*"
+    ]
+  },
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "offscreen",
+    "scripting",
+    "storage",
+    "unlimitedStorage",
+    "webNavigation",
+    "webRequest"
+  ],
+  "optional_permissions": [
+    "privacy",
+    "webRequestAuthProvider",
+    "clipboardRead",
+    "clipboardWrite",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "options_ui": {
+    "page": "settings.html"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "/assets/protonpass-icon-16.png",
+      "32": "/assets/protonpass-icon-32.png",
+      "48": "/assets/protonpass-icon-48.png",
+      "128": "/assets/protonpass-icon-128.png"
+    }
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+X"
+      },
+      "description": "Open Proton Pass"
+    },
+    "open-larger-window": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L"
+      },
+      "description": "Open Proton Pass in a larger window"
+    }
+  },
+  "icons": {
+    "16": "/assets/protonpass-icon-16.png",
+    "32": "/assets/protonpass-icon-32.png",
+    "48": "/assets/protonpass-icon-48.png",
+    "128": "/assets/protonpass-icon-128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "dropdown.html",
+        "notification.html",
+        "elements.js",
+        "assets/*.csv",
+        "assets/*.png",
+        "assets/*.svg",
+        "assets/*.woff",
+        "assets/*.woff2"
+      ],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    },
+    {
+      "resources": [
+        "onboarding.html"
+      ],
+      "matches": [
+        "https://account.proton.me/*"
+      ]
+    },
+    {
+      "resources": [
+        "*.wasm"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiZt8pKnvrDkvOuKzjfj1TtrPc0lwlUc/pvAOAoLmtQ9i5IdVisA7m4zqLKFONapyI3FWPsThpGRteYpLSgIf0LY8E2TGCHRDobYMLagS7OAbVySapvYCqj4LBQ7EOSYNVOEOUgyTAWqDB4udB6vgQXkRV6f2n2hAsAvrkutW1U4Unovg1zksp24bOTwyOxM5rJ6vbqGVzuhiblqaOpinmN+TQ53+8xCmVduWrQCMO3I+/hOPmw6S9nPMFj1Wsc+qIsNMCLT8kEGRGa51gw7ZK7TaYQ1MGB/O+lbUjcL5bjYYvcYXA7bL3Ol8vhSLN5yhhxox9w19O/+bwoyib4OAHQIDAQAB"
+}

@@ -11,6 +11,7 @@
 //! - [`history`]: browsing history, kept per project (K55, K65).
 //! - [`import`]: cookies and passwords from Chrome, Arc and Brave (K61).
 //! - [`dev_servers`]: a project's running dev servers, for the new tab page (K66).
+//! - [`extensions`]: the browser's own extension layer (K69).
 //! - [`passwords`]: the password vault, sign-in capture and autofill (K56, K57).
 //! - [`tools`]: the tool set and its implementation over [`host`].
 //! - [`bridge`]: the MCP server: loopback listener, session tokens, the
@@ -26,6 +27,7 @@ pub mod bridge;
 pub mod cdp;
 pub mod control;
 pub mod dev_servers;
+pub mod extensions;
 pub mod grab;
 pub mod history;
 pub mod host;
