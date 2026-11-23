@@ -142,6 +142,8 @@ pub(crate) struct Preferences {
     pub monos: bool,
     pub rail_monos_pinned: bool,
     pub mono_menu_bar_icon: bool,
+    // Keep computer awake: "on", "agent" (while an agent works) or "off".
+    pub keep_awake: String,
     // Archive
     pub show_archived: bool,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
@@ -244,6 +246,7 @@ impl Default for Preferences {
             monos: true,
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
+            keep_awake: "off".into(),
             show_archived: false,
             keybindings: HashMap::new(),
         }

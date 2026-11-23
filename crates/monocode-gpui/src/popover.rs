@@ -908,6 +908,9 @@ pub(crate) enum MenuItem {
     Custom(AnyView, FocusHandle),
     /// A quiet uppercase caption, like the composer's "Add to message".
     Header(SharedString),
+    /// A menu's own title with its state on the right, as Keep computer
+    /// awake's "Off · Inactive".
+    Heading(SharedString, SharedString),
     Separator,
     Action(Box<MenuAction>),
     /// A footnote paragraph, like AccessPicker's busy note.
@@ -1557,6 +1560,32 @@ impl Render for Menu {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(content(0.4))
                     .child(text.to_uppercase())
+                    .into_any(),
+                MenuItem::Heading(title, state) => div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_2()
+                    .pt(px(4.))
+                    .pb(px(6.))
+                    .text_size(px(12.))
+                    .line_height(px(16.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(content(0.75))
+                            .child(title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(content(0.5))
+                            .child(state.clone()),
+                    )
                     .into_any(),
                 MenuItem::Note(text) => div()
                     .flex_shrink_0()

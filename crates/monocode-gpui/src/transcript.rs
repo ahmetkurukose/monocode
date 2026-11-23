@@ -939,6 +939,10 @@ impl TranscriptView {
     }
     /// liveAgents.ts's toLiveAgent: the last turn's latest tool, as "Read
     /// src/app.rs", when that turn was sent, and how long it ran once done.
+    /// Rows and bytes: they change while an agent writes, and stop when it hangs.
+    pub(crate) fn activity_mark(&self) -> (usize, usize) {
+        (self.source.len(), self.source_bytes)
+    }
     pub(crate) fn live_turn(&self, cwd: &str) -> (Option<String>, Option<u64>, Option<u64>) {
         let Some(prompt) = self.source.iter().rposition(|r| r.first && r.is_prompt()) else {
             return (None, None, None);

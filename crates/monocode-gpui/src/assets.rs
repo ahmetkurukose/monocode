@@ -100,6 +100,8 @@ impl AssetSource for Assets {
    "archive"=>include_bytes!("../assets/hugeicons/archive.svg"),
    "bell-off"=>include_bytes!("../assets/hugeicons/bell-off.svg"),
    "moon"=>include_bytes!("../assets/hugeicons/moon.svg"),
+   "dot"=>include_bytes!("../assets/hugeicons/dot.svg"),
+   "coffee"=>include_bytes!("../assets/hugeicons/coffee.svg"),
    "sun"=>include_bytes!("../assets/hugeicons/sun.svg"),
    "check"=>include_bytes!("../assets/hugeicons/check.svg"),
    "check-2"=>include_bytes!("../assets/hugeicons/check-2.svg"),
