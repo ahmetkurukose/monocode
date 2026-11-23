@@ -1,5 +1,6 @@
 //! Source control for the Changes and History panes, ported from
 //! src-tauri/src/fs.rs. Synchronous: callers run these on a background executor.
+mod pull_request;
 mod review;
 pub(crate) mod shell;
 mod stash;
@@ -17,6 +18,12 @@ use crate::files::remote as remote_workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub use pull_request::{
+    pr_apply_metadata, pr_branch_check, pr_branches, pr_candidates, pr_fetch, pr_file_diff,
+    pr_local_branches, pr_metadata, pr_open, pr_push, pr_push_state, pr_range, pr_set_metadata,
+    pr_setup, CreatedPr, PrBranchCheck, PrCandidates, PrMetadata, PrPush, PrRange, PrRepo,
+    PrSetup, PrSubmit, PrTeam, PrTemplate, PrUser,
+};
 pub use review::{
     commit_file_diff, commit_files, diff_files, file_diff, file_diff_head, file_diff_versions,
     file_history, file_version_diff, review_index, stage_contents, FileDiff, FileDiffVersion,
