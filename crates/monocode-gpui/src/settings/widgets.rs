@@ -841,6 +841,257 @@ impl SettingsView {
 const SEARCHABLE_SELECT: usize = 8;
 
 impl SettingsView {
+    /// A select whose rows check on and off; its list stays open until dismissed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn multi_select(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        summary: SharedString,
+        options: Vec<(String, SharedString, bool)>,
+        width: Option<f32>,
+        cx: &mut Context<Self>,
+        toggle: impl Fn(&mut Self, String, &mut Context<Self>) + Clone + 'static,
+    ) -> AnyElement {
+        let open = self.select_open == Some(id);
+        let slot: AnchorSlot = self
+            .select_anchors
+            .borrow_mut()
+            .entry(id)
+            .or_default()
+            .clone();
+        let searchable = options.len() > SEARCHABLE_SELECT;
+        let mut options = options;
+        let query = if open && searchable {
+            self.select_query.trim().to_lowercase()
+        } else {
+            String::new()
+        };
+        if !query.is_empty() {
+            options.retain(|(_, text, _)| text.to_lowercase().contains(&query));
+        }
+        let values: Vec<String> = options.iter().map(|(v, _, _)| v.clone()).collect();
+        let weak = cx.weak_entity();
+        div()
+            .relative()
+            .map(|d| match width {
+                Some(w) => d.w(px(w)),
+                None => d.max_w(px(208.)),
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!("select-{id}")))
+                    .debug_selector(move || format!("settings-select-{id}"))
+                    .role(Role::ComboBox)
+                    .aria_label(format!("{label}: {summary}"))
+                    .aria_expanded(open)
+                    .relative()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(content(0.1))
+                    .bg(content(0.05))
+                    .px_2()
+                    .py_1()
+                    .text_size(px(12.))
+                    .line_height(px(16.))
+                    .text_color(content(1.))
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(content(0.2)))
+                    .child(slot.probe())
+                    .child(div().min_w_0().flex_1().truncate().child(summary))
+                    .child(icon("chevron-down-hi", 14.).text_color(content(0.5)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.select_open == Some(id) {
+                            this.select_open = None;
+                        } else {
+                            this.select_open = Some(id);
+                            this.select_active = 0;
+                            this.select_scroll.scroll_to_item(0);
+                            this.select_query.clear();
+                            if searchable {
+                                this.select_filter
+                                    .update(cx, |i, cx| i.set_text(String::new(), cx));
+                                window.focus(
+                                    &gpui::Focusable::focus_handle(&this.select_filter, cx),
+                                    cx,
+                                );
+                            } else {
+                                window.focus(&this.select_focus, cx);
+                            }
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                let active = self.select_active;
+                let rows = options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, (option, text, checked))| {
+                        let toggle = toggle.clone();
+                        div()
+                            .id(SharedString::from(format!("select-{id}-{ix}")))
+                            .debug_selector(move || format!("settings-option-{id}-{ix}"))
+                            .role(Role::CheckBox)
+                            .aria_label(text.clone())
+                            .aria_toggled(if checked {
+                                gpui::Toggled::True
+                            } else {
+                                gpui::Toggled::False
+                            })
+                            .w_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_lg()
+                            .px_2()
+                            .py(px(6.))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(content(1.))
+                            .cursor_pointer()
+                            .map(|d| {
+                                if ix == active {
+                                    d.bg(content(0.1))
+                                } else {
+                                    d.hover(|s| s.bg(content(0.05)))
+                                }
+                            })
+                            .child(
+                                div()
+                                    .size(px(14.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(content(if checked { 0. } else { 0.25 }))
+                                    .when(checked, |d| {
+                                        d.bg(accent_color())
+                                            .child(icon("check-hi", 10.).text_color(rgb(0xffffff)))
+                                    }),
+                            )
+                            .child(div().min_w_0().flex_1().truncate().child(text))
+                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                if this.select_active != ix {
+                                    this.select_active = ix;
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_active = ix;
+                                toggle(this, option.clone(), cx);
+                                cx.notify();
+                            }))
+                    })
+                    .collect::<Vec<_>>();
+                let count = rows.len();
+                let filter = searchable.then(|| {
+                    div()
+                        .flex_shrink_0()
+                        .h(px(28.))
+                        .mb_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .px_2()
+                        .child(icon("search-01", 14.).text_color(content(0.45)))
+                        .child(div().min_w_0().flex_1().child(self.select_filter.clone()))
+                });
+                d.child(
+                    popover(
+                        SharedString::from(format!("select-popover-{id}")),
+                        Anchor::Slot(slot),
+                    )
+                    .side(Side::Bottom)
+                    .align(Align::End)
+                    .width(280.)
+                    .max_height(320.)
+                    .padding(4.)
+                    .on_dismiss(move |window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.select_open = None;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .children(filter)
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("select-list-{id}")))
+                                    .role(Role::List)
+                                    .aria_label(label)
+                                    .track_focus(&self.select_focus)
+                                    .track_scroll(&self.select_scroll)
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .children(rows)
+                                    .when(count == 0, |d| {
+                                        d.child(
+                                            div()
+                                                .px_2()
+                                                .py(px(6.))
+                                                .text_size(px(12.))
+                                                .line_height(px(16.))
+                                                .text_color(content(0.5))
+                                                .child("No matches"),
+                                        )
+                                    }),
+                            )
+                            .on_key_down(cx.listener(
+                                move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                    let last = count.saturating_sub(1);
+                                    match event.keystroke.key.as_str() {
+                                        "down" => {
+                                            this.select_active = (this.select_active + 1).min(last)
+                                        }
+                                        "up" => {
+                                            this.select_active =
+                                                this.select_active.saturating_sub(1)
+                                        }
+                                        "enter" | "space" => {
+                                            if let Some(v) = values.get(this.select_active) {
+                                                toggle(this, v.clone(), cx);
+                                            }
+                                        }
+                                        "escape" | "tab" => {
+                                            this.select_open = None;
+                                            window.focus(&this.focus, cx);
+                                        }
+                                        _ => return,
+                                    }
+                                    this.select_scroll.scroll_to_item(this.select_active);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+impl SettingsView {
     pub(super) fn project_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let options = self
             .ctx

@@ -370,3 +370,241 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
     visual.run_until_parked();
     assert_eq!(*changed.borrow(), [false, true]);
 }
+
+#[gpui::test]
+fn integrations_hosts_the_trackers_and_inbox_keeps_its_notifications(cx: &mut TestAppContext) {
+    let app = model::GROUPS[0].1;
+    let at = app
+        .iter()
+        .position(|s| *s == Section::Integrations)
+        .unwrap();
+    assert_eq!(app[at - 1], Section::Connections, "right after Connections");
+    assert_eq!(Section::Integrations.id(), "integrations");
+    for query in ["monday", "jira", "linear", "gitlab"] {
+        assert!(
+            model::search(query, "")
+                .iter()
+                .any(|r| r.section == Section::Integrations),
+            "{query}"
+        );
+    }
+    let window = window(Section::Integrations, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    for id in [
+        "settings-connect-monday",
+        "settings-connect-jira",
+        "settings-connect-linear",
+        "settings-connect-gitlab",
+        "settings-connect-azuredevops",
+    ] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    let monday = visual.debug_bounds("settings-connect-monday").unwrap();
+    let jira = visual.debug_bounds("settings-connect-jira").unwrap();
+    assert!(monday.top() < jira.top(), "monday.com is the first tracker");
+    window
+        .update(visual, |view, _, cx| {
+            view.select_section(Section::Inbox, cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-connect-monday").is_none());
+    assert!(visual.debug_bounds("settings-connect-jira").is_none());
+}
+
+#[gpui::test]
+fn monday_connects_through_the_inbox_and_follows_boards_once_connected(cx: &mut TestAppContext) {
+    let window = window(Section::Integrations, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    let events = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let seen = events.clone();
+    window
+        .update(visual, |_, _, cx| {
+            cx.subscribe_self(move |_, event: &SettingsEvent, _| match event {
+                SettingsEvent::ManageInboxProvider(id) => seen.borrow_mut().push(id.clone()),
+                SettingsEvent::MondayBoards(boards) => seen
+                    .borrow_mut()
+                    .push(format!("boards:{}", boards.join(","))),
+                _ => {}
+            })
+            .detach();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-select-monday-boards")
+            .is_none()
+    );
+    let connect = visual.debug_bounds("settings-connect-monday").unwrap();
+    visual.simulate_click(connect.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(*events.borrow(), ["monday"]);
+    window
+        .update(visual, |view, _, cx| {
+            view.integrations.monday = Some(monocode_core::inbox::Status {
+                connected: true,
+                email: "ayse@acme.com".into(),
+                organization: "Acme".into(),
+                site: "acme.monday.com".into(),
+                ..Default::default()
+            });
+            view.integrations.boards = vec![
+                monocode_core::inbox::OptionRow {
+                    id: "9".into(),
+                    name: "Sprint".into(),
+                    key: "Product".into(),
+                },
+                monocode_core::inbox::OptionRow {
+                    id: "5".into(),
+                    name: "Bugs".into(),
+                    key: String::new(),
+                },
+            ];
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let picker = visual
+        .debug_bounds("settings-select-monday-boards")
+        .unwrap();
+    visual.simulate_click(picker.center(), Default::default());
+    visual.run_until_parked();
+    let first = visual
+        .debug_bounds("settings-option-monday-boards-0")
+        .unwrap();
+    visual.simulate_click(first.center(), Default::default());
+    visual.run_until_parked();
+    // The list stays open for the next board.
+    let second = visual
+        .debug_bounds("settings-option-monday-boards-1")
+        .unwrap();
+    visual.simulate_click(second.center(), Default::default());
+    visual.run_until_parked();
+    assert_eq!(
+        *events.borrow(),
+        ["monday", "boards:9", "boards:9,5"],
+        "Settings hands the shell the followed boards"
+    );
+    window
+        .update(visual, |view, _, _| {
+            assert_eq!(view.ctx.monday_boards, ["9", "5"])
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_project_board_binding_saves_to_the_shared_project_file(cx: &mut TestAppContext) {
+    use monocode_core::integrations::{
+        BoardSchema, Column, ProjectIntegrations, StatusKey, StatusOption,
+    };
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().to_string_lossy().into_owned();
+    let window = window(Section::Integrations, cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |view, _, cx| {
+            view.selected_project = path.clone();
+            view.ctx.projects = vec![(path.clone(), "acme".into())];
+            view.integrations.monday = Some(monocode_core::inbox::Status {
+                connected: true,
+                ..Default::default()
+            });
+            view.integrations.boards = vec![monocode_core::inbox::OptionRow {
+                id: "9".into(),
+                name: "Sprint".into(),
+                key: String::new(),
+            }];
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-select-monday-board")
+            .is_some()
+    );
+    assert!(
+        visual
+            .debug_bounds("settings-select-monday-status-column")
+            .is_none(),
+        "no columns before a board"
+    );
+    let label = |label: &str, done| StatusOption {
+        label: label.into(),
+        color: None,
+        done,
+    };
+    window
+        .update(visual, |view, _, cx| {
+            view.choose_monday_board("9".into(), cx);
+            view.integrations.schema = Some(BoardSchema {
+                id: "9".into(),
+                name: "Sprint".into(),
+                columns: vec![
+                    Column {
+                        id: "status".into(),
+                        title: "Status".into(),
+                        kind: "status".into(),
+                    },
+                    Column {
+                        id: "person".into(),
+                        title: "Owner".into(),
+                        kind: "people".into(),
+                    },
+                ],
+                statuses: vec![(
+                    "status".into(),
+                    vec![
+                        label("Working on it", false),
+                        label("Review", false),
+                        label("Done", true),
+                    ],
+                )],
+                ..Default::default()
+            });
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    for id in [
+        "settings-select-monday-status-column",
+        "settings-select-monday-people-column",
+        "settings-select-monday-map-todo",
+        "settings-select-monday-map-in-progress",
+        "settings-select-monday-map-in-review",
+        "settings-select-monday-map-done",
+        "settings-monday-write-back-ask",
+        "settings-monday-binding-save",
+    ] {
+        assert!(visual.debug_bounds(id).is_some(), "{id}");
+    }
+    window
+        .update(visual, |view, _, cx| {
+            view.edit_monday_draft(cx, |draft| {
+                draft.people_column = Some("person".into());
+                draft
+                    .status_map
+                    .insert(StatusKey::InReview, "Review".into());
+                draft.status_map.insert(StatusKey::Done, "Done".into());
+                draft.write_back = Some(true);
+            });
+            view.save_monday_binding(false, cx);
+            assert!(matches!(&view.integrations.notice, Some(Ok(_))));
+        })
+        .unwrap();
+    let saved = ProjectIntegrations::load(project.path()).monday.unwrap();
+    assert_eq!(
+        (saved.board.as_str(), saved.board_name.as_str()),
+        ("9", "Sprint")
+    );
+    assert_eq!(saved.people_column.as_deref(), Some("person"));
+    assert_eq!(saved.label_for(StatusKey::InReview), Some("Review"));
+    assert_eq!(saved.label_for(StatusKey::Todo), None);
+    assert_eq!(saved.write_back, Some(true));
+    window
+        .update(visual, |view, _, cx| view.save_monday_binding(true, cx))
+        .unwrap();
+    assert_eq!(ProjectIntegrations::load(project.path()).monday, None);
+}
