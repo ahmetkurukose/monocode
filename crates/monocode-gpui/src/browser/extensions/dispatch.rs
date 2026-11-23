@@ -118,11 +118,11 @@ async fn answer(
             let i = rt.instances.get_mut(key)?;
             let kind = i.ctxs.get(ctx)?.kind;
             let mut info = json!({"kind": kind.as_str()});
-            if kind == Kind::Background {
-                if let Some(lifecycle) = i.lifecycle.take() {
-                    for (k, v) in lifecycle.as_object().into_iter().flatten() {
-                        info[k] = v.clone();
-                    }
+            if kind == Kind::Background
+                && let Some(lifecycle) = i.lifecycle.take()
+            {
+                for (k, v) in lifecycle.as_object().into_iter().flatten() {
+                    info[k] = v.clone();
                 }
             }
             Some(info)
@@ -1016,9 +1016,7 @@ async fn scripting(
         let url = url_of(frame);
         if !url.is_empty() && !ext.hosts.matches(&url) && !ext.has("activeTab") {
             if wanted.is_some() {
-                return Err(format!(
-                    "Cannot access contents of the page. Extension manifest must request permission to access the respective host."
-                ));
+                return Err("Cannot access contents of the page. Extension manifest must request permission to access the respective host.".into());
             }
             continue;
         }
@@ -1036,15 +1034,15 @@ async fn scripting(
             .call("Runtime.evaluate", params, session.as_deref())
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(ex) = r.get("exceptionDetails") {
-            if api_name == "scripting.executeScript" {
-                let text = ex["exception"]["description"]
-                    .as_str()
-                    .or(ex["text"].as_str())
-                    .unwrap_or("error");
-                results.push(json!({"frameId": frame, "documentId": pages::document_id(tab, frame), "error": text}));
-                continue;
-            }
+        if let Some(ex) = r.get("exceptionDetails")
+            && api_name == "scripting.executeScript"
+        {
+            let text = ex["exception"]["description"]
+                .as_str()
+                .or(ex["text"].as_str())
+                .unwrap_or("error");
+            results.push(json!({"frameId": frame, "documentId": pages::document_id(tab, frame), "error": text}));
+            continue;
         }
         results.push(json!({"frameId": frame, "documentId": pages::document_id(tab, frame), "result": r["result"]["value"]}));
     }

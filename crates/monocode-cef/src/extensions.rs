@@ -662,14 +662,13 @@ pub fn fetch(profile: Option<String>, spec: FetchSpec, sink: Box<dyn FetchSink>)
             map.append(name, value);
         }
         request.set_header_map(Some(&mut map));
-        if !spec.body.is_empty() {
-            if let (Some(mut post), Some(mut element)) =
+        if !spec.body.is_empty()
+            && let (Some(mut post), Some(mut element)) =
                 (cef::post_data_create(), cef::post_data_element_create())
-            {
-                element.set_to_bytes(spec.body.len(), spec.body.as_ptr());
-                post.add_element(Some(&mut element));
-                request.set_post_data(Some(&mut post));
-            }
+        {
+            element.set_to_bytes(spec.body.len(), spec.body.as_ptr());
+            post.add_element(Some(&mut element));
+            request.set_post_data(Some(&mut post));
         }
         let mut flags = 0;
         if spec.credentials {

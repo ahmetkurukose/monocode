@@ -59,10 +59,8 @@ impl MatchPattern {
             }
             _ => return None,
         };
-        let (authority, path) = match rest.find('/') {
-            Some(at) => (&rest[..at], &rest[at..]),
-            None => return None,
-        };
+        let at = rest.find('/')?;
+        let (authority, path) = (&rest[..at], &rest[at..]);
         let (host, port) = if scheme == Scheme::Is("file".into()) {
             (Host::Any, None)
         } else {

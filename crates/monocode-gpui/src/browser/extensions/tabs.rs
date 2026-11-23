@@ -284,7 +284,7 @@ pub(crate) fn refresh_now() {
     let Some(app) = with(|rt| rt.app.clone()) else {
         return;
     };
-    let (pages, windows) = app.update(|cx| crate::shell::browser_extensions::extension_tabs(cx));
+    let (pages, windows) = app.update(crate::shell::browser_extensions::extension_tabs);
     let Some(changes) = with(|rt| rt.tabs.refresh(pages, windows)) else {
         return;
     };
@@ -329,11 +329,11 @@ fn emit(profile: &ProfileKey, change: Change) {
             Change::Updated(tab, info) => {
                 let tab_json = reveal(*tab);
                 let mut info = info.clone();
-                if tab_json.as_ref().is_some_and(|t| t.get("url").is_none()) {
-                    if let Value::Object(m) = &mut info {
-                        m.remove("url");
-                        m.remove("title");
-                    }
+                if tab_json.as_ref().is_some_and(|t| t.get("url").is_none())
+                    && let Value::Object(m) = &mut info
+                {
+                    m.remove("url");
+                    m.remove("title");
                 }
                 if info.as_object().is_some_and(|m| m.is_empty()) {
                     continue;

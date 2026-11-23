@@ -534,13 +534,13 @@ fn dev_cdp(view: &Rc<monocode_cef::BrowserView>) -> (Option<Rc<CdpClient>>, Opti
     }
     let c = cdp.clone();
     let worker_sub = cdp.subscribe(move |event| {
-        if event.method == "Target.attachedToTarget" {
-            if let Some(session) = event.params["sessionId"].as_str() {
-                let call = c.call("Runtime.enable", json!({}), Some(session));
-                spawn(async move {
-                    let _ = call.await;
-                });
-            }
+        if event.method == "Target.attachedToTarget"
+            && let Some(session) = event.params["sessionId"].as_str()
+        {
+            let call = c.call("Runtime.enable", json!({}), Some(session));
+            spawn(async move {
+                let _ = call.await;
+            });
         }
     });
     (
@@ -671,14 +671,13 @@ pub(crate) fn ensure_ctx(key: &InstanceKey, meta: Meta) {
 pub(crate) fn forget_ctx(key: &InstanceKey, ctx: &str) {
     let Some((ports, pending)) = with(|rt| {
         let i = rt.instances.get_mut(key)?;
-        if let Some(c) = i.ctxs.remove(ctx) {
-            if let Route::Poll {
+        if let Some(c) = i.ctxs.remove(ctx)
+            && let Route::Poll {
                 poller: Some((r, _)),
                 ..
             } = c.route
-            {
-                r.json(200, &json!([]));
-            }
+        {
+            r.json(200, &json!([]));
         }
         let ports: Vec<(String, Vec<String>)> = (i.ports.iter())
             .filter(|(_, ends)| ends.iter().any(|e| e == ctx))
@@ -963,11 +962,11 @@ pub(crate) fn on_bridge(message: Bridge) {
                     super::sleep(POLL).await;
                     with(|rt| {
                         let c = rt.instances.get_mut(&key)?.ctxs.get_mut(&ctx)?;
-                        if let Route::Poll { poller, .. } = &mut c.route {
-                            if poller.as_ref().is_some_and(|(_, t)| *t == token) {
-                                let (r, _) = poller.take().expect("poller");
-                                r.json(200, &json!([]));
-                            }
+                        if let Route::Poll { poller, .. } = &mut c.route
+                            && poller.as_ref().is_some_and(|(_, t)| *t == token)
+                        {
+                            let (r, _) = poller.take().expect("poller");
+                            r.json(200, &json!([]));
                         }
                         Some(())
                     });

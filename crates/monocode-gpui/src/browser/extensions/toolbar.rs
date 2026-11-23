@@ -390,10 +390,10 @@ pub(crate) fn open_popup(key: &InstanceKey, tab: Option<i64>) {
                         height.clamp(MIN.1, MAX.1) as f64,
                     );
                     with(|rt| {
-                        if let Some(p) = rt.instances.get(&k).and_then(|i| i.popup.as_ref()) {
-                            if p.browser_id == browser_id {
-                                p.window.set_size(w, h);
-                            }
+                        if let Some(p) = rt.instances.get(&k).and_then(|i| i.popup.as_ref())
+                            && p.browser_id == browser_id
+                        {
+                            p.window.set_size(w, h);
                         }
                     });
                     if let Some(view) = weak.upgrade() {
@@ -596,15 +596,15 @@ fn button(
         )
         .on_click(move |_, window, _| {
             let zoom = f64::from(window.content_zoom());
-            if let Some(b) = bounds.get() {
-                if let Some(view) = window_view(window) {
-                    let placed = Placed {
-                        view,
-                        right: f64::from(f32::from(b.right())) * zoom,
-                        bottom: f64::from(f32::from(b.bottom())) * zoom + 4.,
-                    };
-                    PLACED.with(|p| p.borrow_mut().insert(id.clone(), placed));
-                }
+            if let Some(b) = bounds.get()
+                && let Some(view) = window_view(window)
+            {
+                let placed = Placed {
+                    view,
+                    right: f64::from(f32::from(b.right())) * zoom,
+                    bottom: f64::from(f32::from(b.bottom())) * zoom + 4.,
+                };
+                PLACED.with(|p| p.borrow_mut().insert(id.clone(), placed));
             }
             open_popup(&key, Some(tab));
         })

@@ -200,6 +200,7 @@ impl SettingsView {
                 "extension-toggle".into(),
                 ix as u64,
             ))
+            .debug_selector(move || format!("settings-extension-toggle-{ix}"))
             .role(gpui::Role::Switch)
             .aria_label(SharedString::from(format!("Enable {}", l.name)))
             .aria_toggled(if on {
@@ -238,6 +239,7 @@ impl SettingsView {
             true,
             false,
         )
+        .debug_selector(move || format!("settings-extension-remove-{ix}"))
         .child(if confirming {
             "Remove with its data"
         } else {
@@ -341,3 +343,7 @@ fn status_line(text: String, error: bool) -> AnyElement {
         .child(text)
         .into_any_element()
 }
+
+#[cfg(test)]
+#[path = "extensions_tests.rs"]
+mod tests;

@@ -570,16 +570,16 @@ fn on_event(tab: i64, event: &CdpEvent) {
         "Network.loadingFailed" if session.is_none() => {
             let details = json!({"error": p["errorText"], "fromCache": false});
             request_event(tab, "webRequest.onErrorOccurred", p, details);
-            if p["type"] == "Document" {
-                if let Some(num) = p["frameId"].as_str().and_then(|f| frame_of(tab, f)) {
-                    navigation_event(
-                        tab,
-                        "webNavigation.onErrorOccurred",
-                        num,
-                        &main_url(tab),
-                        json!({"error": p["errorText"]}),
-                    );
-                }
+            if p["type"] == "Document"
+                && let Some(num) = p["frameId"].as_str().and_then(|f| frame_of(tab, f))
+            {
+                navigation_event(
+                    tab,
+                    "webNavigation.onErrorOccurred",
+                    num,
+                    &main_url(tab),
+                    json!({"error": p["errorText"]}),
+                );
             }
             forget_request(tab, p);
         }
