@@ -102,7 +102,7 @@ Monocode native uygulamasına (Rust + GPUI, `crates/monocode-gpui`, ortak servis
 | K67 | Build yeri | Agent worktree'lerinde **hiç build yok** (cargo check/test dahil). Ortak `CARGO_TARGET_DIR` işe yaramadı: cargo workspace crate'lerini kaynak yoluna göre ayrı derliyor, her worktree kendi kopyalarını ekledi ve disk üç kez doldu. Paralel agent'lar worktree'de yalnız kod yazar; build ve testler birleşik dalda, ana worktree'de alınır. |
 | K68 | PTY başlatma | macOS'ta terminal çocukları `fork`'suz: `posix_spawn` (`SETSID`, `CLOEXEC_DEFAULT`) küçük `monocode-pty-exec`'i başlatır; o PTY'yi kontrol terminali yapar (`TIOCSCTTY`) ve programa `execve` eder. `posix_spawn` dosya işlemleri setsid'den önce çalıştığı için kontrol terminali doğrudan alınamıyor. Helper yoksa uygulamanın kendi image initializer trampoline'i yedek (~270 ms, helper <10 ms). Bundle'da `Contents/MacOS/monocode-pty-exec`. |
 | K69 | Eklenti mimarisi | **Kendi eklenti katmanımız (§8 b, Orca modeli).** Spike'lar (2026-11-23, Proton Pass): hibrit (`--load-extension`) content script/storage/mesajlaşmada çalıştı ama `tabs.query`/`windows` Alloy sekmeleri görmüyor, eklenti sayfaları Alloy'da üst düzey açılamıyor, kurulum/güncelleme API'si yok ve belgelenmemiş davranışa dayanıyor (`browser/ext-spike-hybrid`). Kendi katmanımız (`browser/ext-spike-own`): `mcext://` şeması, `chrome.*` shim, arka plan gizli sayfada worker, content script'ler CDP ile isolated/MAIN world'e, API'ler ana thread'de bizim sekme modelimizle; dört başarı maddesi geçti. Seçim: CEF yükseltmelerinden bağımsız, agent ve UI tamamen bizde; bedeli eklenti başına uyumluluk işi. **Uygulama (Faz 5a):** core `browser/extensions` (CRX3 doğrulama, zip, manifest+i18n, match pattern, WAR kararı `access.rs`, SQLite `storage`, `tabs` modeli, Web Store/Omaha, izin uyarıları, `shim.js` + `external.js`), cef `extensions.rs` (her süreçte `mcext` şeması, profil başına factory, akışlı cevap, `CefURLRequest` fetch proxy'si: akış + abort + profilin cookie'leri `credentials: include` ile), gpui `browser/extensions/` (serve, instance, dispatch, pages, tabs, toolbar) + Settings → Browser. Kapsam: eklenti uygulamaya bir kez kurulur (`<data>/Browser Extensions/<id>/<sürüm>/`); her profil kendi örneğini çalıştırır (ortak profil motor başlarken, izole proje profili ilk sayfasıyla; veri `Browser Extensions/Data/<profil>/<id>/`, giriş profil başına); geçici agent profilleri hiç çalıştırmaz. Arka plan: gizli Alloy sayfada dedicated worker, çökünce 5 dk'da en çok 5 kez yeniden başlar; `onInstalled` profil sürümü ilk görünce, `onStartup` her açılışta (geç eklenen dinleyiciler 15 sn içinde yine duyar). Köprü: çalışma başına token yalnız shim'de; `__mcext/*` yalnız eklentinin kendi bağlamlarına; web sayfaları yalnız WAR. Content script'ler CDP ile eklentiye özel isolated world'e (binding yalnız orada, `__monocodeExt_*`) ve MAIN world'e; OOPIF'ler auto-attach oturumlarıyla, script'ler hazır olana dek bekletilerek. `externally_connectable`: MAIN world `external.js` ↔ isolated world relay (DOM olayı). Her async metod tek adaptörden (callback + promise + `lastError`); QuickJS testi 420 metodu çağırır. Popup: ayrı borderless pencere (K44), CEF auto-resize (25×25–800×600), blur/Esc/`window.close()` ile kapanır. Güncelleme: açılıştan 60 sn sonra ve 5 saatte bir; yeni uyarı ekleyen sürüm onaya kadar bekler. Eklenti kurma/kaldırma agent'a kapalı. Geliştirme kancası `MONOCODE_BROWSER_EXT_DEV` (state.json, komut dosyası; `scripts/browser-extensions/`). |
-| K70 | Faz 5 sırası | Önce **Proton Pass** uçtan uca (kullanıcının gerçek girişi, kasa, alan içi doldurma, popup) doğrulanır; sonra diğer eklentiler. Fazın sonunda deneyimden bir **skill dosyası** yazılır: yeni bir eklentiyi bu katmana ekleme yöntemi (API envanteri, shim, testler, bilinen tuzaklar). |
+| K70 | Faz 5 sırası | **Yapıldı (2026-11-24):** Proton Pass kullanıcının girişiyle doğrulandı; skill `.claude/skills/browser-extension/`. Önce **Proton Pass** uçtan uca (kullanıcının gerçek girişi, kasa, alan içi doldurma, popup) doğrulanır; sonra diğer eklentiler. Fazın sonunda deneyimden bir **skill dosyası** yazılır: yeni bir eklentiyi bu katmana ekleme yöntemi (API envanteri, shim, testler, bilinen tuzaklar). |
 
 ## 3. Referans: Orca'nın yaptığı ve bizim aldığımız
 
@@ -508,14 +508,11 @@ bitmeden başlamaz; her fazın başında kullanıcı onayı alınır.
   - Telefonla QR passkey (hybrid) düzeltmesi + Bluetooth izin akışı (K58, K59).
   - Chrome/Arc/Brave'den cookie ve şifre import'u (K61, §3.3).
 
-### Faz 5 — Eklentiler (seçilmiş 20–30)
-- **Önce (K60):** ~~Proton Pass ile iki spike~~ → yapıldı, kazanan kendi katmanımız (K69).
-- **5a (K70):** Proton Pass'i kendi katmanımızda ürün kalitesinde çalıştırmak ve kullanıcının girişiyle doğrulamak. **Durum (2026-11-23):** katman ve Proton Pass hesap gerektirmeyen her adımda doğrulandı (kurulum, güncelleme denetimi, arka plan, popup, content script'ler OOPIF dahil, externally_connectable, tabs.query, çökme sonrası yeniden başlama, kapat/aç, kaldırma, yeniden açılışta kalıcılık). Kullanıcının girişiyle doğrulama bekliyor.
-- **5b:** Diğer eklentiler; fazın sonunda eklenti ekleme skill'i.
-- Eklenti listesinin belirlenmesi ve gereken `chrome.*` API'lerinin çıkarılması.
-- Hibrit Chrome-style pencere modeli ile kendi eklenti katmanı arasında spike ile seçim (§8).
-- Web Store'dan kurulum, CRX3 doğrulama, otomatik güncelleme.
-- Toolbar, popup, side panel, bağlam menüsü.
+### Faz 5 — Eklentiler (bitti, `phase-5-done.md`; kararlar K60, K69, K70)
+- ~~Proton Pass ile iki spike~~ → yapıldı, kazanan kendi katmanımız (K69).
+- **5a (K70):** Proton Pass kendi katmanımızda; kullanıcının girişiyle doğrulandı (2026-11-24).
+- **Skill:** yeni eklenti ekleme yöntemi `.claude/skills/browser-extension/SKILL.md`.
+- **Sonrası (ayrı işler, skill ile):** listedeki diğer eklentiler (1Password, Bitwarden, reklam engelleyici, React DevTools …). Eksik büyük parçalar: `declarativeNetRequest`, `sidePanel`, `contextMenus`, `notifications`, `identity`, engelleyen `webRequest`.
 
 ### Faz 6 — Windows ve Linux
 - Windows: HWND child view + D3D11 OSR. Linux: X11 child view, Wayland'de OSR (§9).
@@ -550,7 +547,7 @@ Her faz bittiğinde:
 | 2 | Bitti | `phase-2-done.md` |
 | 3 | Bitti | `phase-3-done.md` |
 | 4 | Bitti (2026-11-23) | `phase-4-done.md` |
-| 5 | Sürüyor (5a: kullanıcı doğrulaması bekliyor) | — |
+| 5 | Bitti (2026-11-24) | `phase-5-done.md` |
 | 6 | Başlamadı | — |
 | 7 | Başlamadı | — |
 
