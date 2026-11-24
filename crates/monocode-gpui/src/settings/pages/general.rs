@@ -8,65 +8,6 @@ use crate::theme::*;
 use gpui::{AnyElement, Context, FontWeight, div, prelude::*, px};
 
 impl SettingsView {
-    /// "Allow external CDP connections" and its "Copy endpoint" (context.md
-    /// K27): what Playwright's `connectOverCDP` or dev-browser `--connect`
-    /// take for the selected project's pages.
-    fn external_cdp_row(
-        &self,
-        p: &crate::settings::Preferences,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut description = "Tools outside Monocode, such as Playwright or dev-browser, may drive this project's pages through a private local address. Sessions Monocode starts get it on their own.".to_owned();
-        match &self.browser_endpoint {
-            Some(Ok(())) => description.push_str(" Endpoint copied."),
-            Some(Err(error)) => description.push_str(&format!(" {error}.")),
-            None => {}
-        }
-        let can_copy = p.browser_external_cdp && self.ctx.browser_scope.is_some();
-        self.row(
-            Some("browser-external-cdp"),
-            false,
-            "Allow external CDP connections (Playwright, dev-browser)",
-            Some(description.into()),
-            vec![
-                secondary_button(
-                    "browser-copy-cdp-endpoint",
-                    "Copy endpoint",
-                    false,
-                    !can_copy,
-                )
-                .child("Copy endpoint")
-                .when(can_copy, |d| {
-                    d.on_click(cx.listener(|this, _, _, cx| this.copy_cdp_endpoint(cx)))
-                })
-                .into_any_element(),
-                self.toggle(
-                    "browser-external-cdp",
-                    "Allow external CDP connections",
-                    p.browser_external_cdp,
-                    false,
-                    cx,
-                    |this, on, cx| {
-                        this.browser_endpoint = None;
-                        this.update(cx, |p| p.browser_external_cdp = on)
-                    },
-                ),
-            ],
-        )
-    }
-
-    /// Copies the selected project's CDP endpoint, or says why it cannot.
-    pub(in crate::settings) fn copy_cdp_endpoint(&mut self, cx: &mut Context<Self>) {
-        let Some(scope) = self.ctx.browser_scope.clone() else {
-            return;
-        };
-        self.browser_endpoint = Some(
-            monocode_core::browser::proxy::endpoint(&scope)
-                .map(|url| cx.write_to_clipboard(gpui::ClipboardItem::new_string(url))),
-        );
-        cx.notify();
-    }
-
     pub(super) fn general_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let alerts = vec![
@@ -223,58 +164,6 @@ impl SettingsView {
                 |this, v, cx| this.update(cx, |p| p.set_terminal_placement(v)),
             )],
         ));
-        // Only macOS has the browser pane the links would open in.
-        if cfg!(target_os = "macos") {
-            workspace.push(self.row(
-                Some("browser-all-links"),
-                false,
-                "Open all links in Monocode",
-                Some("Web links in replies and terminals open in a browser tab. Off, only local addresses such as a dev server's do, and the rest open in your browser. ⇧-click a link to open it in the other one.".into()),
-                vec![self.toggle(
-                    "browser-all-links",
-                    "Open all links in Monocode",
-                    p.browser_all_links,
-                    false,
-                    cx,
-                    |this, on, cx| this.update(cx, |p| p.browser_all_links = on),
-                )],
-            ));
-            workspace.push(self.external_cdp_row(&p, cx));
-            workspace.push(self.row(
-                Some("browser-battery-saver"),
-                false,
-                "Browser battery saver",
-                Some("When the battery is low, pages in background tabs pause until you show them. The page you see and pages an agent uses keep full speed. Off, background pages never pause.".into()),
-                vec![self.toggle(
-                    "browser-battery-saver",
-                    "Browser battery saver",
-                    p.browser_battery_saver,
-                    false,
-                    cx,
-                    |this, on, cx| this.update(cx, |p| p.browser_battery_saver = on),
-                )],
-            ));
-            workspace.extend(self.site_permission_rows(cx));
-            workspace.extend(self.browser_import_rows(cx));
-            let memory_saver = p.browser_memory_saver.to_string();
-            workspace.push(self.row(
-                Some("browser-memory-saver"),
-                false,
-                "Browser memory saver",
-                Some("Frees the memory of a background tab you have not used for this long; it loads again when you show it. Tabs playing sound, with an unsent form, with DevTools open, pinned or used by an agent are kept.".into()),
-                vec![self.segmented(
-                    "browser-memory-saver",
-                    "Browser memory saver",
-                    &memory_saver,
-                    &[("0", "Off"), ("15", "15 min"), ("30", "30 min"), ("60", "1 h"), ("240", "4 h")],
-                    cx,
-                    |this, v, cx| {
-                        let minutes = v.parse().unwrap_or(0);
-                        this.update(cx, |p| p.browser_memory_saver = minutes)
-                    },
-                )],
-            ));
-        }
         if cfg!(target_os = "windows") {
             workspace.push(self.row(
                 Some("close-to-tray"),

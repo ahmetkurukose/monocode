@@ -1,4 +1,4 @@
-//! Settings → Extensions (docs/native/browser/context.md K69, K70): add an
+//! Settings → Browser → Extensions (docs/native/browser/context.md K69, K70): add an
 //! extension from the Chrome Web Store by its link or id (Proton Pass one
 //! click away), and the installed ones with what they may do, on/off,
 //! updates waiting for approval, and removal. Extensions are installed for
@@ -63,8 +63,9 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub(in crate::settings) fn extensions_page(
+    pub(in crate::settings) fn extension_groups(
         &mut self,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let field = self.extension_field(cx);
@@ -135,7 +136,7 @@ impl SettingsView {
             .into_any_element();
         let mut page = vec![self.group(
             Some("browser-extensions-add"),
-            true,
+            first,
             "Add extension",
             Some("Extensions come from the Chrome Web Store, verified as Chrome verifies them, and update on their own. Each browser profile runs them with its own data and sign-ins; agents' throwaway profiles run none. Agents cannot add or remove extensions.".into()),
             None,

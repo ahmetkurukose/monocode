@@ -341,7 +341,7 @@ impl Shell {
                 glyph: "globe",
                 run: Rc::new(move |window, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        this.open_settings(crate::settings::Section::General, window, cx);
+                        this.open_settings(crate::settings::Section::Browser, window, cx);
                         if let Some(settings) = this.settings.clone() {
                             settings.update(cx, |view, cx| view.open_browser_import(cx));
                         }

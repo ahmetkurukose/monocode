@@ -8085,7 +8085,10 @@ impl Render for Shell {
             ))
             .on_action(cx.listener(
                 |this, _: &crate::browser::ShowBrowserPasswords, window, cx| {
-                    this.open_settings(crate::settings::Section::Passwords, window, cx)
+                    this.open_settings(crate::settings::Section::Browser, window, cx);
+                    if let Some(settings) = this.settings.clone() {
+                        settings.update(cx, |view, cx| view.open_browser_passwords(cx));
+                    }
                 },
             ))
             .on_action(cx.listener(|this, _: &SearchEverywhere, window, cx| {

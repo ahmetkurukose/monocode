@@ -930,6 +930,31 @@ impl BrowserPage {
         cx.notify();
     }
 
+    /// The Edit menu's Undo … Select All, for the page (or its docked
+    /// DevTools): Chromium hands the keys it leaves alone to the menu.
+    fn edit_actions(d: gpui::Div, devtools: bool, cx: &mut Context<Self>) -> gpui::Div {
+        use monocode_cef::EditCommand as E;
+        d.on_action(cx.listener(move |this, _: &input::Undo, _, _| this.edit(E::Undo, devtools)))
+            .on_action(cx.listener(move |this, _: &input::Redo, _, _| this.edit(E::Redo, devtools)))
+            .on_action(cx.listener(move |this, _: &input::Cut, _, _| this.edit(E::Cut, devtools)))
+            .on_action(cx.listener(move |this, _: &input::Copy, _, _| this.edit(E::Copy, devtools)))
+            .on_action(
+                cx.listener(move |this, _: &input::Paste, _, _| this.edit(E::Paste, devtools)),
+            )
+            .on_action(cx.listener(move |this, _: &input::SelectAll, _, _| {
+                this.edit(E::SelectAll, devtools)
+            }))
+    }
+
+    /// An Edit menu command (⌘C/V/X/A/Z, ⇧⌘Z, K17) for the page, or for its
+    /// docked DevTools when `devtools`.
+    fn edit(&self, command: monocode_cef::EditCommand, devtools: bool) {
+        match (devtools, &self.devtools) {
+            (true, Some(docked)) => docked.host.with_view(|view| view.edit(command)),
+            _ => self.host.with_view(|view| view.edit(command)),
+        };
+    }
+
     /// ⌘P: Chromium prints the page, with the system's print panel.
     pub(crate) fn print(&self) {
         self.host.with_view(|view| view.print());
@@ -1636,7 +1661,7 @@ impl BrowserPage {
             .child(div().flex_1().min_h_0().min_w_0().child(page))
             .child(divider)
             .child(
-                div()
+                Self::edit_actions(div(), true, cx)
                     .key_context(DEVTOOLS_KEY_CONTEXT)
                     .track_focus(&self.devtools_focus)
                     .h(px(height))
@@ -1741,7 +1766,7 @@ impl Render for BrowserPage {
                 None => (self.surface(cx), self.devtools.is_some()),
             },
         };
-        div()
+        Self::edit_actions(div(), false, cx)
             .id("browser-page")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
@@ -3848,7 +3873,18 @@ mod monocode_cef {
             false
         }
         pub fn print(&self) {}
+        pub fn edit(&self, _: EditCommand) {}
         pub fn close(&self) {}
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EditCommand {
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        SelectAll,
     }
 }
 

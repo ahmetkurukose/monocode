@@ -12,8 +12,7 @@ pub(crate) enum Section {
     Appearance,
     Terminal,
     Keybindings,
-    Passwords,
-    Extensions,
+    Browser,
     Chat,
     Providers,
     Mcp,
@@ -34,8 +33,7 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
             Section::Appearance,
             Section::Terminal,
             Section::Keybindings,
-            Section::Passwords,
-            Section::Extensions,
+            Section::Browser,
         ],
     ),
     (
@@ -55,15 +53,14 @@ pub(crate) const GROUPS: [(&str, &[Section]); 3] = [
 ];
 
 impl Section {
-    pub(crate) const ALL: [Section; 16] = [
+    pub(crate) const ALL: [Section; 15] = [
         Section::General,
         Section::Connections,
         Section::Integrations,
         Section::Appearance,
         Section::Terminal,
         Section::Keybindings,
-        Section::Passwords,
-        Section::Extensions,
+        Section::Browser,
         Section::Chat,
         Section::Providers,
         Section::Mcp,
@@ -81,8 +78,7 @@ impl Section {
             Section::Appearance => "appearance",
             Section::Terminal => "terminal",
             Section::Keybindings => "keybindings",
-            Section::Passwords => "passwords",
-            Section::Extensions => "extensions",
+            Section::Browser => "browser",
             Section::Chat => "chat",
             Section::Providers => "providers",
             Section::Mcp => "mcp",
@@ -101,8 +97,7 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Terminal => "Terminal",
             Section::Keybindings => "Keybindings",
-            Section::Passwords => "Passwords",
-            Section::Extensions => "Extensions",
+            Section::Browser => "Browser",
             Section::Chat => "Chat",
             Section::Providers => "Providers",
             Section::Mcp => "MCP",
@@ -131,11 +126,8 @@ impl Section {
             Section::Keybindings => {
                 "Every shortcut the workspace handles, from the app menu and the key handler."
             }
-            Section::Passwords => {
-                "Passwords the browser saved when you signed in, and sites it never saves for."
-            }
-            Section::Extensions => {
-                "Chrome Web Store extensions in the browser: add, turn on or off, update, and remove."
+            Section::Browser => {
+                "Links, power and memory, site permissions, importing, saved passwords, and Chrome Web Store extensions."
             }
             Section::Chat => {
                 "How transcripts read, what the composer does with a follow-up, how files save, and how diffs open."
@@ -165,11 +157,8 @@ impl Section {
             }
             Section::Terminal => "shell font size text zoom select copy clipboard selection iterm",
             Section::Keybindings => "shortcut hotkey keyboard binding",
-            Section::Passwords => {
-                "browser password login sign in credentials vault keychain touch id autofill saved never"
-            }
-            Section::Extensions => {
-                "browser extension add-on plugin chrome web store proton pass password manager install update"
+            Section::Browser => {
+                "web chromium links cdp battery memory site permissions import password login sign in credentials vault keychain touch id autofill saved never extension add-on plugin chrome web store proton pass install update"
             }
             Section::Chat => {
                 "transcript composer prompt message diff review layout format save editor"
@@ -196,8 +185,7 @@ impl Section {
             Section::Appearance => "palette",
             Section::Terminal => "terminal",
             Section::Keybindings => "keyboard",
-            Section::Passwords => "key",
-            Section::Extensions => "package",
+            Section::Browser => "app-window",
             Section::Chat => "message-square",
             Section::Providers => "bot",
             Section::Mcp => "globe",
@@ -352,45 +340,69 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
     ),
     (
         "browser-all-links",
-        Section::General,
+        Section::Browser,
         "Open all links in Monocode",
         "browser web links localhost dev server system default chromium shift click",
     ),
     (
         "browser-external-cdp",
-        Section::General,
+        Section::Browser,
         "Allow external CDP connections",
         "browser chromium devtools protocol playwright dev-browser endpoint copy automation",
     ),
     (
         "browser-battery-saver",
-        Section::General,
+        Section::Browser,
         "Browser battery saver",
         "browser chromium energy power battery low frame rate fps throttle freeze background tabs",
     ),
     (
         "browser-memory-saver",
-        Section::General,
+        Section::Browser,
         "Browser memory saver",
         "browser chromium memory ram discard sleep inactive background tabs unload",
     ),
     (
         "browser-offer-passwords",
-        Section::Passwords,
+        Section::Browser,
         "Offer to save passwords",
         "browser password manager save sign in login autofill suggest 1password",
     ),
     (
         "browser-site-permissions",
-        Section::General,
+        Section::Browser,
         "Site permissions",
         "browser website camera microphone location geolocation notifications clipboard midi allow block reset privacy",
     ),
     (
         "browser-import",
-        Section::General,
+        Section::Browser,
         "Import from another browser",
         "browser chrome arc brave import cookies passwords logins sign in migrate bring",
+    ),
+    (
+        "browser-saved-passwords",
+        Section::Browser,
+        "Saved passwords",
+        "browser password login credentials vault keychain touch id reveal copy edit delete",
+    ),
+    (
+        "browser-never-saved",
+        Section::Browser,
+        "Never saved",
+        "browser password sites never save blocked",
+    ),
+    (
+        "browser-extensions-add",
+        Section::Browser,
+        "Add extension",
+        "browser extension add-on plugin chrome web store proton pass password manager install",
+    ),
+    (
+        "browser-extensions-installed",
+        Section::Browser,
+        "Installed extensions",
+        "browser extension add-on plugin enable disable update remove",
     ),
     (
         "file-word-wrap",

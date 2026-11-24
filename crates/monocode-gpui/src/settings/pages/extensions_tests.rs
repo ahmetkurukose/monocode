@@ -46,7 +46,7 @@ fn window(dir: &std::path::Path, cx: &mut TestAppContext) -> WindowHandle<Settin
             |_, cx| {
                 cx.new(|cx| {
                     SettingsView::new(
-                        Section::Extensions,
+                        Section::Browser,
                         Preferences::default(),
                         SettingsContext::default(),
                         cx,

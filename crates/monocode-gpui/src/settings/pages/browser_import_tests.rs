@@ -136,7 +136,7 @@ fn window(importer: Arc<FakeImporter>, cx: &mut TestAppContext) -> WindowHandle<
             |_, cx| {
                 cx.new(|cx| {
                     let mut view = SettingsView::new(
-                        Section::General,
+                        Section::Browser,
                         Preferences::default(),
                         SettingsContext::default(),
                         cx,

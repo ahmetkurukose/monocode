@@ -1,4 +1,4 @@
-//! General → "Site permissions" (docs/native/browser/context.md K55): the
+//! Browser → "Site permissions" (docs/native/browser/context.md K55): the
 //! browser's remembered answers of every profile, with a reset per site
 //! and one for all. Sites ask again once reset.
 use crate::settings::{SettingsView, widgets::secondary_button};
@@ -15,6 +15,7 @@ impl SettingsView {
 
     pub(in crate::settings) fn site_permission_rows(
         &self,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(root) = self.browser_root() else {
@@ -41,7 +42,7 @@ impl SettingsView {
         let clear_root = root.clone();
         let mut rows = vec![self.row(
             Some("browser-site-permissions"),
-            false,
+            first,
             "Site permissions",
             Some(description.into()),
             vec![

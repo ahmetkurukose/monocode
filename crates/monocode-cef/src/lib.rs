@@ -34,7 +34,7 @@ pub use devtools::{DevToolsAttachment, DevToolsSink};
 pub use runtime::{RuntimeConfig, StartError};
 pub use view::{
     AuthChallenge, AuthRequest, BrowserEvent, BrowserView, CertificateRequest, CreateError,
-    CreateOptions, DialogKind, Download, DownloadInto, DownloadState, Frame, JsDialog,
+    CreateOptions, DialogKind, Download, DownloadInto, DownloadState, EditCommand, Frame, JsDialog,
     PermissionAnswer, PermissionRequest, Profile, cancel_download, forget_profile, profile_id,
     reset_site_permission, take_popup,
 };

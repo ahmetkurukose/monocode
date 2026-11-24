@@ -328,7 +328,7 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
     if !cfg!(target_os = "macos") {
         return;
     }
-    let window = window(Section::General, cx);
+    let window = window(Section::Browser, cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     window
         .update(visual, |view, _, cx| {
@@ -344,7 +344,7 @@ fn external_cdp_is_a_switch_and_its_endpoint_says_why_it_cannot_be_copied(cx: &m
         visual
             .debug_bounds("settings-toggle-browser-external-cdp")
             .is_some(),
-        "the switch is on General"
+        "the switch is on Browser"
     );
     let changed = std::rc::Rc::new(RefCell::new(Vec::new()));
     let seen = changed.clone();

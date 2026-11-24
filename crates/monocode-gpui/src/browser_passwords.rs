@@ -471,7 +471,7 @@ impl BrowserPage {
         match vaults::state(cx) {
             VaultState::Open => {}
             VaultState::Unavailable(_) => {
-                return Err("the saved passwords are locked: the Keychain did not give their key; the user can unlock them in Settings → Passwords".into());
+                return Err("the saved passwords are locked: the Keychain did not give their key; the user can unlock them in Settings → Browser".into());
             }
             VaultState::Locked | VaultState::Unlocking => {
                 if !vaults::saved_any(cx) {
@@ -865,7 +865,7 @@ impl BrowserPage {
 actions!(
     workspace,
     [
-        /// Settings → Passwords.
+        /// Settings → Browser.
         ShowBrowserPasswords
     ]
 );

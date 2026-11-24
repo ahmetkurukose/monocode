@@ -88,6 +88,9 @@ pub struct ExtRequest {
     pub frame_url: Option<String>,
     /// That frame's parent's URL.
     pub parent_url: Option<String>,
+    /// That frame's id. A frame that has just navigated has an empty URL
+    /// for a moment (Chromium's speculative frame); its id stays.
+    pub frame_id: Option<String>,
     pub referrer: String,
 }
 
@@ -136,6 +139,7 @@ wrap_scheme_handler_factory! {
                 _ => Load::Resource,
             };
             let frame_url = frame.as_ref().map(|f| CefString::from(&f.url()).to_string());
+            let frame_id = frame.as_ref().map(|f| CefString::from(&f.identifier()).to_string());
             let parent_url = (frame.as_ref())
                 .and_then(|f| f.parent())
                 .map(|p| CefString::from(&p.url()).to_string());
@@ -155,6 +159,7 @@ wrap_scheme_handler_factory! {
                 browser_id: browser.map(|b| b.identifier()),
                 frame_url,
                 parent_url,
+                frame_id,
                 referrer: CefString::from(&request.referrer_url()).to_string(),
             };
             Some(ExtHandler::new(Arc::new(Mutex::new(Stream::default())), Arc::new(Mutex::new(Some(request)))))

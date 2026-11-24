@@ -574,6 +574,17 @@ pub(crate) fn page_client(state: PageState) -> cef::Client {
 }
 
 /// A page and its native view.
+/// An Edit menu command, for [`BrowserView::edit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
 pub struct BrowserView {
     /// Let go of only while CEF runs ([`Drop`]).
     browser: ManuallyDrop<Browser>,
@@ -874,6 +885,29 @@ impl BrowserView {
         self.browser
             .host()
             .is_some_and(|host| host.is_audio_muted() != 0)
+    }
+
+    /// Runs an Edit menu command in the frame that has the keyboard (the
+    /// main frame when none has). On macOS Chromium sends ⌘C/V/X/A/Z the
+    /// page leaves alone to the app's menu, as Chrome's Edit menu would
+    /// send `copy:` and the like to the page; the app's menu runs its own
+    /// actions instead, so the pane hands them back here.
+    pub fn edit(&self, command: EditCommand) {
+        let Some(frame) = self
+            .browser
+            .focused_frame()
+            .or_else(|| self.browser.main_frame())
+        else {
+            return;
+        };
+        match command {
+            EditCommand::Undo => frame.undo(),
+            EditCommand::Redo => frame.redo(),
+            EditCommand::Cut => frame.cut(),
+            EditCommand::Copy => frame.copy(),
+            EditCommand::Paste => frame.paste(),
+            EditCommand::SelectAll => frame.select_all(),
+        }
     }
 
     /// Prints the page: Chromium's print, which on macOS shows the system's

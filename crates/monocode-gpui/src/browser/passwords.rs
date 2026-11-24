@@ -7,7 +7,7 @@
 //! unavailable until the user tries again; nothing is lost or rewritten.
 //!
 //! Pages (`browser_passwords.rs`) offer to save sign-ins and fill saved
-//! ones; Settings → Passwords lists them; agents fill them without seeing
+//! ones; Settings → Browser lists them; agents fill them without seeing
 //! them (K57). [`password_manager_enabled`] says whether any of it runs.
 use super::*;
 use monocode_core::browser::passwords::{Vaults, keychain};

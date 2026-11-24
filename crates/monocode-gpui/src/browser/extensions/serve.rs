@@ -98,6 +98,30 @@ fn take_expected(url: &str) -> bool {
     }
 }
 
+/// Frames this extension's own documents load in, for a short while: their
+/// first requests may come before Chromium gives the frame its new URL.
+fn own_frames() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static OWN: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    OWN.get_or_init(Default::default)
+}
+
+const OWN_FRAME_FOR: Duration = Duration::from_secs(60);
+
+/// Extension `id`'s document loads in frame `frame`.
+fn note_own_frame(frame: &str, id: &str) {
+    let mut own = own_frames().lock().unwrap();
+    own.retain(|_, (_, at)| at.elapsed() < OWN_FRAME_FOR);
+    own.insert(frame.to_owned(), (id.to_owned(), Instant::now()));
+}
+
+/// Whether frame `frame` loads a document of extension `id` (its URL is
+/// not known yet).
+fn is_own_frame(frame: &str, id: &str) -> bool {
+    let own = own_frames().lock().unwrap();
+    own.get(frame)
+        .is_some_and(|(owner, at)| owner == id && at.elapsed() < OWN_FRAME_FOR)
+}
+
 pub(crate) fn add_host(browser_id: i32, id: &str) {
     hosts().lock().unwrap().insert(browser_id, id.to_owned());
 }
@@ -277,6 +301,13 @@ impl ExtensionRequests for Handler {
         let from_host = (request.browser_id)
             .is_some_and(|b| hosts().lock().unwrap().get(&b).is_some_and(|h| h == id));
         let expected = request.load == Load::MainFrame && take_expected(&request.url);
+        let own_origin = monocode_core::browser::extensions::origin(id);
+        // The frame's new document is this extension's, from before Chromium
+        // gave the frame its URL: a request of that document.
+        let unknown_frame = request.frame_url.as_deref().is_none_or(str::is_empty);
+        let own_frame = matches!(request.load, Load::Resource | Load::Worker)
+            && unknown_frame
+            && (request.frame_id.as_deref()).is_some_and(|f| is_own_frame(f, id));
         let requester = Requester {
             load: Some(match request.load {
                 Load::MainFrame => access::Load::MainFrame,
@@ -284,7 +315,11 @@ impl ExtensionRequests for Handler {
                 Load::Worker => access::Load::Worker,
                 Load::Resource => access::Load::Resource,
             }),
-            frame_url: request.frame_url.as_deref(),
+            frame_url: if own_frame {
+                Some(own_origin.as_str())
+            } else {
+                request.frame_url.as_deref()
+            },
             parent_url: request.parent_url.as_deref(),
             referrer: &request.referrer,
             from_host,
@@ -294,13 +329,19 @@ impl ExtensionRequests for Handler {
         let manifest = &served.ext.manifest;
         if access::decide(manifest, &path, &who) == Access::Deny {
             log::warn!(
-                "browser: extension {id}: refused {path} to {who:?} ({:?}, frame {:?}, parent {:?}, referrer {:?})",
+                "browser: extension {id}: refused {path} to {who:?} ({:?}, frame {:?} {:?}, parent {:?}, referrer {:?})",
                 request.load,
                 request.frame_url,
+                request.frame_id,
                 request.parent_url,
                 request.referrer
             );
             return refuse(responder, 403);
+        }
+        if matches!(request.load, Load::MainFrame | Load::SubFrame)
+            && let Some(frame) = &request.frame_id
+        {
+            note_own_frame(frame, id);
         }
         let key = InstanceKey {
             profile: request.profile.clone() as ProfileKey,

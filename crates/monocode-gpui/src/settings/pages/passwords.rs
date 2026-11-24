@@ -1,4 +1,4 @@
-//! Settings → Passwords (docs/native/browser/context.md K55, K56, K60):
+//! Settings → Browser → Passwords (docs/native/browser/context.md K55, K56, K60):
 //! "Offer to save passwords", the saved logins of every browser profile
 //! with a search, and the sites never saved for. Showing or copying a
 //! password asks for Touch ID (or the account password) first, at most
@@ -12,7 +12,7 @@ use crate::{
     },
     theme::*,
 };
-use gpui::{AnyElement, ClipboardItem, Context, Entity, Focusable, Window, div, prelude::*, px};
+use gpui::{AnyElement, ClipboardItem, Context, Entity, Focusable, div, prelude::*, px};
 use std::{collections::HashMap, time::Duration};
 
 /// A copied password leaves the clipboard after this long.
@@ -58,9 +58,22 @@ impl SettingsView {
         search
     }
 
-    pub(in crate::settings) fn passwords_page(
+    /// Brings the saved passwords into view (a page's key icon →
+    /// "Manage passwords").
+    pub(crate) fn open_browser_passwords(&mut self, cx: &mut Context<Self>) {
+        self.go(
+            crate::settings::model::SearchResult {
+                section: crate::settings::Section::Browser,
+                setting: Some("browser-saved-passwords"),
+                label: "Saved passwords",
+            },
+            cx,
+        );
+    }
+
+    pub(in crate::settings) fn password_groups(
         &mut self,
-        _window: &mut Window,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let offer = self.prefs.browser_offer_passwords;
@@ -78,7 +91,7 @@ impl SettingsView {
                 |this, on, cx| this.update(cx, |p| p.browser_offer_passwords = on),
             )],
         )];
-        let mut page = vec![self.group(None, true, "Browser", None, None, settings)];
+        let mut page = vec![self.group(None, first, "Passwords", None, None, settings)];
         page.extend(self.saved_password_groups(cx));
         page
     }

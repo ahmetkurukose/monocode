@@ -1,4 +1,4 @@
-//! General → "Import from another browser" (docs/native/browser/context.md
+//! Browser → "Import from another browser" (docs/native/browser/context.md
 //! K61): pick Chrome, Arc or Brave and one of its profiles, choose cookies
 //! and passwords, and import once. Importing again merges.
 use crate::browser::import::{CookieWrite, importer};
@@ -99,7 +99,7 @@ impl SettingsView {
         self.show_browser_import(cx);
         self.go(
             model::SearchResult {
-                section: crate::settings::Section::General,
+                section: crate::settings::Section::Browser,
                 setting: Some("browser-import"),
                 label: "Import from another browser",
             },
@@ -237,14 +237,15 @@ impl SettingsView {
 
     pub(in crate::settings) fn browser_import_rows(
         &mut self,
+        first: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let open = self.browser_import.open;
         let mut rows = vec![self.row(
             Some("browser-import"),
-            false,
+            first,
             "Import from another browser",
-            Some("Cookies and saved passwords from Chrome, Arc or Brave, once; importing again merges, and the newer password wins. Passwords go to Settings → Passwords. Google sign-ins stay behind: sign in to Google in Monocode directly.".into()),
+            Some("Cookies and saved passwords from Chrome, Arc or Brave, once; importing again merges, and the newer password wins. Passwords go to Saved passwords below. Google sign-ins stay behind: sign in to Google in Monocode directly.".into()),
             vec![
                 secondary_button("browser-import-open", "Import…", false, false)
                     .child(if open { "Close" } else { "Import…" })
