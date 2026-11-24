@@ -305,9 +305,17 @@ impl ExtensionRequests for Handler {
         // The frame's new document is this extension's, from before Chromium
         // gave the frame its URL: a request of that document.
         let unknown_frame = request.frame_url.as_deref().is_none_or(str::is_empty);
+        // A main frame's site for cookies is its own document: this
+        // extension's page, opened top-level (a tab it navigates to).
+        let own_top = request.parent_url.is_none()
+            && (request.first_party == own_origin
+                || request
+                    .first_party
+                    .strip_prefix(&own_origin)
+                    .is_some_and(|rest| rest.starts_with('/')));
         let own_frame = matches!(request.load, Load::Resource | Load::Worker)
             && unknown_frame
-            && (request.frame_id.as_deref()).is_some_and(|f| is_own_frame(f, id));
+            && (own_top || (request.frame_id.as_deref()).is_some_and(|f| is_own_frame(f, id)));
         let requester = Requester {
             load: Some(match request.load {
                 Load::MainFrame => access::Load::MainFrame,
@@ -329,11 +337,12 @@ impl ExtensionRequests for Handler {
         let manifest = &served.ext.manifest;
         if access::decide(manifest, &path, &who) == Access::Deny {
             log::warn!(
-                "browser: extension {id}: refused {path} to {who:?} ({:?}, frame {:?} {:?}, parent {:?}, referrer {:?})",
+                "browser: extension {id}: refused {path} to {who:?} ({:?}, frame {:?} {:?}, parent {:?}, first party {:?}, referrer {:?})",
                 request.load,
                 request.frame_url,
                 request.frame_id,
                 request.parent_url,
+                request.first_party,
                 request.referrer
             );
             return refuse(responder, 403);

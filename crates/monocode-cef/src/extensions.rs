@@ -91,6 +91,9 @@ pub struct ExtRequest {
     /// That frame's id. A frame that has just navigated has an empty URL
     /// for a moment (Chromium's speculative frame); its id stays.
     pub frame_id: Option<String>,
+    /// The site for cookies: for a request of a main frame, that frame's
+    /// new document's URL, known before the frame's own URL is.
+    pub first_party: String,
     pub referrer: String,
 }
 
@@ -160,6 +163,7 @@ wrap_scheme_handler_factory! {
                 frame_url,
                 parent_url,
                 frame_id,
+                first_party: CefString::from(&request.first_party_for_cookies()).to_string(),
                 referrer: CefString::from(&request.referrer_url()).to_string(),
             };
             Some(ExtHandler::new(Arc::new(Mutex::new(Stream::default())), Arc::new(Mutex::new(Some(request)))))

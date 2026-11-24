@@ -551,7 +551,9 @@
     MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND: 2,
     query: remote("tabs.query", (a) => [a[0] || {}]),
     get: remote("tabs.get"),
-    getCurrent: remote("tabs.getCurrent"),
+    // Outside a tab (a popup, the background) Chrome answers undefined, not
+    // null; Proton Pass takes anything else for "opened in a tab".
+    getCurrent: asyncMethod(async () => (await call("tabs.getCurrent", [])) ?? undefined),
     create: remote("tabs.create", (a) => [a[0] || {}]),
     duplicate: remote("tabs.duplicate"),
     update: remote("tabs.update", (a) => (typeof a[0] === "number" ? [a[0], a[1] || {}] : [null, a[0] || {}])),

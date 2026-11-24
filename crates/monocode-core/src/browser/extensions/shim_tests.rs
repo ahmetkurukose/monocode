@@ -288,3 +288,17 @@ fn content_programs_parse_and_carry_the_right_scripts() {
         assert!(compile.call::<_, bool>((main.clone(),)).unwrap());
     });
 }
+
+#[test]
+fn tabs_get_current_outside_a_tab_is_undefined_as_in_chrome() {
+    // The app answers null outside a tab; Proton Pass's popup takes any
+    // other value than undefined for "opened in a tab" and sizes to 100%.
+    let r = run(
+        r#"__result = {};
+        chrome.tabs.getCurrent().then((t) => { __result.promise = t === undefined; });
+        chrome.tabs.getCurrent((t) => { __result.cb = t === undefined; });"#,
+        "",
+    );
+    assert_eq!(r["promise"], true);
+    assert_eq!(r["cb"], true);
+}
