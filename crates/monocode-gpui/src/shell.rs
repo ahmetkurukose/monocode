@@ -169,6 +169,7 @@ actions!(
         FocusPaneDown,
         ToggleTerminal,
         NewTerminal,
+        NewBrowser,
         SplitTerminal,
         ToggleLayout,
         ToggleWorkspaceStyle,
@@ -318,6 +319,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
         KeyBinding::new(&format!("{modifier}-shift-j"), SplitTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
+        KeyBinding::new(&format!("{modifier}-alt-n"), NewBrowser, context),
         // Switch between the original two-sidebar layout and the new layout.
         KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
         // Switch the Focused layout between its rounded and boxy workspace.
@@ -5733,7 +5735,7 @@ impl Shell {
             ),
             MenuTarget::RailWorktree { project, path } => self.rail_worktree_menu(project, path),
             MenuTarget::GroupTab(id) => self.group_tab_menu(*id, cx),
-            MenuTarget::GroupAdd(_) => self.group_add_menu(),
+            MenuTarget::GroupAdd(_) => self.group_add_menu(cx),
             MenuTarget::GroupMore(visible) => self.group_more_menu(*visible),
             MenuTarget::Session(id) => (
                 format!("Session actions for {}", title(id)).into(),
@@ -8457,6 +8459,9 @@ impl Render for Shell {
             .on_action(
                 cx.listener(|this, _: &NewTerminal, window, cx| this.new_terminal(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &NewBrowser, window, cx| {
+                this.new_browser_pane(None, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &SplitTerminal, window, cx| {
                 // Title bar terminals split beside the focused pane; the dock
                 // and panel placements have no pane to split, so add a tab.

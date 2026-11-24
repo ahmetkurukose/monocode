@@ -121,6 +121,12 @@ pub(crate) const BINDINGS: &[Binding] = &[
         fixed: false,
     },
     Binding {
+        command: "Tab: New Browser",
+        keys: "⌘⌥N",
+        when: "Always",
+        fixed: false,
+    },
+    Binding {
         command: "Tab: Close Others",
         keys: "⌘⌥T",
         when: "Always",
