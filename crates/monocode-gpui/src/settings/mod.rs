@@ -142,7 +142,6 @@ pub(crate) enum SettingsEvent {
     /// A project's `.monocode/integrations.json` changed: the Inbox lists again.
     IntegrationsChanged,
     Changed(Box<Preferences>),
-    /// The Appearance page's Layout picker: true for Focused, false for Classic.
     Section(Section),
     OpenSession(i64),
     Archive(i64, bool),
