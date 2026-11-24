@@ -76,6 +76,8 @@ pub(crate) struct Status {
     pub mode: Mode,
     pub active: bool,
     pub working: usize,
+    /// Running on battery, where macOS sleeps on a closed lid anyway.
+    pub on_battery: bool,
 }
 
 impl Status {
@@ -86,6 +88,13 @@ impl Status {
             self.mode.label(),
             if self.active { "Active" } else { "Inactive" }
         )
+    }
+
+    /// On battery a closed lid sleeps the Mac whatever the assertion says:
+    /// only a root `pmset disablesleep` gets past it, which this does not do.
+    pub(crate) fn lid_warning(self) -> Option<&'static str> {
+        (self.mode != Mode::Off && self.on_battery)
+            .then_some("On battery, closing the lid still puts the Mac to sleep")
     }
 }
 
@@ -98,6 +107,7 @@ pub(crate) struct KeepAwake {
     /// Working agents by session: their last mark and when it changed.
     seen: HashMap<i64, (Mark, Instant)>,
     working: usize,
+    on_battery: bool,
     assertion: Option<platform::Assertion>,
 }
 
@@ -109,6 +119,7 @@ impl KeepAwake {
             mode: self.mode,
             active: self.assertion.is_some(),
             working: self.working,
+            on_battery: self.on_battery,
         }
     }
 
@@ -118,9 +129,16 @@ impl KeepAwake {
         self.apply();
     }
 
-    /// Takes the working agents now: their sessions and transcript marks.
+    /// Takes the working agents now: their sessions and transcript marks,
+    /// and whether the Mac runs on battery.
     /// An agent whose mark has not moved in `STALE_AFTER` is not counted.
-    pub(crate) fn observe(&mut self, now: Instant, agents: impl IntoIterator<Item = (i64, Mark)>) {
+    pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        agents: impl IntoIterator<Item = (i64, Mark)>,
+        on_battery: bool,
+    ) {
+        self.on_battery = on_battery;
         let mut seen = HashMap::new();
         for (id, mark) in agents {
             let since = match self.seen.get(&id) {
@@ -151,6 +169,11 @@ impl KeepAwake {
     }
 }
 
+/// Whether the Mac draws from its battery now.
+pub(crate) fn on_battery() -> bool {
+    platform::on_battery()
+}
+
 /// The global's status, Off until the shell first sets the mode.
 pub(crate) fn status(cx: &App) -> Status {
     cx.try_global::<KeepAwake>()
@@ -178,6 +201,7 @@ mod platform {
             encoding: u32,
         ) -> CFStringRef;
         fn CFRelease(object: *const c_void);
+        fn CFEqual(a: *const c_void, b: *const c_void) -> u8;
     }
 
     #[link(name = "IOKit", kind = "framework")]
@@ -189,6 +213,27 @@ mod platform {
             id: *mut u32,
         ) -> i32;
         fn IOPMAssertionRelease(id: u32) -> i32;
+        fn IOPSCopyPowerSourcesInfo() -> *const c_void;
+        fn IOPSGetProvidingPowerSourceType(snapshot: *const c_void) -> CFStringRef;
+    }
+
+    /// kIOPMBatteryPowerKey is the providing source; a Mac without a battery
+    /// says "AC Power".
+    pub(super) fn on_battery() -> bool {
+        let Some(battery) = CfString::new("Battery Power") else {
+            return false;
+        };
+        unsafe {
+            let snapshot = IOPSCopyPowerSourcesInfo();
+            if snapshot.is_null() {
+                return false;
+            }
+            // Owned by the snapshot: not released on its own.
+            let source = IOPSGetProvidingPowerSourceType(snapshot);
+            let on = !source.is_null() && CFEqual(source, battery.0) != 0;
+            CFRelease(snapshot);
+            on
+        }
     }
 
     struct CfString(CFStringRef);
@@ -243,6 +288,9 @@ mod platform {
             Some(Self)
         }
     }
+    pub(super) fn on_battery() -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -272,10 +320,10 @@ mod tests {
         let now = Instant::now();
         awake.set_mode(Mode::Agent);
         assert!(!awake.status().active);
-        awake.observe(now, [(1, (3, 10))]);
+        awake.observe(now, [(1, (3, 10))], false);
         assert_eq!(awake.status().working, 1);
         assert!(awake.status().active);
-        awake.observe(now, []);
+        awake.observe(now, [], false);
         assert!(!awake.status().active);
         assert_eq!(
             awake.status().summary(),
@@ -295,18 +343,30 @@ mod tests {
     }
 
     #[test]
+    fn the_lid_warning_shows_on_battery_unless_off() {
+        let mut awake = KeepAwake::default();
+        awake.set_mode(Mode::Agent);
+        awake.observe(Instant::now(), [], false);
+        assert_eq!(awake.status().lid_warning(), None, "on AC power");
+        awake.observe(Instant::now(), [], true);
+        assert!(awake.status().lid_warning().is_some(), "Agent, even idle");
+        awake.set_mode(Mode::Off);
+        assert_eq!(awake.status().lid_warning(), None);
+    }
+
+    #[test]
     fn an_agent_quiet_for_two_hours_stops_counting() {
         let mut awake = KeepAwake::default();
         awake.set_mode(Mode::Agent);
         let start = Instant::now();
-        awake.observe(start, [(7, (5, 100))]);
+        awake.observe(start, [(7, (5, 100))], false);
         let later = start + STALE_AFTER - Duration::from_secs(1);
-        awake.observe(later, [(7, (5, 100))]);
+        awake.observe(later, [(7, (5, 100))], false);
         assert!(awake.status().active, "still within the window");
-        awake.observe(start + STALE_AFTER, [(7, (5, 100))]);
+        awake.observe(start + STALE_AFTER, [(7, (5, 100))], false);
         assert!(!awake.status().active, "no change in two hours");
         // Output again: it counts again from now.
-        awake.observe(start + STALE_AFTER, [(7, (6, 140))]);
+        awake.observe(start + STALE_AFTER, [(7, (6, 140))], false);
         assert!(awake.status().active);
     }
 }

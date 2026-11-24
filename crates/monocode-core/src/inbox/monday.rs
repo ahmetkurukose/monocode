@@ -167,7 +167,7 @@ pub fn monday_list_items(
             return Err(error);
         }
     }
-    items.sort_by(|a, b| b.updated_ms().cmp(&a.updated_ms()));
+    items.sort_by_key(|item| std::cmp::Reverse(item.updated_ms()));
     items.truncate(limit);
     Ok(items)
 }

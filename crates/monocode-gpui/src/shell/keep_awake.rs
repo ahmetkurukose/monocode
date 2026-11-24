@@ -31,8 +31,11 @@ impl Shell {
             })
             .collect();
         let before = keep_awake::status(cx);
-        cx.default_global::<KeepAwake>()
-            .observe(std::time::Instant::now(), agents);
+        cx.default_global::<KeepAwake>().observe(
+            std::time::Instant::now(),
+            agents,
+            keep_awake::on_battery(),
+        );
         if keep_awake::status(cx) != before {
             self.keep_awake_changed(cx);
         }
@@ -90,6 +93,10 @@ impl Shell {
                     .checked(chosen)
                     .into(),
             );
+        }
+        if let Some(warning) = status.lid_warning() {
+            items.push(MenuItem::Separator);
+            items.push(MenuItem::Note(warning.into()));
         }
         items
     }
