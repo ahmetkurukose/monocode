@@ -9,7 +9,7 @@ const TOOL: [(&str, &str); 2] = [("pkg/__init__.py", ""), ("pkg/tool.py", "print
 
 /// A menu as lines: captions in brackets, separators as dashes, a row as its
 /// label, and a row with a submenu followed by what the submenu lists.
-fn shape(items: &[MenuItem]) -> Vec<String> {
+pub(super) fn shape(items: &[MenuItem]) -> Vec<String> {
     items
         .iter()
         .map(|item| match item {
@@ -26,20 +26,20 @@ fn shape(items: &[MenuItem]) -> Vec<String> {
 }
 
 impl Fixture {
-    fn menu(&mut self) -> Vec<MenuItem> {
+    pub(super) fn menu(&mut self) -> Vec<MenuItem> {
         let project = self.project.clone();
         self.visual.update(|_, cx| footer::menu_items(&project, cx))
     }
 
     /// The whole menu the button opens, saved actions and all.
-    fn button_menu(&mut self) -> Vec<MenuItem> {
+    pub(super) fn button_menu(&mut self) -> Vec<MenuItem> {
         (self.window)
             .update(&mut self.visual, |shell, _, cx| shell.actions_menu(cx))
             .unwrap()
     }
 
     /// Saves configurations and returns their ids.
-    fn configure(&mut self, configs: &[(&str, &str)]) -> Vec<String> {
+    pub(super) fn configure(&mut self, configs: &[(&str, &str)]) -> Vec<String> {
         let project = self.project.clone();
         let configs: Vec<RunConfig> = configs.iter().map(|(n, c)| user(n, c)).collect();
         let ids = self.feature(move |window, cx| {
@@ -53,7 +53,7 @@ impl Fixture {
     }
 
     /// The project's latest start, as `run:Name`, `action:Name` or `empty`.
-    fn shown(&mut self) -> String {
+    pub(super) fn shown(&mut self) -> String {
         let project = self.project.clone();
         (self.window)
             .update(&mut self.visual, |shell, _, cx| {
@@ -78,7 +78,7 @@ impl Fixture {
             .unwrap()
     }
 
-    fn click(&mut self, selector: &'static str) {
+    pub(super) fn click(&mut self, selector: &'static str) {
         let bounds = (self.visual.debug_bounds(selector)).unwrap_or_else(|| panic!("{selector}"));
         self.visual
             .simulate_click(bounds.center(), Modifiers::default());
@@ -86,18 +86,18 @@ impl Fixture {
     }
 
     /// Opens the button's menu and picks a row.
-    fn pick(&mut self, row: &str) {
+    pub(super) fn pick(&mut self, row: &str) {
         self.click("footer-action-menu");
         // Selectors live as long as the test run.
         self.click(Box::leak(format!("menu-action-{row}").into_boxed_str()));
     }
 
-    fn started(&mut self, count: usize) {
+    pub(super) fn started(&mut self, count: usize) {
         let root = self.root.clone();
         self.wait("the run to start", |_| fx_runs(&root).len() >= count);
     }
 
-    fn add_action(&mut self, name: &str, command: &str) {
+    pub(super) fn add_action(&mut self, name: &str, command: &str) {
         let project = self.project.clone();
         let action = ProjectAction {
             id: "a1".into(),

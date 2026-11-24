@@ -6,9 +6,12 @@
 //! button and builds the menu from inside its own update, so everything here
 //! reads globals (the saved runs, the registry, the focused file) and never
 //! the shell; what a pick or a click starts waits until that update is over.
+//! A group that is starting or running is one row with a submenu, in place of
+//! the Stop rows of its members.
 use super::{
     chip,
     commands::offered,
+    groups,
     header::{PAGE, RERUN_KEY, shown_key},
     start, targets,
 };
@@ -23,12 +26,12 @@ use gpui::{App, Window};
 use monocode_core::{
     code::{
         dap::SessionState,
-        run::{RunConfig, RunId},
+        run::{RunConfig, RunId, RunInfo},
         services::services,
     },
     files::path_key,
 };
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 /// What `workspace.last_actions` holds for a project whose most recent start
 /// was a run and not a saved action. Action ids are hex numbers, so this is
@@ -54,44 +57,77 @@ fn choices(project: &str, max_age: Duration, cx: &App) -> (Checkout, targets::Ch
     (checkout, choices)
 }
 
-/// What is going on in the project: its runs still running and the debug
-/// sessions that have not ended, as menu rows that end them.
-fn running(project: &str, cx: &App) -> Vec<MenuItem> {
+/// The project's runs that are running.
+fn running_runs(project: &str, cx: &App) -> Vec<RunInfo> {
     let key = path_key(project);
+    (services().runs().list().into_iter())
+        .filter(|info| {
+            info.state.is_running() && path_key(&chip::checkout_of(info, cx).project) == key
+        })
+        .collect()
+}
+
+/// A debug session belongs to no project here: one that is alive is worth
+/// ending from wherever the user is.
+fn live_sessions() -> Vec<std::sync::Arc<monocode_core::code::dap::Session>> {
+    (services().dap().sessions().into_iter())
+        .filter(|session| {
+            session.parent().is_none()
+                && !matches!(session.state(), SessionState::Terminated { .. })
+        })
+        .collect()
+}
+
+/// What is going on in the project, as menu rows that end it: a row with a
+/// submenu for each group that is starting or has members running, then the
+/// other runs still running and the debug sessions that have not ended.
+fn running(project: &str, cx: &App) -> Vec<MenuItem> {
     let mut rows: Vec<MenuItem> = Vec::new();
-    for info in services().runs().list() {
-        if info.state.is_running() && path_key(&chip::checkout_of(&info, cx).project) == key {
-            rows.push(
-                MenuAction::new(
-                    format!("stop:{}", info.id.0),
-                    format!("Stop {}", info.label),
-                )
-                .icon("square")
-                .into(),
-            );
+    let mut grouped: HashSet<RunId> = HashSet::new();
+    for group in groups::running_groups(project, cx) {
+        grouped.extend(group.covers.iter().copied());
+        let stop = |id: String, label: String| MenuAction::new(id, label).icon("square");
+        let mut submenu = vec![stop(format!("group-stop:{}", group.id), "Stop all".into())];
+        for (label, id) in &group.members {
+            submenu.push(stop(format!("stop:{}", id.0), format!("Stop {label}")));
         }
+        rows.push(
+            MenuAction::new(format!("group-running:{}", group.id), group.text)
+                .icon("play")
+                .submenu(submenu)
+                .into(),
+        );
     }
-    // A debug session belongs to no project here: one that is alive is
-    // worth ending from wherever the user is.
-    for session in services().dap().sessions() {
-        if session.parent().is_none() && !matches!(session.state(), SessionState::Terminated { .. })
-        {
-            rows.push(
-                MenuAction::new(
-                    format!("stop-debug:{}", session.id()),
-                    format!("Stop debugging {}", session.label()),
-                )
-                .icon("square")
-                .into(),
-            );
+    for info in running_runs(project, cx) {
+        if grouped.contains(&info.id) {
+            continue;
         }
+        rows.push(
+            MenuAction::new(
+                format!("stop:{}", info.id.0),
+                format!("Stop {}", info.label),
+            )
+            .icon("square")
+            .into(),
+        );
+    }
+    for session in live_sessions() {
+        rows.push(
+            MenuAction::new(
+                format!("stop-debug:{}", session.id()),
+                format!("Stop debugging {}", session.label()),
+            )
+            .icon("square")
+            .into(),
+        );
     }
     rows
 }
 
-/// How many things the menu can stop, for the button's label.
+/// How many things the menu can stop, for the button's label: a group counts
+/// its running members, as the runs they are.
 pub(crate) fn running_count(project: &str, cx: &App) -> usize {
-    running(project, cx).len()
+    running_runs(project, cx).len() + live_sessions().len()
 }
 
 /// Ends a debug session: asks the debuggee to end, and cuts the session
@@ -123,9 +159,9 @@ pub(crate) fn remember(project: &str, window: &mut Window, cx: &mut App) {
     });
 }
 
-/// The run part of the menu, top to bottom: the focused file's built-in
-/// tasks, the project's configurations, Debug, Rerun last and a Stop for
-/// each run in the project. Empty when there is nothing to put in it.
+/// The run part of the menu, top to bottom: the running work, the focused
+/// file's built-in tasks, the project's groups and configurations, Debug and
+/// Rerun last. Empty when there is nothing to put in it.
 pub(crate) fn menu_items(project: &str, cx: &App) -> Vec<MenuItem> {
     let (_, offered) = choices(project, targets::TOOLCHAIN_AGE, cx);
     let mut items: Vec<MenuItem> = Vec::new();
@@ -134,7 +170,7 @@ pub(crate) fn menu_items(project: &str, cx: &App) -> Vec<MenuItem> {
         items.push(MenuItem::Header("Running".into()));
         items.extend(running);
     }
-    let mut list = |title: &'static str, configs: &[RunConfig]| {
+    fn list(items: &mut Vec<MenuItem>, title: &'static str, configs: &[RunConfig]) {
         if configs.is_empty() {
             return;
         }
@@ -146,9 +182,20 @@ pub(crate) fn menu_items(project: &str, cx: &App) -> Vec<MenuItem> {
                     .into(),
             );
         }
-    };
-    list("This file", &offered.builtin);
-    list("Run configurations", &offered.user);
+    }
+    list(&mut items, "This file", &offered.builtin);
+    let saved = settings::runs(project, cx);
+    if !saved.groups.is_empty() {
+        items.push(MenuItem::Header("Groups".into()));
+        for group in &saved.groups {
+            items.push(
+                MenuAction::new(format!("group-go:{}", group.id), group.name.clone())
+                    .icon("play")
+                    .into(),
+            );
+        }
+    }
+    list(&mut items, "Run configurations", &offered.user);
     let mut more: Vec<MenuItem> = Vec::new();
     if launch::can_debug(cx) && !offered.is_empty() {
         let targets = (offered.builtin.iter().chain(&offered.user)).map(|config| {
@@ -193,7 +240,7 @@ pub(crate) fn has_items(project: &str, cx: &App) -> bool {
 /// of its rows. Called inside the shell's update, so the work waits.
 pub(crate) fn pick(id: &str, project: &str, window: &mut Window, cx: &mut App) -> bool {
     let known = matches!(id, "rerun" | "run-settings")
-        || ["go:", "debug:", "stop:", "stop-debug:"]
+        || ["go:", "debug:", "stop:", "stop-debug:", "group-"]
             .iter()
             .any(|prefix| id.starts_with(prefix));
     if !known {
@@ -214,6 +261,12 @@ pub(crate) fn pick(id: &str, project: &str, window: &mut Window, cx: &mut App) -
                 stop_debugging(session);
             } else if let Some(run) = id.strip_prefix("stop:").and_then(|run| run.parse().ok()) {
                 start::stop(RunId(run));
+            } else if let Some(group) = id.strip_prefix("group-go:") {
+                let checkout = checkout_of(&project, cx);
+                let (context, _) = offered(&checkout, targets::TOOLCHAIN_AGE, cx);
+                groups::press(group, checkout, context, window, cx);
+            } else if let Some(group) = id.strip_prefix("group-stop:") {
+                groups::stop_all(&project, group, window, cx);
             } else if let Some(config) = id.strip_prefix("go:") {
                 go(config, &project, false, window, cx);
             } else if let Some(config) = id.strip_prefix("debug:") {

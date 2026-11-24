@@ -1,8 +1,9 @@
 //! Run's commands in quick open: every configuration and built-in task
-//! offered where quick open was opened, the last run again, a stop for each
-//! thing that is running, and the way to the configurations.
+//! offered where quick open was opened, the project's groups, the last run
+//! again, a stop for each thing that is running (a group is one), and the way
+//! to the configurations.
 use super::{
-    chip,
+    chip, groups,
     header::{self, PAGE, RERUN_KEY},
     start, targets,
 };
@@ -139,6 +140,16 @@ fn list(scope: &Scope, cx: &App) -> Vec<Command> {
             }),
         });
     }
+    for group in settings::runs(&scope.project, cx).groups {
+        let (id, context, checkout) = (group.id, context.clone(), checkout.clone());
+        list.push(Command {
+            title: format!("Run: {}", group.name).into(),
+            subtitle: "Run group".into(),
+            run: Rc::new(move |window, cx| {
+                groups::press(&id, checkout.clone(), context.clone(), window, cx);
+            }),
+        });
+    }
     if start::has_last(cx) {
         list.push(Command {
             title: "Run: Rerun last".into(),
@@ -149,8 +160,22 @@ fn list(scope: &Scope, cx: &App) -> Vec<Command> {
         });
     }
     let project = path_key(&scope.project);
+    // A group's members are stopped with it, not listed one by one.
+    let mut grouped = std::collections::HashSet::new();
+    for group in groups::running_groups(&scope.project, cx) {
+        grouped.extend(group.covers.iter().copied());
+        let (id, project) = (group.id, scope.project.clone());
+        list.push(Command {
+            title: format!("Run: Stop {}", group.name).into(),
+            subtitle: "Running".into(),
+            run: Rc::new(move |window, cx| groups::stop_all(&project, &id, window, cx)),
+        });
+    }
     for info in services().runs().list() {
-        if !info.state.is_running() || path_key(&chip::checkout_of(&info, cx).project) != project {
+        if !info.state.is_running()
+            || grouped.contains(&info.id)
+            || path_key(&chip::checkout_of(&info, cx).project) != project
+        {
             continue;
         }
         let id = info.id;

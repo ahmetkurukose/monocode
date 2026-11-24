@@ -67,11 +67,36 @@ strings as typed, camelCase in JSON. `command` (+ `args`, appended) is a command
 by shell rules (`shlex`); no shell runs it, so pipes need `sh -c '…'`. `cwd` is empty (the
 checkout), relative to the checkout, or absolute. `env` is `KEY=VALUE` lines
 (`terminal_setup::parse_environment`). A project keeps `ProjectRuns { configs, last_used,
-test_runner }` with `add` (assigns the id) / `update` / `remove` / `move_to` / `get` /
+test_runner, groups }` with `add` (assigns the id) / `update` / `remove` / `move_to` / `get` /
 `mark_used` / `last_used` / `normalized` / `is_empty`. Configurations are defined **per
 project and resolved per checkout**. They are saved beside the terminal setup, in the
 workspace state: `Workspace::project_runs: HashMap<project_path, ProjectRuns>`, normalized
 on restore, an empty entry dropped.
+
+**Groups.** `ProjectRuns::groups` holds `RunGroup { id, name, order, on_failed_start,
+on_member_exit, members }` (camelCase, every field defaulted, absent from the saved JSON
+while empty, so older state loads and older builds ignore it). A group is not a process: its
+`GroupMember { config, label, wait, timeout }` entries name ordinary configurations of the
+project, and `label` remembers the configuration's name so that a member whose configuration
+is gone can still be named. Deleting a configuration removes it from the groups
+(`ProjectRuns::remove`); `normalized` drops unnamed groups and duplicate members and refreshes
+the labels. Settings, all decided by the group (defaults first): `StartOrder` `Sequential` /
+`Parallel`; `OnFailedStart` `DoNotStartRest` / `StopGroup` / `Continue` (a member fails to
+start when it cannot be resolved, ends before its wait is over, or its wait times out);
+`OnMemberExit` `LeaveOthers` / `StopGroup`; per member `Wait` `None` / `Seconds(n)` /
+`Port(p)` (a TCP port on 127.0.0.1) with a `timeout` in seconds (default 60) that applies to
+a port. Waits only count in a sequential group.
+
+`Sequence::new(&RunGroup, label_of)` is the rules as a state machine with no processes and no
+clock; `begin()` and `event(GroupEvent)` return `GroupAction`s for the caller to carry out.
+Events: `Started(i)`, `StartFailed(i, why)`, `Exited(i, code)`, `Stopped(i)` (by hand: never
+a failure, but a sequential group waiting on that member stops starting), `WaitMet(i)`,
+`WaitTimedOut(i)`, `StopAll`. Actions: `Start(i)` (the caller reports `Started` at once for a
+member that runs already, so a second press only starts the missing ones), `Wait(i, wait,
+timeout)`, `Stop(members)` (last member first), `Reveal(i)`, `Notice(sentence)`, `Up`. A
+member whose configuration is gone is skipped with a notice naming it; a group with none left
+(or none at all) is an `Err` sentence from `new`. `port_open(port)` is the short blocking
+connect the caller polls from a background thread.
 
 **Variables.** `$FILE`, `$RELATIVE_FILE`, `$FILE_DIR`, `$FILE_NAME`, `$FILE_STEM`,
 `$CHECKOUT`, `$PROJECT`, `$SYMBOL`, `$ROW`, `$COLUMN`, `$SELECTED_TEXT`, `$PYTHON`,
@@ -525,8 +550,33 @@ each row shows its tab, stops it, runs it again (as the user, in a tab) or opens
 address it announced in the system browser, which never happens by itself. A run with no tab
 (an agent's `run_start`) opens a read-only dock tab that follows the registry's output.
 
+**Groups** (`groups.rs`, `settings_page/groups.rs`). Pressing a group (footer, quick open)
+builds a core `Sequence` for the project's group and carries it out: each start goes through
+`start::begin_in`, the way a single configuration starts, with a tab title of
+`<group>: <name>` (also the registry label); only the first member's tab is revealed (the
+dock opens), none takes the keyboard, a member that fails is revealed, and a member's start is
+not the project's last run. A member of the same configuration already running in this
+checkout counts as started and is not restarted. A delay is a timer and a port check a short
+connect retried every 250 ms on the background executor, counted in tries against the
+timeout. The registry's `Changed` events tell the sequence when a member ends: `Exited`
+(failure or "later exit" by the group's settings) or `Stopped` (by hand). One `Active` is kept
+per checkout and group while it starts or any member runs; a press during the start is
+refused with a notice. The footer's "Groups" section (between "This file" and "Run
+configurations") lists the project's groups; a group that is starting or has members running
+is one row in "Running", "Dev environment · 2 of 3 running" or "· waiting for Backend", with a
+submenu of "Stop all" and a Stop row per running member, and its members are not listed again
+at the top; the button's count still counts each member as a run. Notices (a failed start, a
+stopped group) use `start::notice`. The settings page has a "Groups" section below the
+configurations: the list (add, duplicate, remove, move), then for the selected group its name
+(typed, saved with Save), choices for the start order and the two failure settings (saved at
+once) and the ordered members (add from the project's configurations, remove, move, and per
+member the wait with its seconds or port and timeout; hidden when the order is parallel).
+Like the rest of the footer, the group rows only read globals; a pick is deferred out of the
+shell's update.
+
 **Quick open** (`commands.rs`). `Run: <name>` for every offered configuration and task,
-`Run: Rerun last`, `Run: Stop <label>` per running run, `Run: Edit configurations`.
+`Run: <group>` for every group, `Run: Rerun last`, `Run: Stop <label>` per running run (a
+group is one: `Run: Stop <group>`), `Run: Edit configurations`.
 
 Not there: dragging to reorder configurations, a "running" state on the header button, an
 "Open in browser" control on the run tab's own header (it is on the chip's row), and

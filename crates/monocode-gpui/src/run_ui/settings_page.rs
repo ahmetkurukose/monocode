@@ -3,6 +3,13 @@
 //! line it comes to for the focused file, the variables it may use, and the
 //! project's test runner. What it saves is `Workspace::project_runs`, the
 //! same list the agents' tools read.
+mod groups;
+#[cfg(any(test, feature = "selftest"))]
+#[allow(unused_imports)]
+pub(crate) use groups::MemberField;
+#[allow(unused_imports)]
+pub(crate) use groups::WaitKind;
+
 use super::{Marks, header::PAGE, targets};
 use crate::{
     code_shell::{
@@ -74,6 +81,8 @@ pub(crate) struct RunsPage {
     /// Told when the test runner changes, since the gutter's marks depend
     /// on it.
     marks: Option<Entity<Marks>>,
+    /// The group being edited, below the configurations.
+    group: groups::GroupForm,
     /// The command line shown under the form, worked out off the UI thread
     /// for what it was asked about.
     preview: Option<Preview>,
@@ -136,9 +145,11 @@ impl RunsPage {
             field.set_max_height(58.);
             field
         });
-        let events = [&name, &command, &arguments, &folder, &environment]
+        let mut events: Vec<Subscription> = [&name, &command, &arguments, &folder, &environment]
             .map(|field| cx.subscribe(field, |this, _, _: &input::Changed, cx| this.typed(cx)))
             .into();
+        let (group, group_typed) = groups::GroupForm::new(cx);
+        events.push(group_typed);
         let runs = settings::runs(&project, cx);
         let mut this = Self {
             project,
@@ -151,6 +162,7 @@ impl RunsPage {
             environment,
             unsaved: false,
             filling: false,
+            group,
             marks,
             preview: None,
             #[cfg(test)]
@@ -159,6 +171,8 @@ impl RunsPage {
         };
         let first = this.runs.configs.first().map(|config| config.id.clone());
         this.select(first, cx);
+        let first = this.runs.groups.first().map(|group| group.id.clone());
+        this.select_group(first, cx);
         this
     }
 
@@ -286,6 +300,8 @@ impl RunsPage {
         };
         let at = (self.runs.configs.iter()).position(|config| config.id == id);
         self.runs.remove(&id);
+        // Groups lose the configuration too.
+        self.fill_group(cx);
         let next = at
             .and_then(|at| {
                 let configs = &self.runs.configs;
@@ -678,9 +694,11 @@ impl Render for RunsPage {
             .child(self.list(cx))
             .child(div().flex().child(add))
             .when(self.selected().is_some(), |d| d.child(self.form_fields()))
-            .child(runners);
+            .child(runners)
+            .child(self.groups_section(cx));
         // Under the scrolling body, so it is there however long the form is.
-        let footer = self.selected().is_some().then(|| {
+        let editing = self.selected().is_some() || self.selected_group().is_some();
+        let footer = editing.then(|| {
             div()
                 .flex()
                 .items_center()
