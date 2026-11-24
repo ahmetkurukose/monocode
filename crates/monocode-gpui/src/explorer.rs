@@ -594,7 +594,11 @@ impl Explorer {
         }
         let old = self.lines.len();
         self.lines = lines;
+        // Splicing every row moves the list's scroll top to row 0, so a
+        // rebuild (a right click, a folder read) would jump to the top.
+        let scroll_top = self.list.logical_scroll_top();
         self.list.splice(0..old, self.lines.len());
+        self.list.scroll_to(scroll_top);
         // Folders are read in the background: the followed file's row is
         // scrolled to in the rebuild that first has it.
         if self.front_pending
@@ -1966,6 +1970,40 @@ mod tests {
                 explorer.show(&file, cx);
                 assert!(shown(explorer, &file));
                 assert_eq!(explorer.selected.as_deref(), Some(file.as_str()));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_rebuild_keeps_the_tree_where_it_was_scrolled(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        for ix in 0..40 {
+            std::fs::create_dir_all(format!("{cwd}/dir{ix:02}")).unwrap();
+        }
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+                cx.new(|cx| Explorer::new(git, window, cx))
+            })
+            .unwrap()
+        });
+        window
+            .update(cx, |explorer, _, cx| explorer.set_enabled(true, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| {
+                assert!(explorer.lines.len() >= 40);
+                let scrolled = gpui::ListOffset {
+                    item_ix: 30,
+                    offset_in_item: px(4.),
+                };
+                explorer.list.scroll_to(scrolled);
+                // What a right click on a row does to the tree.
+                explorer.rebuild(cx);
+                assert_eq!(explorer.list.logical_scroll_top(), scrolled);
             })
             .unwrap();
     }
