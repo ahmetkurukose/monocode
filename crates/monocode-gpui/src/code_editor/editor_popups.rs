@@ -3,7 +3,8 @@
 //! answers, and the list a symbol with several targets opens.
 use super::*;
 use crate::code_editor::{
-    LinkProvider, Location, References, ReferencesProvider, ResolvedTarget, Signature, links,
+    LinkProvider, Location, Navigation, NavigationProvider, References, ReferencesProvider,
+    ResolvedTarget, Signature, links,
     markdown::{Document, surface},
 };
 use crate::popover::{Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover};
@@ -296,6 +297,66 @@ impl Input {
                 [] => {}
                 [only] => this.jump(at, &only.location, window, cx),
                 _ => this.open_picker(at, "Definitions", targets, window, cx),
+            },
+        );
+        if let Some(code) = &mut self.code {
+            code.ext_mut().navigation = Some(task);
+        }
+    }
+    pub(in crate::input) fn navigation_provider(&self) -> Option<Rc<dyn NavigationProvider>> {
+        let ext = self.code.as_ref()?.ext.as_ref()?;
+        ext.providers.navigation.clone()
+    }
+    pub(in crate::input) fn go_to_declaration(
+        &mut self,
+        _: &GoToDeclaration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate(Navigation::Declaration, window, cx);
+    }
+    pub(in crate::input) fn go_to_type_definition(
+        &mut self,
+        _: &GoToTypeDefinition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate(Navigation::TypeDefinition, window, cx);
+    }
+    pub(in crate::input) fn go_to_implementation(
+        &mut self,
+        _: &GoToImplementation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate(Navigation::Implementation, window, cx);
+    }
+    /// Jumps to the one place `kind` leads, lists several, and says so when
+    /// there is none.
+    fn navigate(&mut self, kind: Navigation, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(provider), Some(code)) = (self.navigation_provider(), &self.code) else {
+            cx.propagate();
+            return;
+        };
+        let open = (code.document().path.clone(), self.content.clone());
+        let at = self.cursor();
+        let task = self.ask(
+            at,
+            Duration::ZERO,
+            window,
+            cx,
+            move |position, cx| {
+                let found = provider.locate(kind, position, cx);
+                cx.background_executor()
+                    .spawn(async move { found.await.map(|targets| links::resolve(targets, open)) })
+            },
+            move |this, found: Result<Vec<ResolvedTarget>, String>, window, cx| match found {
+                Ok(targets) => match targets.as_slice() {
+                    [] => cx.emit(EditorNotice(format!("No {} found", kind.singular()))),
+                    [only] => this.jump(at, &only.location, window, cx),
+                    _ => this.open_picker(at, kind.plural(), targets, window, cx),
+                },
+                Err(message) => cx.emit(EditorNotice(message)),
             },
         );
         if let Some(code) = &mut self.code {

@@ -674,3 +674,300 @@ fn hover_signature_help_and_usages_show_what_the_server_answers(cx: &mut TestApp
         assert_eq!((back.path.as_path(), back.line), (path.as_path(), 1));
     });
 }
+
+/// basedpyright as `server_for` scripts it, offering rename and code actions.
+fn refactoring_server(launch: &Launch) -> std::io::Result<FakeServer> {
+    if launch.program.ends_with("ruff") {
+        return Ok(server_for(launch));
+    }
+    let mut caps = insight();
+    caps["renameProvider"] = json!({ "prepareProvider": true });
+    caps["codeActionProvider"] = json!({ "resolveProvider": true });
+    Ok(FakeServer::new(caps))
+}
+
+fn editor_error(window: WindowHandle<FileEditor>, cx: &mut VisualTestContext) -> Option<String> {
+    window
+        .read_with(cx, |view, _| view.error_text().map(str::to_owned))
+        .unwrap()
+}
+
+#[gpui::test]
+fn rename_changes_the_open_buffer_in_one_undo_step_and_closed_files_on_disk(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "def add(a, b):\n    return a + b\n\ntotal = add(1, 2)\n";
+    let path = rig.write("app.py", text);
+    let other_text = "from app import add\nadd(3, 4)\n";
+    let other = rig.write("other.py", other_text);
+    let window = open(&path, &rig.root, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    wait(cx, "the server to be ready", |cx| {
+        cx.update(|_, cx| synced(&path, cx))
+            && rig.state_of("basedpyright") == Some(lsp::ServerState::Ready)
+    });
+    let pyright = rig.pyright();
+    let input = input_of(window, cx);
+
+    // Nothing to rename: the editor says so.
+    pyright.on("textDocument/prepareRename", |message, out| {
+        out.result(message, Value::Null)
+    });
+    let blank = text.find("\n\n").unwrap() + 1;
+    input.update(cx, |input, cx| input.select_range(blank..blank, cx));
+    cx.simulate_keystrokes("shift-f6");
+    wait(cx, "the notice", |cx| editor_error(window, cx).is_some());
+    assert_eq!(
+        editor_error(window, cx).as_deref(),
+        Some("There is nothing to rename here")
+    );
+
+    let call = range_of(&text[blank..], "add");
+    let call = json!({
+        "start": { "line": 3, "character": call["start"]["character"] },
+        "end": { "line": 3, "character": call["end"]["character"] },
+    });
+    pyright.on("textDocument/prepareRename", move |message, out| {
+        out.result(message, call.clone())
+    });
+    let (here, there) = (uri(&path), uri(&other));
+    pyright.on("textDocument/rename", move |message, out| {
+        let name = message["params"]["newName"].clone();
+        out.result(
+            message,
+            json!({ "changes": {
+                here.clone(): [
+                    { "range": range((0, 4), (0, 7)), "newText": name },
+                    { "range": range((3, 8), (3, 11)), "newText": name },
+                ],
+                there.clone(): [
+                    { "range": range((0, 16), (0, 19)), "newText": name },
+                    { "range": range((1, 0), (1, 3)), "newText": name },
+                ],
+            } }),
+        );
+    });
+    let at = text.rfind("add").unwrap() + 1;
+    input.update(cx, |input, cx| input.select_range(at..at, cx));
+    cx.simulate_keystrokes("shift-f6");
+    wait(cx, "the rename field", |cx| {
+        input.read_with(cx, |input, _| input.rename_open().is_some())
+    });
+    let field = input.read_with(cx, |input, _| input.rename_open().unwrap());
+    assert_eq!(
+        field.read_with(cx, |field, _| field.content.to_string()),
+        "add"
+    );
+    assert!(
+        cx.debug_bounds("editor-rename").is_some(),
+        "the field is drawn"
+    );
+    field.update(cx, |field, cx| field.set_text("sum".into(), cx));
+    cx.simulate_keystrokes("enter");
+    wait(cx, "the renamed text", |cx| {
+        input.read_with(cx, |input, _| input.content.contains("def sum"))
+            && std::fs::read_to_string(&other).unwrap() != other_text
+    });
+    let renamed = "def sum(a, b):\n    return a + b\n\ntotal = sum(1, 2)\n";
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        renamed
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other).unwrap(),
+        "from app import sum\nsum(3, 4)\n"
+    );
+    assert!(input.read_with(cx, |input, _| input.rename_open().is_none()));
+    // The caret stays on the name it was in.
+    let caret = input.read_with(cx, |input, _| input.selection_range());
+    assert_eq!(&renamed[caret.start - 1..caret.start + 2], "sum");
+    // The open file's part is one step of undo.
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        text
+    );
+}
+
+#[gpui::test]
+fn context_actions_list_fixes_first_apply_edits_and_resolve_the_rest(cx: &mut TestAppContext) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "value = sqrt(4)\n";
+    let path = rig.write("app.py", text);
+    let window = open(&path, &rig.root, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    wait(cx, "the server to be ready", |cx| {
+        cx.update(|_, cx| synced(&path, cx))
+            && rig.state_of("basedpyright") == Some(lsp::ServerState::Ready)
+    });
+    let pyright = rig.pyright();
+    let input = input_of(window, cx);
+    let here = uri(&path);
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([
+                { "title": "Extract variable", "kind": "refactor.extract", "data": 1 },
+                { "title": "Run the linter", "command": "lint.run" },
+                { "title": "Import sqrt from math", "kind": "quickfix", "isPreferred": true,
+                  "edit": { "changes": { here.clone(): [
+                      { "range": range((0, 0), (0, 0)), "newText": "from math import sqrt\n" },
+                  ] } } },
+            ]),
+        );
+    });
+    let at = text.find("sqrt").unwrap();
+    input.update(cx, |input, cx| input.select_range(at..at, cx));
+    cx.simulate_keystrokes("alt-enter");
+    wait(cx, "the actions", |cx| {
+        input.read_with(cx, |input, _| input.actions_open())
+    });
+    let asked = pyright.wait_for("textDocument/codeAction");
+    assert_eq!(
+        asked["params"]["range"],
+        json!({ "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 8 } })
+    );
+    // The fix leads; the action that only runs a command comes last.
+    let fix = cx.debug_bounds("menu-action-0").expect("the fix is listed");
+    assert!(cx.debug_bounds("menu-action-2").is_some());
+    cx.simulate_click(fix.center(), gpui::Modifiers::default());
+    wait(cx, "the fix", |cx| {
+        input.read_with(cx, |input, _| input.content.starts_with("from math"))
+    });
+    assert!(!input.read_with(cx, |input, _| input.actions_open()));
+
+    // An action without its edit is resolved first.
+    let text = input.read_with(cx, |input, _| input.content.to_string());
+    let here = uri(&path);
+    pyright.on("codeAction/resolve", move |message, out| {
+        let mut action = message["params"].clone();
+        action["edit"] = json!({ "changes": { here.clone(): [
+            { "range": range((1, 8), (1, 15)), "newText": "root" },
+        ] } });
+        out.result(message, action);
+    });
+    let at = text.find("sqrt(4)").unwrap();
+    input.update(cx, |input, cx| input.select_range(at..at + 7, cx));
+    cx.simulate_keystrokes("alt-enter");
+    wait(cx, "the actions", |cx| {
+        input.read_with(cx, |input, _| input.actions_open())
+    });
+    let extract = cx.debug_bounds("menu-action-1").expect("the refactoring");
+    cx.simulate_click(extract.center(), gpui::Modifiers::default());
+    wait(cx, "the resolved edit", |cx| {
+        input.read_with(cx, |input, _| input.content.contains("value = root"))
+    });
+    assert_eq!(
+        pyright.wait_for("codeAction/resolve")["params"]["data"],
+        json!(1)
+    );
+
+    // A command runs on the server, which asks for its edit while it does.
+    let here = uri(&path);
+    pyright.on("workspace/executeCommand", move |message, out| {
+        out.send(
+            &json!({ "jsonrpc": "2.0", "id": 77, "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": { here.clone(): [
+                { "range": range((0, 0), (0, 0)), "newText": "# linted\n" } ] } } } }),
+        );
+        out.result(message, Value::Null);
+    });
+    cx.simulate_keystrokes("alt-enter");
+    wait(cx, "the actions", |cx| {
+        input.read_with(cx, |input, _| input.actions_open())
+    });
+    let command = cx.debug_bounds("menu-action-2").expect("the command");
+    cx.simulate_click(command.center(), gpui::Modifiers::default());
+    wait(cx, "the command's edit", |cx| {
+        input.read_with(cx, |input, _| input.content.starts_with("# linted\n"))
+    });
+    assert_eq!(
+        pyright.wait_for("workspace/executeCommand")["params"]["command"],
+        json!("lint.run")
+    );
+}
+
+#[gpui::test]
+fn go_to_type_definition_jumps_implementations_list_and_missing_ones_say_so(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::with(
+        |launch| {
+            if launch.program.ends_with("ruff") {
+                return Ok(server_for(launch));
+            }
+            let mut caps = insight();
+            caps["typeDefinitionProvider"] = json!(true);
+            caps["implementationProvider"] = json!(true);
+            Ok(FakeServer::new(caps))
+        },
+        cx,
+    );
+    let text = "class Shape: pass\nclass Box(Shape): pass\nclass Dot(Shape): pass\nitem = Box()\n";
+    let path = rig.write("app.py", text);
+    let window = open(&path, &rig.root, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    wait(cx, "the server to be ready", |cx| {
+        cx.update(|_, cx| synced(&path, cx))
+            && rig.state_of("basedpyright") == Some(lsp::ServerState::Ready)
+    });
+    let pyright = rig.pyright();
+    let input = input_of(window, cx);
+    let here = uri(&path);
+    let boxed = range_of(text, "Box");
+    pyright.on("textDocument/typeDefinition", move |message, out| {
+        out.result(message, json!({ "uri": here, "range": boxed }))
+    });
+    let here = uri(&path);
+    pyright.on("textDocument/implementation", move |message, out| {
+        out.result(
+            message,
+            json!([{ "uri": here, "range": range((1, 6), (1, 9)) },
+                   { "uri": here, "range": range((2, 6), (2, 9)) }]),
+        )
+    });
+
+    // One type definition: the caret goes there.
+    let item = text.find("item").unwrap();
+    input.update(cx, |input, cx| input.select_range(item..item, cx));
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(input::GoToTypeDefinition), cx)
+        })
+        .unwrap();
+    let target = text.find("Box").unwrap();
+    wait(cx, "the jump", |cx| {
+        input.read_with(cx, |input, _| input.selection_range() == (target..target))
+    });
+
+    // Two implementations: listed in the editor.
+    let shape = text.find("Shape").unwrap();
+    input.update(cx, |input, cx| input.select_range(shape..shape, cx));
+    cx.simulate_keystrokes("cmd-f12");
+    wait(cx, "the list", |cx| {
+        input.read_with(cx, |input, _| input.picker_targets().is_some())
+    });
+    let lines: Vec<usize> = input.read_with(cx, |input, _| {
+        input
+            .picker_targets()
+            .unwrap()
+            .iter()
+            .map(|t| t.location.line)
+            .collect()
+    });
+    assert_eq!(lines, [2, 3]);
+    cx.simulate_keystrokes("escape");
+
+    // A server without declarations: the editor says so.
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(input::GoToDeclaration), cx)
+        })
+        .unwrap();
+    wait(cx, "the notice", |cx| editor_error(window, cx).is_some());
+    assert_eq!(
+        editor_error(window, cx).as_deref(),
+        Some("The language server does not support this.")
+    );
+}

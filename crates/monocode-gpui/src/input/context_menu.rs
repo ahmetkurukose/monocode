@@ -3,6 +3,24 @@
 use super::*;
 use crate::popover::{Anchor, Menu, MenuAction, MenuEvent, MenuItem, menu_popover};
 
+/// Opens an owner's own menu at a right-click. The caret has already moved
+/// there, unless it landed inside the selection. Called after the input's
+/// update ends, so the owner can read it.
+pub(crate) type MenuDelegate = std::rc::Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>;
+
+/// What the editing commands can do right now, for an owner's own menu.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EditingCaps {
+    pub definition: bool,
+    pub usages: bool,
+    pub navigation: bool,
+    pub comment: bool,
+    pub actions: bool,
+    pub rename: bool,
+    pub read_only: bool,
+    pub folds: bool,
+}
+
 pub(super) struct EditingMenu {
     menu: Entity<Menu>,
     position: Point<Pixels>,
@@ -10,6 +28,23 @@ pub(super) struct EditingMenu {
 }
 
 impl Input {
+    /// Right-clicks call `open` instead of opening the shared text menu:
+    /// the file editor builds a menu of its own.
+    pub(crate) fn delegate_context_menu(&mut self, open: MenuDelegate) {
+        self.delegate_menu = Some(open);
+    }
+    pub(crate) fn editing_caps(&self) -> EditingCaps {
+        EditingCaps {
+            definition: self.link_provider().is_some(),
+            usages: self.references_provider().is_some(),
+            navigation: self.navigation_provider().is_some(),
+            comment: self.comment_syntax().is_some(),
+            actions: self.actions_provider().is_some(),
+            rename: self.rename_provider().is_some(),
+            read_only: self.read_only,
+            folds: self.code.is_some() && !self.editor_analysis().folds.is_empty(),
+        }
+    }
     fn editing_menu_items(&self, clipboard: bool) -> Vec<MenuItem> {
         let modifier = if cfg!(target_os = "macos") {
             "⌘"
@@ -95,6 +130,13 @@ impl Input {
         // point so Paste applies where the user opened the menu.
         if self.selection.is_empty() || !self.selection.contains(&index) {
             self.move_to(index, cx);
+        }
+        if let Some(open) = self.delegate_menu.clone() {
+            let at = event.position;
+            window.defer(cx, move |window, cx| open(at, window, cx));
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         let items = self.editing_menu_items(cx.read_from_clipboard().is_some());
         let menu = cx.new(|cx| Menu::new("Text editing", items, window, cx));

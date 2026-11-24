@@ -1,13 +1,14 @@
-//! The editor's completion, hover, signature, definition and usages
-//! providers, answered by the language servers. Every request runs on a
+//! The editor's completion, hover, signature, definition, usages, rename
+//! and code action providers, answered by the language servers. Every request runs on a
 //! background thread with a cancel token that is cancelled when the editor
 //! drops the task it was handed, so a burst of typing leaves no queue of
 //! requests behind it.
 use super::{convert, sync::serves};
 use crate::code_editor::{
-    self, CompletionItem, CompletionProvider, CompletionRequest, CompletionTrigger, DocumentInfo,
-    Hover, HoverProvider, LinkProvider, LinkTarget, Position, ReferencesProvider, Signature,
-    SignatureProvider, TargetPosition,
+    self, CodeActionItem, CodeActionProvider, CompletionItem, CompletionProvider,
+    CompletionRequest, CompletionTrigger, DocumentInfo, FileEdit, Hover, HoverProvider,
+    LinkProvider, LinkTarget, Navigation, NavigationProvider, Position, ReferencesProvider,
+    RenameProvider, RenameRange, Signature, SignatureProvider, TargetPosition, TextEdit,
 };
 use gpui::{App, SharedString, Task};
 use monocode_core::{
@@ -32,6 +33,9 @@ pub(super) fn register(manager: lsp::Manager, cx: &mut App) {
         providers.signature = Some(provider.clone());
         providers.links = Some(provider.clone());
         providers.references = Some(provider.clone());
+        providers.navigation = Some(provider.clone());
+        providers.rename = Some(provider.clone());
+        providers.actions = Some(provider.clone());
     });
 }
 
@@ -148,6 +152,42 @@ impl Places {
             });
         }
         targets
+    }
+
+    /// A server's change as edits in bytes of each file's text: the
+    /// editors' unsaved text for open files, the disk's for the others.
+    /// Reads files: for a background thread.
+    fn file_edits(&self, change: lsp::WorkspaceEdit) -> Result<Vec<FileEdit>, String> {
+        if change.file_operations > 0 {
+            return Err(
+                "The change also creates, renames or deletes files, which is not supported yet"
+                    .into(),
+            );
+        }
+        (change.changes.into_iter())
+            .map(|(path, edits)| {
+                let spelled = self.spell(path.clone());
+                let base: SharedString = match self.open.get(&spelled) {
+                    Some(text) => text.clone(),
+                    None => std::fs::read_to_string(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                        .into(),
+                };
+                let index = LineIndex::new(&base);
+                let edits = (edits.into_iter())
+                    .map(|edit| TextEdit {
+                        range: index.offset_of(&base, edit.range.start)
+                            ..index.offset_of(&base, edit.range.end),
+                        text: edit.text,
+                    })
+                    .collect();
+                Ok(FileEdit {
+                    path: spelled,
+                    base,
+                    edits,
+                })
+            })
+            .collect()
     }
 }
 
@@ -267,6 +307,138 @@ impl ReferencesProvider for Provider {
         self.ask(cx, move |manager, cancel| {
             let found = manager.references(&path, offset, true, cancel);
             places.targets(found.unwrap_or_default())
+        })
+    }
+}
+
+impl RenameProvider for Provider {
+    fn prepare(&self, at: Position, cx: &mut App) -> Task<Result<Option<RenameRange>, String>> {
+        let path = at.doc.path.clone();
+        let (text, offset) = (at.text, at.offset);
+        self.ask(cx, move |manager, cancel| {
+            let Some(target) = manager
+                .prepare_rename(&path, offset, cancel)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            let range = match target.range {
+                Some(span) => {
+                    let index = LineIndex::new(&text);
+                    index.offset_of(&text, span.start)..index.offset_of(&text, span.end)
+                }
+                None => match code_editor::links::word_at(&text, offset) {
+                    Some(word) => word,
+                    None => return Ok(None),
+                },
+            };
+            let placeholder = target
+                .placeholder
+                .or_else(|| text.get(range.clone()).map(str::to_string))
+                .unwrap_or_default();
+            Ok(Some(RenameRange { range, placeholder }))
+        })
+    }
+
+    fn rename(
+        &self,
+        at: Position,
+        name: String,
+        cx: &mut App,
+    ) -> Task<Result<Vec<FileEdit>, String>> {
+        let path = at.doc.path.clone();
+        let offset = at.offset;
+        let places = Places::new(cx);
+        self.ask(cx, move |manager, cancel| {
+            let change = manager
+                .rename(&path, offset, &name, cancel)
+                .map_err(|error| error.to_string())?;
+            if change.is_empty() {
+                return Err("The language server found nothing to rename".into());
+            }
+            places.file_edits(change)
+        })
+    }
+}
+
+impl CodeActionProvider for Provider {
+    fn actions(
+        &self,
+        at: Position,
+        range: std::ops::Range<usize>,
+        cx: &mut App,
+    ) -> Task<Result<Vec<CodeActionItem>, String>> {
+        let path = at.doc.path.clone();
+        let found = self.ask(cx, move |manager, cancel| {
+            manager
+                .code_actions(&path, range, cancel)
+                .map_err(|error| error.to_string())
+        });
+        // The items hold `Rc`s, so they are made back on the UI thread.
+        cx.foreground_executor().spawn(async move {
+            Ok(found
+                .await?
+                .into_iter()
+                .map(|action| CodeActionItem {
+                    title: action.title.clone().into(),
+                    kind: action.kind.clone().map(Into::into),
+                    preferred: action.preferred,
+                    disabled: action.disabled.clone().map(Into::into),
+                    data: Rc::new(action),
+                })
+                .collect())
+        })
+    }
+
+    fn edits(
+        &self,
+        at: Position,
+        item: &CodeActionItem,
+        cx: &mut App,
+    ) -> Task<Result<Vec<FileEdit>, String>> {
+        let Some(action) = item.data.downcast_ref::<lsp::CodeAction>().cloned() else {
+            return Task::ready(Err("The action is not one of the language server's".into()));
+        };
+        let path = at.doc.path.clone();
+        let places = Places::new(cx);
+        self.ask(cx, move |manager, cancel| {
+            let resolved = manager
+                .resolve_code_action(&path, &action, cancel)
+                .map_err(|error| error.to_string())?;
+            match resolved.edit {
+                Some(edit) => places.file_edits(edit),
+                // The command asks for its edits while it runs.
+                None if resolved.command => {
+                    let change = manager
+                        .run_code_action_command(&path, &resolved, cancel)
+                        .map_err(|error| error.to_string())?;
+                    places.file_edits(change)
+                }
+                None => Err("The language server sent no changes for this action".into()),
+            }
+        })
+    }
+}
+
+impl NavigationProvider for Provider {
+    fn locate(
+        &self,
+        kind: Navigation,
+        at: Position,
+        cx: &mut App,
+    ) -> Task<Result<Vec<LinkTarget>, String>> {
+        let path = at.doc.path.clone();
+        let offset = at.offset;
+        let places = Places::new(cx);
+        self.ask(cx, move |manager, cancel| {
+            let found = match kind {
+                Navigation::Declaration => manager.declaration(&path, offset, cancel),
+                Navigation::TypeDefinition => manager.type_definition(&path, offset, cancel),
+                Navigation::Implementation => manager.implementation(&path, offset, cancel),
+            };
+            found
+                .map(|found| places.targets(found))
+                .map_err(|error| error.to_string())
         })
     }
 }

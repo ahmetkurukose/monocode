@@ -5,7 +5,7 @@
 //! now or when it opens.
 use super::{
     DiagnosticCounts, DocumentInfo, ExternalDiagnostic, GutterMark, GutterSlot, History,
-    InlineNote, LineDecoration, Location, ReferencesHandler,
+    InlineNote, LineDecoration, Location, ReferencesHandler, TextEdit,
 };
 use gpui::{Context, EventEmitter, SharedString};
 use std::{
@@ -61,6 +61,13 @@ pub(crate) enum HubEvent {
     },
     /// A feature registered; editors install their providers again.
     Providers,
+    /// Edits for the editors that have the file open, in bytes of `base`:
+    /// a rename or code action reaching this file (`refactor::apply`).
+    Apply {
+        path: PathBuf,
+        base: SharedString,
+        edits: Vec<TextEdit>,
+    },
     History,
 }
 

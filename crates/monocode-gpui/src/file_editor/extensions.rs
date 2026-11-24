@@ -199,6 +199,24 @@ impl FileEditor {
             }
             HubEvent::Gutter { path: file, slot } if file == path => self.mirror_gutter(*slot, cx),
             HubEvent::Decorations(file) if file == path => self.mirror_decorations(cx),
+            HubEvent::Apply {
+                path: file,
+                base,
+                edits,
+            } if file == path => {
+                let applied = self
+                    .input
+                    .update(cx, |input, cx| input.apply_text_edits(base, edits, cx));
+                if !applied {
+                    self.show_notice(
+                        format!(
+                            "{} changed before the edits arrived; it was left as it is",
+                            self.relative_path()
+                        ),
+                        cx,
+                    );
+                }
+            }
             HubEvent::Reveal { path: file, row } if file == path => {
                 let row = *row;
                 self.input.update(cx, |input, cx| input.reveal_row(row, cx));
