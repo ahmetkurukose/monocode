@@ -282,6 +282,10 @@ struct Protocol {
     compact: bool,
     command_probe: bool,
     compact_confirmed: bool,
+    /// What Claude says the context holds after a compaction, until a later
+    /// request reports its own size. The compacting turn's result counts the
+    /// summarizing request, which read the whole old context.
+    compacted_used: Option<u64>,
     active_turn: Option<String>,
     previous_turn: Option<String>,
     interrupt_id: Option<String>,
@@ -323,6 +327,7 @@ impl Protocol {
             compact: false,
             command_probe: false,
             compact_confirmed: false,
+            compacted_used: None,
             active_turn: None,
             previous_turn: None,
             interrupt_id: None,
@@ -491,6 +496,22 @@ impl Protocol {
                 .is_some_and(|subtype| subtype.starts_with("compact"))
             {
                 self.compaction(None, ToolState::Completed, &mut events);
+                if v["subtype"] == "compact_boundary" {
+                    let meta = if v["compact_metadata"].is_object() {
+                        &v["compact_metadata"]
+                    } else {
+                        &v["compactMetadata"]
+                    };
+                    let used = meta["post_tokens"]
+                        .as_u64()
+                        .or_else(|| meta["postTokens"].as_u64())
+                        .unwrap_or(0);
+                    self.compacted_used = Some(used);
+                    events.push(Event::Context {
+                        used: Some(used),
+                        window: None,
+                    });
+                }
             }
         }
         if let Some(commands) = self.command_updates(&v) {
@@ -870,6 +891,7 @@ impl Protocol {
                         if v["parent_tool_use_id"].is_null() {
                             if let Some(used) = crate::context::claude_used(&v["message"]["usage"])
                             {
+                                self.compacted_used = None;
                                 events.push(Event::Context {
                                     used: Some(used),
                                     window: None,
@@ -961,7 +983,10 @@ impl Protocol {
                             .as_array()
                             .and_then(|iterations| iterations.last())
                             .unwrap_or(&v["usage"]);
-                        let used = crate::context::claude_used(last);
+                        let used = self
+                            .compacted_used
+                            .take()
+                            .or_else(|| crate::context::claude_used(last));
                         let window = v["modelUsage"]
                             .as_object()
                             .into_iter()
@@ -2050,6 +2075,38 @@ mod tests {
         assert!(events.contains(&Event::Context {
             used: Some(2050),
             window: Some(200000)
+        }));
+    }
+    #[test]
+    fn claude_compaction_reports_the_context_it_left() {
+        let mut claude = protocol(Kind::Claude);
+        let events = claude.frame(json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":851299,"post_tokens":21522}}),&mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Context {
+            used: Some(21522),
+            window: None
+        }));
+        // The turn's result counts the summarizing request, not what is left.
+        let events = claude.frame(json!({"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":851299,"output_tokens":4000},"modelUsage":{"model":{"contextWindow":1000000}}}),&mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Context {
+            used: Some(21522),
+            window: Some(1000000)
+        }));
+        // A request after the compaction reports its own size again.
+        claude.frame(json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":900000}}),&mut Vec::new()).unwrap();
+        let events = claude
+            .frame(
+                json!({"type":"assistant","message":{"content":[],"usage":{"input_tokens":30000}}}),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert!(events.contains(&Event::Context {
+            used: Some(30000),
+            window: None
+        }));
+        let events = claude.frame(json!({"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":31000}}),&mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Context {
+            used: Some(31000),
+            window: None
         }));
     }
     #[test]
