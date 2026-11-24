@@ -44,6 +44,16 @@ pub(crate) struct Request {
     pub debug: bool,
 }
 
+/// What makes a start one of a group's members: its tab says which group it
+/// belongs to, only the first one opens the dock, and nothing of it is the
+/// project's "last run".
+#[derive(Clone)]
+pub(super) struct GroupTab {
+    pub group: String,
+    /// Show the tab (opening the dock). The others are added where they are.
+    pub reveal: bool,
+}
+
 /// How a start ended: the run's id in the registry, or the sentence the
 /// user was shown. A debug start that worked sends nothing and closes.
 pub(crate) type Outcome = async_channel::Receiver<Result<RunId, String>>;
@@ -190,6 +200,32 @@ pub(crate) fn stop(id: RunId) {
     services().runs().stop(id);
 }
 
+/// The run of a configuration that is running in this checkout's tab, as the
+/// user started it: what a group counts as started already.
+pub(super) fn running_config(config: &str, folder: &str, cx: &App) -> Option<RunId> {
+    let state = cx.try_global::<State>()?;
+    (state.live.iter())
+        .find(|live| {
+            live.config.as_deref() == Some(config)
+                && live.by == StartedBy::User
+                && live.checkout.folder == folder
+                && running(live.id)
+        })
+        .map(|live| live.id)
+}
+
+/// Shows a run's tab, if it has one, without taking the keyboard.
+pub(super) fn reveal(id: RunId, window: &mut Window, cx: &mut App) {
+    let Some(tab) = tab_of(id, cx) else {
+        return;
+    };
+    let focused = window.focused(cx);
+    tab.reveal(window, cx);
+    if let Some(focused) = focused {
+        window.focus(&focused, cx);
+    }
+}
+
 /// The tab of a run, while it has one that is open.
 pub(crate) fn tab_of(id: RunId, cx: &App) -> Option<DockTabHandle> {
     let state = cx.try_global::<State>()?;
@@ -241,6 +277,11 @@ fn save_focused(cx: &mut App) -> Option<(async_channel::Receiver<()>, Subscripti
 /// Starts `request`. Returns at once; the work continues on the UI thread
 /// once the file is saved and the configuration resolved.
 pub(crate) fn begin(request: Request, cx: &mut App) -> Outcome {
+    begin_in(request, None, cx)
+}
+
+/// `begin`, for a member of a group when `tab` says so.
+pub(super) fn begin_in(request: Request, tab: Option<GroupTab>, cx: &mut App) -> Outcome {
     let (report, outcome) = async_channel::bounded(1);
     cx.spawn(async move |cx| {
         // Not read here, before the spawn: a gutter menu's click runs inside
@@ -280,7 +321,15 @@ pub(crate) fn begin(request: Request, cx: &mut App) -> Outcome {
         cx.update(|cx| {
             code_shell::in_window(cx, |window, cx| {
                 let result = match resolved {
-                    Ok(spawn) => started(spawn, config, checkout, by, debug, window, cx),
+                    Ok(spawn) => started(
+                        spawn,
+                        config,
+                        checkout,
+                        (by, debug),
+                        tab.as_ref(),
+                        window,
+                        cx,
+                    ),
                     Err(unresolved) => {
                         let label = config.map(|config| config.label()).unwrap_or_default();
                         Err(format!("\u{201c}{label}\u{201d} cannot run. {unresolved}"))
@@ -306,14 +355,18 @@ pub(crate) fn begin(request: Request, cx: &mut App) -> Outcome {
 /// The resolved process goes to its tab or to the debugger, and a user's
 /// run is remembered.
 fn started(
-    spawn: Spawn,
+    mut spawn: Spawn,
     config: Option<RunConfig>,
     checkout: Checkout,
-    by: StartedBy,
-    debug: bool,
+    (by, debug): (StartedBy, bool),
+    tab: Option<&GroupTab>,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Option<RunId>, String> {
+    if let Some(tab) = tab {
+        spawn.label = format!("{}: {}", tab.group, spawn.label);
+    }
+    let reveal = tab.is_none_or(|tab| tab.reveal);
     let id = if debug {
         if !launch::debug(spawn.clone(), checkout.clone(), window, cx) {
             return Err("No debugger is installed.".into());
@@ -321,9 +374,17 @@ fn started(
         None
     } else {
         let config = config.as_ref().map(|config| config.id.as_str());
-        Some(launch(spawn.clone(), &checkout, by, config, window, cx)?)
+        Some(launch(
+            spawn.clone(),
+            &checkout,
+            by,
+            config,
+            reveal,
+            window,
+            cx,
+        )?)
     };
-    if by != StartedBy::User {
+    if by != StartedBy::User || tab.is_some() {
         return Ok(id);
     }
     // The footer's button repeats the latest start, of either kind.
@@ -369,6 +430,7 @@ fn launch(
     checkout: &Checkout,
     by: StartedBy,
     config: Option<&str>,
+    reveal: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<RunId, String> {
@@ -425,6 +487,7 @@ fn launch(
     };
     let request = RunRequest {
         agent,
+        reveal,
         ..RunRequest::new(spawn.clone(), checkout.clone())
     };
     let run = dock::run(request, window, cx)?;

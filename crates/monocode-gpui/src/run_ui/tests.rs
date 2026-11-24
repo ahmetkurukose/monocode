@@ -4,12 +4,13 @@
 //! header's menu, the gutter's markers, the settings page, the chip and
 //! quick open. One test, gated on `MONOCODE_TEST_PYTHON`, runs real pytest.
 mod footer;
+mod groups;
 
 use super::{
     chip, gutter,
     header::{self, PAGE},
     output,
-    settings_page::{Field, RunsPage},
+    settings_page::{Field, MemberField, RunsPage, WaitKind},
     start, targets,
 };
 use crate::{

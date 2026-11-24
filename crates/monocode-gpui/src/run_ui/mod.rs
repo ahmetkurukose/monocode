@@ -8,6 +8,7 @@
 mod chip;
 mod commands;
 pub(crate) mod footer;
+mod groups;
 mod gutter;
 mod header;
 mod output;
@@ -69,6 +70,7 @@ pub(crate) fn init(cx: &mut App) {
     .detach();
     targets::init(cx);
     start::init(cx);
+    groups::init(cx);
     header::init(cx);
     chip::init(cx);
     commands::init(cx);

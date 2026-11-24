@@ -1671,24 +1671,35 @@ impl Shell {
     }
 
     /// The strip's `+`: what opens lands in this group.
-    pub(super) fn group_add_menu(&self) -> (SharedString, Vec<MenuItem>, f32, MenuStyle) {
+    pub(super) fn group_add_menu(&self, cx: &App) -> (SharedString, Vec<MenuItem>, f32, MenuStyle) {
+        // Each row shows the key the keymap gives it now, a rebound one too.
+        let row = |id: &'static str,
+                   label: &'static str,
+                   icon: &'static str,
+                   action: &dyn gpui::Action| {
+            let item = MenuAction::new(id, label).icon(icon);
+            match super::empty_workspace::bound_shortcut(action, cx) {
+                Some(keys) => item.shortcut(keys),
+                None => item,
+            }
+        };
+        // Where terminals open as tabs, the terminal key opens one as this
+        // row does; elsewhere the nearest is the key for a new terminal.
+        let terminal: &dyn gpui::Action = if self.terminal_in_title() {
+            &ToggleTerminal
+        } else {
+            &NewTerminal
+        };
         (
             "New tab".into(),
             vec![
-                MenuAction::new("session", "New Session")
-                    .icon("plus")
-                    .shortcut(format!("{MOD}T"))
-                    .into(),
-                MenuAction::new("terminal", "New Terminal")
-                    .icon("terminal")
-                    .into(),
-                MenuAction::new("browser", "New Browser")
-                    .icon("globe")
-                    .into(),
+                row("session", "New Session", "plus", &NewCodex).into(),
+                row("terminal", "New Terminal", "terminal", terminal).into(),
+                row("browser", "New Browser", "globe", &NewBrowser).into(),
                 MenuItem::Separator,
-                MenuAction::new("file", "Open File…").icon("search").into(),
+                row("file", "Open File\u{2026}", "search", &GoToFile).into(),
             ],
-            200.,
+            220.,
             MenuStyle::Explorer,
         )
     }

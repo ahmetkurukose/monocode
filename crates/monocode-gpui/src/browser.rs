@@ -2954,6 +2954,10 @@ impl Host<monocode_cef::BrowserView> {
     /// Closes the view now, rather than when the last frame lets go of it.
     fn close(&self) {
         if let Some(hosted) = self.view.borrow_mut().take() {
+            // A page that is closed while it has the keyboard would leave it
+            // with the window: the chat or terminal that gets GPUI's focus
+            // next shows its caret and hears no key until it is clicked.
+            hosted.release_keyboard();
             hosted.view.close();
             #[cfg(target_os = "macos")]
             hosted.clip.removeFromSuperview();
@@ -3471,6 +3475,8 @@ impl<V> Drop for Host<V> {
         // Calls waiting on the page learn first that it is gone.
         self.end_agent();
         if let Some(hosted) = self.view.get_mut().take() {
+            // As in `close`: the keyboard goes back before the view goes.
+            hosted.release_keyboard();
             drop(hosted.view);
             #[cfg(target_os = "macos")]
             hosted.clip.removeFromSuperview();

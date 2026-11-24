@@ -4,19 +4,25 @@
 //! the registry of what is running. Headless: the terminal dock executes
 //! the resolved `Spawn`, and the agents' MCP tools use the same calls.
 mod config;
+mod group;
 mod headless;
 mod output;
 mod ports;
 mod registry;
 mod resolve;
+mod sequence;
 mod tasks;
 mod variables;
 
 pub use config::{ProjectRuns, RunConfig, TestRunner, BUILTIN_PREFIX};
+pub use group::{
+    GroupMember, OnFailedStart, OnMemberExit, RunGroup, StartOrder, Wait, DEFAULT_WAIT_TIMEOUT,
+};
 pub use output::RunOutput;
 pub use ports::{first_local_url, local_urls, machine_ips};
 pub use registry::{registry, Registry, RunEvent, RunId, RunInfo, RunState, StartedBy};
 pub use resolve::{resolve, variables_used, Unresolved};
+pub use sequence::{port_open, Action as GroupAction, Event as GroupEvent, Phase, Sequence};
 pub use tasks::{
     builtin_tasks, is_python_test_file, runnable_tasks, task_languages, Runnable, RunnableKind,
 };

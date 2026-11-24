@@ -33,7 +33,7 @@ const ROWS: [Row; 7] = [
     }),
     ("new-session", "New session", None, || Box::new(NewCodex)),
     ("find-in-files", "Find in files", None, || {
-        Box::new(SearchFiles)
+        Box::new(FindInFiles)
     }),
     ("toggle-terminal", "Toggle terminal", None, || {
         Box::new(ToggleTerminal)
