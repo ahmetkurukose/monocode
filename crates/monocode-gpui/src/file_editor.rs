@@ -21,12 +21,15 @@ mod diff;
 #[cfg(test)]
 mod extension_tests;
 mod extensions;
+mod git_actions;
 mod media;
 #[cfg(test)]
 #[path = "file_editor/tests.rs"]
 mod parity_tests;
+mod run_actions;
 mod search;
 mod selection;
+mod sql_actions;
 
 actions!(
     file_editor,
@@ -48,7 +51,17 @@ actions!(
         NextChange,
         RevertChange,
         NavigateBack,
-        NavigateForward
+        NavigateForward,
+        RunFile,
+        DebugFile,
+        RunAtCaret,
+        DebugAtCaret,
+        ExecuteSql,
+        ExplainSql,
+        ToggleBlame,
+        ShowLineHistory,
+        OpenOnRemote,
+        CompareWithClipboard
     ]
 );
 pub(crate) fn bind(cx: &mut App) {
@@ -68,8 +81,10 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("alt-r", Regex, Some("FileEditor")),
         KeyBinding::new("f3", FindNext, Some("FileEditor")),
         KeyBinding::new("shift-f3", FindPrevious, Some("FileEditor")),
-        KeyBinding::new("alt-up", PreviousChange, Some("FileEditor")),
-        KeyBinding::new("alt-down", NextChange, Some("FileEditor")),
+        KeyBinding::new("ctrl-alt-shift-up", PreviousChange, Some("FileEditor")),
+        KeyBinding::new("ctrl-alt-shift-down", NextChange, Some("FileEditor")),
+        KeyBinding::new("ctrl-shift-r", RunAtCaret, Some("FileEditor")),
+        KeyBinding::new("ctrl-shift-d", DebugAtCaret, Some("FileEditor")),
         KeyBinding::new(&format!("{m}-g"), FindNext, Some("FileEditor")),
         KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, Some("FileEditor")),
         KeyBinding::new("escape", DismissSearch, Some("FileEditor")),
@@ -1323,6 +1338,16 @@ impl gpui::Render for FileEditor {
             .on_action(
                 cx.listener(|this, _: &NavigateBack, w, cx| this.navigate_history(true, w, cx)),
             )
+            .on_action(cx.listener(Self::run_file))
+            .on_action(cx.listener(Self::debug_file))
+            .on_action(cx.listener(Self::run_at_caret))
+            .on_action(cx.listener(Self::debug_at_caret))
+            .on_action(cx.listener(Self::execute_sql))
+            .on_action(cx.listener(Self::explain_sql))
+            .on_action(cx.listener(Self::toggle_blame))
+            .on_action(cx.listener(Self::show_line_history))
+            .on_action(cx.listener(Self::open_on_remote))
+            .on_action(cx.listener(Self::compare_with_clipboard))
             .on_action(
                 cx.listener(|this, _: &NavigateForward, w, cx| this.navigate_history(false, w, cx)),
             )

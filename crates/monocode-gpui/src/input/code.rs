@@ -16,6 +16,8 @@ mod ext;
 mod ext_tests;
 #[path = "../code_editor/editor_gutter.rs"]
 mod gutter;
+#[path = "../code_editor/editor_lines.rs"]
+mod lines;
 #[path = "../code_editor/editor_popups.rs"]
 mod popups;
 #[path = "../code_editor/editor_refactor.rs"]

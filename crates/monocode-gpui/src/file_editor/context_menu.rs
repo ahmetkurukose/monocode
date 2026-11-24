@@ -3,8 +3,8 @@
 //! search, Git and the places the file opens in. It replaces both the shared
 //! text menu and the floating bar a selection used to show.
 use super::{
-    FileEditor, FileEvent, Find, Format, NavigateBack, NavigateForward, NextChange, PreviousChange,
-    Replace, RevertChange, ToggleWordWrap, selection::db_dot,
+    CompareWithClipboard, FileEditor, FileEvent, Find, Format, NavigateBack, NavigateForward,
+    Replace, ToggleWordWrap,
 };
 use crate::{
     input,
@@ -41,6 +41,15 @@ fn keys(mac: &'static str, other: &'static str) -> &'static str {
     }
 }
 
+/// The Refactor submenu: code action kinds asked for by name.
+const REFACTOR_KINDS: [(&str, &str); 5] = [
+    ("refactor.extract", "Extract…"),
+    ("refactor.inline", "Inline…"),
+    ("refactor.rewrite", "Rewrite…"),
+    ("source.organizeImports", "Organize Imports"),
+    ("source.fixAll", "Fix All"),
+];
+
 /// Prompts the AI actions put in the chat draft, ahead of the reference.
 const AI_PROMPTS: [(&str, &str, &str); 5] = [
     ("ai-explain", "Explain Code", "Explain what this code does:"),
@@ -69,7 +78,6 @@ impl FileEditor {
         let selected = !input.selection_range().is_empty();
         let clipboard = cx.read_from_clipboard().is_some();
         let writable = !caps.read_only;
-        let changes = !input.editor_analysis().changes.is_empty();
         let action = |id: &'static str, label: &'static str| MenuAction::new(id, label);
 
         let mut items: Vec<MenuItem> = vec![
@@ -81,6 +89,16 @@ impl FileEditor {
             action("rename", "Rename…")
                 .shortcut(keys("⇧F6", "Shift+F6"))
                 .disabled(!caps.rename || !writable)
+                .into(),
+            action("refactor", "Refactor")
+                .icon("wand")
+                .disabled(!caps.actions || !writable)
+                .submenu(
+                    REFACTOR_KINDS
+                        .iter()
+                        .map(|(kind, label)| MenuAction::new(format!("kind:{kind}"), *label))
+                        .collect(),
+                )
                 .into(),
             MenuItem::Separator,
             action(
@@ -123,6 +141,10 @@ impl FileEditor {
                     action("copy-name", "Copy File Name"),
                 ])
                 .into(),
+            action("compare-clipboard", "Compare with Clipboard")
+                .icon("git-compare")
+                .disabled(!clipboard)
+                .into(),
             MenuItem::Separator,
             action("goto", "Go To")
                 .icon("arrow-right-2")
@@ -152,6 +174,25 @@ impl FileEditor {
                     action("unfold-all", "Expand All").shortcut(keys("⌘⌥⇧]", "Ctrl+Alt+Shift+]")),
                 ])
                 .into(),
+            action("edit", "Edit")
+                .icon("pencil-edit")
+                .submenu(vec![
+                    action("expand-selection", "Expand Selection").shortcut(keys("⌥↑", "Alt+Up")),
+                    action("shrink-selection", "Shrink Selection").shortcut(keys("⌥↓", "Alt+Down")),
+                    action("duplicate-line", "Duplicate Line").disabled(!writable),
+                    action("move-line-up", "Move Line Up")
+                        .shortcut(keys("⌥⇧↑", "Alt+Shift+Up"))
+                        .disabled(!writable),
+                    action("move-line-down", "Move Line Down")
+                        .shortcut(keys("⌥⇧↓", "Alt+Shift+Down"))
+                        .disabled(!writable),
+                    action("column-selection", "Column Selection Mode")
+                        .shortcut(keys("⇧⌘8", "Ctrl+Shift+8"))
+                        .checked(input.column_selection()),
+                    action("caret-above", "Add Caret Above"),
+                    action("caret-below", "Add Caret Below"),
+                ])
+                .into(),
             MenuItem::Separator,
             action("comment", "Toggle Comment")
                 .shortcut(keys("⌘/", "Ctrl+/"))
@@ -163,30 +204,15 @@ impl FileEditor {
                 .disabled(!writable)
                 .into(),
         ];
-        if selected && !sources.is_empty() {
-            items.extend([
-                MenuItem::Separator,
-                action("database", "Send to Database")
-                    .icon("database")
-                    .submenu(
-                        sources
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, source)| {
-                                // A source that accepts writes says so.
-                                let row = MenuAction::new(format!("db:{ix}"), source.name.clone())
-                                    .icon("dot")
-                                    .icon_color(db_dot(source.color));
-                                if source.read_only {
-                                    row
-                                } else {
-                                    row.value("writable")
-                                }
-                            })
-                            .collect(),
-                    )
-                    .into(),
-            ]);
+        let run = self.run_menu_items(cx);
+        if !run.is_empty() {
+            items.push(MenuItem::Separator);
+            items.extend(run);
+        }
+        let sql = self.sql_menu_items(sources, cx);
+        if !sql.is_empty() {
+            items.push(MenuItem::Separator);
+            items.extend(sql);
         }
         items.extend([
             MenuItem::Separator,
@@ -201,16 +227,7 @@ impl FileEditor {
             MenuItem::Separator,
             action("git", "Git")
                 .icon("git-branch")
-                .submenu(vec![
-                    action("history", "Show History"),
-                    action("previous-change", "Previous Change")
-                        .shortcut(keys("⌥↑", "Alt+Up"))
-                        .disabled(!changes),
-                    action("next-change", "Next Change")
-                        .shortcut(keys("⌥↓", "Alt+Down"))
-                        .disabled(!changes),
-                    action("revert-change", "Revert Change").disabled(!changes || !writable),
-                ])
+                .submenu(self.git_menu_items(cx))
                 .into(),
             action("open-in", "Open In")
                 .icon("external-link")
@@ -279,20 +296,16 @@ impl FileEditor {
             )));
             return;
         }
-        if let Some(ix) = id
-            .strip_prefix("db:")
-            .and_then(|ix| ix.parse::<usize>().ok())
+        if self.sql_menu_pick(id, target, sources, window, cx)
+            || self.run_menu_pick(id, window, cx)
+            || self.git_menu_pick(id, window, cx)
         {
-            if let (Some(source), Some(text)) =
-                (sources.get(ix), self.selected_text(&target.range, cx))
-            {
-                cx.emit(FileEvent::SendToDatabase {
-                    source: source.id.clone(),
-                    text,
-                    first_line: target.lines.0,
-                    last_line: target.lines.1,
-                });
-            }
+            return;
+        }
+        if let Some(kind) = id.strip_prefix("kind:") {
+            let action = input::CodeActionsOfKind(kind.to_string().into());
+            window.focus(&self.input.focus_handle(cx), cx);
+            window.dispatch_action(Box::new(action), cx);
             return;
         }
         let action: Box<dyn Action> = match id {
@@ -310,13 +323,6 @@ impl FileEditor {
                     .file_name()
                     .map_or_else(|| self.path.clone(), |n| n.to_string_lossy().into_owned());
                 return copy(name, cx);
-            }
-            "history" => {
-                cx.emit(FileEvent::FileHistory {
-                    cwd: self.cwd.clone(),
-                    path: self.path.clone(),
-                });
-                return;
             }
             "show-in-explorer" => {
                 cx.emit(FileEvent::ShowInExplorer(self.path.clone()));
@@ -353,9 +359,15 @@ impl FileEditor {
             "forward" => Box::new(NavigateForward),
             "find" => Box::new(Find),
             "replace" => Box::new(Replace),
-            "previous-change" => Box::new(PreviousChange),
-            "next-change" => Box::new(NextChange),
-            "revert-change" => Box::new(RevertChange),
+            "compare-clipboard" => Box::new(CompareWithClipboard),
+            "expand-selection" => Box::new(input::ExpandSelection),
+            "shrink-selection" => Box::new(input::ShrinkSelection),
+            "duplicate-line" => Box::new(input::DuplicateLine),
+            "move-line-up" => Box::new(input::MoveLineUp),
+            "move-line-down" => Box::new(input::MoveLineDown),
+            "column-selection" => Box::new(input::ToggleColumnSelection),
+            "caret-above" => Box::new(input::AddCaretAbove),
+            "caret-below" => Box::new(input::AddCaretBelow),
             "wrap" => Box::new(ToggleWordWrap),
             _ => return,
         };

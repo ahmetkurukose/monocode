@@ -87,9 +87,22 @@ actions!(
         RenameSymbol,
         GoToDeclaration,
         GoToTypeDefinition,
-        GoToImplementation
+        GoToImplementation,
+        ExpandSelection,
+        ShrinkSelection,
+        DuplicateLine,
+        MoveLineUp,
+        MoveLineDown,
+        ToggleColumnSelection,
+        AddCaretAbove,
+        AddCaretBelow
     ]
 );
+/// The code actions of one kind at the caret, such as `refactor.extract`
+/// or `source.organizeImports`: the code menu's Refactor rows.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = composer, no_json)]
+pub(crate) struct CodeActionsOfKind(pub SharedString);
 pub struct Submitted;
 /// Cmd/Ctrl+Enter in a composer that sends either way, asking for the
 /// opposite of its usual follow-up behavior.
@@ -154,6 +167,12 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("shift-f6", RenameSymbol, Some("CodeEditor")),
         KeyBinding::new("cmd-f12", GoToImplementation, Some("CodeEditor")),
         KeyBinding::new("ctrl-f12", GoToImplementation, Some("CodeEditor")),
+        KeyBinding::new("alt-up", ExpandSelection, Some("CodeEditor")),
+        KeyBinding::new("alt-down", ShrinkSelection, Some("CodeEditor")),
+        KeyBinding::new("alt-shift-up", MoveLineUp, Some("CodeEditor")),
+        KeyBinding::new("alt-shift-down", MoveLineDown, Some("CodeEditor")),
+        KeyBinding::new("cmd-shift-8", ToggleColumnSelection, Some("CodeEditor")),
+        KeyBinding::new("ctrl-shift-8", ToggleColumnSelection, Some("CodeEditor")),
         KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
         // Not Cmd+Shift+Space: the quick composer takes that system-wide.
         KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
@@ -2005,6 +2024,15 @@ impl Render for Input {
             .on_action(cx.listener(Self::go_to_declaration))
             .on_action(cx.listener(Self::go_to_type_definition))
             .on_action(cx.listener(Self::go_to_implementation))
+            .on_action(cx.listener(Self::code_actions_of_kind))
+            .on_action(cx.listener(Self::expand_selection))
+            .on_action(cx.listener(Self::shrink_selection))
+            .on_action(cx.listener(Self::duplicate_line))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::toggle_column_selection))
+            .on_action(cx.listener(Self::add_caret_above))
+            .on_action(cx.listener(Self::add_caret_below))
             .on_modifiers_changed(cx.listener(Self::code_modifiers))
             .on_action(cx.listener(Self::start_completion))
             .on_action(cx.listener(Self::dismiss_completion))

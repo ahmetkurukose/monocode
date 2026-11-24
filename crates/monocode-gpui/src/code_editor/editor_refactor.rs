@@ -113,6 +113,17 @@ impl Input {
         }
     }
 
+    /// The code actions of one kind at the caret (`CodeActionsOfKind`): one
+    /// is taken at once, several are listed, none is said.
+    pub(in crate::input) fn code_actions_of_kind(
+        &mut self,
+        _: &CodeActionsOfKind,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.propagate();
+    }
+
     fn open_actions(
         &mut self,
         position: Position,
