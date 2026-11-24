@@ -172,8 +172,6 @@ actions!(
         NewTerminal,
         NewBrowser,
         SplitTerminal,
-        ToggleLayout,
-        ToggleWorkspaceStyle,
         OpenSettings,
         GoToFile,
         OpenCommandPalette,
@@ -321,10 +319,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-shift-j"), SplitTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
         KeyBinding::new(&format!("{modifier}-alt-n"), NewBrowser, context),
-        // Switch between the original two-sidebar layout and the new layout.
-        KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
-        // Switch the Focused layout between its rounded and boxy workspace.
-        KeyBinding::new(&format!("{modifier}-alt-l"), ToggleWorkspaceStyle, context),
         KeyBinding::new(&format!("{modifier}-shift-d"), SplitDown, context),
         KeyBinding::new(&format!("{modifier}-="), ZoomIn, context),
         KeyBinding::new(&format!("{modifier}-+"), ZoomIn, context),
@@ -930,6 +924,10 @@ pub(crate) struct Shell {
     observations: Vec<Subscription>,
     /// Terminals whose shell ended, closed on the next frame.
     exited_terminals: Vec<gpui::EntityId>,
+    /// Tests that exercise the dock open new terminals there, not as title
+    /// bar tabs.
+    #[cfg(test)]
+    pub(crate) terminals_in_dock: bool,
     generation: Arc<AtomicU64>,
     latest_state: Arc<Mutex<String>>,
     pub(crate) render_passes: usize,
@@ -1309,6 +1307,8 @@ impl Shell {
             viewport_width: 1200.,
             viewport_height: 800.,
             exited_terminals: Vec::new(),
+            #[cfg(test)]
+            terminals_in_dock: false,
             code: Default::default(),
             observations: vec![
                 git_observation,
@@ -1853,11 +1853,9 @@ impl Shell {
                 && self.settings.is_none())
             .then(|| self.classic_sidebar_tab.tool_tab())
             .flatten();
-            let terminal_tab = self.terminal_in_panel(cx);
             panel.update(cx, |p, cx| {
                 p.set_shown(shown, cx);
                 p.set_sidebar_tab(sidebar_tab, cx);
-                p.set_terminal_tab(terminal_tab, cx);
             });
         }
     }
@@ -2131,10 +2129,8 @@ impl Shell {
             self.workspace.right_panel_tabs.clone(),
         );
         let strip = self.workspace.right_panel_strip.clone();
-        let terminal_tab = self.terminal_in_panel(cx);
         let panel = cx.new(|cx| {
             let mut panel = RightPanel::new(git, tab, order, window, cx);
-            panel.set_terminal_tab(terminal_tab, cx);
             panel.set_strip(strip, cx);
             panel
         });
@@ -2274,9 +2270,6 @@ impl Shell {
                 match event {
                     PanelEvent::Tab(tab) => {
                         this.workspace.right_panel_tab = *tab;
-                        if *tab == crate::right_panel::RightTab::Terminal {
-                            this.ensure_panel_terminal(cx);
-                        }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
                     PanelEvent::Strip(strip) => this.workspace.right_panel_strip = strip.clone(),
@@ -3257,14 +3250,6 @@ impl Shell {
         self.dock_tab_scroll.scroll_to_item(added);
         let terminal = self.spawn_terminal(cwd, cx);
         self.terminals.entry(project).or_default().push(terminal);
-        if self.terminal_in_panel(cx) {
-            if let Some(dock) = self.workspace.docks.get_mut(&self.workspace.project) {
-                dock.open = false;
-            }
-            self.show_panel_terminal(window, cx);
-            self.persist(cx);
-            return;
-        }
         if !was_open {
             self.slide_dock(true, cx);
         }
@@ -3282,14 +3267,6 @@ impl Shell {
         }
         let project = self.workspace.project.clone();
         self.wake_project(&project, cx);
-        if self.terminal_in_panel(cx) {
-            if self.panel_terminal_shown(cx) {
-                self.set_right_panel_open(false, window, cx);
-            } else {
-                self.show_panel_terminal(window, cx);
-            }
-            return;
-        }
         let project = self.workspace.project.clone();
         let Some(dock) = self
             .workspace
@@ -3337,32 +3314,6 @@ impl Shell {
             let t = terminal.read(cx);
             (t.foreground.clone(), project_name(&t.cwd))
         };
-        // The panel's last terminal stays: closing it hides the panel, and
-        // stops whatever it was running.
-        if self.terminal_in_panel(cx) && self.terminals.get(&project).is_some_and(|t| t.len() == 1)
-        {
-            let Some(process) = process else {
-                self.set_right_panel_open(false, window, cx);
-                return;
-            };
-            let answer = window.prompt(
-                gpui::PromptLevel::Warning,
-                &format!("\"{process}\" is still running in {label}. Stop it and close the panel?"),
-                None,
-                &["Stop", "Cancel"],
-                cx,
-            );
-            cx.spawn_in(window, async move |this, cx| {
-                if matches!(answer.await, Ok(0)) {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        terminal.update(cx, |t, cx| t.stop_foreground(cx));
-                        this.set_right_panel_open(false, window, cx);
-                    });
-                }
-            })
-            .detach();
-            return;
-        }
         let Some(process) = process else {
             self.remove_terminal(&project, ix, window, cx);
             return;
@@ -3476,9 +3427,8 @@ impl Shell {
                 terminal.update(cx, |t, _| t.visible = shown);
             }
         }
-        // The right panel's Terminal tab hosts the shells instead, and a
-        // sleeping project has none until it wakes.
-        if self.terminal_in_panel(cx) || self.project_asleep(&project) {
+        // A sleeping project has no shells until it wakes.
+        if self.project_asleep(&project) {
             return body;
         }
         let Some(dock) = self.workspace.docks.get(&project).cloned() else {
@@ -5029,7 +4979,6 @@ impl Shell {
         panel: Entity<RightPanel>,
         width: f32,
         full: f32,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content =
@@ -5046,10 +4995,6 @@ impl Shell {
                         .cached(StyleRefinement::default().size_full())
                         .into_any_element()
                 }
-            } else if self.terminal_in_panel(cx)
-                && panel.read(cx).tab() == crate::right_panel::RightTab::Terminal
-            {
-                self.panel_terminal(window, cx)
             } else {
                 panel
                     .cached(StyleRefinement::default().size_full())
@@ -5530,11 +5475,9 @@ impl Shell {
                 crate::right_panel::tabs_width(self.right_tab_count(cx)),
             )
     }
-    /// Explorer, History and Worktrees, and Terminal when it lives in the panel.
-    /// Changes opens from the diff stat instead.
+    /// Explorer, History and Worktrees. Changes opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        3 + usize::from(self.terminal_in_panel(cx))
-            + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
+        3 + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
     fn toggle_room(&self, cx: &App) -> f32 {
@@ -8476,12 +8419,6 @@ impl Render for Shell {
                     this.new_terminal(window, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleLayout, _, cx| this.toggle_layout(cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleWorkspaceStyle, _, cx| {
-                    this.toggle_workspace_style(cx)
-                }),
-            )
             .on_action(
                 cx.listener(|this, _: &SplitRight, _, cx| this.split_session(SplitDir::Right, cx)),
             )
@@ -9980,81 +9917,6 @@ mod tests {
             })
             .unwrap();
     }
-    #[gpui::test]
-    fn switching_layout_with_working_session_marks_keeps_cached_paint_valid(
-        cx: &mut TestAppContext,
-    ) {
-        use std::time::Duration;
-        let (window, a, b) = window(cx);
-        cx.update(|cx| {
-            bind_keys(cx);
-            crate::input::bind(cx);
-        });
-        window
-            .update(cx, |shell, w, cx| {
-                for id in [a, b] {
-                    shell.sessions[&id].update(cx, |session, cx| {
-                        session.summary.cwd = "/work/monocode".into();
-                        session.summary.has_messages = true;
-                        cx.emit(SessionChanged);
-                    });
-                }
-                shell.sessions[&a].update(cx, |session, cx| {
-                    session.busy = true;
-                    cx.emit(SessionChanged);
-                });
-                shell.focus_active(w, cx);
-                shell.toggle_right_panel(w, cx);
-                for _ in 0..30 {
-                    shell.workspace.tabs.extend([a, b]);
-                }
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, w, cx| {
-                w.simulate_next_frame(cx);
-                w.draw(cx).clear(cx);
-            })
-            .unwrap();
-        };
-        draw(cx);
-        // Reusing the sidebar after an earlier sibling shrinks relocates its
-        // text cache. A subsequent uncached slide must not replay old indices.
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.tabs.truncate(2);
-                cx.notify();
-            })
-            .unwrap();
-        draw(cx);
-        window
-            .update(cx, |shell, w, cx| shell.toggle_sidebar(w, cx))
-            .unwrap();
-        draw(cx);
-        for step in 0..20 {
-            for _ in 0..5 {
-                cx.executor().advance_clock(Duration::from_millis(20));
-                cx.run_until_parked();
-                cx.update_window(window.into(), |_, w, cx| {
-                    w.simulate_next_frame(cx);
-                    w.draw(cx).clear(cx);
-                })
-                .unwrap();
-            }
-            window
-                .update(cx, |shell, w, cx| {
-                    if step % 3 == 0 {
-                        shell.toggle_sidebar(w, cx);
-                    }
-                    shell.toggle_layout(cx);
-                })
-                .unwrap();
-            cx.run_until_parked();
-        }
-    }
 
     #[gpui::test]
     fn titlebar_panel_buttons_keep_window_bounds_for_single_and_double_clicks(
@@ -11357,46 +11219,6 @@ mod tests {
         (window, ids.0, ids.1)
     }
     #[gpui::test]
-    fn leaving_the_original_layout_defaults_to_boxy_only_before_the_notice(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, _, _) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.new_layout_boxy = false;
-                shell.workspace.new_layout_prompt_dismissed = false;
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.classic_layout);
-                assert!(shell.workspace.new_layout_boxy);
-                assert!(shell.workspace.new_layout_prompt_dismissed);
-
-                shell.workspace.classic_layout = true;
-                shell.workspace.new_layout_boxy = false;
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-            })
-            .unwrap();
-    }
-    #[gpui::test]
-    fn workspace_style_shortcut_only_switches_the_focused_layout(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = false;
-                shell.workspace.new_layout_boxy = false;
-                shell.toggle_workspace_style(cx);
-                assert!(shell.workspace.new_layout_boxy);
-                shell.toggle_workspace_style(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-
-                shell.workspace.classic_layout = true;
-                shell.toggle_workspace_style(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-            })
-            .unwrap();
-    }
-    #[gpui::test]
     fn slash_menu_stays_below_tabs_with_centered_and_docked_input(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, id) = window(cx);
@@ -12040,7 +11862,7 @@ mod tests {
                         shell.workspace.active.unwrap()
                     }
                     ClosingKind::Terminal => {
-                        shell.workspace.preferences.set_terminal_placement("title");
+                        shell.terminals_in_dock = false;
                         shell.split_title_terminal(w, cx);
                         shell.workspace.active.unwrap()
                     }

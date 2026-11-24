@@ -237,17 +237,6 @@ impl Shell {
                     this.invalidate_chrome(cx);
                     cx.notify();
                 }
-                SettingsEvent::NewLayout(on) => {
-                    if this.workspace.classic_layout == *on {
-                        this.toggle_layout(cx);
-                    }
-                    this.sync_settings(cx);
-                }
-                SettingsEvent::NewLayoutBoxy(boxy) => {
-                    this.workspace.new_layout_boxy = *boxy;
-                    this.layout_changed(cx);
-                    this.sync_settings(cx);
-                }
                 SettingsEvent::OpenSession(id) => {
                     this.close_settings(window, cx);
                     this.open(*id, window, cx);

@@ -142,9 +142,6 @@ pub(crate) enum SettingsEvent {
     /// A project's `.monocode/integrations.json` changed: the Inbox lists again.
     IntegrationsChanged,
     Changed(Box<Preferences>),
-    /// The Appearance page's Layout picker: true for Focused, false for Classic.
-    NewLayout(bool),
-    NewLayoutBoxy(bool),
     Section(Section),
     OpenSession(i64),
     Archive(i64, bool),
@@ -610,8 +607,6 @@ impl SettingsView {
     fn restore_defaults(&mut self, cx: &mut Context<Self>) {
         self.accent_custom_open = false;
         self.update(cx, |p| p.restore_appearance());
-        // onInsetLayout(INSET_LAYOUT_DEFAULT): React's default is the classic layout.
-        cx.emit(SettingsEvent::NewLayout(false));
     }
     /// Jump to a search result, on this page or another.
     fn go(&mut self, result: model::SearchResult, cx: &mut Context<Self>) {

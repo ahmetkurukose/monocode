@@ -278,12 +278,6 @@ impl Shell {
         add("View", "Toggle Files and Changes", "panel-right", || {
             Box::new(ToggleRightPanel)
         });
-        add("View", "Switch Workspace Layout", "dashboard", || {
-            Box::new(ToggleLayout)
-        });
-        add("View", "Switch Rounded or Boxy Workspace", "square", || {
-            Box::new(ToggleWorkspaceStyle)
-        });
         add("View", "Zoom In", "add-01", || Box::new(ZoomIn));
         add("View", "Zoom Out", "minus-sign", || Box::new(ZoomOut));
         add("View", "Reset Zoom", "rotate-ccw", || Box::new(ResetZoom));

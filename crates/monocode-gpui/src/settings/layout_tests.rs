@@ -36,70 +36,7 @@ fn window(section: Section, cx: &mut TestAppContext) -> WindowHandle<SettingsVie
 }
 
 #[gpui::test]
-fn workspace_style_is_only_offered_under_the_new_layout(cx: &mut TestAppContext) {
-    let window = window(Section::Appearance, cx);
-    let visual = &mut VisualTestContext::from_window(window.into(), cx);
-    for classic in [false, true, false] {
-        window
-            .update(visual, |view, _, cx| {
-                view.ctx.classic = classic;
-                view.ctx.new_layout_boxy = true;
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert_eq!(
-            visual
-                .debug_bounds("settings-new-layout-style-boxy")
-                .is_some(),
-            !classic
-        );
-        assert_eq!(
-            visual
-                .debug_bounds("settings-new-layout-style-rounded")
-                .is_some(),
-            !classic
-        );
-        assert!(
-            visual
-                .debug_bounds("settings-collapsed-project-rail-hidden")
-                .is_none()
-        );
-    }
-}
-
-#[gpui::test]
-fn the_project_list_choice_is_only_offered_in_classic_and_defaults_to_the_list(
-    cx: &mut TestAppContext,
-) {
-    assert!(!Preferences::default().project_rail_tree());
-    assert!(
-        !serde_json::from_str::<Preferences>("{}")
-            .unwrap()
-            .project_rail_tree()
-    );
-    let window = window(Section::Appearance, cx);
-    let visual = &mut VisualTestContext::from_window(window.into(), cx);
-    for classic in [true, false, true] {
-        window
-            .update(visual, |view, _, cx| {
-                view.ctx.classic = classic;
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        for option in ["list", "tree"] {
-            let id = match option {
-                "list" => "settings-project-rail-view-list",
-                _ => "settings-project-rail-view-tree",
-            };
-            assert_eq!(visual.debug_bounds(id).is_some(), classic, "{id}");
-        }
-    }
-}
-
-#[gpui::test]
-fn project_apps_are_offered_with_the_tree_only_and_switch_one_by_one(cx: &mut TestAppContext) {
+fn project_apps_switch_one_by_one_and_the_layout_is_not_a_choice(cx: &mut TestAppContext) {
     let mut prefs = Preferences::default();
     assert!(prefs.project_app_shown("inbox") && prefs.project_app_shown("database"));
     assert!(prefs.project_app_shown("api"));
@@ -113,26 +50,19 @@ fn project_apps_are_offered_with_the_tree_only_and_switch_one_by_one(cx: &mut Te
     );
     let window = window(Section::Appearance, cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
-    for (classic, tree, shown) in [
-        (true, true, true),
-        (true, false, false),
-        (false, true, false),
+    visual.run_until_parked();
+    assert!(
+        visual
+            .debug_bounds("settings-toggle-project-app-notes")
+            .is_some()
+    );
+    // The layout, project list and terminal placement are no longer choices.
+    for gone in [
+        "settings-inset-layout-focused",
+        "settings-project-rail-view-list",
+        "settings-new-layout-style-boxy",
     ] {
-        window
-            .update(visual, |view, _, cx| {
-                view.ctx.classic = classic;
-                view.prefs.project_rail_view = if tree { "tree" } else { "list" }.into();
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert_eq!(
-            visual
-                .debug_bounds("settings-toggle-project-app-notes")
-                .is_some(),
-            shown,
-            "classic {classic}, tree {tree}"
-        );
+        assert!(visual.debug_bounds(gone).is_none(), "{gone}");
     }
 }
 
