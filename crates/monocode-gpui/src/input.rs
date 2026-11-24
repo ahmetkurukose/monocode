@@ -12,9 +12,11 @@ use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod code;
+pub(crate) use code::EditorNotice;
 mod command;
 mod comment;
 mod context_menu;
+pub(crate) use context_menu::MenuDelegate;
 mod history;
 mod image_pills;
 mod mention;
@@ -80,7 +82,12 @@ actions!(
         GoToDefinition,
         FindUsages,
         ShowHover,
-        ShowSignature
+        ShowSignature,
+        ShowContextActions,
+        RenameSymbol,
+        GoToDeclaration,
+        GoToTypeDefinition,
+        GoToImplementation
     ]
 );
 pub struct Submitted;
@@ -143,6 +150,10 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-/", ToggleComment, Some("CodeEditor")),
         KeyBinding::new("f12", GoToDefinition, Some("CodeEditor")),
         KeyBinding::new("shift-f12", FindUsages, Some("CodeEditor")),
+        KeyBinding::new("alt-enter", ShowContextActions, Some("CodeEditor")),
+        KeyBinding::new("shift-f6", RenameSymbol, Some("CodeEditor")),
+        KeyBinding::new("cmd-f12", GoToImplementation, Some("CodeEditor")),
+        KeyBinding::new("ctrl-f12", GoToImplementation, Some("CodeEditor")),
         KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
         // Not Cmd+Shift+Space: the quick composer takes that system-wide.
         KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
@@ -219,6 +230,8 @@ pub fn bind(cx: &mut App) {
 
 pub struct Input {
     context_menu: Option<context_menu::EditingMenu>,
+    /// Right-clicks open the owner's menu instead of the shared one.
+    delegate_menu: Option<MenuDelegate>,
     code: Option<code::Code>,
     history: history::History,
     /// Set by Backspace/Delete so the edit they make joins a deleting run,
@@ -283,6 +296,7 @@ impl Input {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             context_menu: None,
+            delegate_menu: None,
             code: None,
             history: Default::default(),
             edit_kind: None,
@@ -593,17 +607,6 @@ impl Input {
     }
     pub(crate) fn selection_dragging(&self) -> bool {
         self.selecting
-    }
-    pub(crate) fn selection_anchor(&self) -> Option<Bounds<Pixels>> {
-        if self.selection.is_empty() {
-            return None;
-        }
-        let bounds = self.bounds?;
-        let origin =
-            bounds.origin + self.position(self.cursor()) - point(self.scroll_x, self.scroll_y);
-        bounds
-            .contains(&origin)
-            .then(|| Bounds::new(origin, size(px(1.), self.line_height())))
     }
     pub(crate) fn cursor_anchor(&self) -> Option<Bounds<Pixels>> {
         let bounds = self.bounds?;
@@ -1997,6 +2000,11 @@ impl Render for Input {
             .on_action(cx.listener(Self::find_usages))
             .on_action(cx.listener(Self::show_hover))
             .on_action(cx.listener(Self::show_signature))
+            .on_action(cx.listener(Self::show_context_actions))
+            .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::go_to_declaration))
+            .on_action(cx.listener(Self::go_to_type_definition))
+            .on_action(cx.listener(Self::go_to_implementation))
             .on_modifiers_changed(cx.listener(Self::code_modifiers))
             .on_action(cx.listener(Self::start_completion))
             .on_action(cx.listener(Self::dismiss_completion))
@@ -2062,6 +2070,7 @@ impl Render for Input {
             .children(self.completion_popup(cx))
             .children(self.hunk_actions(cx))
             .children(self.code_popovers(cx))
+            .children(self.refactor_popovers(cx))
             .children(self.editing_menu(cx))
     }
 }

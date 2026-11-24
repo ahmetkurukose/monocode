@@ -80,6 +80,9 @@ pub struct Diagnostic {
     /// Deprecated code, to be drawn struck through.
     pub deprecated: bool,
     pub related: Vec<(Location, String)>,
+    /// The diagnostic as the server sent it, handed back in the context of
+    /// a code action request so the server can find its own fixes.
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +181,51 @@ coded_kind!(
 pub struct TextEdit {
     pub range: Span,
     pub text: String,
+}
+
+/// Changes a server asks for across files: each file's edits, in that
+/// file's own positions, none overlapping.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceEdit {
+    pub changes: Vec<(PathBuf, Vec<TextEdit>)>,
+    /// File creations, renames and deletions the edit also asked for. They
+    /// are not carried out here; an edit that has any is refused whole.
+    pub file_operations: usize,
+}
+
+impl WorkspaceEdit {
+    pub fn is_empty(&self) -> bool {
+        self.changes.iter().all(|(_, edits)| edits.is_empty()) && self.file_operations == 0
+    }
+}
+
+/// Something a server offers to do at a place: a quick fix for a
+/// diagnostic, a refactoring, or a source action such as organizing imports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    /// `quickfix`, `refactor.extract`, `source.organizeImports`, ...
+    pub kind: Option<String>,
+    /// The fix the server would apply without asking.
+    pub preferred: bool,
+    /// Why the action cannot be taken now, when the server lists it anyway.
+    pub disabled: Option<String>,
+    /// The changes, when the server sent them; `Manager::resolve_code_action`
+    /// asks for them otherwise.
+    pub edit: Option<WorkspaceEdit>,
+    /// The action (also) runs a server command, which this client does not do.
+    pub command: bool,
+    pub server: ServerId,
+    pub raw: Value,
+}
+
+/// What a rename at a place would replace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameTarget {
+    /// The symbol's range, when the server says; else the word there.
+    pub range: Option<Span>,
+    /// The name to start from, when the server suggests one.
+    pub placeholder: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -25,6 +25,7 @@ mod hub;
 pub(crate) mod links;
 pub(crate) mod markdown;
 pub(crate) mod popup_place;
+pub(crate) mod refactor;
 pub(crate) mod symbols;
 
 pub(crate) use completion::{
@@ -44,8 +45,11 @@ pub(crate) use history::History;
 pub(crate) use hover::{Hover, HoverProvider, Signature, SignatureProvider};
 pub(crate) use hub::{DocumentEvent, Hub, HubEvent, OpenDocument};
 pub(crate) use links::{
-    LinkProvider, LinkTarget, Location, References, ReferencesHandler, ReferencesProvider,
-    ResolvedTarget, TargetPosition,
+    LinkProvider, LinkTarget, Location, Navigation, NavigationProvider, References,
+    ReferencesHandler, ReferencesProvider, ResolvedTarget, TargetPosition,
+};
+pub(crate) use refactor::{
+    ActionGroup, CodeActionItem, CodeActionProvider, FileEdit, RenameProvider, RenameRange,
 };
 
 /// The file an editor shows: its absolute path, the checkout it was opened
@@ -93,6 +97,9 @@ pub(crate) struct Providers {
     pub signature: Option<Rc<dyn SignatureProvider>>,
     pub links: Option<Rc<dyn LinkProvider>>,
     pub references: Option<Rc<dyn ReferencesProvider>>,
+    pub navigation: Option<Rc<dyn NavigationProvider>>,
+    pub rename: Option<Rc<dyn RenameProvider>>,
+    pub actions: Option<Rc<dyn CodeActionProvider>>,
     pub breakpoints: Option<Rc<dyn GutterProvider>>,
     pub run_markers: Option<Rc<dyn GutterProvider>>,
     pub header: Vec<Rc<dyn HeaderProvider>>,
@@ -110,6 +117,9 @@ impl Providers {
             && self.signature.is_none()
             && self.links.is_none()
             && self.references.is_none()
+            && self.navigation.is_none()
+            && self.rename.is_none()
+            && self.actions.is_none()
             && self.breakpoints.is_none()
             && self.run_markers.is_none()
             && self.header.is_empty()

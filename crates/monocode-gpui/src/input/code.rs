@@ -18,6 +18,9 @@ mod ext_tests;
 mod gutter;
 #[path = "../code_editor/editor_popups.rs"]
 mod popups;
+#[path = "../code_editor/editor_refactor.rs"]
+mod refactor_ui;
+pub(crate) use refactor_ui::EditorNotice;
 
 const TOP_PADDING: f32 = 8.;
 const BOTTOM_PADDING: f32 = 32.;

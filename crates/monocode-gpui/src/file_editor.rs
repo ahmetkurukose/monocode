@@ -16,6 +16,7 @@ use monocode_core::files::document::{self, Document, TextDocument};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod chrome;
+mod context_menu;
 mod diff;
 #[cfg(test)]
 mod extension_tests;
@@ -147,6 +148,13 @@ pub(crate) enum FileEvent {
         first_line: usize,
         last_line: usize,
     },
+    /// The code menu asked for the file's versions.
+    FileHistory {
+        cwd: String,
+        path: String,
+    },
+    /// The code menu asked for the file's row in the Explorer.
+    ShowInExplorer(String),
 }
 
 pub(crate) struct FileEditor {
@@ -162,7 +170,8 @@ pub(crate) struct FileEditor {
     syntax: Arc<std::sync::Mutex<Option<crate::editor_syntax::Session>>>,
     focus: FocusHandle,
     pub input: Entity<Input>,
-    selection: selection::Selection,
+    /// The editor's right-click menu, while it is open.
+    code_menu: Option<context_menu::CodeMenu>,
     /// Where the saved data sources are, to offer them for sending text to.
     pub(crate) database_dir: PathBuf,
     search: Entity<Input>,
@@ -177,6 +186,8 @@ pub(crate) struct FileEditor {
     matches: Vec<crate::editor_analysis::SearchMatch>,
     autosave: Option<Task<()>>,
     formatting: Option<Task<()>>,
+    /// Clears a passing message shown in `error`.
+    notice: Option<Task<()>>,
     pub show_diff: bool,
     change_index: usize,
     match_index: usize,
@@ -236,7 +247,13 @@ impl FileEditor {
             field.set_font_size(12.);
             field
         });
-        input.update(cx, |input, _| input.set_editor_path(path.clone()));
+        let weak = cx.entity().downgrade();
+        input.update(cx, |input, _| {
+            input.set_editor_path(path.clone());
+            input.delegate_context_menu(std::rc::Rc::new(move |at, window, cx| {
+                let _ = weak.update(cx, |this, cx| this.open_code_menu(at, window, cx));
+            }));
+        });
         let subscriptions = vec![
             cx.subscribe(&input, |this, _, _: &input::Changed, cx| this.edited(cx)),
             cx.subscribe(&input, |this, _, action: &input::CodeAction, cx| {
@@ -247,9 +264,9 @@ impl FileEditor {
                 this.change_index = index;
                 this.apply_change(stage, cx);
             }),
-            cx.observe(&input, |this, _, cx| {
-                this.observe_code_selection(cx);
-                cx.notify();
+            cx.observe(&input, |_, _, cx| cx.notify()),
+            cx.subscribe(&input, |this, _, event: &input::EditorNotice, cx| {
+                this.show_notice(event.0.clone(), cx)
             }),
             cx.subscribe(&input, |this, _, event: &input::Rejected, cx| {
                 this.error = Some(event.0.into());
@@ -317,7 +334,7 @@ impl FileEditor {
             syntax: Default::default(),
             focus: cx.focus_handle(),
             input,
-            selection: selection::Selection::default(),
+            code_menu: None,
             database_dir: crate::data_dir().join("db"),
             search,
             search_open: false,
@@ -330,6 +347,7 @@ impl FileEditor {
             search_task: None,
             autosave: None,
             formatting: None,
+            notice: None,
             show_diff: false,
             change_index: 0,
             matches: Vec::new(),
@@ -416,7 +434,7 @@ impl FileEditor {
         let was = self.visible;
         self.visible = visible;
         if !visible {
-            self.selection.dismiss();
+            self.code_menu = None;
         }
         if let Some(media) = &self.media {
             media.update(cx, |m, _| m.set_visible(visible));
@@ -599,8 +617,27 @@ impl FileEditor {
         })
         .detach();
     }
+    #[cfg(test)]
+    pub(crate) fn error_text(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    /// A message above the text that goes away by itself, such as why a
+    /// rename could not be done.
+    fn show_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.error = Some(message.clone());
+        self.notice = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(6)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.error.as_deref() == Some(message.as_str()) {
+                    this.error = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
     fn edited(&mut self, cx: &mut Context<Self>) {
-        self.selection.dismiss();
+        self.code_menu = None;
         let Some(doc) = &self.document else { return };
         let dirty = self.input.read(cx).content.as_ref() != doc.text;
         if self.dirty != dirty {
@@ -913,7 +950,7 @@ impl FileEditor {
         }
     }
     fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.selection.dismiss();
+        self.code_menu = None;
         self.preview = !self.preview;
         if cx.has_global::<crate::settings::Preferences>() {
             cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
@@ -1066,7 +1103,7 @@ impl gpui::Render for FileEditor {
                 })
                 .into_any_element()
         });
-        let selection_menu = self.code_selection_menu(window, cx);
+        let code_menu = self.code_menu_popover(cx);
         let header_parts = self.header_parts(cx);
         let header_menu = self.header_menu(cx);
         self.input.update(cx, |i, _| {
@@ -1230,16 +1267,6 @@ impl gpui::Render for FileEditor {
             .flex_col()
             .key_context("FileEditor")
             .track_focus(&self.focus)
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.finish_code_selection(window, cx)),
-            )
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    this.selection.dismiss();
-                    cx.notify();
-                }
-            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, w, cx| {
                 if this.search_open
                     && event.keystroke.key == "enter"
@@ -1322,8 +1349,7 @@ impl gpui::Render for FileEditor {
             )
             .child(div().flex_1().min_h_0().min_w_0().child(body))
             .when(ready && !self.preview, |d| d.child(self.status_footer(cx)))
-            .child(self.selection_surface(cx))
-            .children(selection_menu)
+            .children(code_menu)
             .children(header_menu)
     }
 }

@@ -759,6 +759,9 @@ pub(crate) enum MenuStyle {
     /// ModelPicker's recent models: 40px rows of harness icon, model name
     /// over its harness, and a muted check on the current one.
     Recent,
+    /// The code editor's context menu: dense 26px rows, an icon column kept
+    /// even for rows without one so labels line up, shortcuts on the right.
+    Code,
 }
 impl MenuStyle {
     fn padding(self) -> f32 {
@@ -772,7 +775,12 @@ impl MenuStyle {
     fn highlights(self) -> bool {
         matches!(
             self,
-            Self::Explorer | Self::Access | Self::Settings | Self::Filter | Self::Recent
+            Self::Explorer
+                | Self::Access
+                | Self::Settings
+                | Self::Filter
+                | Self::Recent
+                | Self::Code
         )
     }
 }
@@ -1250,18 +1258,24 @@ impl Menu {
             }
             MenuStyle::Switcher => content(0.08),
             MenuStyle::Composer | MenuStyle::Git => content(0.1),
+            MenuStyle::Code => content(0.08),
             _ => content(0.05),
         };
         let icon_size = self
             .row_metrics
             .map(|(_, size)| size)
             .unwrap_or_else(|| match style {
-                MenuStyle::Group | MenuStyle::Access | MenuStyle::Git | MenuStyle::Filter => 14.,
+                MenuStyle::Group
+                | MenuStyle::Access
+                | MenuStyle::Git
+                | MenuStyle::Filter
+                | MenuStyle::Code => 14.,
                 _ => 16.,
             });
         let icon_ink = action.icon_color.unwrap_or(match style {
             MenuStyle::Group | MenuStyle::Switcher => content(0.55),
             MenuStyle::Access => content(0.7),
+            MenuStyle::Code => content(0.65),
             _ => content(1.),
         });
         let has_submenu = !action.submenu.is_empty() || action.flyout.is_some();
@@ -1335,6 +1349,12 @@ impl Menu {
                 }
                 MenuStyle::Settings => d.items_center().gap_2().rounded(px(8.)).h(px(36.)),
                 MenuStyle::Recent => d.items_center().gap_2().rounded(px(8.)).h(px(40.)),
+                MenuStyle::Code => d
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(6.))
+                    .line_height(px(16.))
+                    .h(px(26.)),
                 MenuStyle::Composer | MenuStyle::Access => {
                     d.items_start().gap(px(10.)).rounded(px(8.)).py_2()
                 }
@@ -1363,6 +1383,13 @@ impl Menu {
             .when_some(action.image, |d, provider| {
                 d.child(provider_icon(provider, icon_size))
             })
+            .when(
+                style == MenuStyle::Code
+                    && action.icon.is_none()
+                    && action.icon_artwork.is_none()
+                    && action.image.is_none(),
+                |d| d.child(div().size(px(icon_size)).flex_shrink_0()),
+            )
             .child(self.row_text(action, style))
             .when_some(action.value.clone(), |d, value| {
                 d.child(match style {
@@ -1436,8 +1463,13 @@ impl Menu {
                     d.child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(content(0.4))
+                            .when(style == MenuStyle::Code, |d| d.pl_4())
+                            .text_size(px(if style == MenuStyle::Code { 12. } else { 11. }))
+                            .text_color(content(if action.disabled && style == MenuStyle::Code {
+                                0.2
+                            } else {
+                                0.4
+                            }))
                             .child(shortcut),
                     )
                 } else {
@@ -1630,7 +1662,11 @@ impl Render for Menu {
                     self.row(
                         sub,
                         item,
-                        MenuStyle::Explorer,
+                        if self.style == MenuStyle::Code {
+                            MenuStyle::Code
+                        } else {
+                            MenuStyle::Explorer
+                        },
                         self.sub_active == Some(sub),
                         true,
                         cx,
@@ -1773,6 +1809,8 @@ fn separator(ix: usize, style: MenuStyle) -> AnyElement {
             } else if style == MenuStyle::Git {
                 // `mx-1 border-t border-content/10`.
                 d.mx_1().bg(content(0.1))
+            } else if style == MenuStyle::Code {
+                d.mx(px(10.)).bg(content(0.08))
             } else {
                 d.bg(content(0.1))
             }

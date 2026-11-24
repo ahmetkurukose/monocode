@@ -5,8 +5,9 @@
 use super::client::uri_to_path;
 use super::position::{Encoding, LineIndex, Point, Position, Span};
 use super::types::{
-    CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentSymbol, Hover, Location,
-    ParameterInfo, ServerId, Severity, SignatureHelp, SignatureInfo, SymbolKind, TextEdit,
+    CodeAction, CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentSymbol, Hover,
+    Location, ParameterInfo, RenameTarget, ServerId, Severity, SignatureHelp, SignatureInfo,
+    SymbolKind, TextEdit, WorkspaceEdit,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -166,6 +167,7 @@ pub(crate) fn diagnostics(
                 server: server.to_string(),
                 unnecessary: has_tag(1),
                 deprecated: has_tag(2),
+                raw: item.clone(),
                 related: list(item.get("relatedInformation"))
                     .iter()
                     .filter_map(|related| {
@@ -181,6 +183,126 @@ pub(crate) fn diagnostics(
         .collect();
     found.sort_by_key(|diagnostic| (diagnostic.range, diagnostic.severity));
     found
+}
+
+/// One file's `TextEdit[]`, also `AnnotatedTextEdit[]`, by position.
+fn text_edits(converter: &mut Converter, path: &Path, edits: &[Value]) -> Vec<TextEdit> {
+    let mut found: Vec<TextEdit> = edits
+        .iter()
+        .filter_map(|edit| {
+            Some(TextEdit {
+                range: converter.span(path, edit.get("range")?)?,
+                text: edit.get("newText")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|edit| edit.range);
+    found
+}
+
+/// A `WorkspaceEdit`: `documentChanges` when the server sends them (text
+/// edits and file operations mixed), else the `changes` map. Edits to one
+/// file in several entries are merged.
+pub(crate) fn workspace_edit(converter: &mut Converter, value: &Value) -> WorkspaceEdit {
+    let mut edit = WorkspaceEdit::default();
+    let add = |edit: &mut WorkspaceEdit, path: PathBuf, edits: Vec<TextEdit>| match edit
+        .changes
+        .iter_mut()
+        .find(|(known, _)| *known == path)
+    {
+        Some((_, known)) => {
+            known.extend(edits);
+            known.sort_by_key(|edit| edit.range);
+        }
+        None => edit.changes.push((path, edits)),
+    };
+    if let Some(changes) = value.get("documentChanges").and_then(Value::as_array) {
+        for change in changes {
+            let document = change.get("textDocument");
+            let Some(uri) = document.and_then(|document| document.get("uri")) else {
+                // `create`, `rename` or `delete`.
+                edit.file_operations += 1;
+                continue;
+            };
+            let Some(path) = uri.as_str().and_then(uri_to_path) else {
+                continue;
+            };
+            let edits = text_edits(converter, &path, list(change.get("edits")));
+            add(&mut edit, path, edits);
+        }
+    } else if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            let Some(path) = uri_to_path(uri) else {
+                continue;
+            };
+            let edits = text_edits(
+                converter,
+                &path,
+                edits.as_array().map_or(&[], Vec::as_slice),
+            );
+            add(&mut edit, path, edits);
+        }
+    }
+    edit
+}
+
+/// `(Command | CodeAction)[]`. A bare command is kept as an action that
+/// only runs a command, so it can be shown as one that is not available.
+pub(crate) fn code_actions(
+    converter: &mut Converter,
+    result: &Value,
+    server: ServerId,
+) -> Vec<CodeAction> {
+    list(Some(result))
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            // A `Command` has its command name as a string here; a
+            // `CodeAction`'s `command` is an object.
+            let bare = item.get("command").is_some_and(Value::is_string);
+            Some(CodeAction {
+                title,
+                kind: text_of(item.get("kind")),
+                preferred: item.get("isPreferred").and_then(Value::as_bool) == Some(true),
+                disabled: item
+                    .get("disabled")
+                    .and_then(|disabled| disabled.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                edit: item
+                    .get("edit")
+                    .filter(|edit| edit.is_object())
+                    .map(|edit| workspace_edit(converter, edit)),
+                command: bare || item.get("command").is_some_and(Value::is_object),
+                server,
+                raw: item.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `prepareRename`'s answer: `Range`, `{ range, placeholder }`,
+/// `{ defaultBehavior }` or null (nothing to rename there).
+pub(crate) fn rename_target(
+    converter: &mut Converter,
+    path: &Path,
+    result: &Value,
+) -> Option<RenameTarget> {
+    if result.is_null() {
+        return None;
+    }
+    if result.get("start").is_some() {
+        return Some(RenameTarget {
+            range: converter.span(path, result),
+            placeholder: None,
+        });
+    }
+    Some(RenameTarget {
+        range: result
+            .get("range")
+            .and_then(|range| converter.span(path, range)),
+        placeholder: text_of(result.get("placeholder")),
+    })
 }
 
 /// `Location`, `Location[]` or `LocationLink[]`, without repeats.

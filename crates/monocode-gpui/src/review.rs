@@ -530,6 +530,15 @@ impl ReviewPane {
                 if let FileEvent::WordWrap(wrap) = event {
                     cx.emit(ReviewEvent::WordWrap(*wrap));
                 }
+                if let FileEvent::FileHistory { cwd, path } = event {
+                    cx.emit(ReviewEvent::FileHistory {
+                        cwd: cwd.clone(),
+                        path: path.clone(),
+                    });
+                }
+                if let FileEvent::ShowInExplorer(path) = event {
+                    cx.emit(ReviewEvent::ShowInExplorer(path.clone()));
+                }
                 if matches!(event, FileEvent::SaveFailed) {
                     this.pending_close = None;
                     this.close_prompted = false;

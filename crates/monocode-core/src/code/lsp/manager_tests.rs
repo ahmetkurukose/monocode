@@ -7,7 +7,7 @@ use super::manager::{DocumentContext, Manager, ManagerOptions};
 use super::position::{Point, Span};
 use super::registry::Registry;
 use super::types::{
-    CompletionKind, Location, LspError, LspEvent, ServerState, ServerStatus, Severity,
+    CompletionKind, Location, LspError, LspEvent, RenameTarget, ServerState, ServerStatus, Severity,
 };
 use crate::code::toolchain::Toolchain;
 use serde_json::{json, Value};
@@ -1185,4 +1185,268 @@ fn a_library_in_the_checkouts_virtual_environment_joins_the_checkouts_server() {
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].root, rig.checkout);
     assert_eq!(statuses[0].open_documents, 2);
+}
+
+#[test]
+fn rename_reads_the_servers_edits_across_files_without_applying_them() {
+    let rig = Rig::with(ManagerOptions::default(), Registry::builtin(), |launch| {
+        let mut caps = capabilities(launch);
+        if !launch.program.ends_with("ruff") {
+            caps["renameProvider"] = json!({ "prepareProvider": true });
+        }
+        Ok(FakeServer::new(caps))
+    });
+    let text = "def ş(): pass\nş()\n";
+    let a = rig.open("a.py", text);
+    let b = rig.file("b.py");
+    std::fs::write(&b, "from a import ş\n").unwrap();
+    let pyright = rig.pyright();
+    pyright.on("textDocument/prepareRename", |message, out| {
+        out.result(
+            message,
+            json!({ "range": range(1, 0, 1, 1), "placeholder": "ş" }),
+        );
+    });
+    let (here, there) = (uri(&a), uri(&b));
+    pyright.on("textDocument/rename", move |message, out| {
+        out.result(
+            message,
+            json!({ "documentChanges": [
+                { "textDocument": { "uri": here, "version": 1 }, "edits": [
+                    { "range": range(1, 0, 1, 1), "newText": "go" },
+                    { "range": range(0, 4, 0, 5), "newText": "go" },
+                ] },
+                { "textDocument": { "uri": there, "version": null }, "edits": [
+                    { "range": range(0, 14, 0, 15), "newText": "go" },
+                ] },
+            ] }),
+        );
+    });
+    let offset = text.rfind('ş').unwrap();
+    let target = rig.manager.prepare_rename(&a, offset, &none()).unwrap();
+    assert_eq!(
+        target,
+        Some(RenameTarget {
+            // `ş` is one UTF-16 unit and two bytes.
+            range: Some(span(1, 0, 1, 2)),
+            placeholder: Some("ş".into()),
+        })
+    );
+    let edit = rig.manager.rename(&a, offset, "go", &none()).unwrap();
+    assert_eq!(
+        pyright.wait_for("textDocument/rename")["params"]["newName"],
+        json!("go")
+    );
+    assert_eq!(edit.file_operations, 0);
+    assert_eq!(edit.changes.len(), 2);
+    assert_eq!(edit.changes[0].0, a);
+    // Sorted by position, each counted in its own file's bytes.
+    let ranges: Vec<_> = edit.changes[0].1.iter().map(|edit| edit.range).collect();
+    assert_eq!(ranges, [span(0, 4, 0, 6), span(1, 0, 1, 2)]);
+    assert_eq!(edit.changes[1].0, b);
+    assert_eq!(edit.changes[1].1[0].range, span(0, 14, 0, 16));
+    // Text the disk does not have yet is never written by the manager.
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "from a import ş\n");
+}
+
+#[test]
+fn code_actions_come_from_every_server_with_their_own_diagnostics_and_resolve() {
+    let rig = Rig::with(ManagerOptions::default(), Registry::builtin(), |launch| {
+        let mut caps = capabilities(launch);
+        caps["codeActionProvider"] = json!({ "resolveProvider": true });
+        let fake = FakeServer::new(caps);
+        if launch.program.ends_with("ruff") {
+            fake.on("textDocument/diagnostic", |message, out| {
+                let items = json!([{
+                    "range": range(1, 7, 1, 9), "severity": 2, "code": "F401",
+                    "source": "Ruff", "message": "unused", "data": { "fix": 1 },
+                }]);
+                out.result(message, json!({ "kind": "full", "items": items }));
+            });
+        }
+        Ok(fake)
+    });
+    let text = "x = 1\nimport os\n";
+    let a = rig.open("a.py", text);
+    wait_until(|| rig.manager.diagnostics(&a).len() == 1);
+    let here = uri(&a);
+    rig.ruff()
+        .on("textDocument/codeAction", move |message, out| {
+            out.result(
+                message,
+                json!([{ "title": "Remove unused import", "kind": "quickfix", "isPreferred": true,
+                     "edit": { "changes": { here.clone(): [
+                         { "range": range(1, 0, 2, 0), "newText": "" } ] } } }]),
+            );
+        });
+    let pyright = rig.pyright();
+    pyright.on("textDocument/codeAction", |message, out| {
+        out.result(
+            message,
+            json!([
+                { "title": "Extract variable", "kind": "refactor.extract", "data": 3 },
+                { "title": "Run a command", "command": "do.it" },
+            ]),
+        );
+    });
+    let here = uri(&a);
+    pyright.on("codeAction/resolve", move |message, out| {
+        let mut action = message["params"].clone();
+        action["edit"] = json!({ "changes": { here.clone(): [
+            { "range": range(0, 4, 0, 5), "newText": "one" } ] } });
+        out.result(message, action);
+    });
+
+    let start = text.find("os").unwrap();
+    let mut actions = rig
+        .manager
+        .code_actions(&a, start..start + 2, &none())
+        .unwrap();
+    actions.sort_by(|a, b| a.title.cmp(&b.title));
+    let titles: Vec<_> = actions.iter().map(|action| action.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Extract variable", "Remove unused import", "Run a command"]
+    );
+    // Each server hears of its own diagnostics only, as it sent them.
+    let asked = rig.ruff().wait_for("textDocument/codeAction");
+    assert_eq!(
+        asked["params"]["context"]["diagnostics"][0]["data"],
+        json!({ "fix": 1 })
+    );
+    assert_eq!(
+        asked["params"]["range"],
+        json!({ "start": { "line": 1, "character": 7 }, "end": { "line": 1, "character": 9 } })
+    );
+    let asked = pyright.wait_for("textDocument/codeAction");
+    assert_eq!(asked["params"]["context"]["diagnostics"], json!([]));
+
+    let fix = &actions[1];
+    assert!(fix.preferred && !fix.command);
+    assert_eq!(fix.kind.as_deref(), Some("quickfix"));
+    assert_eq!(
+        fix.edit.as_ref().unwrap().changes[0].1[0].range,
+        span(1, 0, 2, 0)
+    );
+    assert!(actions[2].command && actions[2].edit.is_none());
+
+    let extract = rig
+        .manager
+        .resolve_code_action(&a, &actions[0], &none())
+        .unwrap();
+    assert_eq!(
+        pyright.wait_for("codeAction/resolve")["params"]["data"],
+        json!(3)
+    );
+    let edit = extract.edit.unwrap();
+    assert_eq!(edit.changes[0].1[0].text, "one");
+}
+
+#[test]
+fn type_definition_implementation_and_declaration_are_located_or_unsupported() {
+    let rig = Rig::with(ManagerOptions::default(), Registry::builtin(), |launch| {
+        let mut caps = capabilities(launch);
+        if !launch.program.ends_with("ruff") {
+            caps["typeDefinitionProvider"] = json!(true);
+            caps["implementationProvider"] = json!({});
+        }
+        Ok(FakeServer::new(caps))
+    });
+    let text = "class A(Base): pass\na = A()\n";
+    let a = rig.open("a.py", text);
+    let pyright = rig.pyright();
+    let here = uri(&a);
+    pyright.on("textDocument/typeDefinition", move |message, out| {
+        out.result(message, json!({ "uri": here, "range": range(0, 6, 0, 7) }));
+    });
+    let here = uri(&a);
+    pyright.on("textDocument/implementation", move |message, out| {
+        out.result(
+            message,
+            json!([{ "uri": here, "range": range(0, 0, 0, 1) },
+                   { "uri": here, "range": range(1, 0, 1, 1) }]),
+        );
+    });
+    let offset = text.rfind('a').unwrap();
+    let found = rig.manager.type_definition(&a, offset, &none()).unwrap();
+    assert_eq!(found[0].range, span(0, 6, 0, 7));
+    assert_eq!(
+        pyright.wait_for("textDocument/typeDefinition")["params"]["position"],
+        json!({ "line": 1, "character": 0 })
+    );
+    assert_eq!(
+        rig.manager
+            .implementation(&a, offset, &none())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        rig.manager.declaration(&a, offset, &none()),
+        Err(LspError::Unsupported)
+    );
+}
+
+#[test]
+fn a_code_actions_command_runs_and_brings_back_the_edits_it_asked_for() {
+    let rig = Rig::with(ManagerOptions::default(), Registry::builtin(), |launch| {
+        let mut caps = capabilities(launch);
+        caps["codeActionProvider"] = json!(true);
+        caps["executeCommandProvider"] = json!({ "commands": ["organize"] });
+        Ok(FakeServer::new(caps))
+    });
+    let text = "import sys\nimport os\n";
+    let a = rig.open("a.py", text);
+    let pyright = rig.pyright();
+    let here = uri(&a);
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Organize imports", "kind": "source.organizeImports",
+                     "command": { "title": "Organize", "command": "organize",
+                                  "arguments": [here.clone()] } }]),
+        );
+    });
+    let here = uri(&a);
+    pyright.on("workspace/executeCommand", move |message, out| {
+        // The server asks for its edit first and finishes the command after.
+        out.send(
+            &json!({ "jsonrpc": "2.0", "id": 900, "method": "workspace/applyEdit",
+            "params": { "label": "Organize", "edit": { "changes": { here.clone(): [
+                { "range": range(0, 0, 2, 0), "newText": "import os\nimport sys\n" } ] } } } }),
+        );
+        out.result(message, Value::Null);
+    });
+    let actions = rig.manager.code_actions(&a, 0..0, &none()).unwrap();
+    assert!(actions[0].command && actions[0].edit.is_none());
+    let change = rig
+        .manager
+        .run_code_action_command(&a, &actions[0], &none())
+        .unwrap();
+    let ran = pyright.wait_for("workspace/executeCommand");
+    assert_eq!(ran["params"]["command"], json!("organize"));
+    assert_eq!(ran["params"]["arguments"], json!([uri(&a)]));
+    assert_eq!(
+        pyright.wait_for_response(900)["result"],
+        json!({ "applied": true })
+    );
+    assert_eq!(change.changes.len(), 1);
+    assert_eq!(change.changes[0].1[0].text, "import os\nimport sys\n");
+    assert_eq!(change.changes[0].1[0].range, span(0, 0, 2, 0));
+
+    // Outside a command, a server's own request to edit is turned down.
+    let here = uri(&a);
+    let fake = rig.pyright();
+    fake.on("textDocument/hover", move |message, out| {
+        out.send(
+            &json!({ "jsonrpc": "2.0", "id": 901, "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": { here.clone(): [] } } } }),
+        );
+        out.result(message, Value::Null);
+    });
+    let _ = rig.manager.hover(&a, 0, &none());
+    assert_eq!(
+        fake.wait_for_response(901)["result"]["applied"],
+        json!(false)
+    );
 }
