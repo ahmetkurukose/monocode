@@ -287,7 +287,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", DismissMenu, context),
         KeyBinding::new(&format!("{modifier}-b"), ToggleSidebar, context),
         KeyBinding::new(&format!("{modifier}-k"), SearchEverywhere, context),
-        KeyBinding::new(&format!("{modifier}-shift-f"), SearchFiles, context),
+        // Find in files is Search Everywhere on its Content tab; the Explorer's
+        // search panel is in the menu and the palette, without a key.
+        KeyBinding::new(&format!("{modifier}-shift-f"), FindInFiles, context),
         KeyBinding::new(&format!("{modifier}-alt-t"), CloseOtherTabs, context),
         KeyBinding::new(&format!("{modifier}-shift-]"), NextTab, context),
         KeyBinding::new(&format!("{modifier}-}}"), NextTab, context),

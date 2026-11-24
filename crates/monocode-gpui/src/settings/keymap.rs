@@ -57,6 +57,7 @@ fn command(binding: &KeyBinding) -> Option<&'static str> {
         }
         "workspace::OpenSettings" => "App: Settings",
         "workspace::SearchEverywhere" => "App: Search",
+        "workspace::FindInFiles" => "App: Find in Files",
         "workspace::OpenProject" => "App: Open Project",
         "workspace::ToggleSidebar" => "App: Toggle Sidebar",
         "workspace::ToggleRightPanel" => "App: Toggle Session Sidebar",
