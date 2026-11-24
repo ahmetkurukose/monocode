@@ -229,6 +229,28 @@ async fn answer(
             })
             .flatten()
             .unwrap_or_default();
+            // Which frames of the tab have a content script, for a message
+            // that reaches none of them (or one frame of several).
+            if targets.is_empty() || frame.is_some() {
+                let frames: Vec<(i64, bool)> = with(|rt| {
+                    let i = rt.instances.get(key)?;
+                    let listening = i.listeners(event, ctx);
+                    Some(
+                        (i.ctxs.iter())
+                            .filter(|(_, c)| c.kind == Kind::Content && c.tab == Some(tab))
+                            .map(|(id, c)| (c.frame_id, listening.contains(id)))
+                            .collect(),
+                    )
+                })
+                .flatten()
+                .unwrap_or_default();
+                let kind = arg(&args, 1)["type"].as_str().unwrap_or("").to_owned();
+                log::warn!(
+                    "browser: extension {}: {api_name} {kind} to tab {tab} frame {frame:?}: {} receiver(s); content (frame, listening): {frames:?}",
+                    key.id,
+                    targets.len()
+                );
+            }
             if connect {
                 instance::connect(
                     key,
