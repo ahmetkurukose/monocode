@@ -87,7 +87,6 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let p = self.prefs.clone();
-        let inset = !self.ctx.classic;
         let light = p.theme == "light"
             || (p.theme == "system"
                 && matches!(
@@ -274,20 +273,6 @@ impl SettingsView {
             .collect();
         let mut layout = vec![
             self.row(
-                Some("inset-layout"),
-                true,
-                "Layout",
-                Some("Classic keeps everything in one sidebar. Focused adds a project switcher, workspace tabs and a right panel.".into()),
-                vec![self.segmented(
-                    "inset-layout",
-                    "Layout",
-                    if inset { "focused" } else { "classic" },
-                    &[("classic", "Classic"), ("focused", "Focused")],
-                    cx,
-                    |_, value, cx| cx.emit(SettingsEvent::NewLayout(value == "focused")),
-                )],
-            ),
-            self.row(
                 Some("interface-scale"),
                 false,
                 "Interface scale",
@@ -321,97 +306,46 @@ impl SettingsView {
                 )],
             ),
         ];
-        if !inset {
-            layout.insert(
-                1,
-                self.row(
-                    Some("project-rail-view"),
-                    false,
-                    "Project list",
-                    Some("Tree lists each project's sessions and open terminals under it.".into()),
-                    vec![self.segmented(
-                        "project-rail-view",
-                        "Project list",
-                        if p.project_rail_tree() {
-                            "tree"
-                        } else {
-                            "list"
-                        },
-                        &[("list", "List"), ("tree", "Tree")],
-                        cx,
-                        |this, value, cx| this.update(cx, |p| p.project_rail_view = value.into()),
-                    )],
-                ),
-            );
-            if p.project_rail_tree() {
-                let apps = [
-                    ("project-app-inbox", "inbox", "Inbox"),
-                    ("project-app-notes", "notes", "Notes"),
-                    ("project-app-database", "database", "Database"),
-                    ("project-app-api", "api", "API"),
-                ];
-                let controls = apps
-                    .into_iter()
-                    .map(|(id, app, label)| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(px(12.))
-                            .text_color(content(0.7))
-                            .child(label)
-                            .child(self.toggle(
-                                id,
-                                label,
-                                p.project_app_shown(app),
-                                false,
-                                cx,
-                                move |this, on, cx| {
-                                    this.update(cx, |p| p.set_project_app_shown(app, on))
-                                },
-                            ))
-                            .into_any_element()
-                    })
-                    .collect();
-                layout.insert(
-                    2,
-                    self.row(
-                        Some("project-apps"),
+        let apps = [
+            ("project-app-inbox", "inbox", "Inbox"),
+            ("project-app-notes", "notes", "Notes"),
+            ("project-app-database", "database", "Database"),
+            ("project-app-api", "api", "API"),
+        ];
+        let controls = apps
+            .into_iter()
+            .map(|(id, app, label)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(px(12.))
+                    .text_color(content(0.7))
+                    .child(label)
+                    .child(self.toggle(
+                        id,
+                        label,
+                        p.project_app_shown(app),
                         false,
-                        "Project apps",
-                        Some("Shown under each project in the tree; each opens as that project's tab.".into()),
-                        controls,
-                    ),
-                );
-            }
-        }
-        if inset {
-            layout.insert(
-                1,
-                self.row(
-                    Some("new-layout-style"),
-                    false,
-                    "Workspace style",
-                    Some(if cfg!(target_os = "macos") {
-                        "Choose a rounded card or a full-height boxy workspace. ⌘⌥L switches between them.".into()
-                    } else {
-                        "Choose a rounded card or a full-height boxy workspace. Ctrl+Alt+L switches between them.".into()
-                    }),
-                    vec![self.segmented(
-                        "new-layout-style",
-                        "Workspace style",
-                        if self.ctx.new_layout_boxy {
-                            "boxy"
-                        } else {
-                            "rounded"
-                        },
-                        &[("rounded", "Rounded"), ("boxy", "Boxy")],
                         cx,
-                        |_, value, cx| cx.emit(SettingsEvent::NewLayoutBoxy(value == "boxy")),
-                    )],
+                        move |this, on, cx| this.update(cx, |p| p.set_project_app_shown(app, on)),
+                    ))
+                    .into_any_element()
+            })
+            .collect();
+        layout.insert(
+            0,
+            self.row(
+                Some("project-apps"),
+                false,
+                "Project apps",
+                Some(
+                    "Shown under each project in the tree; each opens as that project's tab."
+                        .into(),
                 ),
-            );
-        }
+                controls,
+            ),
+        );
         page.push(self.group(None, false, "Layout", None, None, layout));
         page
     }

@@ -240,20 +240,13 @@ impl Shell {
             .push(terminal.clone());
         if reveal && project == self.workspace.project {
             self.dock_tab_scroll.scroll_to_item(added);
-            if self.terminal_in_panel(cx) {
-                if let Some(dock) = self.workspace.docks.get_mut(project) {
-                    dock.open = false;
-                }
-                self.show_panel_terminal(window, cx);
-            } else {
-                if !was_open {
-                    self.slide_dock(true, cx);
-                }
-                if focus {
-                    self.focus_terminal(window, cx);
-                }
-                self.fit_sidebar(cx);
+            if !was_open {
+                self.slide_dock(true, cx);
             }
+            if focus {
+                self.focus_terminal(window, cx);
+            }
+            self.fit_sidebar(cx);
         }
         self.persist(cx);
         cx.notify();
@@ -352,18 +345,11 @@ impl Shell {
         dock.active = ix.min(dock.terminals.len().saturating_sub(1));
         dock.open = true;
         self.dock_tab_scroll.scroll_to_item(ix);
-        if self.terminal_in_panel(cx) {
-            if let Some(dock) = self.workspace.docks.get_mut(&project) {
-                dock.open = false;
-            }
-            self.show_panel_terminal(window, cx);
-        } else {
-            if !was_open {
-                self.slide_dock(true, cx);
-            }
-            self.focus_terminal(window, cx);
-            self.fit_sidebar(cx);
+        if !was_open {
+            self.slide_dock(true, cx);
         }
+        self.focus_terminal(window, cx);
+        self.fit_sidebar(cx);
         self.persist(cx);
         cx.notify();
         true
@@ -410,24 +396,17 @@ impl Shell {
         if !tabs.iter().any(|tab| tab.read(cx).hosted_view().is_some()) {
             return;
         }
-        let placement = if self.terminal_in_panel(cx) {
-            DockPlacement {
-                area: DockArea::Panel,
-                extent: self.right_panel_width(),
-            }
-        } else {
-            let Some(dock) = self.workspace.docks.get(project) else {
-                return;
-            };
-            DockPlacement {
-                area: match dock.side {
-                    DockSide::Bottom => DockArea::Bottom,
-                    DockSide::Top => DockArea::Top,
-                    DockSide::Left => DockArea::Left,
-                    DockSide::Right => DockArea::Right,
-                },
-                extent: dock.size,
-            }
+        let Some(dock) = self.workspace.docks.get(project) else {
+            return;
+        };
+        let placement = DockPlacement {
+            area: match dock.side {
+                DockSide::Bottom => DockArea::Bottom,
+                DockSide::Top => DockArea::Top,
+                DockSide::Left => DockArea::Left,
+                DockSide::Right => DockArea::Right,
+            },
+            extent: dock.size,
         };
         for tab in tabs.clone() {
             if tab.read(cx).hosted_view().is_some() {

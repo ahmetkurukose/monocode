@@ -2157,10 +2157,6 @@ mod tests {
         let (window, _, _) = super::super::tests::window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
-            .unwrap();
-        visual.run_until_parked();
         let projects = visual.debug_bounds("project-rail-frame").unwrap();
         let sessions = visual.debug_bounds("sidebar-frame").unwrap();
         let main = visual.debug_bounds("main-pane-frame").unwrap();
@@ -2388,7 +2384,7 @@ mod tests {
                         .workspace
                         .add_project(&format!("/projects/project-{i}"));
                 }
-                shell.toggle_layout(cx);
+                shell.invalidate_chrome(cx);
                 shell.sessions.len()
             })
             .unwrap();
@@ -2409,10 +2405,6 @@ mod tests {
         let (window, _, active) = super::super::tests::window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
-            .unwrap();
-        visual.run_until_parked();
         for compact in [false, true] {
             window
                 .update(visual, |shell, _, cx| {
@@ -2481,30 +2473,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[gpui::test]
-    fn new_boxy_style_is_independent_of_the_navigation_layout(cx: &mut TestAppContext) {
-        let (window, _, active) = super::super::tests::window(cx);
-        window
-            .update(cx, |shell, w, cx| {
-                shell.open_settings(crate::settings::Section::Appearance, w, cx);
-                shell.settings.clone().unwrap().update(cx, |_, cx| {
-                    cx.emit(crate::settings::SettingsEvent::NewLayoutBoxy(true))
-                });
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, cx| {
-                assert!(!shell.workspace.classic_layout);
-                assert!(shell.workspace.new_layout_boxy);
-                shell.toggle_layout(cx);
-                assert!(shell.workspace.classic_layout);
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.classic_layout && shell.workspace.new_layout_boxy);
-                assert!(shell.sessions.contains_key(&active));
-            })
-            .unwrap();
     }
 }

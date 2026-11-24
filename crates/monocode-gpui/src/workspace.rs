@@ -661,13 +661,14 @@ impl Workspace {
         self.classic_layout || self.new_layout_boxy
     }
 
-    /// The saved state a fresh install starts from: the Classic layout and
-    /// the fresh-install preferences. It names no project, so the startup
-    /// project is still found as usual.
+    /// The saved state a fresh install starts from: the Classic layout, the
+    /// Automations shortcut hidden and the fresh-install preferences. It names
+    /// no project, so the startup project is still found as usual.
     pub fn fresh_install_json() -> String {
         serde_json::json!({
             "classic_layout": true,
             "new_layout_boxy": false,
+            "sidebar_automations_visible": false,
             "preferences": crate::settings::Preferences::fresh_install(),
         })
         .to_string()
@@ -693,6 +694,8 @@ impl Workspace {
                 state.preferences.empty_session = if games { "games" } else { "none" }.into();
             }
         }
+        // Classic is the only layout; saved Focused choices land there.
+        state.classic_layout = true;
         let has_rail_state = saved
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
             .is_some_and(|value| value.get("project_rail_pinned").is_some());

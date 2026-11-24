@@ -412,7 +412,6 @@ mod tests {
                 shell.workspace.classic_layout = true;
                 shell.workspace.project_rail_open = true;
                 shell.workspace.preferences.monos = false;
-                shell.workspace.preferences.project_rail_view = "tree".into();
                 shell.workspace.project_rail_expanded =
                     ["/work/another-project".to_string()].into();
                 shell.invalidate_chrome(cx);

@@ -113,8 +113,6 @@ pub(crate) fn install(prefs: &crate::settings::Preferences, cx: &mut App) {
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Toggle Session Sidebar", ToggleRightPanel),
-            MenuItem::action("Toggle Layout", ToggleLayout),
-            MenuItem::action("Toggle Workspace Style", ToggleWorkspaceStyle),
             MenuItem::action("Inbox", OpenInbox),
             MenuItem::action("Notes", OpenNotes),
             MenuItem::action("Toggle Terminal", ToggleTerminal),

@@ -159,10 +159,6 @@ impl SearchView {
         }
         view
     }
-    pub(crate) fn set_classic(&mut self, classic: bool, cx: &mut Context<Self>) {
-        self.classic = classic;
-        cx.notify();
-    }
     /// Original SearchView owns a native title strip and reserves the leading
     /// space occupied by the shared window navigation above its compact rail.
     pub(crate) fn set_original_header(&mut self, inset: Option<f32>, cx: &mut Context<Self>) {

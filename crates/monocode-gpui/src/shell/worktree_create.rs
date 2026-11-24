@@ -399,7 +399,7 @@ impl Shell {
             .push(terminal);
         if project == self.workspace.project {
             self.dock_tab_scroll.scroll_to_item(added);
-            if !self.terminal_in_panel(cx) && !was_open {
+            if !was_open {
                 self.slide_dock(true, cx);
             }
         }
