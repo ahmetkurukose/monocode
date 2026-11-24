@@ -72,6 +72,10 @@ pub(super) struct Code {
     ext: Option<Box<ext::Ext>>,
 }
 impl Code {
+    /// The file this editor shows, as it was opened.
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
     fn new() -> Self {
         Self {
             hovered_change: None,
@@ -2588,6 +2592,43 @@ mod feature_tests {
                 let at = i.content.find("emoji").unwrap();
                 i.select_range(at..at + 5, cx);
                 assert!(i.code.as_ref().unwrap().folded.is_empty());
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn toggle_comment_takes_the_selected_lines_or_the_carets_and_undoes_in_one_step(
+        cx: &mut TestAppContext,
+    ) {
+        let window = editor(cx);
+        window
+            .update(cx, |i, w, cx| {
+                i.set_editor_path("a.py".into());
+                i.set_text("def f():\n    a = 1\n    b = 2\nend".into(), cx);
+                // From inside line 2 to inside line 3: both whole lines.
+                i.select_range(13..24, cx);
+                i.toggle_comment(&ToggleComment, w, cx);
+                assert_eq!(
+                    i.content.as_ref(),
+                    "def f():\n    # a = 1\n    # b = 2\nend"
+                );
+                assert_eq!(i.selection, 9..32);
+                i.toggle_comment(&ToggleComment, w, cx);
+                assert_eq!(i.content.as_ref(), "def f():\n    a = 1\n    b = 2\nend");
+                i.undo(&Undo, w, cx);
+                assert_eq!(
+                    i.content.as_ref(),
+                    "def f():\n    # a = 1\n    # b = 2\nend"
+                );
+                // No selection: the caret's line, and the caret stays in its text.
+                i.set_text("x = 1\ny = 2".into(), cx);
+                i.select_range(9..9, cx);
+                i.toggle_comment(&ToggleComment, w, cx);
+                assert_eq!(i.content.as_ref(), "x = 1\n# y = 2");
+                assert_eq!(i.selection, 11..11);
+                // A file whose format has no comments is left alone.
+                i.set_editor_path("a.json".into());
+                i.set_text("{}".into(), cx);
+                assert!(i.comment_syntax().is_none());
             })
             .unwrap();
     }

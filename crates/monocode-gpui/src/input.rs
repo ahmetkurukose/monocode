@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod code;
 mod command;
+mod comment;
 mod context_menu;
 mod history;
 mod image_pills;
@@ -42,6 +43,7 @@ actions!(
         Redo,
         Indent,
         Outdent,
+        ToggleComment,
         Backspace,
         Delete,
         Left,
@@ -137,6 +139,8 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("escape", DismissCompletion, Some("CodeEditor")),
         KeyBinding::new("tab", Indent, Some("CodeEditor")),
         KeyBinding::new("shift-tab", Outdent, Some("CodeEditor")),
+        KeyBinding::new("cmd-/", ToggleComment, Some("CodeEditor")),
+        KeyBinding::new("ctrl-/", ToggleComment, Some("CodeEditor")),
         KeyBinding::new("f12", GoToDefinition, Some("CodeEditor")),
         KeyBinding::new("shift-f12", FindUsages, Some("CodeEditor")),
         KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
@@ -2004,6 +2008,7 @@ impl Render for Input {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::indent))
             .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::toggle_comment))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))

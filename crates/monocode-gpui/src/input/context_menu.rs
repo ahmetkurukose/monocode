@@ -62,6 +62,12 @@ impl Input {
                 MenuItem::Separator,
             ]);
         }
+        if self.comment_syntax().is_some() {
+            items.extend([
+                action("comment", "Toggle Comment", "/", true),
+                MenuItem::Separator,
+            ]);
+        }
         items.extend([
             action("cut", "Cut", "X", selected && !self.read_only),
             action("copy", "Copy", "C", selected),
@@ -102,6 +108,7 @@ impl Input {
                     "copy" => Box::new(Copy),
                     "paste" => Box::new(Paste),
                     "select-all" => Box::new(SelectAll),
+                    "comment" => Box::new(ToggleComment),
                     "definition" => Box::new(GoToDefinition),
                     "usages" => Box::new(FindUsages),
                     _ => return,
