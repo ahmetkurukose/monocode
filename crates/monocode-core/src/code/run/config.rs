@@ -2,6 +2,7 @@
 //! and environment, and the ordered list of them a project keeps. They are
 //! defined once per project and resolved per checkout, so one definition
 //! works in every agent worktree.
+use super::group::RunGroup;
 use serde::{Deserialize, Serialize};
 
 /// Ids of the tasks this app offers by itself start with this, so they can
@@ -77,6 +78,11 @@ pub struct ProjectRuns {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used: Option<RunConfig>,
     pub test_runner: TestRunner,
+    /// Named lists of the configurations above that are started together.
+    /// Absent from what is saved while there are none, so an older build
+    /// that does not know them loses nothing it had.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<RunGroup>,
 }
 
 fn new_id() -> String {
@@ -89,6 +95,7 @@ impl ProjectRuns {
         self.configs.is_empty()
             && self.last_used.is_none()
             && self.test_runner == TestRunner::Pytest
+            && self.groups.is_empty()
     }
 
     /// As it should be saved: trimmed, without configurations that have no
@@ -114,7 +121,32 @@ impl ProjectRuns {
         if self.last_used().is_none() {
             self.last_used = None;
         }
+        self.groups = self.normalized_groups();
         self
+    }
+
+    /// Groups without a name are left out like configurations without a
+    /// command; every group gets an id of its own, and each member the name
+    /// its configuration has now. A member whose configuration is gone is
+    /// kept: the group names it when it is skipped.
+    fn normalized_groups(&mut self) -> Vec<RunGroup> {
+        let mut groups: Vec<RunGroup> = Vec::with_capacity(self.groups.len());
+        for group in std::mem::take(&mut self.groups) {
+            let mut group = group.normalized();
+            if group.name.is_empty() {
+                continue;
+            }
+            if group.id.is_empty() || groups.iter().any(|kept| kept.id == group.id) {
+                group.id = new_id();
+            }
+            for member in &mut group.members {
+                if let Some(config) = self.configs.iter().find(|c| c.id == member.config) {
+                    member.label = config.label();
+                }
+            }
+            groups.push(group);
+        }
+        groups
     }
 
     pub fn get(&self, id: &str) -> Option<&RunConfig> {
@@ -146,7 +178,42 @@ impl ProjectRuns {
         if self.last_used.as_ref().is_some_and(|last| last.id == id) {
             self.last_used = None;
         }
+        for group in &mut self.groups {
+            group.members.retain(|member| member.config != id);
+        }
         Some(self.configs.remove(index))
+    }
+
+    pub fn group(&self, id: &str) -> Option<&RunGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: &str) -> Option<&mut RunGroup> {
+        self.groups.iter_mut().find(|group| group.id == id)
+    }
+
+    /// Adds `group` at the end under a new id, which is returned.
+    pub fn add_group(&mut self, mut group: RunGroup) -> String {
+        group.id = new_id();
+        let id = group.id.clone();
+        self.groups.push(group);
+        id
+    }
+
+    pub fn remove_group(&mut self, id: &str) -> Option<RunGroup> {
+        let index = self.groups.iter().position(|group| group.id == id)?;
+        Some(self.groups.remove(index))
+    }
+
+    /// Moves a group so that it ends up at `index` (clamped to the list).
+    /// False when there is no such group.
+    pub fn move_group(&mut self, id: &str, index: usize) -> bool {
+        let Some(from) = self.groups.iter().position(|group| group.id == id) else {
+            return false;
+        };
+        let group = self.groups.remove(from);
+        self.groups.insert(index.min(self.groups.len()), group);
+        true
     }
 
     /// Moves a configuration so that it ends up at `index` (clamped to the
@@ -181,6 +248,9 @@ impl ProjectRuns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code::run::group::{
+        GroupMember, OnFailedStart, OnMemberExit, StartOrder, Wait, DEFAULT_WAIT_TIMEOUT,
+    };
 
     fn config(name: &str, command: &str) -> RunConfig {
         RunConfig {
@@ -326,6 +396,7 @@ mod tests {
                 ..config("Gone", "true")
             }),
             test_runner: TestRunner::Pytest,
+            groups: Vec::new(),
         }
         .normalized();
         assert_eq!(names(&runs), ["Serve", "Twin", "No id", "Pretender"]);
@@ -349,6 +420,149 @@ mod tests {
         }
         .normalized()
         .is_empty());
+    }
+
+    fn group_of(runs: &mut ProjectRuns, name: &str, configs: &[&str]) -> String {
+        let mut group = RunGroup::named(name);
+        for id in configs {
+            let label = runs.get(id).map(RunConfig::label).unwrap_or_default();
+            group.add_member(id, &label);
+        }
+        runs.add_group(group)
+    }
+
+    #[test]
+    fn groups_round_trip_and_older_state_loads_without_them() {
+        let mut runs = ProjectRuns::default();
+        let tunnel = runs.add(config("Tunnel", "ssh -N db"));
+        let backend = runs.add(config("Backend", "npm start"));
+        let id = group_of(&mut runs, "Dev environment", &[&tunnel, &backend]);
+        let group = runs.group_mut(&id).unwrap();
+        group.order = StartOrder::Parallel;
+        group.on_failed_start = OnFailedStart::StopGroup;
+        group.on_member_exit = OnMemberExit::StopGroup;
+        group.members[0].wait = Wait::Port(5432);
+        group.members[0].timeout = 20;
+        group.members[1].wait = Wait::Seconds(3);
+        let saved = serde_json::to_string(&runs).unwrap();
+        assert!(saved.contains("\"onFailedStart\":\"stopGroup\""), "{saved}");
+        assert!(saved.contains("\"wait\":{\"port\":5432}"), "{saved}");
+        assert_eq!(serde_json::from_str::<ProjectRuns>(&saved).unwrap(), runs);
+        assert!(!runs.is_empty());
+        assert!(!ProjectRuns {
+            groups: runs.groups.clone(),
+            ..ProjectRuns::default()
+        }
+        .is_empty());
+
+        // State saved before groups existed, and one without settings, load
+        // with the defaults.
+        let old: ProjectRuns = serde_json::from_str(
+            r#"{"configs":[{"id":"a","command":"make"}],"testRunner":"unittest"}"#,
+        )
+        .unwrap();
+        assert!(old.groups.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("groups"));
+        let bare: ProjectRuns = serde_json::from_str(
+            r#"{"groups":[{"id":"g","name":"Dev","members":[{"config":"a"}]}]}"#,
+        )
+        .unwrap();
+        let group = &bare.groups[0];
+        assert_eq!(
+            (group.order, group.on_failed_start, group.on_member_exit),
+            (
+                StartOrder::Sequential,
+                OnFailedStart::DoNotStartRest,
+                OnMemberExit::LeaveOthers
+            )
+        );
+        assert_eq!(group.members[0].wait, Wait::None);
+        assert_eq!(group.members[0].timeout, DEFAULT_WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn deleting_a_configuration_removes_it_from_the_groups() {
+        let mut runs = ProjectRuns::default();
+        let a = runs.add(config("A", "a"));
+        let b = runs.add(config("B", "b"));
+        let first = group_of(&mut runs, "One", &[&a, &b]);
+        let second = group_of(&mut runs, "Two", &[&b]);
+        runs.remove(&b);
+        let members = |runs: &ProjectRuns, id: &str| -> Vec<String> {
+            (runs.group(id).unwrap().members.iter())
+                .map(|member| member.label.clone())
+                .collect()
+        };
+        assert_eq!(members(&runs, &first), ["A"]);
+        assert!(members(&runs, &second).is_empty(), "the group stays, empty");
+        assert!(runs.remove_group(&second).is_some());
+        assert!(runs.remove_group(&second).is_none());
+    }
+
+    #[test]
+    fn groups_are_repaired_and_follow_renamed_configurations() {
+        let mut runs = ProjectRuns::default();
+        let a = runs.add(config("A", "a"));
+        let id = group_of(&mut runs, "  Dev ", &[&a]);
+        runs.group_mut(&id).unwrap().members.push(GroupMember {
+            config: "gone".into(),
+            label: "Gone".into(),
+            ..GroupMember::default()
+        });
+        runs.group_mut(&id).unwrap().members.push(GroupMember {
+            config: a.clone(),
+            ..GroupMember::default()
+        });
+        runs.groups.push(RunGroup {
+            id: id.clone(),
+            name: "Twin".into(),
+            ..RunGroup::default()
+        });
+        runs.groups.push(RunGroup::named("   "));
+        let mut renamed = runs.get(&a).unwrap().clone();
+        renamed.name = "Alpha".into();
+        runs.update(renamed);
+        let runs = runs.normalized();
+        assert_eq!(runs.groups.len(), 2, "the nameless group is dropped");
+        assert_eq!(runs.groups[0].name, "Dev");
+        assert_ne!(runs.groups[1].id, runs.groups[0].id);
+        let members: Vec<(&str, &str)> = (runs.groups[0].members.iter())
+            .map(|member| (member.config.as_str(), member.label.as_str()))
+            .collect();
+        // A duplicate is dropped; a member without a configuration keeps the
+        // name it had, so it can be reported.
+        assert_eq!(members, [(a.as_str(), "Alpha"), ("gone", "Gone")]);
+
+        let mut group = runs.groups[0].clone();
+        assert_eq!(group.problem(), None);
+        group.members[0].wait = Wait::Port(0);
+        assert!(group.problem().unwrap().contains("port 0"));
+        group.name = " ".into();
+        assert_eq!(group.problem().unwrap(), "A group needs a name.");
+    }
+
+    #[test]
+    fn groups_move_and_their_members_move() {
+        let mut runs = ProjectRuns::default();
+        let one = group_of(&mut runs, "One", &[]);
+        let two = group_of(&mut runs, "Two", &[]);
+        let three = group_of(&mut runs, "Three", &[]);
+        assert!(runs.move_group(&three, 0));
+        let names = |runs: &ProjectRuns| -> Vec<String> {
+            runs.groups.iter().map(|group| group.name.clone()).collect()
+        };
+        assert_eq!(names(&runs), ["Three", "One", "Two"]);
+        assert!(runs.move_group(&three, 99));
+        assert_eq!(names(&runs), ["One", "Two", "Three"]);
+        assert!(!runs.move_group("absent", 0));
+        let _ = (one, two);
+
+        let mut group = RunGroup::named("G");
+        assert!(group.add_member("a", "A") && group.add_member("b", "B"));
+        assert!(!group.add_member("a", "A"));
+        assert!(group.move_member(1, 0));
+        assert_eq!(group.members[0].config, "b");
+        assert!(!group.move_member(5, 0));
     }
 
     #[test]
