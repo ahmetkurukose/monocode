@@ -535,6 +535,10 @@ enum PagePrompt {
 /// One browser page in a pane: its toolbar, and the Chromium view below.
 pub(crate) struct BrowserPage {
     pub url: String,
+    /// `url` came from the app, not a page: a restored tab, the address
+    /// bar, or an address Chromium already committed. An extension's page
+    /// at such an address loads as from Chrome's own UI.
+    pub(crate) url_from_app: bool,
     pub title: String,
     loading: bool,
     can_go_back: bool,
@@ -664,6 +668,7 @@ impl BrowserPage {
         ];
         Self {
             url,
+            url_from_app: false,
             title,
             loading: false,
             can_go_back: false,
@@ -767,6 +772,7 @@ impl BrowserPage {
     pub(crate) fn navigate_for_extension(&mut self, url: String, cx: &mut Context<Self>) {
         self.next_transition(history::Transition::Link);
         self.url = url.clone();
+        self.url_from_app = false;
         self.failure = None;
         if !self.host.with_view(|view| view.load_url(&url)) {
             cx.notify();
@@ -780,7 +786,9 @@ impl BrowserPage {
         self.next_transition(history::Transition::Typed);
         self.close_suggestions(cx);
         self.url = url.clone();
+        self.url_from_app = true;
         self.failure = None;
+        extensions::app_loads(&url);
         if !self.host.with_view(|view| view.load_url(&url)) {
             cx.notify();
         }
@@ -795,6 +803,8 @@ impl BrowserPage {
                 self.sites_follow_address(&url);
                 self.passwords_follow_address(&url);
                 self.record_visit(&url, cx);
+                // Chromium committed it: it was allowed to load.
+                self.url_from_app = true;
                 if url != self.url {
                     self.url = url.clone();
                     self.address.update(cx, |field, cx| field.set_text(url, cx));
@@ -962,6 +972,9 @@ impl BrowserPage {
 
     fn reload(&mut self, ignore_cache: bool) {
         self.next_transition(history::Transition::Reload);
+        if self.url_from_app {
+            extensions::app_loads(&self.url);
+        }
         self.host.with_view(|view| {
             if ignore_cache {
                 view.reload_ignore_cache();
@@ -1522,6 +1535,7 @@ impl BrowserPage {
             self.url.clone()
         };
         let page = cx.weak_entity();
+        let from_app = self.url_from_app;
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
@@ -1529,6 +1543,9 @@ impl BrowserPage {
                 let made = host.clone();
                 let generation = host.shared.generation.get();
                 host.paint(bounds, window, cx, |parent, frame, cx| {
+                    if from_app {
+                        extensions::app_loads(&url);
+                    }
                     match make_view(page.clone(), generation, parent, frame, &url, &options, cx) {
                         Ok(view) => {
                             // Once the view is in its slot, which paint holds.
@@ -2039,6 +2056,9 @@ impl BrowserPage {
         };
         let raw = Retained::as_ptr(&clip) as *mut std::ffi::c_void;
         let generation = self.host.shared.generation.get();
+        if self.url_from_app {
+            extensions::app_loads(&url);
+        }
         let view = match make_view(cx.weak_entity(), generation, raw, frame, &url, &options, cx) {
             Ok(view) => view,
             Err(error) => {

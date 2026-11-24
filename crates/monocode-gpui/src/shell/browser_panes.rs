@@ -49,6 +49,8 @@ impl Shell {
         let links = self.browser_page_links(pane, cx);
         let page = cx.new(|cx| {
             let mut page = BrowserPage::new(state.url, state.title, zoom, profiles, cx);
+            // A restored tab's address was the page's before (K20).
+            page.url_from_app = !state.fresh;
             page.set_profile(profile, cx);
             page.set_history(history, !state.fresh, state.opened_by.is_some());
             page.links = Some(links);

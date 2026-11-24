@@ -122,6 +122,39 @@ fn is_own_frame(frame: &str, id: &str) -> bool {
         .is_some_and(|(owner, at)| owner == id && at.elapsed() < OWN_FRAME_FOR)
 }
 
+/// One-time keys put in the shim tag of the documents this extension's
+/// frames load, for a short while. A frame's first requests come before
+/// Chromium gives it its URL; the key in its shim's address says the
+/// request is that document's, and only the document has it (a page
+/// cannot read a cross-origin frame's document).
+fn doc_keys() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static KEYS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+
+const DOC_KEY_FOR: Duration = Duration::from_secs(30);
+
+/// A new key for a document of extension `id`.
+fn issue_doc_key(id: &str) -> String {
+    let key = core::random_token();
+    let mut keys = doc_keys().lock().unwrap();
+    keys.retain(|_, (_, at)| at.elapsed() < DOC_KEY_FOR);
+    keys.insert(key.clone(), (id.to_owned(), Instant::now()));
+    key
+}
+
+/// Whether `key` is a fresh key of extension `id`'s, used up.
+fn take_doc_key(key: &str, id: &str) -> bool {
+    let mut keys = doc_keys().lock().unwrap();
+    match keys.get(key) {
+        Some((owner, at)) if owner == id && at.elapsed() < DOC_KEY_FOR => {
+            keys.remove(key);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn add_host(browser_id: i32, id: &str) {
     hosts().lock().unwrap().insert(browser_id, id.to_owned());
 }
@@ -246,10 +279,14 @@ fn refuse(responder: Responder, status: i32) {
     responder.respond(Head::new(status, "text/plain"), Vec::new());
 }
 
-/// The shim first, before any of the page's own scripts.
-fn with_shim(html: &[u8]) -> Vec<u8> {
+/// The shim first, before any of the page's own scripts; `key`, a
+/// document's one-time key ([`issue_doc_key`]), in its address.
+fn with_shim(html: &[u8], key: Option<&str>) -> Vec<u8> {
     let text = String::from_utf8_lossy(html);
-    let tag = "<script src=\"/__mcext/shim.js\"></script>";
+    let tag = match key {
+        Some(key) => format!("<script src=\"/__mcext/shim.js?doc={key}\"></script>"),
+        None => "<script src=\"/__mcext/shim.js\"></script>".to_owned(),
+    };
     let lower = text.to_ascii_lowercase();
     let at = lower
         .find("<head")
@@ -313,9 +350,20 @@ impl ExtensionRequests for Handler {
                     .first_party
                     .strip_prefix(&own_origin)
                     .is_some_and(|rest| rest.starts_with('/')));
+        // A frame's own shim, by its document's key: the frame is this
+        // extension's from now on (its scripts and styles follow).
+        let keyed = path == "__mcext/shim.js"
+            && request.load == Load::Resource
+            && unknown_frame
+            && take_doc_key(&query_value(query, "doc"), id);
+        if keyed && let Some(frame) = &request.frame_id {
+            note_own_frame(frame, id);
+        }
         let own_frame = matches!(request.load, Load::Resource | Load::Worker)
             && unknown_frame
-            && (own_top || (request.frame_id.as_deref()).is_some_and(|f| is_own_frame(f, id)));
+            && (own_top
+                || keyed
+                || (request.frame_id.as_deref()).is_some_and(|f| is_own_frame(f, id)));
         let requester = Requester {
             load: Some(match request.load {
                 Load::MainFrame => access::Load::MainFrame,
@@ -404,7 +452,11 @@ impl ExtensionRequests for Handler {
                 }
                 let body = if kind == "text/html" {
                     head = head.header("Content-Security-Policy", &csp);
-                    with_shim(&bytes)
+                    // Only a document gets a key: a page may fetch a listed
+                    // page and read it, but never a frame's document.
+                    let document = matches!(request.load, Load::MainFrame | Load::SubFrame);
+                    let key = document.then(|| issue_doc_key(id));
+                    with_shim(&bytes, key.as_deref())
                 } else {
                     if kind == "text/javascript" {
                         head = head.header("Content-Security-Policy", &csp);
@@ -575,17 +627,33 @@ mod tests {
         );
         assert_eq!(split_url("mcext://abc"), Some(("abc", "", "")));
         assert_eq!(split_url("https://abc/"), None);
-        let html =
-            with_shim(b"<!doctype html><html><head><title>x</title><script src=a.js></script>");
+        let html = with_shim(
+            b"<!doctype html><html><head><title>x</title><script src=a.js></script>",
+            None,
+        );
         let html = String::from_utf8(html).unwrap();
         assert!(html.starts_with(
             "<!doctype html><html><head><script src=\"/__mcext/shim.js\"></script><title>"
         ));
-        let bare = String::from_utf8(with_shim(b"<div>")).unwrap();
+        let bare = String::from_utf8(with_shim(b"<div>", None)).unwrap();
         assert!(bare.starts_with("<script src=\"/__mcext/shim.js\">"));
+        let keyed = String::from_utf8(with_shim(b"<head>", Some("k1"))).unwrap();
+        assert_eq!(
+            keyed,
+            "<head><script src=\"/__mcext/shim.js?doc=k1\"></script>"
+        );
         assert_eq!(percent_decode("a%20b%2"), "a b%2");
         assert_eq!(query_value("ctx=a%2Fb&x=1", "ctx"), "a/b");
         assert_eq!(enc("a b/é"), "a%20b%2F%C3%A9");
+    }
+
+    #[test]
+    fn a_document_key_is_its_extensions_and_works_once() {
+        let key = issue_doc_key("ext-a");
+        assert!(!take_doc_key(&key, "ext-b"));
+        assert!(take_doc_key(&key, "ext-a"));
+        assert!(!take_doc_key(&key, "ext-a"));
+        assert!(!take_doc_key("", "ext-a"));
     }
 
     #[test]

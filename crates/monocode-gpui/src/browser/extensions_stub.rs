@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 pub(crate) type ProfileKey = Option<String>;
 
+pub(crate) fn app_loads(_: &str) {}
+
 pub(crate) fn profile_key(_: &super::monocode_cef::Profile) -> Option<ProfileKey> {
     None
 }

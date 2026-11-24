@@ -32,6 +32,15 @@ mod serve;
 mod tabs;
 pub(crate) mod toolbar;
 
+/// The app itself loads `url` top-level: a restored tab, the address bar,
+/// a reload. An extension's page loads then as Chrome loads one from its
+/// own UI (a page could not open it unless the extension lists it).
+pub(crate) fn app_loads(url: &str) {
+    if url.starts_with(&format!("{}://", core::SCHEME)) {
+        serve::expect(url);
+    }
+}
+
 use std::{
     cell::RefCell,
     collections::HashMap,
