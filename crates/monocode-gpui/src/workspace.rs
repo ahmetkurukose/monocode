@@ -2080,10 +2080,19 @@ mod tests {
             &[],
             "/work",
         );
-        assert!(!state.classic_layout);
-        assert!(state.new_layout_boxy);
+        // Classic is the only layout now, so the legacy boxy save opens there.
+        assert!(state.classic_layout);
         assert!(state.boxy_layout());
         assert_eq!(state.preferences.collapsed_project_rail, "compact");
+        let focused = super::Workspace::restore(
+            Some(r#"{"classic_layout":false,"new_layout_boxy":false}"#),
+            &[],
+            "/work",
+        );
+        assert!(
+            focused.classic_layout,
+            "a saved Focused layout opens in Classic"
+        );
         let saved = serde_json::to_string(&state).unwrap();
         let mut state = super::Workspace::restore(Some(&saved), &[], "/work");
         state.classic_layout = true;
@@ -2091,7 +2100,7 @@ mod tests {
         state.project_rail_width = 248.;
         let saved = serde_json::to_string(&state).unwrap();
         let state = super::Workspace::restore(Some(&saved), &[], "/work");
-        assert!(state.classic_layout && state.new_layout_boxy);
+        assert!(state.classic_layout);
         assert!(!state.project_rail_open);
         assert_eq!(state.project_rail_width, 248.);
     }

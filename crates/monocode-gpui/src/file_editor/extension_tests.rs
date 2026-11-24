@@ -540,3 +540,71 @@ fn cmd_alt_arrows_walk_the_places_the_caret_has_been_across_files(cx: &mut TestA
     settle(cx, 50);
     assert_eq!(*opened.borrow(), [format!("{}:3:1", other.display())]);
 }
+
+#[gpui::test]
+fn an_editor_follows_its_file_when_a_change_renames_or_deletes_it(cx: &mut TestAppContext) {
+    use crate::code_editor::refactor::FileMoved;
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("pkg");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("app.py");
+    std::fs::write(&path, "value = 1\n").unwrap();
+    let window = open(&path, cx);
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    settle(cx, 50);
+    let heard = Rc::new(RefCell::new(Vec::new()));
+    let log = heard.clone();
+    window
+        .update(cx, |_, _, cx| {
+            cx.subscribe(
+                &cx.entity(),
+                move |_, _, event: &FileEvent, _| match event {
+                    FileEvent::Moved(to) => log.borrow_mut().push(format!("moved {to}")),
+                    FileEvent::Deleted => log.borrow_mut().push("deleted".into()),
+                    _ => {}
+                },
+            )
+            .detach();
+        })
+        .unwrap();
+    type_text(window, "# unsaved\n", cx);
+    settle(cx, 300);
+
+    // A folder above it was renamed: the buffer stays, under the new path.
+    let renamed = dir.path().join("lib");
+    std::fs::rename(&folder, &renamed).unwrap();
+    cx.update(|_, cx| {
+        code_editor::hub(cx).update(cx, |_, cx| {
+            cx.emit(FileMoved::Renamed {
+                from: folder.clone(),
+                to: renamed.clone(),
+            })
+        })
+    });
+    settle(cx, 300);
+    let moved = renamed.join("app.py");
+    window
+        .read_with(cx, |view, cx| {
+            assert_eq!(view.path, moved.to_string_lossy());
+            assert!(view.input.read(cx).content.starts_with("# unsaved"));
+        })
+        .unwrap();
+    cx.update(|_, cx| {
+        let hub = code_editor::hub(cx);
+        assert!(hub.read(cx).document(&moved).is_some(), "reopened there");
+        assert!(hub.read(cx).document(&path).is_none(), "and closed here");
+    });
+
+    // Another file going away is not this one; this one is.
+    cx.update(|_, cx| {
+        code_editor::hub(cx).update(cx, |_, cx| {
+            cx.emit(FileMoved::Deleted(dir.path().join("other.py")));
+            cx.emit(FileMoved::Deleted(moved.clone()));
+        })
+    });
+    settle(cx, 50);
+    assert_eq!(
+        *heard.borrow(),
+        [format!("moved {}", moved.display()), "deleted".to_string()]
+    );
+}

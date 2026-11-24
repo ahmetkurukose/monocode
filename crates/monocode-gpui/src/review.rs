@@ -186,6 +186,8 @@ pub(crate) enum ReviewEvent {
     FileHistory {
         cwd: String,
         path: String,
+        /// What to show instead of all versions.
+        request: Option<crate::file_history::Request>,
     },
     WordWrap(bool),
 }
@@ -530,14 +532,33 @@ impl ReviewPane {
                 if let FileEvent::WordWrap(wrap) = event {
                     cx.emit(ReviewEvent::WordWrap(*wrap));
                 }
-                if let FileEvent::FileHistory { cwd, path } = event {
+                if let FileEvent::FileHistory { cwd, path, request } = event {
                     cx.emit(ReviewEvent::FileHistory {
                         cwd: cwd.clone(),
                         path: path.clone(),
+                        request: request.clone(),
                     });
                 }
                 if let FileEvent::ShowInExplorer(path) = event {
                     cx.emit(ReviewEvent::ShowInExplorer(path.clone()));
+                }
+                // A code action renamed or deleted the file the tab shows.
+                if let FileEvent::Moved(moved) = event
+                    && let Some(source) = (this.sources.iter_mut())
+                        .find(|source| source.editor.as_ref() == Some(&editor))
+                    && let ReviewTab::File { path, .. } = &mut source.tab
+                {
+                    if this.preview_path.as_ref() == Some(path) {
+                        this.preview_path = Some(moved.clone());
+                    }
+                    *path = moved.clone();
+                    cx.emit(ReviewEvent::Changed);
+                }
+                if matches!(event, FileEvent::Deleted)
+                    && let Some(ix) = (this.sources.iter())
+                        .position(|source| source.editor.as_ref() == Some(&editor))
+                {
+                    this.close_tab(ix, cx);
                 }
                 if matches!(event, FileEvent::SaveFailed) {
                     this.pending_close = None;
@@ -1599,6 +1620,7 @@ impl ReviewPane {
                     ("git-history", Some((cwd, path))) => cx.emit(ReviewEvent::FileHistory {
                         cwd: cwd.clone(),
                         path: path.clone(),
+                        request: None,
                     }),
                     ("show-in-explorer", Some((_, path))) => {
                         cx.emit(ReviewEvent::ShowInExplorer(path.clone()))
@@ -2098,7 +2120,7 @@ mod tests {
                     &cx.entity(),
                     move |_, _, event: &ReviewEvent, _| match event {
                         ReviewEvent::ShowInExplorer(path) => seen.borrow_mut().push(path.clone()),
-                        ReviewEvent::FileHistory { cwd, path } => {
+                        ReviewEvent::FileHistory { cwd, path, .. } => {
                             seen.borrow_mut().push(format!("history {cwd} {path}"))
                         }
                         _ => {}

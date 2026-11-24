@@ -467,8 +467,6 @@ impl Monos {
             return;
         }
         self.original_chrome = original;
-        self.details
-            .update(cx, |view, cx| view.set_original_chrome(original, cx));
         cx.notify();
     }
     /// A floating panel can show a chat while the workspace stays inactive.

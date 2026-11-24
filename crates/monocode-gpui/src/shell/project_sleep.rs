@@ -754,6 +754,8 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
+                // The dock (remote projects' terminals) holds the shell.
+                shell.terminals_in_dock = true;
                 shell.open(a, w, cx);
                 shell.focus_active(w, cx);
             })

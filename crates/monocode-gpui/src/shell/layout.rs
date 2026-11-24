@@ -939,7 +939,8 @@ mod tests {
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        for boxy in [false, true] {
+        // Classic, the only layout, has the boxy frame's panel buttons.
+        for boxy in [true] {
             let selectors = if boxy {
                 ["right-panel-explorer", "right-panel-history"]
             } else {
@@ -1010,7 +1011,8 @@ mod tests {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, manager, mono, session) = mixed_window(cx);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        for classic in [false, true] {
+        // Classic is the only layout.
+        for classic in [true] {
             window
                 .update(visual, |shell, _, cx| {
                     shell.workspace.classic_layout = classic;
@@ -1081,33 +1083,22 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
-            if classic {
-                assert!(visual.debug_bounds("right-panel-frame").is_none());
-            } else {
-                // The session's group strips are the title bar, so the card
-                // rises to the window's top; the panel keeps its column.
-                let frame = visual.debug_bounds("right-panel-frame").unwrap();
-                assert_eq!(frame.left(), mono_bounds.left());
-                assert_eq!(frame.size.width, mono_bounds.size.width);
-                assert_eq!(frame.bottom(), mono_bounds.bottom());
-            }
+            // The tree's Classic layout keeps the panel's column for the
+            // session's tools.
+            let frame = visual.debug_bounds("right-panel-frame").unwrap();
+            assert_eq!(frame.left(), mono_bounds.left());
+            assert_eq!(frame.size.width, mono_bounds.size.width);
+            assert_eq!(frame.bottom(), mono_bounds.bottom());
             assert!(visual.debug_bounds("mono-overview-panel").is_none());
-            if !classic {
-                let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
-                visual.simulate_click(toggle.center(), Default::default());
-                visual.run_until_parked();
-            }
+            let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
             window
                 .update(visual, |_, w, cx| {
                     manager.update(cx, |m, cx| m.open(&mono, w, cx))
                 })
                 .unwrap();
             visual.run_until_parked();
-            if classic {
-                let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
-                visual.simulate_click(toggle.center(), Default::default());
-                visual.run_until_parked();
-            }
             assert!(visual.debug_bounds("right-panel-frame").is_none());
             window
                 .update(visual, |shell, _, _| {

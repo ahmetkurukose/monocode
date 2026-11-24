@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod agents;
+mod code_actions;
 
 fn touch(path: &Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1237,14 +1238,15 @@ fn rename_reads_the_servers_edits_across_files_without_applying_them() {
         pyright.wait_for("textDocument/rename")["params"]["newName"],
         json!("go")
     );
-    assert_eq!(edit.file_operations, 0);
-    assert_eq!(edit.changes.len(), 2);
-    assert_eq!(edit.changes[0].0, a);
+    assert_eq!(edit.file_operations(), 0);
+    let files: Vec<_> = edit.text_edits().collect();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].0, a);
     // Sorted by position, each counted in its own file's bytes.
-    let ranges: Vec<_> = edit.changes[0].1.iter().map(|edit| edit.range).collect();
+    let ranges: Vec<_> = files[0].1.iter().map(|edit| edit.range).collect();
     assert_eq!(ranges, [span(0, 4, 0, 6), span(1, 0, 1, 2)]);
-    assert_eq!(edit.changes[1].0, b);
-    assert_eq!(edit.changes[1].1[0].range, span(0, 14, 0, 16));
+    assert_eq!(files[1].0, b);
+    assert_eq!(files[1].1[0].range, span(0, 14, 0, 16));
     // Text the disk does not have yet is never written by the manager.
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "from a import ş\n");
 }
@@ -1300,7 +1302,7 @@ fn code_actions_come_from_every_server_with_their_own_diagnostics_and_resolve() 
     let start = text.find("os").unwrap();
     let mut actions = rig
         .manager
-        .code_actions(&a, start..start + 2, &none())
+        .code_actions(&a, start..start + 2, None, &none())
         .unwrap();
     actions.sort_by(|a, b| a.title.cmp(&b.title));
     let titles: Vec<_> = actions.iter().map(|action| action.title.as_str()).collect();
@@ -1325,7 +1327,7 @@ fn code_actions_come_from_every_server_with_their_own_diagnostics_and_resolve() 
     assert!(fix.preferred && !fix.command);
     assert_eq!(fix.kind.as_deref(), Some("quickfix"));
     assert_eq!(
-        fix.edit.as_ref().unwrap().changes[0].1[0].range,
+        fix.edit.as_ref().unwrap().text_edits().next().unwrap().1[0].range,
         span(1, 0, 2, 0)
     );
     assert!(actions[2].command && actions[2].edit.is_none());
@@ -1339,7 +1341,7 @@ fn code_actions_come_from_every_server_with_their_own_diagnostics_and_resolve() 
         json!(3)
     );
     let edit = extract.edit.unwrap();
-    assert_eq!(edit.changes[0].1[0].text, "one");
+    assert_eq!(edit.text_edits().next().unwrap().1[0].text, "one");
 }
 
 #[test]
@@ -1417,7 +1419,7 @@ fn a_code_actions_command_runs_and_brings_back_the_edits_it_asked_for() {
         );
         out.result(message, Value::Null);
     });
-    let actions = rig.manager.code_actions(&a, 0..0, &none()).unwrap();
+    let actions = rig.manager.code_actions(&a, 0..0, None, &none()).unwrap();
     assert!(actions[0].command && actions[0].edit.is_none());
     let change = rig
         .manager
@@ -1430,9 +1432,10 @@ fn a_code_actions_command_runs_and_brings_back_the_edits_it_asked_for() {
         pyright.wait_for_response(900)["result"],
         json!({ "applied": true })
     );
-    assert_eq!(change.changes.len(), 1);
-    assert_eq!(change.changes[0].1[0].text, "import os\nimport sys\n");
-    assert_eq!(change.changes[0].1[0].range, span(0, 0, 2, 0));
+    let files: Vec<_> = change.text_edits().collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1[0].text, "import os\nimport sys\n");
+    assert_eq!(files[0].1[0].range, span(0, 0, 2, 0));
 
     // Outside a command, a server's own request to edit is turned down.
     let here = uri(&a);

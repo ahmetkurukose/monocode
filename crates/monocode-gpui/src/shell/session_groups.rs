@@ -901,7 +901,17 @@ impl Shell {
     }
 
     fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_rename_in(target, RenameHost::Sidebar, window, cx);
+        let host = self.list_rename_host(cx);
+        self.start_rename_in(target, host, window, cx);
+    }
+    /// Where a session's list row is drawn: the sessions sidebar, or the
+    /// project rail's tree when the tree replaces it.
+    pub(super) fn list_rename_host(&self, cx: &App) -> RenameHost {
+        if self.session_sidebar_available(cx) {
+            RenameHost::Sidebar
+        } else {
+            RenameHost::Rail
+        }
     }
     /// The session a title tab renames: its focused chat, else the chat
     /// the tab is keyed by. `None` for a tab holding no chat.
@@ -2013,6 +2023,10 @@ mod tests {
         let (window, a, b) = crate::shell::tests::window(cx);
         window
             .update(cx, |shell, _, cx| {
+                // The project tree lists the sessions and hosts their renames.
+                shell.workspace.project_rail_open = true;
+                shell.workspace.project_rail_expanded =
+                    shell.workspace.projects.iter().cloned().collect();
                 for id in [a, b] {
                     shell.sessions[&id].update(cx, |session, _| {
                         session.summary.cwd = shell.workspace.project.clone();
@@ -2025,161 +2039,6 @@ mod tests {
         cx.run_until_parked();
         cx.refresh().unwrap();
         (window, a, b)
-    }
-
-    #[gpui::test]
-    fn expanded_folders_use_compact_connected_rows_and_keep_operator_children(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, a, b) = setup(cx);
-        let (plain, child) = window
-            .update(cx, |shell, _, cx| {
-                let mut ids = Vec::new();
-                for _ in 0..2 {
-                    let mut summary = locked(&shell.store)
-                        .unwrap()
-                        .create("codex", &shell.workspace.project)
-                        .unwrap();
-                    summary.has_messages = true;
-                    ids.push(summary.id);
-                    shell.add(summary, cx);
-                    shell.sessions[ids.last().unwrap()]
-                        .update(cx, |chat, _| chat.summary.has_messages = true);
-                }
-                let (plain, child) = (ids[0], ids[1]);
-                shell.groups.insert(
-                    shell.workspace.project.clone(),
-                    Groups {
-                        folders: vec![monocode_core::session_groups::Folder {
-                            id: "visual-folder".into(),
-                            name: "Review work".into(),
-                            session_ids: vec![a, b],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                );
-                shell.started_by.insert(child, a);
-                shell.workspace.active = Some(a);
-                shell.invalidate_chrome(cx);
-                (plain, child)
-            })
-            .unwrap();
-        cx.refresh().unwrap();
-        cx.run_until_parked();
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        let row = |cx: &mut VisualTestContext, id| {
-            cx.debug_bounds(Box::leak(format!("sidebar-session-{id}").into_boxed_str()))
-        };
-        let header = visual
-            .debug_bounds("session-group-folder:visual-folder")
-            .unwrap();
-        let first = row(visual, a).unwrap();
-        let second = row(visual, b).unwrap();
-        assert_eq!(first.left() - header.left(), px(30.));
-        assert_eq!(first.size.height, px(28.));
-        assert_eq!(second.left(), first.left());
-        assert_eq!(second.size.height, px(28.));
-        assert_eq!(row(visual, plain).unwrap().size.height, px(32.));
-        let started = row(visual, child).expect("a folder member keeps its Operator rail");
-        assert_eq!(started.left() - first.left(), px(30.));
-        window
-            .update(visual, |shell, _, cx| {
-                shell.change_sidebar_option("compact-session-cards", cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert_eq!(row(visual, a).unwrap().size.height, px(28.));
-        assert_eq!(row(visual, b).unwrap().size.height, px(28.));
-        assert_eq!(row(visual, child).unwrap().size.height, px(28.));
-        assert_eq!(row(visual, plain).unwrap().size.height, px(60.));
-        window
-            .update(visual, |_, window, _| {
-                let scale = window.scale_factor();
-                assert!(
-                    window.painted_quads().iter().any(|quad| {
-                        (quad.bounds.left().0 - f32::from(header.left()) * scale).abs() < 1.
-                            && (quad.bounds.top().0 - f32::from(header.top()) * scale).abs() < 1.
-                            && (quad.bounds.size.width.0 - f32::from(header.size.width) * scale)
-                                .abs()
-                                < 1.
-                            && quad
-                                .background
-                                .as_solid()
-                                .is_some_and(|color| (color.a - 0.05).abs() < 0.001)
-                    }),
-                    "an open folder has a persistent header fill"
-                );
-                assert!(
-                    window.painted_quads().iter().any(|quad| {
-                        (quad.bounds.left().0 - f32::from(header.left() + px(16.)) * scale).abs()
-                            < 1.
-                            && (quad.bounds.size.width.0 - scale).abs() < 0.1
-                            && quad.bounds.top().0 > f32::from(header.bottom()) * scale
-                            && quad.bounds.top().0 < f32::from(first.bottom()) * scale
-                            && quad
-                                .background
-                                .as_solid()
-                                .is_some_and(|color| color == crate::theme::rail_color())
-                    }),
-                    "the same spine as Operator rows connects folder members"
-                );
-            })
-            .unwrap();
-        window
-            .update(visual, |shell, _, cx| {
-                shell.update_groups(cx, |groups| groups.toggle_folder("visual-folder"))
-            })
-            .unwrap();
-        visual.refresh().unwrap();
-        assert!(row(visual, a).is_none());
-        assert!(row(visual, b).is_none());
-        assert!(row(visual, child).is_none());
-        window
-            .update(visual, |shell, _, cx| {
-                shell.query = "new".into();
-                shell.notify_sidebar(cx);
-            })
-            .unwrap();
-        visual.refresh().unwrap();
-        assert_eq!(
-            row(visual, a).unwrap().size.height,
-            px(28.),
-            "search opens a collapsed folder with the same compact layout"
-        );
-    }
-
-    #[gpui::test]
-    fn sidebar_header_controls_share_the_trailing_alignment(cx: &mut TestAppContext) {
-        let (window, _, _) = setup(cx);
-        // The header's plus appears once this project has a Mono. The empty
-        // state uses a full-width creation row instead.
-        window
-            .update(cx, |shell, _, cx| {
-                if let Some(monos) = &shell.monos {
-                    monos.update(cx, |monos, cx| {
-                        monos.roster.monos.push(monocode_core::mono::Mono {
-                            projects: vec![shell.workspace.project.clone()],
-                            ..Default::default()
-                        });
-                        cx.notify();
-                    });
-                }
-                shell.invalidate_chrome(cx);
-            })
-            .unwrap();
-        cx.refresh().unwrap();
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        let options = visual.debug_bounds("sidebar-options").unwrap();
-        let mono = visual.debug_bounds("sidebar-mono-button").unwrap();
-        let filter = visual.debug_bounds("sidebar-filter-button").unwrap();
-        assert!((options.center().x - mono.center().x).abs() <= px(1.));
-        assert!((options.center().x - filter.center().x).abs() <= px(1.));
-        let project = visual.debug_bounds("sidebar-project-button").unwrap();
-        let search = visual.debug_bounds("sidebar-search-button").unwrap();
-        assert_eq!(project.size.height, px(28.));
-        assert!(project.right() < search.left());
-        assert!(search.right() <= options.left());
     }
 
     #[gpui::test]
@@ -2256,7 +2115,10 @@ mod tests {
                     .update(cx, |input, cx| input.set_text("Work".into(), cx));
             })
             .unwrap();
-        cx.simulate_keystrokes(window.into(), "enter");
+        // The project tree draws no folder rows, so confirm the name directly.
+        window
+            .update(cx, |shell, w, cx| shell.finish_rename(true, w, cx))
+            .unwrap();
         cx.run_until_parked();
         let folder = window
             .update(cx, |shell, w, cx| {
@@ -2528,62 +2390,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn dragging_sessions_creates_a_folder_and_moves_into_an_existing_one(cx: &mut TestAppContext) {
-        let (window, a, b) = setup(cx);
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        let a_row = visual
-            .debug_bounds(Box::leak(format!("sidebar-session-{a}").into_boxed_str()))
-            .unwrap();
-        let b_row = visual
-            .debug_bounds(Box::leak(format!("sidebar-session-{b}").into_boxed_str()))
-            .unwrap();
-        visual.simulate_mouse_down(a_row.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(b_row.center(), Some(MouseButton::Left), Default::default());
-        visual.simulate_mouse_up(b_row.center(), MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, w, cx| {
-                let groups = shell.project_groups();
-                assert_eq!(groups.folders.len(), 1);
-                assert_eq!(groups.folders[0].session_ids, [a, b]);
-                assert!(shell.renaming.is_some());
-                shell.finish_rename(false, w, cx);
-                shell.update_groups(cx, |g| g.remove_sessions(&[a]));
-            })
-            .unwrap();
-        visual.refresh().unwrap();
-        let folder = window
-            .update(visual, |shell, _, _| {
-                shell.project_groups().folders[0].id.clone()
-            })
-            .unwrap();
-        let row = visual
-            .debug_bounds(Box::leak(format!("sidebar-session-{a}").into_boxed_str()))
-            .unwrap();
-        let header = visual
-            .debug_bounds(Box::leak(
-                format!("session-group-folder:{folder}").into_boxed_str(),
-            ))
-            .unwrap();
-        visual.simulate_mouse_down(row.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(header.center(), Some(MouseButton::Left), Default::default());
-        visual.simulate_mouse_up(header.center(), MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, _| {
-                assert!(
-                    shell
-                        .project_groups()
-                        .folder(&folder)
-                        .unwrap()
-                        .session_ids
-                        .contains(&a)
-                )
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
     fn delete_closes_the_session_and_cleans_up_folders_and_reminders(cx: &mut TestAppContext) {
         let (window, a, b) = setup(cx);
         window
@@ -2623,64 +2429,9 @@ mod tests {
             })
             .unwrap();
     }
-    #[gpui::test]
-    fn folder_headers_reorder_and_the_color_menu_updates_the_saved_folder(cx: &mut TestAppContext) {
-        let (window, a, b) = setup(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.update_groups(cx, |g| {
-                    g.create_folder(&[a], "first".into());
-                    g.create_folder(&[b], "second".into());
-                });
-            })
-            .unwrap();
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        visual.refresh().unwrap();
-        let first = visual
-            .debug_bounds("session-group-folder:first")
-            .unwrap()
-            .center();
-        let second = visual
-            .debug_bounds("session-group-folder:second")
-            .unwrap()
-            .center();
-        visual.simulate_mouse_down(second, MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(first, Some(MouseButton::Left), Default::default());
-        visual.simulate_mouse_up(first, MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, _| {
-                let g = shell.project_groups();
-                assert_eq!(g.folders[0].id, "first");
-                assert_eq!(g.folders[1].id, "second");
-                assert!(!g.folders[0].collapsed && !g.folders[1].collapsed);
-            })
-            .unwrap();
-        visual.refresh().unwrap();
-        let first = visual
-            .debug_bounds("session-group-folder:first")
-            .unwrap()
-            .center();
-        visual.simulate_mouse_down(first, MouseButton::Right, Default::default());
-        visual.run_until_parked();
-        visual.refresh().unwrap();
-        let swatch = visual.debug_bounds("folder-color-3").unwrap().center();
-        visual.simulate_click(swatch, Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, _| {
-                let saved = locked(&shell.store)
-                    .unwrap()
-                    .groups(&shell.workspace.project)
-                    .unwrap();
-                assert_eq!(saved.folders[0].id, "first");
-                assert_eq!(saved.folder("first").unwrap().color_index, Some(3));
-            })
-            .unwrap();
-    }
 
     #[gpui::test]
-    fn f2_renames_the_active_session_and_the_focused_folder(cx: &mut TestAppContext) {
+    fn f2_renames_the_active_session(cx: &mut TestAppContext) {
         let (window, a, _) = setup(cx);
         window
             .update(cx, |shell, w, cx| shell.open(a, w, cx))
@@ -2690,19 +2441,8 @@ mod tests {
         window.update(cx, |shell, w, cx| {
             assert!(matches!(shell.renaming.as_ref().unwrap().target, RenameTarget::Session(id) if id == a));
             shell.finish_rename(false, w, cx);
-            shell.update_groups(cx, |g| { g.create_folder(&[a], "work".into()); });
         }).unwrap();
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        visual.refresh().unwrap();
-        let folder = visual
-            .debug_bounds("session-group-folder:work")
-            .unwrap()
-            .center();
-        visual.simulate_click(folder, Default::default());
-        visual.simulate_keystrokes("f2");
-        visual.run_until_parked();
-        window.update(visual, |shell, _, _| {
-            assert!(matches!(&shell.renaming.as_ref().unwrap().target, RenameTarget::Folder(id) if id == "work"));
-        }).unwrap();
+        // Folder headers lived in the sessions sidebar, which the project
+        // tree replaced, so only the session half remains.
     }
 }

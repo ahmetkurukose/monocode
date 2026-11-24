@@ -19,6 +19,8 @@ pub(super) enum EditKind {
 struct Snapshot {
     text: SharedString,
     selection: Range<usize>,
+    /// The code editor's other carets; empty everywhere else.
+    carets: Vec<code::Caret>,
 }
 
 /// The step being extended: what it does and where its caret ended.
@@ -42,6 +44,7 @@ impl History {
         kind: EditKind,
         text: &SharedString,
         selection: Range<usize>,
+        carets: Vec<code::Caret>,
         range: &Range<usize>,
         caret: usize,
         now: Instant,
@@ -56,6 +59,7 @@ impl History {
             self.undo.push(Snapshot {
                 text: text.clone(),
                 selection,
+                carets,
             });
             let mut bytes = 0;
             let keep = self
@@ -84,6 +88,7 @@ impl History {
         redo: bool,
         text: SharedString,
         selection: Range<usize>,
+        carets: Vec<code::Caret>,
     ) -> Option<Snapshot> {
         let (source, target) = if redo {
             (&mut self.redo, &mut self.undo)
@@ -91,7 +96,11 @@ impl History {
             (&mut self.undo, &mut self.redo)
         };
         let snapshot = source.pop()?;
-        target.push(Snapshot { text, selection });
+        target.push(Snapshot {
+            text,
+            selection,
+            carets,
+        });
         self.run = None;
         Some(snapshot)
     }
@@ -125,10 +134,12 @@ impl Input {
             return;
         }
         let now = cx.background_executor().now();
+        let carets = self.secondary_carets();
         self.history.record(
             kind,
             &self.content,
             self.selection.clone(),
+            carets,
             range,
             caret,
             now,
@@ -174,9 +185,10 @@ impl Input {
         if self.marked.is_some() {
             return;
         }
-        let Some(snapshot) = self
-            .history
-            .step(redo, self.content.clone(), self.selection.clone())
+        let carets = self.secondary_carets();
+        let Some(snapshot) =
+            self.history
+                .step(redo, self.content.clone(), self.selection.clone(), carets)
         else {
             return;
         };
@@ -191,6 +203,12 @@ impl Input {
         self.selection = self.clip_range(snapshot.selection);
         self.reversed = false;
         self.code_changed();
+        if !snapshot.carets.is_empty() {
+            let mut carets = snapshot.carets;
+            carets.insert(0, code::Caret::at(self.selection.end));
+            carets[0].range = self.selection.clone();
+            self.set_carets(carets);
+        }
         self.reveal_code();
         self.command_removed(previous_command, cx);
         cx.emit(Changed);

@@ -49,7 +49,7 @@ pub(crate) enum Event {
 pub(crate) use external::LinkState;
 #[cfg(test)]
 pub(crate) use send::write_sources;
-pub(crate) use send::{MAX_SEND_BYTES, Origin, Target, send_targets};
+pub(crate) use send::{MAX_SEND_BYTES, Origin, RunMode, Target, request_run, send_targets};
 
 const LIMITS: [usize; 4] = [100, 500, 1000, 5000];
 const TREE_ROW: f32 = 26.;
@@ -568,6 +568,8 @@ pub(crate) struct DatabaseView {
     results_hidden: bool,
     send_target: Option<String>,
     sent: HashMap<String, u32>,
+    /// The console a file's statement just ran in, until the view shows it.
+    ran: Option<(String, u32)>,
     /// With project tabs, the project whose data sources the tree lists.
     scope: Option<String>,
     /// The workspace's projects, for the dialog's Projects list.
@@ -739,6 +741,7 @@ impl DatabaseView {
             results_hidden: saved.results_hidden,
             send_target: saved.send_target,
             sent: saved.sent,
+            ran: None,
             scope: None,
             projects: Vec::new(),
             selected_by_scope: saved.selected_by_scope,

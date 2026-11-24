@@ -522,11 +522,14 @@ impl Manager {
     /// What the servers offer to do over bytes `range` of `path`: fixes for
     /// the diagnostics there, refactorings and source actions. Every server
     /// of the file that has them is asked, linters too, and is given its own
-    /// diagnostics that touch the range. Blocks.
+    /// diagnostics that touch the range. With `only` (a kind such as
+    /// `refactor.extract`) just the actions of that kind or one under it
+    /// come back, whether or not the server heeds the request. Blocks.
     pub fn code_actions(
         &self,
         path: &Path,
         range: std::ops::Range<usize>,
+        only: Option<&str>,
         cancel: &CancelToken,
     ) -> Result<Vec<CodeAction>, LspError> {
         let mut targets = self.shared.targets(path, "codeActionProvider");
@@ -559,20 +562,33 @@ impl Manager {
                 &target,
                 "textDocument/codeAction",
                 |converter| {
+                    let mut context = json!({ "diagnostics": context, "triggerKind": 1 });
+                    if let Some(kind) = only {
+                        context["only"] = json!([kind]);
+                    }
                     json!({
                         "textDocument": { "uri": target.uri },
                         "range": {
                             "start": converter.position(path, start),
                             "end": converter.position(path, end),
                         },
-                        "context": { "diagnostics": context, "triggerKind": 1 },
+                        "context": context,
                     })
                 },
                 cancel,
                 |converter, result| protocol::code_actions(converter, result, target.id),
             );
             match asked {
-                Ok(actions) => found.extend(actions),
+                Ok(actions) => found.extend(actions.into_iter().filter(|action| {
+                    only.is_none_or(|only| {
+                        action.kind.as_deref().is_some_and(|kind| {
+                            kind == only
+                                || kind
+                                    .strip_prefix(only)
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                        })
+                    })
+                })),
                 Err(LspError::Cancelled) => return Err(LspError::Cancelled),
                 Err(error) => failure = Some(error),
             }
@@ -623,7 +639,10 @@ impl Manager {
 
     /// Runs the command of `action` on the server that offered it and
     /// returns the changes the server asked for while it ran, nothing
-    /// applied. For an action that has no edit of its own. Blocks.
+    /// applied. An action with an edit of its own runs its command once
+    /// that edit is applied and the document's new text is with the
+    /// manager, as the server counts on it. Rounds of edits come back in
+    /// order, each counted on the text the ones before it left. Blocks.
     pub fn run_code_action_command(
         &self,
         path: &Path,
@@ -646,6 +665,8 @@ impl Manager {
             target
                 .client
                 .execute_command(&command, self.shared.options.request_timeout, cancel)?;
+        // One converter for every round, so each is read on the text the
+        // rounds before it left.
         let mut converter = Converter::new(target.client.encoding(), |other: &Path| {
             if other == path {
                 return Some(target.text.clone());
@@ -655,18 +676,7 @@ impl Manager {
         let mut change = WorkspaceEdit::default();
         for edit in edits {
             let edit = protocol::workspace_edit(&mut converter, &edit);
-            change.file_operations += edit.file_operations;
-            for (file, edits) in edit.changes {
-                // A second round on a file is counted on the text the first
-                // one left, which only applying it would give.
-                if change.changes.iter().any(|(known, _)| *known == file) {
-                    return Err(LspError::Io(
-                        "The command changed a file in several steps, which is not supported yet"
-                            .into(),
-                    ));
-                }
-                change.changes.push((file, edits));
-            }
+            change.changes.extend(edit.changes);
         }
         Ok(change)
     }
@@ -871,6 +881,27 @@ impl Manager {
             .documents
             .get(path)
             .map(|document| document.text.clone())
+    }
+
+    /// Waits up to `timeout` for the open document `path` to hold `text`,
+    /// as the editor reports its edits a moment after making them. True at
+    /// once for a file the manager does not have open. Blocks.
+    pub fn await_document_text(
+        &self,
+        path: &Path,
+        text: &str,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.document_text(path) {
+                None => return true,
+                Some(held) if &*held == text => return true,
+                Some(_) if cancel.is_cancelled() || Instant::now() >= deadline => return false,
+                Some(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     /// Which servers of the kinds `path` gets are running (or starting) now

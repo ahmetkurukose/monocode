@@ -264,7 +264,7 @@ fn client_capabilities() -> Value {
             "workspaceFolders": true,
             "workspaceEdit": {
                 "documentChanges": true,
-                "resourceOperations": [],
+                "resourceOperations": ["create", "rename", "delete"],
                 "failureHandling": "abort",
             },
             "didChangeConfiguration": { "dynamicRegistration": true },
@@ -578,10 +578,6 @@ impl Shared {
                 Ok(Value::Null)
             }
             "window/showDocument" => Ok(json!({ "success": false })),
-            "workspace/applyEdit" => Ok(json!({
-                "applied": false,
-                "failureReason": "Edits from the server are not supported.",
-            })),
             _ => Err((METHOD_NOT_FOUND, format!("Method not found: {method}"))),
         }
     }

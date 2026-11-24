@@ -4,8 +4,9 @@
 //! child of the editor so it can reach the buffer.
 use super::*;
 use crate::code_editor::{
-    ActionGroup, CodeActionItem, CodeActionProvider, FileEdit, Position, RenameProvider,
-    RenameRange, TextEdit, refactor,
+    ActionGroup, CodeActionItem, CodeActionProvider, Position, RenameProvider, RenameRange,
+    TextEdit,
+    refactor::{self, FileChange, FollowUp},
 };
 use crate::popover::{
     Anchor, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, menu_popover, popover,
@@ -37,6 +38,20 @@ pub(in crate::input) struct RenameField {
 }
 
 const ACTIONS_WIDTH: f32 = 380.;
+
+/// A kind's last part in words: `source.organizeImports` is "organize
+/// imports".
+fn kind_label(kind: &str) -> String {
+    let last = kind.rsplit('.').next().unwrap_or(kind);
+    let mut label = String::with_capacity(last.len() + 4);
+    for character in last.chars() {
+        if character.is_uppercase() && !label.is_empty() {
+            label.push(' ');
+        }
+        label.extend(character.to_lowercase());
+    }
+    label
+}
 const RENAME_WIDTH: f32 = 280.;
 
 impl Input {
@@ -62,23 +77,54 @@ impl Input {
     }
 
     /// Hands a change to `refactor::apply` once this update is over: it
-    /// reaches this editor's buffer too, through the hub.
-    fn apply_change(&mut self, change: Vec<FileEdit>, window: &mut Window, cx: &mut Context<Self>) {
+    /// reaches this editor's buffer too, through the hub. `then` is asked
+    /// once the change is made, and what it answers is applied in turn.
+    fn apply_change(
+        &mut self,
+        change: Vec<FileChange>,
+        then: Option<FollowUp>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let this = cx.entity().downgrade();
+        let flush = (self.code.as_ref())
+            .and_then(|code| code.ext.as_ref())
+            .and_then(|ext| ext.flush.clone());
         window.defer(cx, move |_, cx| {
             let fail = move |message: String, cx: &mut App| {
                 let _ = this.update(cx, |this, cx| this.refactor_failed(message, cx));
             };
-            match refactor::apply(change, cx) {
-                Err(message) => fail(message, cx),
-                Ok(written) => cx
-                    .spawn(async move |cx| {
-                        if let Err(message) = written.await {
-                            let _ = cx.update(|cx| fail(message, cx));
-                        }
-                    })
-                    .detach(),
-            }
+            let written = match refactor::apply(change, cx) {
+                Err(message) => return fail(message, cx),
+                Ok(written) => written,
+            };
+            cx.spawn(async move |cx| {
+                if let Err(message) = written.await {
+                    let _ = cx.update(|cx| fail(message, cx));
+                    return;
+                }
+                let Some(then) = then else {
+                    return;
+                };
+                // The servers are told of the edit now rather than after
+                // the editor's pause.
+                let asked = cx.update(|cx| {
+                    if let Some(flush) = &flush {
+                        flush(cx);
+                    }
+                    then(cx)
+                });
+                let next = asked.await;
+                let outcome =
+                    match cx.update(|cx| next.and_then(|change| refactor::apply(change, cx))) {
+                        Ok(written) => written.await,
+                        Err(message) => Err(message),
+                    };
+                if let Err(message) = outcome {
+                    let _ = cx.update(|cx| fail(message, cx));
+                }
+            })
+            .detach();
         });
     }
 
@@ -99,7 +145,7 @@ impl Input {
             window,
             cx,
             move |position, cx| {
-                let found = provider.actions(position.clone(), range, cx);
+                let found = provider.actions(position.clone(), range, None, cx);
                 cx.foreground_executor()
                     .spawn(async move { (position, found.await) })
             },
@@ -113,15 +159,53 @@ impl Input {
         }
     }
 
-    /// The code actions of one kind at the caret (`CodeActionsOfKind`): one
-    /// is taken at once, several are listed, none is said.
+    /// The code actions of one kind over the selection or at the caret
+    /// (`CodeActionsOfKind`): the only one that can be taken is taken at
+    /// once, several are listed as ⌥↩ lists them, none is said.
     pub(in crate::input) fn code_actions_of_kind(
         &mut self,
-        _: &CodeActionsOfKind,
-        _: &mut Window,
+        wanted: &CodeActionsOfKind,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.propagate();
+        let Some(provider) = self.actions_provider() else {
+            cx.propagate();
+            return;
+        };
+        let kind = wanted.0.clone();
+        let range = self.selection.clone();
+        let task = self.ask(
+            self.cursor(),
+            Duration::ZERO,
+            window,
+            cx,
+            move |position, cx| {
+                let found = provider.actions(position.clone(), range, Some(kind.clone()), cx);
+                cx.foreground_executor()
+                    .spawn(async move { (position, kind, found.await) })
+            },
+            |this, (position, kind, found), window, cx| {
+                let mut items = match found {
+                    Ok(items) => items,
+                    Err(message) => return this.refactor_failed(message, cx),
+                };
+                items.retain(|item| refactor::kind_matches(item.kind.as_deref(), &kind));
+                let mut open = items.iter().filter(|item| item.disabled.is_none());
+                match (open.next(), open.next()) {
+                    (None, _) if items.is_empty() => {
+                        this.refactor_failed(format!("No {} actions here", kind_label(&kind)), cx)
+                    }
+                    (Some(only), None) => {
+                        let only = only.clone();
+                        this.take_action(position, only, window, cx)
+                    }
+                    _ => this.open_actions(position, items, window, cx),
+                }
+            },
+        );
+        if let Some(code) = &mut self.code {
+            code.ext_mut().refactor_task = Some(task);
+        }
     }
 
     fn open_actions(
@@ -214,7 +298,7 @@ impl Input {
                 Ok(_) if this.content != text => {
                     this.refactor_failed("The file changed; try the action again".into(), cx)
                 }
-                Ok(change) => this.apply_change(change, window, cx),
+                Ok(action) => this.apply_change(action.change, action.then, window, cx),
                 Err(message) => this.refactor_failed(message, cx),
             });
         });
@@ -336,7 +420,7 @@ impl Input {
                 Ok(_) if this.content != text => {
                     this.refactor_failed("The file changed; rename again".into(), cx)
                 }
-                Ok(change) => this.apply_change(change, window, cx),
+                Ok(change) => this.apply_change(change, None, window, cx),
                 Err(message) => this.refactor_failed(message, cx),
             });
         });

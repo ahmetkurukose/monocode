@@ -14,6 +14,36 @@ pub(crate) struct Target {
     pub name: String,
     pub color: Option<monocode_core::db::DbColor>,
     pub read_only: bool,
+    pub kind: DbKind,
+}
+
+/// What a statement sent from a file does once it is in its console.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunMode {
+    Execute,
+    Explain,
+    ExplainAnalyze,
+}
+
+/// The run a file asked for, picked up when its text reaches the console.
+#[derive(Default)]
+struct PendingRun(Option<(String, String, RunMode)>);
+
+impl gpui::Global for PendingRun {}
+
+/// Asks that `text`, when it is next sent to `source`, also runs as `mode`.
+/// Only the latest request is kept.
+pub(crate) fn request_run(source: &str, text: &str, mode: RunMode, cx: &mut gpui::App) {
+    cx.default_global::<PendingRun>().0 = Some((source.to_owned(), text.to_owned(), mode));
+}
+
+/// The run asked for `text` on `source`, taken so it happens once.
+fn take_run(source: &str, text: &str, cx: &mut gpui::App) -> Option<RunMode> {
+    let pending = cx.default_global::<PendingRun>();
+    match &pending.0 {
+        Some((s, t, _)) if s == source && t == text => pending.0.take().map(|(.., mode)| mode),
+        _ => None,
+    }
 }
 
 /// The saved data sources, the one used last first, read from `dir` so a file
@@ -33,6 +63,7 @@ pub(crate) fn send_targets(dir: &std::path::Path, place: &str) -> Vec<Target> {
             name: s.name,
             color: s.color,
             read_only: s.read_only,
+            kind: s.kind,
         })
         .collect();
     targets.sort_by_key(|t| (Some(&t.id) != last.as_ref(), t.name.to_lowercase()));
@@ -61,9 +92,42 @@ impl DatabaseView {
             .collect()
     }
 
+    /// The active console of `source`: its error and the statement it names.
+    #[cfg(test)]
+    pub(crate) fn console_error(&self, source: &str) -> Option<(String, String)> {
+        let id = self.active.get(source)?;
+        let ix = self.console_index(source, *id)?;
+        let (error, statement) = self.consoles[ix].error.clone()?;
+        Some((error.message, statement))
+    }
+
+    /// Whether the active console of `source` is running something.
+    #[cfg(test)]
+    pub(crate) fn console_running(&self, source: &str) -> bool {
+        self.active
+            .get(source)
+            .and_then(|id| self.console_index(source, *id))
+            .is_some_and(|ix| self.consoles[ix].running)
+    }
+
+    /// The selected text of the active console of `source`.
+    #[cfg(test)]
+    pub(crate) fn console_selection(&self, source: &str, cx: &gpui::App) -> String {
+        let Some(ix) = self
+            .active
+            .get(source)
+            .and_then(|id| self.console_index(source, *id))
+        else {
+            return String::new();
+        };
+        let input = self.consoles[ix].editor.read(cx);
+        input.content[input.selection_range()].to_string()
+    }
+
     /// Puts `text` in the console of `origin`'s file under `source`, making it
-    /// when this file has none yet. Nothing runs, and the view stays as it is
-    /// apart from remembering the console as the one to show.
+    /// when this file has none yet. Nothing runs unless the file asked for a
+    /// run with [`request_run`], and the view stays as it is apart from
+    /// remembering the console as the one to show.
     pub(crate) fn send_text(
         &mut self,
         source: &str,
@@ -81,13 +145,16 @@ impl DatabaseView {
             return Err("That is too large to send (over 1 MB)".into());
         }
         self.ensure_consoles(source, cx);
-        let block = format!(
-            "{} from {}\n{}{}",
+        let head = format!(
+            "{} from {}\n",
             self.kind_of(source).line_comment(),
-            origin.label,
-            text,
+            origin.label
+        );
+        let block = format!(
+            "{head}{text}{}",
             if text.ends_with('\n') { "" } else { "\n" }
         );
+        let block_len = block.len();
         let key = format!("{source}\0{}", origin.path);
         let existing = self
             .sent
@@ -149,12 +216,69 @@ impl DatabaseView {
         self.active.insert(source.to_owned(), id);
         self.send_target = Some(source.to_owned());
         self.save_state();
+        if let Some(mode) = take_run(source, text, cx) {
+            self.run_sent(source, id, head.len(), block_len, text.len(), mode, cx);
+        }
         cx.notify();
         let name = self
             .source(source)
             .map(|s| s.name.clone())
             .unwrap_or_default();
         Ok(format!("{name} · {}", origin.name))
+    }
+}
+
+impl DatabaseView {
+    /// Runs or explains what was just sent: the text `len` bytes long, `head`
+    /// bytes into the `block` that ends the console.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sent(
+        &mut self,
+        source: &str,
+        id: u32,
+        head: usize,
+        block: usize,
+        len: usize,
+        mode: RunMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.console_index(source, id) else {
+            return;
+        };
+        if self.consoles[ix].running {
+            self.notice = Some("A statement is still running in that console".into());
+            return;
+        }
+        let editor = self.consoles[ix].editor.clone();
+        let start = editor.read(cx).content.len() - block + head;
+        editor.update(cx, |input, cx| input.select_range(start..start + len, cx));
+        match mode {
+            RunMode::Execute => self.run(source, id, false, cx),
+            RunMode::Explain => self.explain(source, id, false, cx),
+            RunMode::ExplainAnalyze => self.explain(source, id, true, cx),
+        }
+        self.ran = Some((source.to_owned(), id));
+    }
+
+    /// Whether a file's run is waiting to be shown.
+    pub(crate) fn has_run_to_show(&self) -> bool {
+        self.ran.is_some()
+    }
+
+    /// Shows the console a file's statement last ran in; call it once the
+    /// view is open, as opening may pick another source.
+    pub(crate) fn show_run(&mut self, cx: &mut Context<Self>) {
+        let Some((source, id)) = self.ran.take() else {
+            return;
+        };
+        if self.source(&source).is_none() {
+            return;
+        }
+        self.selected = Some(source.clone());
+        self.ensure_consoles(&source, cx);
+        self.active.insert(source, id);
+        self.save_state();
+        cx.notify();
     }
 }
 

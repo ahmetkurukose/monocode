@@ -236,8 +236,8 @@ fn assert_original_surface(surface: Surface, cx: &mut TestAppContext) {
     visual.run_until_parked();
     visual.refresh().unwrap();
     assert!(
-        visual.debug_bounds("sidebar-content").is_some(),
-        "{surface:?} keeps the original sessions sidebar"
+        visual.debug_bounds("project-rail-frame").is_some(),
+        "{surface:?} keeps the project rail and its sessions tree"
     );
     window
         .read_with(visual, |shell, cx| {
@@ -310,134 +310,6 @@ fn original_app_surfaces_search_is_a_tab_and_closes_back_to_the_session(cx: &mut
 #[gpui::test]
 fn original_app_surfaces_mono_is_a_tab_and_closes_back_to_the_session(cx: &mut TestAppContext) {
     assert_original_surface(Surface::Mono, cx);
-}
-
-#[gpui::test]
-fn new_layout_projects_restore_the_last_session_or_mono_tab(cx: &mut TestAppContext) {
-    for boxy in [false, true] {
-        let (window, _) = setup(cx, false, boxy);
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        let stable = |value: String| Box::leak(value.into_boxed_str()) as &'static str;
-        let mut targets = Vec::new();
-        for path in ["/work/monocode", "/work/another-project"] {
-            let target = window
-                .update(visual, |shell, window, cx| {
-                    shell.select_project(path.into(), window, cx);
-                    let session = shell.workspace.active.unwrap();
-                    Surface::Mono.open(shell, window, cx);
-                    let mono = shell.mono_manager().read(cx).active.clone().unwrap();
-                    let ix = shell
-                        .workspace
-                        .projects
-                        .iter()
-                        .position(|p| p == path)
-                        .unwrap();
-                    (stable(format!("project-space-{ix}")), session, mono)
-                })
-                .unwrap();
-            visual.run_until_parked();
-            targets.push(target);
-        }
-        let click = |selector: &'static str, visual: &mut VisualTestContext| {
-            visual.refresh().unwrap();
-            let bounds = visual.debug_bounds(selector).unwrap();
-            visual.simulate_click(bounds.center(), Default::default());
-            visual.run_until_parked();
-            visual.refresh().unwrap();
-        };
-        let assert_mono = |ix: usize, visual: &mut VisualTestContext| {
-            window
-                .read_with(visual, |shell, cx| {
-                    assert_eq!(
-                        shell.mono_manager().read(cx).active.as_ref(),
-                        Some(&targets[ix].2)
-                    );
-                    assert!(shell.mono_active(cx), "its tab has focus");
-                    let mono = shell.mono_tab(targets[ix].2.clone());
-                    assert!(shell.scope_view_pane(&mono, &shell.tab_scope()).is_some());
-                })
-                .unwrap();
-        };
-        click(targets[0].0, visual);
-        assert_mono(0, visual);
-        let session = targets[0].1;
-        window
-            .update(visual, |shell, window, cx| shell.open(session, window, cx))
-            .unwrap();
-        visual.run_until_parked();
-        click(targets[1].0, visual);
-        assert_mono(1, visual);
-        click(targets[0].0, visual);
-        window
-            .read_with(visual, |shell, cx| {
-                assert!(!shell.mono_active(cx));
-                assert_eq!(shell.workspace.active, Some(targets[0].1));
-            })
-            .unwrap();
-        click(stable(format!("mono-rail-{}", targets[0].2)), visual);
-        assert_mono(0, visual);
-        // Both same-project clicks and returning from another project restore
-        // a selected Mono in either new frame style.
-        click(targets[0].0, visual);
-        assert_mono(0, visual);
-        click(targets[1].0, visual);
-        assert_mono(1, visual);
-        click(targets[0].0, visual);
-        assert_mono(0, visual);
-    }
-}
-
-#[gpui::test]
-fn original_app_surfaces_leave_both_new_layout_styles_tabbed(cx: &mut TestAppContext) {
-    for boxy in [false, true] {
-        let (window, session) = setup(cx, false, boxy);
-        let visual = &mut VisualTestContext::from_window(window.into(), cx);
-        for surface in [
-            Surface::Inbox,
-            Surface::Notes,
-            Surface::Automations,
-            Surface::Search,
-            Surface::Mono,
-        ] {
-            window
-                .update(visual, |shell, window, cx| surface.open(shell, window, cx))
-                .unwrap();
-            visual.run_until_parked();
-            visual.refresh().unwrap();
-            assert!(
-                visual.debug_bounds("sidebar-content").is_some(),
-                "{surface:?} keeps the new layout sidebar (boxy={boxy})"
-            );
-            let app = match surface {
-                Surface::Inbox => Some(app_views::AppView::Inbox),
-                Surface::Notes => Some(app_views::AppView::Notes),
-                Surface::Automations => Some(app_views::AppView::Automations),
-                _ => None,
-            };
-            window
-                .read_with(visual, |shell, _| {
-                    assert!(surface.shown(shell), "{surface:?} is the focused tab");
-                    if let Some(app) = app {
-                        assert_eq!(shell.active_app_view(), Some(app));
-                    }
-                })
-                .unwrap();
-            assert!(visual.debug_bounds("project-rail-frame").is_none());
-            window
-                .read_with(visual, |shell, _| {
-                    assert!(!shell.workspace.classic_layout);
-                    assert_eq!(shell.workspace.new_layout_boxy, boxy);
-                    assert!(shell.workspace.sidebar_visible);
-                })
-                .unwrap();
-            window
-                .update(visual, |shell, window, cx| {
-                    surface.close(shell, session, window, cx)
-                })
-                .unwrap();
-            visual.run_until_parked();
-        }
-    }
 }
 
 #[gpui::test]

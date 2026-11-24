@@ -383,6 +383,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
+                shell.terminals_in_dock = true;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
             })

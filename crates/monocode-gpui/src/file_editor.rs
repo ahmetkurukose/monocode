@@ -85,6 +85,13 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-down", NextChange, Some("FileEditor")),
         KeyBinding::new("ctrl-shift-r", RunAtCaret, Some("FileEditor")),
         KeyBinding::new("ctrl-shift-d", DebugAtCaret, Some("FileEditor")),
+        // On the code input itself, so it wins over the input's own
+        // Composer binding for the key (bound earlier, at the same depth).
+        KeyBinding::new(
+            &format!("{m}-enter"),
+            ExecuteSql,
+            Some("FileEditor > CodeEditor"),
+        ),
         KeyBinding::new(&format!("{m}-g"), FindNext, Some("FileEditor")),
         KeyBinding::new(&format!("{m}-shift-g"), FindPrevious, Some("FileEditor")),
         KeyBinding::new("escape", DismissSearch, Some("FileEditor")),
@@ -167,7 +174,15 @@ pub(crate) enum FileEvent {
     FileHistory {
         cwd: String,
         path: String,
+        /// What to show instead of all versions (a line range, a commit, a
+        /// comparison).
+        request: Option<crate::file_history::Request>,
     },
+    /// A code action renamed the file (or a folder above it): the editor
+    /// now shows it under this path, buffer and all.
+    Moved(String),
+    /// A code action deleted the file.
+    Deleted,
     /// The code menu asked for the file's row in the Explorer.
     ShowInExplorer(String),
 }

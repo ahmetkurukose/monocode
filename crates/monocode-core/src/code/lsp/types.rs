@@ -4,7 +4,7 @@
 use super::position::Span;
 use serde_json::Value;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Names one server process for as long as the manager knows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -183,19 +183,62 @@ pub struct TextEdit {
     pub text: String,
 }
 
-/// Changes a server asks for across files: each file's edits, in that
-/// file's own positions, none overlapping.
+/// Changes a server asks for across files, as steps to take in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceEdit {
-    pub changes: Vec<(PathBuf, Vec<TextEdit>)>,
-    /// File creations, renames and deletions the edit also asked for. They
-    /// are not carried out here; an edit that has any is refused whole.
-    pub file_operations: usize,
+    pub changes: Vec<DocumentChange>,
+}
+
+/// One step of a `WorkspaceEdit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentChange {
+    /// Edits to a file in its positions as the steps before left its text,
+    /// by position, none overlapping.
+    Edit { path: PathBuf, edits: Vec<TextEdit> },
+    /// A new empty file. One that exists is emptied with `overwrite`, left
+    /// alone with `ignore_if_exists`, else the edit fails.
+    Create {
+        path: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    /// A file or folder moved; `overwrite` and `ignore_if_exists` are about
+    /// `to` as for `Create`.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    /// A file, or with `recursive` a folder and all it holds.
+    Delete {
+        path: PathBuf,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    },
 }
 
 impl WorkspaceEdit {
     pub fn is_empty(&self) -> bool {
-        self.changes.iter().all(|(_, edits)| edits.is_empty()) && self.file_operations == 0
+        self.changes.iter().all(|change| match change {
+            DocumentChange::Edit { edits, .. } => edits.is_empty(),
+            _ => false,
+        })
+    }
+
+    /// The text edits, file by file, in the order they come.
+    pub fn text_edits(&self) -> impl Iterator<Item = (&Path, &[TextEdit])> {
+        self.changes.iter().filter_map(|change| match change {
+            DocumentChange::Edit { path, edits } => Some((path.as_path(), edits.as_slice())),
+            _ => None,
+        })
+    }
+
+    /// How many steps create, rename or delete files.
+    pub fn file_operations(&self) -> usize {
+        (self.changes.iter())
+            .filter(|change| !matches!(change, DocumentChange::Edit { .. }))
+            .count()
     }
 }
 
@@ -213,7 +256,8 @@ pub struct CodeAction {
     /// The changes, when the server sent them; `Manager::resolve_code_action`
     /// asks for them otherwise.
     pub edit: Option<WorkspaceEdit>,
-    /// The action (also) runs a server command, which this client does not do.
+    /// The action (also) runs a server command: after its edit, when it
+    /// has one (`Manager::run_code_action_command`).
     pub command: bool,
     pub server: ServerId,
     pub raw: Value,

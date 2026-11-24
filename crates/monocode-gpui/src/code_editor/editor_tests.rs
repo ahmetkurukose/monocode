@@ -807,3 +807,420 @@ fn line_decorations_and_notes_draw_follow_edits_and_reveal_without_moving_the_ca
         .unwrap();
     visual.run_until_parked();
 }
+
+/// An editor for `path` holding `text`, focused and drawn once.
+fn focused_editor(cx: &mut TestAppContext, path: &str, text: &str) -> WindowHandle<Input> {
+    let window = editor(cx);
+    window
+        .update(cx, |i, w, cx| {
+            w.focus(&i.focus, cx);
+            i.set_editor_path(path.into());
+            i.set_text(text.into(), cx);
+            i.select_range(0..0, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+}
+fn modifier() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    }
+}
+/// What every caret selects, in document order, the primary one marked.
+fn carets(window: WindowHandle<Input>, cx: &mut TestAppContext) -> Vec<(Range<usize>, bool)> {
+    window
+        .update(cx, |i, _, _| {
+            let primary = i.selection.clone();
+            let mut all: Vec<_> = i
+                .all_carets()
+                .into_iter()
+                .map(|c| (c.range.clone(), c.range == primary))
+                .collect();
+            all.sort_by_key(|(r, _)| r.start);
+            all
+        })
+        .unwrap()
+}
+fn text_of(window: WindowHandle<Input>, cx: &mut TestAppContext) -> String {
+    window.update(cx, |i, _, _| i.content.to_string()).unwrap()
+}
+
+#[gpui::test]
+fn extend_selection_walks_out_through_the_syntax_and_shrink_walks_back(cx: &mut TestAppContext) {
+    let text = "function f() {\n  call(a, \"some text\");\n}\n";
+    let window = focused_editor(cx, "a.js", text);
+    let at = text.find("some").unwrap();
+    window
+        .update(cx, |i, _, cx| i.select_range(at + 1..at + 1, cx))
+        .unwrap();
+    let selected = |window: WindowHandle<Input>, cx: &mut TestAppContext| {
+        window
+            .update(cx, |i, _, _| i.content[i.selection.clone()].to_owned())
+            .unwrap()
+    };
+    let steps = [
+        "some",
+        "some text",
+        "\"some text\"",
+        "a, \"some text\"",
+        "(a, \"some text\")",
+        "call(a, \"some text\")",
+        "call(a, \"some text\");",
+    ];
+    for step in steps {
+        cx.simulate_keystrokes(window.into(), "alt-up");
+        assert_eq!(selected(window, cx), step);
+    }
+    for _ in 0..10 {
+        cx.simulate_keystrokes(window.into(), "alt-up");
+    }
+    assert_eq!(selected(window, cx), text, "it ends at the whole file");
+    for _ in 0..20 {
+        cx.simulate_keystrokes(window.into(), "alt-down");
+    }
+    assert_eq!(
+        carets(window, cx),
+        [(at + 1..at + 1, true)],
+        "back at the caret"
+    );
+    cx.simulate_keystrokes(window.into(), "alt-up alt-up");
+    assert_eq!(selected(window, cx), "some text");
+    // Any other selection change forgets the way back.
+    cx.simulate_keystrokes(window.into(), "shift-right alt-down");
+    assert_eq!(selected(window, cx), "some text\"");
+}
+
+#[gpui::test]
+fn extend_selection_without_a_grammar_uses_words_quotes_brackets_and_lines(
+    cx: &mut TestAppContext,
+) {
+    let text = "say(\"hi there\", [1, 2])\nnext";
+    let window = focused_editor(cx, "notes.unknown", text);
+    let at = text.find("there").unwrap();
+    window
+        .update(cx, |i, _, cx| i.select_range(at..at, cx))
+        .unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..7 {
+        cx.simulate_keystrokes(window.into(), "alt-up");
+        seen.push(
+            window
+                .update(cx, |i, _, _| i.content[i.selection.clone()].to_owned())
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        seen,
+        [
+            "there",
+            "hi there",
+            "\"hi there\"",
+            "\"hi there\", [1, 2]",
+            "(\"hi there\", [1, 2])",
+            "say(\"hi there\", [1, 2])",
+            text,
+        ]
+    );
+}
+
+#[gpui::test]
+fn duplicate_line_copies_the_line_the_selection_or_the_selected_lines(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "a\nbc\nd");
+    window
+        .update(cx, |i, w, cx| {
+            i.select_range(3..3, cx);
+            i.duplicate_line(&DuplicateLine, w, cx);
+            assert_eq!(i.content.as_ref(), "a\nbc\nbc\nd");
+            assert_eq!(i.selection, 6..6, "the caret moves to the copy");
+            i.undo(&Undo, w, cx);
+            assert_eq!(i.content.as_ref(), "a\nbc\nd");
+            assert_eq!(i.selection, 3..3);
+            // A selection inside a line is repeated after itself.
+            i.select_range(2..4, cx);
+            i.duplicate_line(&DuplicateLine, w, cx);
+            assert_eq!(i.content.as_ref(), "a\nbcbc\nd");
+            assert_eq!(i.selection, 4..6);
+            i.undo(&Undo, w, cx);
+            // A selection over two lines duplicates both, whole.
+            i.select_range(0..3, cx);
+            i.duplicate_line(&DuplicateLine, w, cx);
+            assert_eq!(i.content.as_ref(), "a\nbc\na\nbc\nd");
+            assert_eq!(i.selection, 5..8);
+            i.undo(&Undo, w, cx);
+            assert_eq!(i.content.as_ref(), "a\nbc\nd");
+            assert!(!i.history_available(false));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn move_line_swaps_with_neighbours_keeps_the_selection_and_stops_at_the_edges(
+    cx: &mut TestAppContext,
+) {
+    let window = focused_editor(cx, "a.txt", "one\ntwo\nthree");
+    let m = modifier();
+    window
+        .update(cx, |i, _, cx| i.select_range(5..5, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "alt-shift-up");
+    assert_eq!(text_of(window, cx), "two\none\nthree");
+    assert_eq!(carets(window, cx), [(1..1, true)]);
+    cx.simulate_keystrokes(window.into(), "alt-shift-up");
+    assert_eq!(text_of(window, cx), "two\none\nthree", "the top stops it");
+    cx.simulate_keystrokes(window.into(), "alt-shift-down alt-shift-down");
+    assert_eq!(text_of(window, cx), "one\nthree\ntwo");
+    assert_eq!(carets(window, cx), [(11..11, true)]);
+    cx.simulate_keystrokes(window.into(), "alt-shift-down");
+    assert_eq!(
+        text_of(window, cx),
+        "one\nthree\ntwo",
+        "the bottom stops it"
+    );
+    // Each move is its own undo step.
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "one\ntwo\nthree");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "two\none\nthree");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "one\ntwo\nthree");
+    // Several selected lines move together and stay selected.
+    window
+        .update(cx, |i, _, cx| i.select_range(1..6, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "alt-shift-down");
+    assert_eq!(text_of(window, cx), "three\none\ntwo");
+    assert_eq!(carets(window, cx), [(7..12, true)]);
+}
+
+#[gpui::test]
+fn moving_a_line_over_a_folded_region_jumps_it_whole_and_keeps_it_folded(cx: &mut TestAppContext) {
+    let text = "let a = 1;\nfunction f() {\n  return 1;\n}\nlet b = 2;";
+    let window = focused_editor(cx, "a.js", text);
+    window
+        .update(cx, |i, _, cx| {
+            i.set_editor_analysis(
+                crate::editor_analysis::analyze("a.js", text, None).unwrap(),
+                cx,
+            );
+            i.toggle_fold_row(1, cx);
+            i.select_range(0..0, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "alt-shift-down");
+    window
+        .update(cx, |i, w, cx| {
+            assert_eq!(
+                i.content.as_ref(),
+                "function f() {\n  return 1;\n}\nlet a = 1;\nlet b = 2;"
+            );
+            let code = i.code.as_ref().unwrap();
+            assert_eq!(code.folded.len(), 1);
+            let fold = &code.folded[0];
+            assert_eq!(&i.content[fold.from..fold.to], "\n  return 1;\n");
+            assert_eq!(code.row(i.cursor()), 3);
+            // Moving the folded function itself takes all of it.
+            i.select_range(0..0, cx);
+            i.move_line_down(&MoveLineDown, w, cx);
+            assert_eq!(
+                i.content.as_ref(),
+                "let a = 1;\nfunction f() {\n  return 1;\n}\nlet b = 2;"
+            );
+            let code = i.code.as_ref().unwrap();
+            assert_eq!(code.folded.len(), 1);
+            assert_eq!(code.row(code.folded[0].from), 1);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn carets_added_above_and_below_keep_their_column_and_skip_short_lines(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "abcd\na\nabcd\nabcd");
+    window
+        .update(cx, |i, w, cx| {
+            i.select_range(3..3, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+        })
+        .unwrap();
+    // Row 1 is too short for column 3.
+    assert_eq!(carets(window, cx), [(3..3, false), (10..10, true)]);
+    window
+        .update(cx, |i, w, cx| {
+            i.add_caret_below(&AddCaretBelow, w, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+            i.add_caret_above(&AddCaretAbove, w, cx);
+        })
+        .unwrap();
+    // Nothing is below the last line or above the first.
+    assert_eq!(
+        carets(window, cx),
+        [(3..3, false), (10..10, false), (15..15, true)]
+    );
+    cx.simulate_keystrokes(window.into(), "escape");
+    assert_eq!(carets(window, cx).len(), 1, "Escape leaves one caret");
+}
+
+#[gpui::test]
+fn several_carets_type_delete_move_and_undo_as_one(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "abc\nabc\nabc");
+    let m = modifier();
+    window
+        .update(cx, |i, w, cx| {
+            i.select_range(1..1, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "x y");
+    assert_eq!(text_of(window, cx), "axybc\naxybc\naxybc");
+    cx.simulate_keystrokes(window.into(), "backspace");
+    assert_eq!(text_of(window, cx), "axbc\naxbc\naxbc");
+    cx.simulate_keystrokes(window.into(), "delete");
+    assert_eq!(text_of(window, cx), "axc\naxc\naxc");
+    cx.simulate_keystrokes(window.into(), "end z");
+    assert_eq!(text_of(window, cx), "axcz\naxcz\naxcz");
+    cx.simulate_keystrokes(window.into(), "home left");
+    // The first caret cannot go left of the buffer start; the others wrap.
+    assert_eq!(
+        carets(window, cx)
+            .iter()
+            .map(|(r, _)| r.start)
+            .collect::<Vec<_>>(),
+        [0, 4, 9]
+    );
+    cx.simulate_keystrokes(window.into(), "shift-enter");
+    assert_eq!(text_of(window, cx), "\naxcz\n\naxcz\n\naxcz");
+    // Each edit with every caret is one step, and undo brings the carets back.
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "axcz\naxcz\naxcz");
+    assert_eq!(carets(window, cx).len(), 3);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "axc\naxc\naxc");
+    // Backspace and Delete in a row are one deleting step, as with one caret.
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "axybc\naxybc\naxybc");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "abc\nabc\nabc");
+    assert_eq!(carets(window, cx).len(), 3);
+    // A click leaves one caret.
+    window
+        .update(cx, |i, _, cx| i.select_range(0..0, cx))
+        .unwrap();
+    assert_eq!(carets(window, cx).len(), 1);
+}
+
+#[gpui::test]
+fn several_carets_copy_cut_and_paste_a_line_each(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "one\ntwo\nsix");
+    let m = modifier();
+    window
+        .update(cx, |i, w, cx| {
+            i.select_range(0..0, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+            i.add_caret_below(&AddCaretBelow, w, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "shift-right shift-right");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-c"));
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("on\ntw\nsi")
+    );
+    cx.simulate_keystrokes(window.into(), &format!("{m}-x"));
+    assert_eq!(text_of(window, cx), "e\no\nx");
+    // As many lines as carets: one line each, in order.
+    cx.simulate_keystrokes(window.into(), &format!("{m}-v"));
+    assert_eq!(text_of(window, cx), "one\ntwo\nsix");
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("-".into()));
+    cx.simulate_keystrokes(window.into(), &format!("{m}-v"));
+    assert_eq!(text_of(window, cx), "on-e\ntw-o\nsi-x");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "one\ntwo\nsix");
+}
+
+#[gpui::test]
+fn column_selection_mode_selects_a_rectangle_one_caret_per_line(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "abcdef\nab\nabcdef");
+    let m = modifier();
+    window
+        .update(cx, |i, _, cx| i.select_range(1..1, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), &format!("{m}-shift-8"));
+    assert!(window.update(cx, |i, _, _| i.column_selection()).unwrap());
+    cx.simulate_keystrokes(
+        window.into(),
+        "shift-down shift-down shift-right shift-right shift-right",
+    );
+    // The short middle line is selected as far as it goes.
+    assert_eq!(
+        carets(window, cx),
+        [(1..4, false), (8..9, false), (11..14, true)]
+    );
+    cx.simulate_keystrokes(window.into(), &format!("{m}-c"));
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("bcd\nb\nbcd")
+    );
+    cx.simulate_keystrokes(window.into(), "z");
+    assert_eq!(text_of(window, cx), "azef\naz\nazef");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "abcdef\nab\nabcdef");
+    // Out of column mode Shift+Down selects text again.
+    cx.simulate_keystrokes(window.into(), &format!("{m}-shift-8"));
+    window
+        .update(cx, |i, _, cx| i.select_range(1..1, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "shift-down");
+    assert_eq!(carets(window, cx), [(1..8, true)]);
+}
+
+#[gpui::test]
+fn alt_shift_click_adds_and_removes_carets(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "abc\nabc");
+    window
+        .update(cx, |i, _, cx| {
+            i.select_range(1..1, cx);
+            i.toggle_caret_at(6, cx);
+            assert_eq!(i.all_carets().len(), 2);
+            assert_eq!(i.selection, 6..6);
+            i.toggle_caret_at(1, cx);
+            assert_eq!(i.all_carets().len(), 1);
+            assert_eq!(i.selection, 6..6);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn dragging_in_column_mode_selects_a_rectangle(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "abcdef\nabcdef\nabcdef");
+    window
+        .update(cx, |i, w, cx| {
+            i.toggle_column_selection(&ToggleColumnSelection, w, cx)
+        })
+        .unwrap();
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    let (from, to) = window
+        .update(visual, |i, _, _| {
+            let at = |offset| {
+                i.bounds.unwrap().origin + i.code_position(offset) - point(i.scroll_x, i.scroll_y)
+                    + point(px(1.), px(10.))
+            };
+            (at(1), at(18))
+        })
+        .unwrap();
+    visual.simulate_mouse_down(from, MouseButton::Left, Default::default());
+    visual.simulate_mouse_move(to, MouseButton::Left, Default::default());
+    visual.simulate_mouse_up(to, MouseButton::Left, Default::default());
+    visual.run_until_parked();
+    window
+        .update(visual, |i, _, _| {
+            let mut all: Vec<_> = i.all_carets().into_iter().map(|c| c.range).collect();
+            all.sort_by_key(|r| r.start);
+            assert_eq!(all, [1..4, 8..11, 15..18]);
+        })
+        .unwrap();
+}

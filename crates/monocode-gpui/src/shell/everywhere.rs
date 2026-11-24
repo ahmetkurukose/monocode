@@ -938,7 +938,8 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         let before = window
-            .update(cx, |shell, _, _| shell.workspace.sidebar_visible)
+            // In Classic, Toggle Sidebar shows and hides the project rail.
+            .update(cx, |shell, _, _| shell.workspace.project_rail_open)
             .unwrap();
         window
             .update(cx, |shell, _, cx| {
@@ -952,7 +953,7 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert!(shell.palette.is_none());
-                assert_ne!(shell.workspace.sidebar_visible, before);
+                assert_ne!(shell.workspace.project_rail_open, before);
                 let history = cx.global::<everywhere::ActionHistory>();
                 assert_eq!(history.0[0].as_ref(), "View: Toggle Sidebar");
             })

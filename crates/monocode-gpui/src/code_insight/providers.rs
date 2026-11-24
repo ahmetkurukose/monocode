@@ -9,17 +9,23 @@ use crate::code_editor::{
     CompletionRequest, CompletionTrigger, DocumentInfo, FileEdit, Hover, HoverProvider,
     LinkProvider, LinkTarget, Navigation, NavigationProvider, Position, ReferencesProvider,
     RenameProvider, RenameRange, Signature, SignatureProvider, TargetPosition, TextEdit,
+    refactor::{self, ActionChange, FileChange, FollowUp},
 };
 use gpui::{App, SharedString, Task};
 use monocode_core::{
-    code::lsp::{self, CancelToken, LineIndex, Point, ServerState},
+    code::lsp::{self, CancelToken, DocumentChange, LineIndex, Point, ServerState},
     files::document::MAX_TEXT_BYTES,
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
+    time::Duration,
 };
+
+/// How long a command that follows an action's edit waits for the server
+/// to have the edited text; the editors report edits a moment after.
+const EDIT_REACHES_SERVER: Duration = Duration::from_secs(3);
 
 /// Installs the providers on every file a language server may run for.
 pub(super) fn register(manager: lsp::Manager, cx: &mut App) {
@@ -51,23 +57,31 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Runs a blocking question off the UI thread. Dropping the returned task
+/// cancels the question, which makes the blocked call return.
+fn ask<T: Send + 'static>(
+    manager: &lsp::Manager,
+    cx: &App,
+    work: impl FnOnce(&lsp::Manager, &CancelToken) -> T + Send + 'static,
+) -> Task<T> {
+    let manager = manager.clone();
+    let token = CancelToken::new();
+    let guard = CancelOnDrop(token.clone());
+    let executor = cx.background_executor().clone();
+    let call = executor.spawn(async move { work(&manager, &token) });
+    executor.spawn(async move {
+        let _guard = guard;
+        call.await
+    })
+}
+
 impl Provider {
-    /// Runs a blocking question off the UI thread. Dropping the returned
-    /// task cancels the question, which makes the blocked call return.
     fn ask<T: Send + 'static>(
         &self,
         cx: &App,
         work: impl FnOnce(&lsp::Manager, &CancelToken) -> T + Send + 'static,
     ) -> Task<T> {
-        let manager = self.manager.clone();
-        let token = CancelToken::new();
-        let guard = CancelOnDrop(token.clone());
-        let executor = cx.background_executor().clone();
-        let call = executor.spawn(async move { work(&manager, &token) });
-        executor.spawn(async move {
-            let _guard = guard;
-            call.await
-        })
+        ask(&self.manager, cx, work)
     }
 
     /// False while the file's server is still starting. A question would
@@ -154,41 +168,220 @@ impl Places {
         targets
     }
 
-    /// A server's change as edits in bytes of each file's text: the
-    /// editors' unsaved text for open files, the disk's for the others.
-    /// Reads files: for a background thread.
-    fn file_edits(&self, change: lsp::WorkspaceEdit) -> Result<Vec<FileEdit>, String> {
-        if change.file_operations > 0 {
-            return Err(
-                "The change also creates, renames or deletes files, which is not supported yet"
-                    .into(),
-            );
+    /// A server's change as steps for `refactor::apply`, edits in bytes of
+    /// each file's text at that step: the editors' unsaved text for open
+    /// files, the disk's for the others, then what the steps before made
+    /// of it. Steps the server's flags skip are left out, and one that
+    /// cannot be taken refuses the change. Reads files: for a background
+    /// thread.
+    fn changes(&self, change: lsp::WorkspaceEdit) -> Result<Vec<FileChange>, String> {
+        let mut known: HashMap<PathBuf, Known> = HashMap::new();
+        // The renames and deletions so far, to find where a path not met
+        // yet was before them.
+        let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let mut steps = Vec::new();
+        for step in change.changes {
+            match step {
+                DocumentChange::Edit { path, edits } => {
+                    let path = self.spell(path);
+                    let base = match self.state(&mut known, &done, &path) {
+                        Known::Text(text) => text,
+                        Known::Missing => {
+                            return Err(format!("{} does not exist", path.display()));
+                        }
+                        Known::Other => {
+                            return Err(format!("{} is not a text file", path.display()));
+                        }
+                    };
+                    if edits.is_empty() {
+                        continue;
+                    }
+                    let index = LineIndex::new(&base);
+                    let edits: Vec<TextEdit> = (edits.into_iter())
+                        .map(|edit| TextEdit {
+                            range: index.offset_of(&base, edit.range.start)
+                                ..index.offset_of(&base, edit.range.end),
+                            text: edit.text,
+                        })
+                        .collect();
+                    let Some(after) = refactor::applied(&base, &edits) else {
+                        return Err(format!(
+                            "The edits for {} do not fit the file",
+                            path.display()
+                        ));
+                    };
+                    known.insert(path.clone(), Known::Text(after.into()));
+                    steps.push(FileChange::Edit(FileEdit { path, base, edits }));
+                }
+                DocumentChange::Create {
+                    path,
+                    overwrite,
+                    ignore_if_exists,
+                } => {
+                    let path = self.spell(path);
+                    let exists = !matches!(self.state(&mut known, &done, &path), Known::Missing);
+                    if exists && !overwrite {
+                        if ignore_if_exists {
+                            continue;
+                        }
+                        return Err(format!("{} already exists", path.display()));
+                    }
+                    known.insert(path.clone(), Known::Text(SharedString::default()));
+                    steps.push(FileChange::Create {
+                        path,
+                        overwrite,
+                        ignore_if_exists,
+                    });
+                }
+                DocumentChange::Rename {
+                    from,
+                    to,
+                    overwrite,
+                    ignore_if_exists,
+                } => {
+                    let (from, to) = (self.spell(from), self.spell(to));
+                    if matches!(self.state(&mut known, &done, &from), Known::Missing) {
+                        return Err(format!("{} does not exist", from.display()));
+                    }
+                    let taken = !matches!(self.state(&mut known, &done, &to), Known::Missing);
+                    if taken && !overwrite {
+                        if ignore_if_exists {
+                            continue;
+                        }
+                        return Err(format!("{} already exists", to.display()));
+                    }
+                    let inside: Vec<PathBuf> = (known.keys())
+                        .filter(|path| path.starts_with(&from) || path.starts_with(&to))
+                        .cloned()
+                        .collect();
+                    let mut arrived = Vec::new();
+                    for path in inside {
+                        let state = known.insert(path.clone(), Known::Missing);
+                        if let Some(state) = state
+                            && let Some(new) = moved_to(&path, &from, &to)
+                        {
+                            arrived.push((new, state));
+                        }
+                    }
+                    known.extend(arrived);
+                    done.push((from.clone(), Some(to.clone())));
+                    steps.push(FileChange::Rename {
+                        from,
+                        to,
+                        overwrite,
+                        ignore_if_exists,
+                    });
+                }
+                DocumentChange::Delete {
+                    path,
+                    recursive,
+                    ignore_if_not_exists,
+                } => {
+                    let path = self.spell(path);
+                    if matches!(self.state(&mut known, &done, &path), Known::Missing) {
+                        if ignore_if_not_exists {
+                            continue;
+                        }
+                        return Err(format!("{} does not exist", path.display()));
+                    }
+                    for (known_path, state) in known.iter_mut() {
+                        if known_path.starts_with(&path) {
+                            *state = Known::Missing;
+                        }
+                    }
+                    done.push((path.clone(), None));
+                    steps.push(FileChange::Delete {
+                        path,
+                        recursive,
+                        ignore_if_not_exists,
+                    });
+                }
+            }
         }
-        (change.changes.into_iter())
-            .map(|(path, edits)| {
-                let spelled = self.spell(path.clone());
-                let base: SharedString = match self.open.get(&spelled) {
-                    Some(text) => text.clone(),
-                    None => std::fs::read_to_string(&path)
-                        .map_err(|error| format!("{}: {error}", path.display()))?
-                        .into(),
-                };
-                let index = LineIndex::new(&base);
-                let edits = (edits.into_iter())
-                    .map(|edit| TextEdit {
-                        range: index.offset_of(&base, edit.range.start)
-                            ..index.offset_of(&base, edit.range.end),
-                        text: edit.text,
-                    })
-                    .collect();
-                Ok(FileEdit {
-                    path: spelled,
-                    base,
-                    edits,
-                })
-            })
-            .collect()
+        Ok(steps)
     }
+
+    /// What `path` holds at this step of a change: what a step before made
+    /// of it, else what it had before the change, found at the place the
+    /// renames so far moved it from.
+    fn state(
+        &self,
+        known: &mut HashMap<PathBuf, Known>,
+        done: &[(PathBuf, Option<PathBuf>)],
+        path: &Path,
+    ) -> Known {
+        if let Some(state) = known.get(path) {
+            return state.clone();
+        }
+        let mut origin = path.to_path_buf();
+        for (from, to) in done.iter().rev() {
+            match to {
+                Some(to) => match moved_to(&origin, to, from) {
+                    Some(before) => origin = before,
+                    None if origin.starts_with(from) => return Known::Missing,
+                    None => {}
+                },
+                None if origin.starts_with(from) => return Known::Missing,
+                None => {}
+            }
+        }
+        let state = match self.open.get(&origin) {
+            Some(text) => Known::Text(text.clone()),
+            None => match std::fs::read_to_string(&origin) {
+                Ok(text) => Known::Text(text.into()),
+                Err(_) if std::fs::symlink_metadata(&origin).is_ok() => Known::Other,
+                Err(_) => Known::Missing,
+            },
+        };
+        known.insert(path.to_path_buf(), state.clone());
+        state
+    }
+
+    /// These texts in place of what the editors last reported for them.
+    fn with_texts(mut self, texts: &[(PathBuf, SharedString)]) -> Self {
+        for (path, text) in texts {
+            if self.open.contains_key(path) {
+                self.open.insert(path.clone(), text.clone());
+            }
+        }
+        self
+    }
+}
+
+/// What a path holds partway through a change.
+#[derive(Clone)]
+enum Known {
+    Missing,
+    Text(SharedString),
+    /// A folder, or a file that is not text.
+    Other,
+}
+
+/// `path` at the place `from` moved to, when it is `from` or inside it.
+fn moved_to(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(match rest.as_os_str().is_empty() {
+        true => to.to_path_buf(),
+        false => to.join(rest),
+    })
+}
+
+/// The text each edited file has once `change` is applied.
+fn edited_texts(change: &[FileChange]) -> Vec<(PathBuf, SharedString)> {
+    let mut texts: Vec<(PathBuf, SharedString)> = Vec::new();
+    for step in change {
+        let FileChange::Edit(file) = step else {
+            continue;
+        };
+        let Some(after) = refactor::applied(&file.base, &file.edits) else {
+            continue;
+        };
+        match texts.iter_mut().find(|(path, _)| *path == file.path) {
+            Some((_, text)) => *text = after.into(),
+            None => texts.push((file.path.clone(), after.into())),
+        }
+    }
+    texts
 }
 
 impl CompletionProvider for Provider {
@@ -345,7 +538,7 @@ impl RenameProvider for Provider {
         at: Position,
         name: String,
         cx: &mut App,
-    ) -> Task<Result<Vec<FileEdit>, String>> {
+    ) -> Task<Result<Vec<FileChange>, String>> {
         let path = at.doc.path.clone();
         let offset = at.offset;
         let places = Places::new(cx);
@@ -356,7 +549,7 @@ impl RenameProvider for Provider {
             if change.is_empty() {
                 return Err("The language server found nothing to rename".into());
             }
-            places.file_edits(change)
+            places.changes(change)
         })
     }
 }
@@ -366,12 +559,13 @@ impl CodeActionProvider for Provider {
         &self,
         at: Position,
         range: std::ops::Range<usize>,
+        only: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Vec<CodeActionItem>, String>> {
         let path = at.doc.path.clone();
         let found = self.ask(cx, move |manager, cancel| {
             manager
-                .code_actions(&path, range, cancel)
+                .code_actions(&path, range, only.as_deref(), cancel)
                 .map_err(|error| error.to_string())
         });
         // The items hold `Rc`s, so they are made back on the UI thread.
@@ -395,29 +589,65 @@ impl CodeActionProvider for Provider {
         at: Position,
         item: &CodeActionItem,
         cx: &mut App,
-    ) -> Task<Result<Vec<FileEdit>, String>> {
+    ) -> Task<Result<ActionChange, String>> {
         let Some(action) = item.data.downcast_ref::<lsp::CodeAction>().cloned() else {
             return Task::ready(Err("The action is not one of the language server's".into()));
         };
         let path = at.doc.path.clone();
         let places = Places::new(cx);
-        self.ask(cx, move |manager, cancel| {
+        let asked = self.ask(cx, move |manager, cancel| -> Result<_, String> {
             let resolved = manager
                 .resolve_code_action(&path, &action, cancel)
                 .map_err(|error| error.to_string())?;
-            match resolved.edit {
-                Some(edit) => places.file_edits(edit),
+            match resolved.edit.clone() {
+                // Its command, if any, runs once the edit is in place.
+                Some(edit) => Ok((places.changes(edit)?, resolved.command.then_some(resolved))),
                 // The command asks for its edits while it runs.
                 None if resolved.command => {
                     let change = manager
                         .run_code_action_command(&path, &resolved, cancel)
                         .map_err(|error| error.to_string())?;
-                    places.file_edits(change)
+                    Ok((places.changes(change)?, None))
                 }
                 None => Err("The language server sent no changes for this action".into()),
             }
+        });
+        let (manager, path) = (self.manager.clone(), at.doc.path.clone());
+        cx.foreground_executor().spawn(async move {
+            let (change, command) = asked.await?;
+            let then = command.map(|action| follow_up(manager, path, action, &change));
+            Ok(ActionChange { change, then })
         })
     }
+}
+
+/// Runs `action`'s command once `change`, its own edit, is applied and the
+/// servers have the files' new text, and reads what the command asks for
+/// on that text.
+fn follow_up(
+    manager: lsp::Manager,
+    path: PathBuf,
+    action: lsp::CodeAction,
+    change: &[FileChange],
+) -> FollowUp {
+    let texts = edited_texts(change);
+    Box::new(move |cx| {
+        let places = Places::new(cx).with_texts(&texts);
+        ask(&manager, cx, move |manager, cancel| {
+            for (file, text) in &texts {
+                if !manager.await_document_text(file, text, EDIT_REACHES_SERVER, cancel) {
+                    return Err(format!(
+                        "{} changed before the action's command could run",
+                        file.display()
+                    ));
+                }
+            }
+            let change = manager
+                .run_code_action_command(&path, &action, cancel)
+                .map_err(|error| error.to_string())?;
+            places.changes(change)
+        })
+    })
 }
 
 impl NavigationProvider for Provider {

@@ -971,3 +971,382 @@ fn go_to_type_definition_jumps_implementations_list_and_missing_ones_say_so(
         Some("The language server does not support this.")
     );
 }
+
+/// Asks for the code actions of `kind`, as the code menu's Refactor rows do.
+fn actions_of_kind(window: WindowHandle<FileEditor>, kind: &str, cx: &mut VisualTestContext) {
+    let action = input::CodeActionsOfKind(kind.to_string().into());
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(action), cx)
+        })
+        .unwrap();
+}
+
+/// Opens `path` once its server is ready, with the server and the editor.
+fn open_ready(
+    rig: &Rig,
+    path: &Path,
+    cx: &mut TestAppContext,
+) -> (
+    WindowHandle<FileEditor>,
+    VisualTestContext,
+    FakeServer,
+    Entity<input::Input>,
+) {
+    let window = open(path, &rig.root, cx);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    wait(&mut cx, "the server to be ready", |cx| {
+        cx.update(|_, cx| synced(path, cx))
+            && rig.state_of("basedpyright") == Some(lsp::ServerState::Ready)
+    });
+    let input = input_of(window, &mut cx);
+    (window, cx, rig.pyright(), input)
+}
+
+#[gpui::test]
+fn actions_of_a_kind_take_the_only_one_list_several_and_say_when_there_are_none(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "value = sqrt(4)\n";
+    let path = rig.write("app.py", text);
+    let (window, mut cx, pyright, input) = open_ready(&rig, &path, cx);
+    let cx = &mut cx;
+    let here = uri(&path);
+    pyright.on("textDocument/codeAction", move |message, out| {
+        let only = message["params"]["context"]["only"][0]
+            .as_str()
+            .unwrap_or("");
+        let found = match only {
+            // The server ignores `only` and sends an inline too; the only
+            // extraction that can be taken is.
+            "refactor.extract" => json!([
+                { "title": "Extract variable", "kind": "refactor.extract",
+                  "edit": { "changes": { here.clone(): [
+                      { "range": range((0, 8), (0, 15)), "newText": "root" } ] } } },
+                { "title": "Extract method", "kind": "refactor.extract.function",
+                  "disabled": { "reason": "Select whole statements" } },
+                { "title": "Inline", "kind": "refactor.inline" },
+            ]),
+            "refactor.rewrite" => json!([
+                { "title": "Use f-string", "kind": "refactor.rewrite" },
+                { "title": "Flip", "kind": "refactor.rewrite.flip" },
+            ]),
+            _ => json!([{ "title": "Fix", "kind": "quickfix" }]),
+        };
+        out.result(message, found);
+    });
+    let at = text.find("sqrt").unwrap();
+    input.update(cx, |input, cx| input.select_range(at..at + 7, cx));
+    actions_of_kind(window, "refactor.extract", cx);
+    wait(cx, "the extraction", |cx| {
+        input.read_with(cx, |input, _| input.content.as_ref() == "value = root\n")
+    });
+    let asked = pyright.wait_for("textDocument/codeAction");
+    assert_eq!(
+        asked["params"]["context"]["only"],
+        json!(["refactor.extract"])
+    );
+    assert_eq!(
+        asked["params"]["range"],
+        json!({ "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 15 } })
+    );
+    assert!(!input.read_with(cx, |input, _| input.actions_open()));
+
+    // Two: listed as ⌥↩ lists them.
+    actions_of_kind(window, "refactor.rewrite", cx);
+    wait(cx, "the list", |cx| {
+        input.read_with(cx, |input, _| input.actions_open())
+    });
+    assert!(cx.debug_bounds("menu-action-1").is_some());
+    assert!(cx.debug_bounds("menu-action-2").is_none());
+    cx.simulate_keystrokes("escape");
+
+    // None: said.
+    actions_of_kind(window, "source.organizeImports", cx);
+    wait(cx, "the notice", |cx| editor_error(window, cx).is_some());
+    assert_eq!(
+        editor_error(window, cx).as_deref(),
+        Some("No organize imports actions here")
+    );
+    assert!(!input.read_with(cx, |input, _| input.actions_open()));
+}
+
+#[gpui::test]
+fn an_actions_command_runs_after_its_edit_on_the_text_the_edit_left(cx: &mut TestAppContext) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "value = 1\n";
+    let path = rig.write("app.py", text);
+    let (window, mut cx, pyright, input) = open_ready(&rig, &path, cx);
+    let cx = &mut cx;
+    let here = uri(&path);
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Add a header and name it", "kind": "refactor.rewrite",
+                     "edit": { "changes": { here.clone(): [
+                         { "range": range((0, 0), (0, 0)), "newText": "ğ = 0\n" } ] } },
+                     "command": { "title": "Name", "command": "name.it" } }]),
+        );
+    });
+    let (here, server) = (uri(&path), pyright.clone());
+    pyright.on("workspace/executeCommand", move |message, out| {
+        // The server has the edited text by now; its edit is counted on it.
+        let changes = server.received("textDocument/didChange");
+        let seen = changes.last().map(|change| {
+            change["params"]["contentChanges"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        });
+        let wanted = seen.as_deref() == Some("ğ = 0\nvalue = 1\n");
+        out.send(
+            &json!({ "jsonrpc": "2.0", "id": 930, "method": "workspace/applyEdit",
+            "params": { "edit": { "changes": { here.clone(): [
+                { "range": range((0, 1), (0, 1)),
+                  "newText": if wanted { "x" } else { "stale" } } ] } } } }),
+        );
+        out.result(message, Value::Null);
+    });
+    actions_of_kind(window, "refactor.rewrite", cx);
+    wait(cx, "the command's edit", |cx| {
+        input.read_with(cx, |input, _| input.content.contains('x'))
+            || editor_error(window, cx).is_some()
+    });
+    assert_eq!(editor_error(window, cx), None);
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        "ğx = 0\nvalue = 1\n"
+    );
+    assert_eq!(
+        pyright.wait_for("workspace/executeCommand")["params"]["command"],
+        json!("name.it")
+    );
+}
+
+#[gpui::test]
+fn a_command_editing_a_file_in_rounds_applies_them_in_turn_as_one_undo_step(
+    cx: &mut TestAppContext,
+) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "import sys\nimport os\n";
+    let path = rig.write("app.py", text);
+    let other = rig.write("other.py", "b = 2\n");
+    let (window, mut cx, pyright, input) = open_ready(&rig, &path, cx);
+    let cx = &mut cx;
+    pyright.on("textDocument/codeAction", |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Organize imports", "kind": "source.organizeImports",
+                     "command": { "title": "Organize", "command": "organize" } }]),
+        );
+    });
+    let (here, there) = (uri(&path), uri(&other));
+    pyright.on("workspace/executeCommand", move |message, out| {
+        let round = |id: i64, uri: &str, edits: Value| {
+            json!({ "jsonrpc": "2.0", "id": id, "method": "workspace/applyEdit",
+                    "params": { "edit": { "changes": { uri: edits } } } })
+        };
+        out.send(&round(
+            940,
+            &here,
+            json!([
+            { "range": range((0, 0), (2, 0)), "newText": "import os\nimport sys\n" } ]),
+        ));
+        // On the text the first round left.
+        out.send(&round(
+            941,
+            &here,
+            json!([
+            { "range": range((2, 0), (2, 0)), "newText": "\nş = 'ğ'\n" } ]),
+        ));
+        out.send(&round(
+            942,
+            &here,
+            json!([
+            { "range": range((3, 5), (3, 6)), "newText": "g" } ]),
+        ));
+        out.send(&round(
+            943,
+            &there,
+            json!([
+            { "range": range((0, 0), (0, 1)), "newText": "c" } ]),
+        ));
+        out.send(&round(
+            944,
+            &there,
+            json!([
+            { "range": range((0, 1), (0, 1)), "newText": "c" } ]),
+        ));
+        out.result(message, Value::Null);
+    });
+    actions_of_kind(window, "source.organizeImports", cx);
+    let organized = "import os\nimport sys\n\nş = 'g'\n";
+    wait(cx, "the rounds", |cx| {
+        input.read_with(cx, |input, _| input.content.as_ref() == organized)
+            && std::fs::read_to_string(&other).unwrap() == "cc = 2\n"
+    });
+    assert_eq!(editor_error(window, cx), None);
+    // All of the open file's rounds are one step of undo.
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        text
+    );
+}
+
+#[gpui::test]
+fn changes_that_create_rename_and_delete_files_are_carried_out_in_order(cx: &mut TestAppContext) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "from util import helper\nhelper()\n";
+    let path = rig.write("app.py", text);
+    let util = rig.write("util.py", "def helper(): pass\n");
+    let gone = rig.write("old/gone.py", "x = 1\n");
+    let (window, mut cx, pyright, input) = open_ready(&rig, &path, cx);
+    let cx = &mut cx;
+    let moved = watch_moves(cx);
+    let (made, tools) = (rig.root.join("pkg/new.py"), rig.root.join("tools.py"));
+    let (here, util_uri, made_uri, tools_uri) = (uri(&path), uri(&util), uri(&made), uri(&tools));
+    let old = uri(&rig.root.join("old"));
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Move helper", "kind": "refactor.move",
+                     "edit": { "documentChanges": [
+                { "kind": "create", "uri": made_uri },
+                { "textDocument": { "uri": made_uri, "version": null }, "edits": [
+                    { "range": range((0, 0), (0, 0)), "newText": "# ğ\n" } ] } ,
+                { "textDocument": { "uri": made_uri, "version": null }, "edits": [
+                    { "range": range((0, 3), (0, 3)), "newText": "!" } ] },
+                { "kind": "rename", "oldUri": util_uri, "newUri": tools_uri },
+                { "textDocument": { "uri": tools_uri, "version": null }, "edits": [
+                    { "range": range((0, 4), (0, 10)), "newText": "tool" } ] },
+                { "textDocument": { "uri": here, "version": 1 }, "edits": [
+                    { "range": range((0, 5), (0, 9)), "newText": "tools" },
+                    { "range": range((0, 17), (0, 23)), "newText": "tool" },
+                    { "range": range((1, 0), (1, 6)), "newText": "tool" } ] },
+                { "kind": "delete", "uri": old, "options": { "recursive": true } },
+                { "kind": "delete", "uri": uri(&rig_missing()),
+                  "options": { "ignoreIfNotExists": true } },
+            ] } }]),
+        );
+    });
+    actions_of_kind(window, "refactor.move", cx);
+    wait(cx, "the files", |cx| {
+        input.read_with(cx, |input, _| input.content.starts_with("from tools"))
+            && !gone.exists()
+            && !moved.lock().unwrap().is_empty()
+    });
+    assert_eq!(editor_error(window, cx), None);
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        "from tools import tool\ntool()\n"
+    );
+    assert_eq!(std::fs::read_to_string(&made).unwrap(), "# ğ!\n");
+    assert!(!util.exists());
+    assert_eq!(
+        std::fs::read_to_string(&tools).unwrap(),
+        "def tool(): pass\n"
+    );
+    assert!(!rig.root.join("old").exists());
+    assert_eq!(
+        *moved.lock().unwrap(),
+        [
+            code_editor::refactor::FileMoved::Renamed {
+                from: util.clone(),
+                to: tools.clone(),
+            },
+            code_editor::refactor::FileMoved::Deleted(rig.root.join("old")),
+        ]
+    );
+
+    // A step that cannot be taken refuses the whole change.
+    let (here, tools_uri) = (uri(&path), uri(&tools));
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Clash", "kind": "refactor.move",
+                     "edit": { "documentChanges": [
+                { "textDocument": { "uri": here, "version": null }, "edits": [
+                    { "range": range((0, 0), (0, 0)), "newText": "# no\n" } ] },
+                { "kind": "create", "uri": tools_uri },
+            ] } }]),
+        );
+    });
+    actions_of_kind(window, "refactor.move", cx);
+    wait(cx, "the refusal", |cx| {
+        editor_error(window, cx).is_some_and(|error| error.contains("already exists"))
+    });
+    assert!(input.read_with(cx, |input, _| input.content.starts_with("from tools")));
+    assert_eq!(
+        std::fs::read_to_string(&tools).unwrap(),
+        "def tool(): pass\n"
+    );
+}
+
+/// What the hub is told a change moved or deleted, from now on.
+fn watch_moves(
+    cx: &mut VisualTestContext,
+) -> Arc<std::sync::Mutex<Vec<code_editor::refactor::FileMoved>>> {
+    let moved = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let told = moved.clone();
+    cx.update(|_, cx| {
+        let hub = code_editor::hub(cx);
+        cx.subscribe(
+            &hub,
+            move |_, event: &code_editor::refactor::FileMoved, _| {
+                told.lock().unwrap().push(event.clone())
+            },
+        )
+        .detach();
+    });
+    moved
+}
+
+/// A path nothing is at.
+fn rig_missing() -> PathBuf {
+    std::env::temp_dir().join("monocode-no-such-file-for-a-code-action.py")
+}
+
+#[gpui::test]
+fn renaming_an_open_file_keeps_its_edits_in_the_editor_and_tells_the_hub(cx: &mut TestAppContext) {
+    let rig = Rig::with(refactoring_server, cx);
+    let text = "a = 1\n";
+    let path = rig.write("app.py", text);
+    let (window, mut cx, pyright, input) = open_ready(&rig, &path, cx);
+    let cx = &mut cx;
+    let moved = watch_moves(cx);
+    let main = rig.root.join("main.py");
+    let (here, there) = (uri(&path), uri(&main));
+    pyright.on("textDocument/codeAction", move |message, out| {
+        out.result(
+            message,
+            json!([{ "title": "Rename module", "kind": "refactor.rewrite",
+                     "edit": { "documentChanges": [
+                { "textDocument": { "uri": here, "version": 1 }, "edits": [
+                    { "range": range((0, 0), (0, 1)), "newText": "b" } ] },
+                { "kind": "rename", "oldUri": here, "newUri": there },
+                // Meant for the same file at its new name.
+                { "textDocument": { "uri": there, "version": null }, "edits": [
+                    { "range": range((0, 4), (0, 5)), "newText": "2" } ] },
+            ] } }]),
+        );
+    });
+    actions_of_kind(window, "refactor.rewrite", cx);
+    wait(cx, "the move", |_| !moved.lock().unwrap().is_empty());
+    assert_eq!(editor_error(window, cx), None);
+    // Both edits are in the buffer, which is the file's; the disk moved.
+    assert_eq!(
+        input.read_with(cx, |input, _| input.content.to_string()),
+        "b = 2\n"
+    );
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+    assert_eq!(
+        *moved.lock().unwrap(),
+        [code_editor::refactor::FileMoved::Renamed {
+            from: path.clone(),
+            to: main.clone(),
+        }]
+    );
+}
