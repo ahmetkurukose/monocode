@@ -82,7 +82,7 @@ pub struct Keychain {
 
 impl KeySource for Keychain {
     fn read(&self) -> Result<Option<VaultKey>, KeyError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &self.account)
+        let entry = crate::credentials::entry(KEYCHAIN_SERVICE, &self.account)
             .map_err(|e| KeyError::Unavailable(e.to_string()))?;
         match entry.get_password() {
             Ok(text) => VaultKey::decode(&text)
@@ -94,7 +94,7 @@ impl KeySource for Keychain {
     }
 
     fn write(&self, key: &VaultKey) -> Result<(), KeyError> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, &self.account)
+        crate::credentials::entry(KEYCHAIN_SERVICE, &self.account)
             .and_then(|entry| entry.set_password(&key.encode()))
             .map_err(|e| KeyError::Unavailable(e.to_string()))
     }

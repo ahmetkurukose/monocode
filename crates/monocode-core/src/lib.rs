@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod browser;
 pub mod code;
 pub mod context;
+pub mod credentials;
 pub mod db;
 pub mod db_bridge;
 pub mod desktop_preferences;
