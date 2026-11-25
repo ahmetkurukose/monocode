@@ -9,6 +9,8 @@ pub(crate) fn backdrop(radius: f32) -> impl IntoElement {
         move |bounds, _, window, _| {
             // A browser page under the card hides: GPUI cannot draw over it.
             crate::browser::cover(bounds, window);
+            // Glass over a web page takes the page's colours (`popover`).
+            let light = light || crate::popover::over_page();
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let quad = if light {
                 gpui::fill(bounds, opaque)
