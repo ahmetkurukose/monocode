@@ -2508,6 +2508,7 @@ impl Shell {
                         text,
                         first_line,
                         last_line,
+                        run,
                     } => {
                         this.pending_database_sends
                             .push(database_send::DbSend::Text {
@@ -2515,6 +2516,7 @@ impl Shell {
                                 source: source.clone(),
                                 text: text.clone(),
                                 lines: Some((*first_line, *last_line)),
+                                run: *run,
                             });
                         cx.notify();
                     }

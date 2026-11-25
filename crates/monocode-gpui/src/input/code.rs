@@ -85,6 +85,9 @@ pub(super) struct Code {
     block: Option<Block>,
     /// Width of one character of the editor font, as last measured.
     char_width: f32,
+    /// The word Select Next Occurrence started from at a bare caret; while
+    /// it is what is selected, only whole words match.
+    occurrence_word: Option<String>,
     /// What Extend Selection grew from, for Shrink Selection.
     expansion: Option<lines::Expansion>,
     /// A parse for Extend Selection, made the first time it is used.
@@ -161,6 +164,7 @@ impl Code {
             column_mode: false,
             block: None,
             char_width: 7.5,
+            occurrence_word: None,
             expansion: None,
             structure: None,
         }
@@ -348,7 +352,8 @@ impl Input {
         cx.notify();
     }
     pub(crate) fn schedule_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
-        if self.is_composing() || !self.selection.is_empty() || self.has_carets() {
+        // With several carets the popup follows the primary one.
+        if self.is_composing() || !self.selection.is_empty() {
             return;
         }
         let at = self.cursor();
@@ -1960,16 +1965,12 @@ impl Element for CodeElement {
             if let Some(decor) = &code.decor {
                 let left = state.text_bounds.left() - px(code.gutter());
                 for ((row, line), top) in state.lines.iter().zip(&tops) {
-                    gutter::paint_row(
-                        decor,
-                        *row,
-                        Bounds::new(
-                            point(left, bounds.top() + px(*top) - state.scroll.y),
-                            size(bounds.right() - px(WIDTH) - left, line.size(lh).height),
-                        ),
-                        lh,
-                        w,
+                    let row_bounds = Bounds::new(
+                        point(left, bounds.top() + px(*top) - state.scroll.y),
+                        size(bounds.right() - px(WIDTH) - left, line.size(lh).height),
                     );
+                    gutter::paint_row(decor, *row, row_bounds, lh, w);
+                    gutter::paint_annotation(decor, *row, row_bounds, lh, w, cx);
                 }
             }
             if code.diff {

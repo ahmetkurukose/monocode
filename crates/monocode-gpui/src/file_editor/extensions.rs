@@ -48,6 +48,8 @@ pub(super) struct Extensions {
     menu: Option<HeaderMenu>,
     _hub: Subscription,
     _moves: Subscription,
+    /// Presses in this editor's blame column that it answers itself.
+    _blame: Subscription,
 }
 
 /// What the extension points add to the header, built per draw.
@@ -101,6 +103,7 @@ impl Extensions {
             _moves: cx.subscribe(&hub, |this, _, event: &FileMoved, cx| {
                 this.file_moved(event, cx)
             }),
+            _blame: super::git_actions::watch_blame(cx),
         }
     }
 }
@@ -194,6 +197,7 @@ impl FileEditor {
             self.mirror_gutter(slot, cx);
         }
         self.mirror_decorations(cx);
+        self.mirror_annotations(cx);
     }
     /// Reports the buffer if it differs from the last report. Returns the
     /// document's version.
@@ -256,6 +260,7 @@ impl FileEditor {
             }
             HubEvent::Gutter { path: file, slot } if file == path => self.mirror_gutter(*slot, cx),
             HubEvent::Decorations(file) if file == path => self.mirror_decorations(cx),
+            HubEvent::Annotations(file) if file == path => self.mirror_annotations(cx),
             HubEvent::Apply {
                 path: file,
                 base,
@@ -321,6 +326,13 @@ impl FileEditor {
             input.set_line_decorations(lines, cx);
             input.set_inline_notes(notes, cx);
         });
+    }
+
+    fn mirror_annotations(&mut self, cx: &mut Context<Self>) {
+        let path = &self.extensions.doc.path;
+        let annotations = code_editor::hub(cx).read(cx).annotations(path).cloned();
+        self.input
+            .update(cx, |input, cx| input.set_annotations(annotations, cx));
     }
 
     fn location(&self, cx: &App) -> Location {

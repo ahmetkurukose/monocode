@@ -2,15 +2,17 @@
 //! console. The Database view is made if it was never opened but is not
 //! shown: the user stays where they were, and the notice says where it went.
 use super::*;
-use crate::database::{MAX_SEND_BYTES, Origin};
+use crate::database::{MAX_SEND_BYTES, Origin, RunMode};
 
 pub(super) enum DbSend {
-    /// Text selected in a file; `lines` are 1-based when it is part of one.
+    /// Text selected in a file; `lines` are 1-based when it is part of one,
+    /// and `run` asks the console to run it.
     Text {
         path: String,
         source: String,
         text: String,
         lines: Option<(usize, usize)>,
+        run: Option<RunMode>,
     },
     /// A file, read when it is sent.
     File { path: String, source: String },
@@ -78,7 +80,8 @@ impl Shell {
                     source,
                     text,
                     lines,
-                } => self.deliver_to_database(path, source, text, lines, window, cx),
+                    run,
+                } => self.deliver_to_database(path, source, text, lines, run, window, cx),
                 DbSend::File { path, source } => {
                     let read = {
                         let path = path.clone();
@@ -96,7 +99,7 @@ impl Shell {
                         let text = read.await;
                         let _ = this.update_in(cx, |this, window, cx| match text {
                             Ok(text) => {
-                                this.deliver_to_database(path, source, text, None, window, cx)
+                                this.deliver_to_database(path, source, text, None, None, window, cx)
                             }
                             Err(error) => this.database_send_failed(error, cx),
                         });
@@ -107,18 +110,22 @@ impl Shell {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn deliver_to_database(
         &mut self,
         path: String,
         source: String,
         text: String,
         lines: Option<(usize, usize)>,
+        run: Option<RunMode>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let origin = self.database_origin(&path, lines);
         let view = self.ensure_database(window, cx);
-        match view.update(cx, |view, cx| view.send_text(&source, &origin, &text, cx)) {
+        match view.update(cx, |view, cx| {
+            view.send_text(&source, &origin, &text, run, cx)
+        }) {
             Ok(message) => self
                 .notification_state
                 .database_sent
@@ -174,6 +181,7 @@ mod tests {
                     source: source.clone(),
                     text: "insert into t values (7);".into(),
                     lines: Some((3, 4)),
+                    run: None,
                 });
                 shell.send_file_to_database(file.clone(), source.clone(), cx);
             })
@@ -203,6 +211,43 @@ mod tests {
                 );
                 assert!(shell.notification_state.database_sent.read(cx).is_visible());
                 assert!(!shell.notification_state.file_error.read(cx).is_visible());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_run_asked_for_with_the_text_happens_in_its_console(cx: &mut TestAppContext) {
+        let db = tempfile::tempdir().unwrap();
+        let (source, _) = crate::database::write_sources(db.path(), &["alpha", "beta"]);
+        let dir = project();
+        let file = dir
+            .path()
+            .join("seed/one.sql")
+            .to_string_lossy()
+            .to_string();
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.database_dir = db.path().to_owned();
+                shell.workspace.project = dir.path().to_string_lossy().to_string();
+                shell.pending_database_sends.push(DbSend::Text {
+                    path: file.clone(),
+                    source: source.clone(),
+                    text: "delete from t".into(),
+                    lines: Some((1, 1)),
+                    run: Some(RunMode::Execute),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        settle(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let view = shell.database.clone().expect("made without being shown");
+                // The source is read-only, so the run is refused before it reaches a server.
+                let (error, statement) = view.read(cx).console_error(&source).expect("it ran");
+                assert!(error.contains("read-only"), "{error}");
+                assert_eq!(statement, "delete from t");
             })
             .unwrap();
     }

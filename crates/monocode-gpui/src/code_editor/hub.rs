@@ -1,11 +1,11 @@
 //! The meeting point between file editors and the features around them. An
 //! editor reports its document's life here and features subscribe to it; a
 //! feature stores what it knows about a file here (diagnostics, gutter
-//! marks, line decorations) and every editor showing that file picks it up,
-//! now or when it opens.
+//! marks, line decorations, an annotation column) and every editor showing
+//! that file picks it up, now or when it opens.
 use super::{
-    DiagnosticCounts, DocumentInfo, ExternalDiagnostic, GutterMark, GutterSlot, History,
-    InlineNote, LineDecoration, Location, ReferencesHandler, TextEdit,
+    Annotations, DiagnosticCounts, DocumentInfo, ExternalDiagnostic, GutterMark, GutterSlot,
+    History, InlineNote, LineDecoration, Location, ReferencesHandler, TextEdit,
 };
 use gpui::{Context, EventEmitter, SharedString};
 use std::{
@@ -54,6 +54,8 @@ pub(crate) enum HubEvent {
         slot: GutterSlot,
     },
     Decorations(PathBuf),
+    /// The file's annotation column was set or cleared.
+    Annotations(PathBuf),
     /// Scroll this row (zero-based) into view in editors showing the file.
     Reveal {
         path: PathBuf,
@@ -85,6 +87,7 @@ struct FileState {
     marks: [Vec<GutterMark>; 2],
     lines: Vec<(SharedString, Vec<LineDecoration>)>,
     notes: Vec<(SharedString, Vec<InlineNote>)>,
+    annotations: Option<Annotations>,
 }
 impl FileState {
     fn is_empty(&self) -> bool {
@@ -92,6 +95,7 @@ impl FileState {
             && self.marks.iter().all(Vec::is_empty)
             && self.lines.is_empty()
             && self.notes.is_empty()
+            && self.annotations.is_none()
     }
 }
 
@@ -337,6 +341,29 @@ impl Hub {
             .collect();
         all.sort_by_key(|note| note.row);
         all
+    }
+    /// Sets the file's annotation column (one at a time: a new source
+    /// replaces the last), or clears it with `None`. Rows are zero-based
+    /// rows of the text the editors have now.
+    pub(crate) fn set_annotations(
+        &mut self,
+        path: &Path,
+        annotations: Option<Annotations>,
+        cx: &mut Context<Self>,
+    ) {
+        if annotations.is_none() && self.annotations(path).is_none() {
+            return;
+        }
+        self.file(path).annotations = annotations.map(|mut annotations| {
+            annotations.rows.sort_by_key(|line| line.row);
+            annotations.rows.dedup_by_key(|line| line.row);
+            annotations
+        });
+        self.forget_if_empty(path);
+        cx.emit(HubEvent::Annotations(path.to_owned()));
+    }
+    pub(crate) fn annotations(&self, path: &Path) -> Option<&Annotations> {
+        self.files.get(path)?.annotations.as_ref()
     }
     /// Scrolls a row into view in the editors showing the file, without
     /// moving their carets. A file nobody shows is opened with

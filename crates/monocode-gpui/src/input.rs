@@ -95,7 +95,9 @@ actions!(
         MoveLineDown,
         ToggleColumnSelection,
         AddCaretAbove,
-        AddCaretBelow
+        AddCaretBelow,
+        SelectNextOccurrence,
+        SelectAllOccurrences
     ]
 );
 /// The code actions of one kind at the caret, such as `refactor.extract`
@@ -177,6 +179,14 @@ pub fn bind(cx: &mut App) {
         // Not Cmd+Shift+Space: the quick composer takes that system-wide.
         KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
     ]);
+    let [duplicate, above, below, next, all] = caret_keys();
+    cx.bind_keys([
+        KeyBinding::new(duplicate, DuplicateLine, Some("CodeEditor")),
+        KeyBinding::new(above, AddCaretAbove, Some("CodeEditor")),
+        KeyBinding::new(below, AddCaretBelow, Some("CodeEditor")),
+        KeyBinding::new(next, SelectNextOccurrence, Some("CodeEditor")),
+        KeyBinding::new(all, SelectAllOccurrences, Some("CodeEditor")),
+    ]);
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-z"), Undo, Some("Composer")),
         KeyBinding::new(&format!("{modifier}-shift-z"), Redo, Some("Composer")),
@@ -245,6 +255,33 @@ pub fn bind(cx: &mut App) {
             Some("Composer"),
         ),
     ]);
+}
+
+/// The code editor's keys for duplicating lines, adding carets and adding
+/// occurrences: IntelliJ's where the app leaves them free. Its ⌘D (and
+/// Windows' Ctrl+D) split a pane here, ⌥⌥↑ is a double tap no binding can
+/// hold, and the arrow chords are taken on Windows and Linux by sessions,
+/// panes, line moves and changes.
+/// In order: Duplicate Line, Add Caret Above and Below, Select Next and
+/// All Occurrences.
+pub(crate) fn caret_keys() -> [&'static str; 5] {
+    if cfg!(target_os = "macos") {
+        [
+            "alt-shift-d",
+            "ctrl-shift-up",
+            "ctrl-shift-down",
+            "ctrl-g",
+            "ctrl-cmd-g",
+        ]
+    } else {
+        [
+            "alt-shift-d",
+            "alt-pageup",
+            "alt-pagedown",
+            "alt-j",
+            "ctrl-alt-shift-j",
+        ]
+    }
 }
 
 pub struct Input {
@@ -2118,6 +2155,8 @@ impl Render for Input {
             .on_action(cx.listener(Self::toggle_column_selection))
             .on_action(cx.listener(Self::add_caret_above))
             .on_action(cx.listener(Self::add_caret_below))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::select_all_occurrences))
             .on_modifiers_changed(cx.listener(Self::code_modifiers))
             .on_action(cx.listener(Self::start_completion))
             .on_action(cx.listener(Self::dismiss_completion))

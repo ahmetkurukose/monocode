@@ -25,27 +25,6 @@ pub(crate) enum RunMode {
     ExplainAnalyze,
 }
 
-/// The run a file asked for, picked up when its text reaches the console.
-#[derive(Default)]
-struct PendingRun(Option<(String, String, RunMode)>);
-
-impl gpui::Global for PendingRun {}
-
-/// Asks that `text`, when it is next sent to `source`, also runs as `mode`.
-/// Only the latest request is kept.
-pub(crate) fn request_run(source: &str, text: &str, mode: RunMode, cx: &mut gpui::App) {
-    cx.default_global::<PendingRun>().0 = Some((source.to_owned(), text.to_owned(), mode));
-}
-
-/// The run asked for `text` on `source`, taken so it happens once.
-fn take_run(source: &str, text: &str, cx: &mut gpui::App) -> Option<RunMode> {
-    let pending = cx.default_global::<PendingRun>();
-    match &pending.0 {
-        Some((s, t, _)) if s == source && t == text => pending.0.take().map(|(.., mode)| mode),
-        _ => None,
-    }
-}
-
 /// The saved data sources, the one used last first, read from `dir` so a file
 /// editor can offer them without the Database view being open. Sources that
 /// belong to other projects than `place`'s are left out.
@@ -125,14 +104,15 @@ impl DatabaseView {
     }
 
     /// Puts `text` in the console of `origin`'s file under `source`, making it
-    /// when this file has none yet. Nothing runs unless the file asked for a
-    /// run with [`request_run`], and the view stays as it is apart from
-    /// remembering the console as the one to show.
+    /// when this file has none yet. Nothing runs unless `run` asks for it,
+    /// and the view stays as it is apart from remembering the console as the
+    /// one to show.
     pub(crate) fn send_text(
         &mut self,
         source: &str,
         origin: &Origin,
         text: &str,
+        run: Option<RunMode>,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
         if self.source(source).is_none() {
@@ -216,7 +196,7 @@ impl DatabaseView {
         self.active.insert(source.to_owned(), id);
         self.send_target = Some(source.to_owned());
         self.save_state();
-        if let Some(mode) = take_run(source, text, cx) {
+        if let Some(mode) = run {
             self.run_sent(source, id, head.len(), block_len, text.len(), mode, cx);
         }
         cx.notify();
@@ -338,11 +318,11 @@ mod tests {
                     .editor
                     .update(cx, |input, cx| input.set_text("select 1;".into(), cx));
                 let first = view
-                    .send_text(&id, &origin("/p/one.sql", "seed/one.sql (lines 1–2)", "one.sql"), "insert into t values (1);\n", cx)
+                    .send_text(&id, &origin("/p/one.sql", "seed/one.sql (lines 1–2)", "one.sql"), "insert into t values (1);\n", None, cx)
                     .unwrap();
                 assert!(first.ends_with("one.sql"), "{first}");
                 let second = view
-                    .send_text(&id, &origin("/p/two.sql", "seed/two.sql", "two.sql"), "insert into t values (2);", cx)
+                    .send_text(&id, &origin("/p/two.sql", "seed/two.sql", "two.sql"), "insert into t values (2);", None, cx)
                     .unwrap();
                 assert!(second.ends_with("two.sql"));
                 let ids: Vec<u32> = view.consoles.iter().map(|c| c.id).collect();
@@ -364,7 +344,7 @@ mod tests {
                 assert_eq!(view.active.get(&source_id), Some(&3), "the last sent is the one to show");
                 assert_eq!(view.console_store.name(&source_id, 2).as_deref(), Some("one.sql"));
                 // The same file again goes to its own console, below what is there.
-                view.send_text(&id, &origin("/p/one.sql", "seed/one.sql (line 9)", "one.sql"), "insert into t values (9);", cx)
+                view.send_text(&id, &origin("/p/one.sql", "seed/one.sql (line 9)", "one.sql"), "insert into t values (9);", None, cx)
                     .unwrap();
                 assert_eq!(view.consoles.len(), 3, "no new console for the same file");
                 assert_eq!(
@@ -386,10 +366,10 @@ mod tests {
                 let id = a.id.clone();
                 view.save_source(a, None, cx);
                 let o = origin("/p/x.sql", "x.sql", "x.sql");
-                assert!(view.send_text(&id, &o, "   \n", cx).is_err());
-                assert!(view.send_text("missing", &o, "select 1", cx).is_err());
+                assert!(view.send_text(&id, &o, "   \n", None, cx).is_err());
+                assert!(view.send_text("missing", &o, "select 1", None, cx).is_err());
                 let huge = "x".repeat(MAX_SEND_BYTES + 1);
-                assert!(view.send_text(&id, &o, &huge, cx).is_err());
+                assert!(view.send_text(&id, &o, &huge, None, cx).is_err());
                 assert_eq!(view.consoles.len(), 1, "nothing was made");
             })
             .unwrap();

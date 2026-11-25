@@ -93,19 +93,19 @@ impl FileEditor {
         statement_at(text, range.start.min(text.len()))
     }
 
-    /// Sends the statement to run to `source`'s console for this file and
-    /// asks the console to run it as `mode`.
+    /// Sends the statement to run to `source`'s console for this file, asking
+    /// the console to run it as `mode`.
     fn run_sql(&mut self, source: &Target, mode: RunMode, cx: &mut Context<Self>) {
         let Some((range, text)) = self.sql_to_run(cx) else {
             return;
         };
         let (first_line, last_line) = lines_of(&self.input.read(cx).content, &range);
-        crate::database::request_run(&source.id, &text, mode, cx);
         cx.emit(FileEvent::SendToDatabase {
             source: source.id.clone(),
             text,
             first_line,
             last_line,
+            run: Some(mode),
         });
     }
 
@@ -191,6 +191,7 @@ impl FileEditor {
                             text,
                             first_line: target.lines.0,
                             last_line: target.lines.1,
+                            run: None,
                         });
                     }
                     return true;
@@ -252,9 +253,12 @@ mod tests {
         assert!(!is_sql_path("/p/sql/main.rs"));
     }
 
+    /// What the file sent: the source, the text and the run it asked for.
+    type Sent = (String, String, Option<RunMode>);
+
     struct Setup {
         window: WindowHandle<FileEditor>,
-        events: Rc<RefCell<Vec<(String, String)>>>,
+        events: Rc<RefCell<Vec<Sent>>>,
         /// The source used last, then the other one.
         sources: (String, String),
         db: tempfile::TempDir,
@@ -297,8 +301,11 @@ mod tests {
         window
             .update(cx, |editor, _, cx| {
                 cx.subscribe(&cx.entity(), move |_, _, event: &FileEvent, _| {
-                    if let FileEvent::SendToDatabase { source, text, .. } = event {
-                        log.borrow_mut().push((source.clone(), text.clone()));
+                    if let FileEvent::SendToDatabase {
+                        source, text, run, ..
+                    } = event
+                    {
+                        log.borrow_mut().push((source.clone(), text.clone(), *run));
                     }
                 })
                 .detach();
@@ -384,7 +391,8 @@ mod tests {
             *s.events.borrow(),
             [(
                 s.sources.0.clone(),
-                "update t set a = 1 where id = 2".to_owned()
+                "update t set a = 1 where id = 2".to_owned(),
+                Some(RunMode::Execute)
             )]
         );
         let text = s
@@ -411,18 +419,18 @@ mod tests {
     fn deliver(
         cx: &mut TestAppContext,
         view: WindowHandle<DatabaseView>,
-        events: &Rc<RefCell<Vec<(String, String)>>>,
+        events: &Rc<RefCell<Vec<Sent>>>,
         check: impl FnOnce(&mut DatabaseView, &mut Context<DatabaseView>),
     ) {
         let sent: Vec<_> = events.borrow_mut().drain(..).collect();
         view.update(cx, |view, _, cx| {
-            for (source, text) in sent {
+            for (source, text, run) in sent {
                 let origin = crate::database::Origin {
                     path: "/p/q.sql".into(),
                     label: "q.sql".into(),
                     name: "q.sql".into(),
                 };
-                view.send_text(&source, &origin, &text, cx).unwrap();
+                view.send_text(&source, &origin, &text, run, cx).unwrap();
             }
             check(view, cx);
         })
@@ -474,6 +482,11 @@ mod tests {
                 assert!(editor.sql_menu_pick("sql-explain:plan", &target, &sources, window, cx));
             })
             .unwrap();
+        assert_eq!(
+            s.events.borrow()[0].2,
+            Some(RunMode::Explain),
+            "the run rides on the event"
+        );
         deliver(cx, view, &s.events, |view, cx| {
             assert!(view.console_running(&last), "the plan was asked for");
             assert_eq!(view.console_selection(&last, cx), "select 1");
@@ -489,6 +502,12 @@ mod tests {
                 editor.sql_menu_pick("db:1", &target, &sources, window, cx);
             })
             .unwrap();
+        let runs: Vec<_> = s.events.borrow().iter().map(|e| e.2).collect();
+        assert_eq!(
+            runs,
+            [Some(RunMode::Execute), None],
+            "a plain send asks for no run"
+        );
         deliver(cx, view, &s.events, |view, cx| {
             assert!(view.console_running(&other), "Execute in started on beta");
             assert_eq!(

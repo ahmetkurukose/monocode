@@ -179,7 +179,9 @@ impl FileEditor {
                 .submenu(vec![
                     action("expand-selection", "Expand Selection").shortcut(keys("⌥↑", "Alt+Up")),
                     action("shrink-selection", "Shrink Selection").shortcut(keys("⌥↓", "Alt+Down")),
-                    action("duplicate-line", "Duplicate Line").disabled(!writable),
+                    action("duplicate-line", "Duplicate Line")
+                        .shortcut(keys("⌥⇧D", "Alt+Shift+D"))
+                        .disabled(!writable),
                     action("move-line-up", "Move Line Up")
                         .shortcut(keys("⌥⇧↑", "Alt+Shift+Up"))
                         .disabled(!writable),
@@ -189,8 +191,12 @@ impl FileEditor {
                     action("column-selection", "Column Selection Mode")
                         .shortcut(keys("⇧⌘8", "Ctrl+Shift+8"))
                         .checked(input.column_selection()),
-                    action("caret-above", "Add Caret Above"),
-                    action("caret-below", "Add Caret Below"),
+                    action("caret-above", "Add Caret Above").shortcut(keys("⌃⇧↑", "Alt+PgUp")),
+                    action("caret-below", "Add Caret Below").shortcut(keys("⌃⇧↓", "Alt+PgDown")),
+                    action("next-occurrence", "Select Next Occurrence")
+                        .shortcut(keys("⌃G", "Alt+J")),
+                    action("all-occurrences", "Select All Occurrences")
+                        .shortcut(keys("⌃⌘G", "Ctrl+Alt+Shift+J")),
                 ])
                 .into(),
             MenuItem::Separator,
@@ -368,6 +374,8 @@ impl FileEditor {
             "column-selection" => Box::new(input::ToggleColumnSelection),
             "caret-above" => Box::new(input::AddCaretAbove),
             "caret-below" => Box::new(input::AddCaretBelow),
+            "next-occurrence" => Box::new(input::SelectNextOccurrence),
+            "all-occurrences" => Box::new(input::SelectAllOccurrences),
             "wrap" => Box::new(ToggleWordWrap),
             _ => return,
         };
@@ -444,6 +452,7 @@ mod tests {
                             text,
                             first_line,
                             last_line,
+                            ..
                         } => format!("db {source} {text} {first_line}-{last_line}"),
                         FileEvent::FileHistory { .. } => "history".into(),
                         FileEvent::ShowInExplorer(_) => "explorer".into(),

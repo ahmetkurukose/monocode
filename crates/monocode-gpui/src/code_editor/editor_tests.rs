@@ -1224,3 +1224,214 @@ fn dragging_in_column_mode_selects_a_rectangle(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// Puts the carets at `ranges`, the first one primary.
+fn set_carets(window: WindowHandle<Input>, cx: &mut TestAppContext, ranges: &[Range<usize>]) {
+    window
+        .update(cx, |i, _, cx| {
+            i.select_range(0..0, cx);
+            i.set_carets(
+                ranges
+                    .iter()
+                    .map(|range| Caret {
+                        range: range.clone(),
+                        reversed: false,
+                    })
+                    .collect(),
+            );
+        })
+        .unwrap();
+}
+fn heads(window: WindowHandle<Input>, cx: &mut TestAppContext) -> Vec<usize> {
+    carets(window, cx).iter().map(|(r, _)| r.end).collect()
+}
+
+#[gpui::test]
+fn several_carets_toggle_comments_on_each_line_once(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.py", "ab\ncd\nef");
+    let m = modifier();
+    // Two carets on the first line comment it once.
+    set_carets(window, cx, &[1..1, 2..2, 7..7]);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-/"));
+    assert_eq!(text_of(window, cx), "# ab\ncd\n# ef");
+    assert_eq!(heads(window, cx), [3, 4, 11], "each caret keeps its place");
+    cx.simulate_keystrokes(window.into(), &format!("{m}-/"));
+    assert_eq!(text_of(window, cx), "ab\ncd\nef");
+    // A selection over two lines and a caret below share one block.
+    set_carets(window, cx, &[0..4, 7..7]);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-/"));
+    assert_eq!(text_of(window, cx), "# ab\n# cd\n# ef");
+    // The selection still covers its lines whole, as with one caret.
+    assert_eq!(carets(window, cx), [(0..8, true), (13..13, false)]);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "ab\ncd\nef", "one undo step");
+    assert_eq!(carets(window, cx).len(), 2);
+}
+
+#[gpui::test]
+fn several_carets_indent_and_outdent_every_line_they_select_once(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "a\nb\nc\nd");
+    set_carets(window, cx, &[0..3, 2..2, 6..7]);
+    cx.simulate_keystrokes(window.into(), "tab");
+    assert_eq!(text_of(window, cx), "    a\n    b\nc\n    d");
+    cx.simulate_keystrokes(window.into(), "shift-tab");
+    assert_eq!(text_of(window, cx), "a\nb\nc\nd");
+}
+
+#[gpui::test]
+fn several_carets_duplicate_their_lines_or_selections(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "a\nbc\nd");
+    let m = modifier();
+    // Two carets on one line copy it once; a selection in a line repeats.
+    set_carets(window, cx, &[0..0, 1..1, 2..3, 6..6]);
+    window
+        .update(cx, |i, w, cx| i.duplicate_line(&DuplicateLine, w, cx))
+        .unwrap();
+    assert_eq!(text_of(window, cx), "a\na\nbbc\nd\nd");
+    assert_eq!(
+        carets(window, cx),
+        [(2..2, true), (3..3, false), (5..6, false), (11..11, false)]
+    );
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "a\nbc\nd");
+}
+
+#[gpui::test]
+fn several_carets_move_their_lines_together_and_stop_at_the_edges(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "a\nb\nc\nd\ne");
+    let m = modifier();
+    set_carets(window, cx, &[2..2, 6..6]);
+    cx.simulate_keystrokes(window.into(), "alt-shift-up");
+    assert_eq!(text_of(window, cx), "b\na\nd\nc\ne");
+    assert_eq!(heads(window, cx), [0, 4]);
+    cx.simulate_keystrokes(window.into(), "alt-shift-up");
+    assert_eq!(text_of(window, cx), "b\na\nd\nc\ne", "the top stops all");
+    cx.simulate_keystrokes(window.into(), "alt-shift-down");
+    assert_eq!(text_of(window, cx), "a\nb\nc\nd\ne");
+    assert_eq!(heads(window, cx), [2, 6]);
+    // Carets on touching lines move as one run.
+    set_carets(window, cx, &[2..2, 4..4]);
+    cx.simulate_keystrokes(window.into(), "alt-shift-up");
+    assert_eq!(text_of(window, cx), "b\nc\na\nd\ne");
+    assert_eq!(heads(window, cx), [0, 2]);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), "a\nb\nc\nd\ne");
+}
+
+#[gpui::test]
+fn a_completion_goes_in_at_every_caret_replacing_matching_prefixes(cx: &mut TestAppContext) {
+    let text = "p = Pa\nq = Pa\nr = x";
+    let window = focused_editor(cx, "a.py", text);
+    let m = modifier();
+    set_carets(window, cx, &[6..6, 13..13, 19..19]);
+    window
+        .update(cx, |i, _, cx| {
+            // The popup follows the primary caret while there are others.
+            i.schedule_completion(true, cx);
+            assert!(i.code.as_ref().unwrap().completion_source.is_some());
+            i.apply_completion(
+                CompletionItem {
+                    label: "Path".into(),
+                    insert: "Path".into(),
+                    replace: 4..6,
+                    additional_edits: vec![TextEdit {
+                        range: 0..0,
+                        text: "from pathlib import Path\n".into(),
+                    }],
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                i.content.as_ref(),
+                "from pathlib import Path\np = Path\nq = Path\nr = xPath"
+            );
+            assert_eq!(
+                &i.content[..i.cursor()],
+                "from pathlib import Path\np = Path"
+            );
+        })
+        .unwrap();
+    assert_eq!(heads(window, cx), [33, 42, 52]);
+    cx.simulate_keystrokes(window.into(), &format!("{m}-z"));
+    assert_eq!(text_of(window, cx), text, "one undo step");
+}
+
+#[gpui::test]
+fn select_next_occurrence_adds_whole_words_from_a_caret_and_select_all_takes_every_match(
+    cx: &mut TestAppContext,
+) {
+    let [_, _, _, next, all] = caret_keys();
+    let window = focused_editor(cx, "a.txt", "foo foobar foo\nfoo");
+    window
+        .update(cx, |i, _, cx| i.select_range(1..1, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), next);
+    assert_eq!(carets(window, cx), [(0..3, true)], "first the word");
+    // From a bare caret only whole words match: "foobar" is skipped.
+    cx.simulate_keystrokes(window.into(), next);
+    assert_eq!(carets(window, cx), [(0..3, false), (11..14, true)]);
+    cx.simulate_keystrokes(window.into(), &format!("{next} {next}"));
+    assert_eq!(
+        carets(window, cx),
+        [(0..3, false), (11..14, false), (15..18, true)],
+        "nothing is left after wrapping around"
+    );
+    cx.simulate_keystrokes(window.into(), "x");
+    assert_eq!(text_of(window, cx), "x foobar x\nx");
+    // A selection made by hand matches inside words too.
+    window
+        .update(cx, |i, _, cx| {
+            i.set_text("ab ab abc".into(), cx);
+            i.select_range(3..5, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), all);
+    assert_eq!(
+        carets(window, cx),
+        [(0..2, false), (3..5, true), (6..8, false)]
+    );
+}
+
+#[gpui::test]
+fn caret_keys_reach_the_editor_and_leave_the_workspace_keys_alone(cx: &mut TestAppContext) {
+    let window = focused_editor(cx, "a.txt", "ab\nab\nab");
+    cx.update(|cx| {
+        crate::shell::bind_keys(cx);
+        crate::file_editor::bind(cx);
+    });
+    let names = [
+        "composer::DuplicateLine",
+        "composer::AddCaretAbove",
+        "composer::AddCaretBelow",
+        "composer::SelectNextOccurrence",
+        "composer::SelectAllOccurrences",
+    ];
+    let bound = |cx: &mut TestAppContext, key: &str| -> Vec<&'static str> {
+        let key = gpui::Keystroke::parse(key).unwrap().unparse();
+        cx.update(|cx| {
+            cx.key_bindings()
+                .borrow()
+                .bindings()
+                .filter(|b| b.keystrokes().len() == 1 && b.keystrokes()[0].unparse() == key)
+                .map(|b| b.action().name())
+                .collect()
+        })
+    };
+    // Nothing else anywhere in the app takes these keys.
+    for (key, name) in caret_keys().into_iter().zip(names) {
+        assert_eq!(bound(cx, key), [name], "{key}");
+    }
+    // The workspace's split keys are not bound in the editor.
+    let m = modifier();
+    assert_eq!(bound(cx, &format!("{m}-d")), ["workspace::SplitRight"]);
+    assert_eq!(bound(cx, &format!("{m}-shift-d")), ["workspace::SplitDown"]);
+    let [duplicate, above, below, _, _] = caret_keys();
+    window
+        .update(cx, |i, _, cx| i.select_range(4..4, cx))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), &format!("{above} {below}"));
+    assert_eq!(heads(window, cx), [1, 4, 7]);
+    cx.simulate_keystrokes(window.into(), duplicate);
+    assert_eq!(text_of(window, cx), "ab\nab\nab\nab\nab\nab");
+}

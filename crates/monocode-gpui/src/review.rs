@@ -168,13 +168,14 @@ pub(crate) struct ReviewState {
 pub(crate) enum ReviewEvent {
     Changed,
     Comment(String),
-    /// Text selected in a file, for a data source's console.
+    /// Text selected in a file, for a data source's console; `run` asks it to run.
     SendToDatabase {
         path: String,
         source: String,
         text: String,
         first_line: usize,
         last_line: usize,
+        run: Option<crate::database::RunMode>,
     },
     /// The last tab closed.
     Empty,
@@ -519,6 +520,7 @@ impl ReviewPane {
                     text,
                     first_line,
                     last_line,
+                    run,
                 } = event
                 {
                     cx.emit(ReviewEvent::SendToDatabase {
@@ -527,6 +529,7 @@ impl ReviewPane {
                         text: text.clone(),
                         first_line: *first_line,
                         last_line: *last_line,
+                        run: *run,
                     });
                 }
                 if let FileEvent::WordWrap(wrap) = event {

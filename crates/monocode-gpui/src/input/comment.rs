@@ -115,7 +115,118 @@ pub(super) fn toggle(lines: &[&str], comment: Comment) -> Vec<String> {
         .collect()
 }
 
+/// The smallest change from `old` to `new` at `at`: what differs between
+/// their common start and common end.
+fn line_splice(at: usize, old: &str, new: &str) -> Option<(Range<usize>, String)> {
+    if old == new {
+        return None;
+    }
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut head = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(head) || !new.is_char_boundary(head) {
+        head -= 1;
+    }
+    let room = a.len().min(b.len()) - head;
+    let mut tail = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(room)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !old.is_char_boundary(a.len() - tail) || !new.is_char_boundary(b.len() - tail) {
+        tail -= 1;
+    }
+    Some((
+        at + head..at + a.len() - tail,
+        new[head..b.len() - tail].to_owned(),
+    ))
+}
+
+/// Where `at` lands after `edits` (sorted, in the old offsets). An offset at
+/// an edit's start goes after its new text only when `after` says so.
+fn shifted(edits: &[(Range<usize>, String)], at: usize, after: bool) -> usize {
+    let mut delta = 0isize;
+    for (range, text) in edits {
+        if at < range.start || at == range.start && !after {
+            break;
+        }
+        if at < range.end || at == range.start {
+            return (range.start as isize + delta) as usize + text.len();
+        }
+        delta += text.len() as isize - range.len() as isize;
+    }
+    (at as isize + delta) as usize
+}
+
 impl Input {
+    /// The lines a selection touches, from the start of the first to the
+    /// end of the last. A selection that ends at the start of a line does
+    /// not take it.
+    fn comment_span(&self, selection: &Range<usize>) -> Range<usize> {
+        let start = self.content[..selection.start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        let last = if selection.end > selection.start
+            && self.content.as_bytes().get(selection.end - 1) == Some(&b'\n')
+        {
+            selection.end - 1
+        } else {
+            selection.end
+        };
+        let end = self.content[last..]
+            .find('\n')
+            .map_or(self.content.len(), |n| last + n);
+        start..end
+    }
+    /// Toggle Comment with several carets: the lines of each caret toggle
+    /// as one block (carets on the same or touching lines share it), every
+    /// line once, as one undo step.
+    fn toggle_comment_carets(&mut self, comment: Comment, cx: &mut Context<Self>) {
+        let carets = self.all_carets();
+        let mut spans: Vec<Range<usize>> =
+            carets.iter().map(|c| self.comment_span(&c.range)).collect();
+        spans.sort_by_key(|span| span.start);
+        let mut blocks: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+        for span in spans {
+            if let Some(block) = blocks.last_mut()
+                && span.start <= block.end + 1
+            {
+                block.end = block.end.max(span.end);
+                continue;
+            }
+            blocks.push(span);
+        }
+        let mut edits = Vec::new();
+        for block in blocks {
+            let lines: Vec<&str> = self.content[block.clone()].split('\n').collect();
+            let mut at = block.start;
+            for (old, new) in lines.iter().zip(toggle(&lines, comment)) {
+                edits.extend(line_splice(at, old, &new));
+                at += old.len() + 1;
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let after = carets
+            .iter()
+            .map(|caret| {
+                let range = if caret.range.is_empty() {
+                    let at = shifted(&edits, caret.range.start, true);
+                    at..at
+                } else {
+                    shifted(&edits, caret.range.start, false)
+                        ..shifted(&edits, caret.range.end, true)
+                };
+                code::Caret {
+                    range,
+                    reversed: caret.reversed,
+                }
+            })
+            .collect();
+        self.splice_carets(edits, after, EditKind::Other, cx);
+    }
     /// The comment syntax of this editor's file, when it has one and may be
     /// edited.
     pub(super) fn comment_syntax(&self) -> Option<Comment> {
@@ -138,21 +249,12 @@ impl Input {
         if self.marked.is_some() {
             return;
         }
+        if self.has_carets() {
+            self.toggle_comment_carets(comment, cx);
+            return;
+        }
         let selection = self.selection.clone();
-        let start = self.content[..selection.start]
-            .rfind('\n')
-            .map_or(0, |at| at + 1);
-        // A selection that ends at the start of a line does not take it.
-        let last = if selection.end > selection.start
-            && self.content.as_bytes().get(selection.end - 1) == Some(&b'\n')
-        {
-            selection.end - 1
-        } else {
-            selection.end
-        };
-        let end = self.content[last..]
-            .find('\n')
-            .map_or(self.content.len(), |n| last + n);
+        let Range { start, end } = self.comment_span(&selection);
         let before = self.content[start..end].to_owned();
         let lines: Vec<&str> = before.split('\n').collect();
         let replacement = toggle(&lines, comment).join("\n");

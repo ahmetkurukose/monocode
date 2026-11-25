@@ -164,11 +164,13 @@ pub(crate) enum FileEvent {
     WordWrap(bool),
     AddToChat(String),
     /// Selected text, for the console of this data source. Lines are 1-based.
+    /// `run` asks the console to run it too.
     SendToDatabase {
         source: String,
         text: String,
         first_line: usize,
         last_line: usize,
+        run: Option<crate::database::RunMode>,
     },
     /// The code menu asked for the file's versions.
     FileHistory {

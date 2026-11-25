@@ -1313,7 +1313,7 @@ fn a_mongodb_source_names_its_tree_pages_and_sent_text_in_its_own_terms(cx: &mut
                 label: "seed.js".into(),
                 name: "seed.js".into(),
             };
-            view.send_text(&id, &origin, "db.t.insertOne({ a: 1 })", cx)
+            view.send_text(&id, &origin, "db.t.insertOne({ a: 1 })", None, cx)
                 .unwrap();
             let texts = view.console_texts(&id, cx);
             assert!(

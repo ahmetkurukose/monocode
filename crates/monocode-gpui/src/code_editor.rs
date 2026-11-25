@@ -1,7 +1,7 @@
 //! The file editor's extension points. Code insight, run and debug plug into
 //! the editor through what is declared here and never edit the editor itself:
 //! they subscribe to the [`Hub`] for document events, push diagnostics, gutter
-//! marks and line decorations into it by file path, and install providers for
+//! marks, line decorations and annotation columns into it by file path, and install providers for
 //! completion, hover, signature help, symbol links, the gutter and the header.
 //! Providers are called on the UI thread and must return at once, handing
 //! back a `Task` for anything that waits on a process.
@@ -36,9 +36,10 @@ pub(crate) use diagnostics::{
     DiagnosticCounts, ExternalDiagnostic, Severity, remap as remap_diagnostics,
 };
 pub(crate) use gutter::{
-    Breakpoint, Decor, GutterButton, GutterClick, GutterMark, GutterMarkKind, GutterMenu,
-    GutterProvider, GutterSlot, InlineNote, LineDecoration, LineStyle, NoteTone, RowShift,
-    SLOT_WIDTH,
+    ANNOTATION_PAD, ANNOTATION_TEXT, Annotation, AnnotationClick, AnnotationColumn,
+    AnnotationProvider, Annotations, Breakpoint, Decor, GutterButton, GutterClick, GutterMark,
+    GutterMarkKind, GutterMenu, GutterProvider, GutterSlot, InlineNote, LineAnnotation,
+    LineDecoration, LineStyle, NoteTone, RowShift, SLOT_WIDTH,
 };
 pub(crate) use header::{Crumb, HeaderAction, HeaderClick, HeaderProvider};
 pub(crate) use history::History;

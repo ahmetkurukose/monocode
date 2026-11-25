@@ -1296,10 +1296,11 @@ impl DatabaseView {
         let status = self.status_line(ix);
         let console = &self.consoles[ix];
         let note = console.note.clone();
-        let has_grid = console
-            .result
-            .as_ref()
-            .is_some_and(|r| !r.columns.is_empty());
+        let has_grid = console.plan.is_none()
+            && console
+                .result
+                .as_ref()
+                .is_some_and(|r| !r.columns.is_empty());
         let page = console.paging.as_ref().map(|p| {
             (
                 p.page,
@@ -1360,6 +1361,8 @@ impl DatabaseView {
         });
         let body: AnyElement = if let Some((error, statement)) = console.error.clone() {
             Self::error_panel(&error, &statement, self.kind_of(&console.source))
+        } else if console.plan.is_some() {
+            self.plan_tree(ix, cx)
         } else if let Some(result) = console.result.clone() {
             if result.columns.is_empty() {
                 div()

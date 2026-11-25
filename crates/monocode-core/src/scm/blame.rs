@@ -12,9 +12,16 @@ pub struct BlameCommit {
     pub sha: String,
     pub short_sha: String,
     pub author: String,
+    /// Without the angle brackets.
+    pub email: String,
     /// Seconds since the epoch.
     pub time: u64,
     pub subject: String,
+    /// The message after its subject line, trimmed.
+    pub body: String,
+    /// The commit before this one that had the file, and the file's path
+    /// there, for blaming the revision before it.
+    pub previous: Option<(String, String)>,
 }
 
 /// A line of the blamed version and the commit (an index into
@@ -107,21 +114,67 @@ fn git_checked_output(root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Who last changed each line of `path` as HEAD has it (`git blame
-/// --porcelain`). `path` is absolute.
-pub fn blame_file(path: &Path) -> Result<Blame, String> {
+/// --porcelain`), or as revision `at.0` has the file at repository path
+/// `at.1`. `path` is absolute.
+pub fn blame_file(path: &Path, at: Option<(&str, &str)>) -> Result<Blame, String> {
     let (root, relative) = locate(path)?;
-    let head = head_of(&root)?;
+    let (head, relative) = match at {
+        Some((revision, repo_path)) => (
+            git_stdout(
+                &root,
+                &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+            )
+            .ok_or("That revision is not in this repository.")?,
+            repo_path.to_owned(),
+        ),
+        None => (head_of(&root)?, relative),
+    };
     if git_blob(&root, &format!("{head}:{relative}")).is_none() {
         return Err("This file is not committed yet.".into());
     }
     let out = git_checked_output(&root, &["blame", "--porcelain", &head, "--", &relative])?;
-    let (commits, lines) = parse_blame_porcelain(&out);
+    let (mut commits, lines) = parse_blame_porcelain(&out);
+    add_bodies(&root, &mut commits);
     Ok(Blame {
         head,
         path: relative,
         commits,
         lines,
     })
+}
+
+/// Fills in the commits' message bodies, which blame does not print. A
+/// failure leaves them empty: the subject is still there.
+fn add_bodies(root: &Path, commits: &mut [BlameCommit]) {
+    let mut args = vec!["log", "--no-walk=unsorted", "--format=%x1e%H%x1f%b"];
+    args.extend(
+        commits
+            .iter()
+            .map(|commit| commit.sha.as_str())
+            .filter(|sha| sha.bytes().any(|b| b != b'0')),
+    );
+    if args.len() == 3 {
+        return;
+    }
+    let Ok(out) = git_checked_output(root, &args) else {
+        return;
+    };
+    let bodies = parse_bodies(&out);
+    for commit in commits {
+        if let Some(body) = bodies.get(&commit.sha) {
+            commit.body = body.clone();
+        }
+    }
+}
+
+/// Reads `git log --format=%x1e%H%x1f%b`: each commit's body by its sha.
+fn parse_bodies(text: &str) -> HashMap<String, String> {
+    text.split('\x1e')
+        .filter_map(|record| {
+            let (sha, body) = record.split_once('\x1f')?;
+            Some((sha.trim().to_owned(), body.trim().to_owned()))
+        })
+        .collect()
 }
 
 fn is_sha(token: &str) -> bool {
@@ -166,8 +219,18 @@ pub fn parse_blame_porcelain(text: &str) -> (Vec<BlameCommit>, Vec<BlameLine>) {
         };
         match key {
             "author" => commit.author = value.to_owned(),
+            "author-mail" => {
+                let mail = value.trim();
+                let mail = mail.strip_prefix('<').unwrap_or(mail);
+                commit.email = mail.strip_suffix('>').unwrap_or(mail).to_owned();
+            }
             "author-time" => commit.time = value.trim().parse().unwrap_or(0),
             "summary" => commit.subject = value.to_owned(),
+            "previous" => {
+                commit.previous = value
+                    .split_once(' ')
+                    .map(|(sha, path)| (sha.to_owned(), path.to_owned()))
+            }
             _ => {}
         }
     }
@@ -646,11 +709,21 @@ mod blame_tests {
         let (commits, lines) = parse_blame_porcelain(&text);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].author, "Ann");
+        assert_eq!(commits[0].email, "ann@x");
         assert_eq!(commits[0].short_sha, "aaaaaaa");
+        assert_eq!(commits[0].previous, None);
+        assert_eq!(commits[1].previous, Some((a.clone(), "f.txt".into())));
         assert_eq!(commits[1].subject, "Second");
         assert_eq!(commits[1].time, 1_700_000_100);
         let rows: Vec<_> = lines.iter().map(|l| (l.commit, l.text.as_str())).collect();
         assert_eq!(rows, [(0, "one"), (0, "two"), (1, "three")]);
+    }
+
+    #[test]
+    fn bodies_are_read_per_commit_and_trimmed() {
+        let bodies = parse_bodies("\x1eaaa\x1fWhy it changed.\n\nMore.\n\n\x1ebbb\x1f\n");
+        assert_eq!(bodies["aaa"], "Why it changed.\n\nMore.");
+        assert_eq!(bodies["bbb"], "");
     }
 
     #[test]
@@ -758,7 +831,7 @@ mod blame_tests {
         git(dir, &["commit", "-am", "second"]);
         std::fs::write(dir.join("new.txt"), "x\n").unwrap();
 
-        let blame = blame_file(&file).unwrap();
+        let blame = blame_file(&file, None).unwrap();
         assert_eq!(blame.path, "a.txt");
         let by: Vec<_> = blame
             .lines
@@ -770,8 +843,15 @@ mod blame_tests {
             [("first", "one"), ("first", "two"), ("second", "three")]
         );
         assert_eq!(blame.commits[0].author, "Ann");
+        assert_eq!(blame.commits[0].email, "ann@example.com");
         assert_eq!(head_revision(&file).as_deref(), Some(blame.head.as_str()));
-        assert!(blame_file(&dir.join("new.txt")).is_err());
+        assert!(blame_file(&dir.join("new.txt"), None).is_err());
+        // The revision before "second" has only the first two lines.
+        let (before, at) = blame.commits[1].previous.clone().expect("a parent");
+        let older = blame_file(&file, Some((&before, &at))).unwrap();
+        assert_eq!(older.head, before);
+        assert_eq!(older.lines.len(), 2);
+        assert!(blame_file(&file, Some(("0123abc", "a.txt"))).is_err());
         assert!(local_repo(&file).is_some_and(|repo| repo.remote.is_none()));
 
         // Line 3 only came with the second commit; line 1 with the first.

@@ -366,6 +366,12 @@ impl Input {
         self.edit_each_caret(kind, cx, |_, caret| {
             Some((caret.range.clone(), text.clone()))
         });
+        // Typed text asks for completion at the primary caret, as with one.
+        if kind == EditKind::Typing
+            && let Some(code) = &mut self.code
+        {
+            code.suppress_completion = false;
+        }
     }
     /// Removes each selection, or from each caret to where `to` says.
     pub(in crate::input) fn delete_at_carets(
@@ -522,14 +528,32 @@ impl Input {
     }
     /// The rows a selection covers. A selection ending at the start of a
     /// line leaves that line out.
-    fn selected_rows(&self) -> (usize, usize) {
+    fn caret_rows(&self, range: &Range<usize>) -> (usize, usize) {
         let code = self.code.as_ref().unwrap();
-        let first = code.row(self.selection.start);
-        let mut last = code.row(self.selection.end);
-        if last > first && code.offsets[last] == self.selection.end {
+        let first = code.row(range.start);
+        let mut last = code.row(range.end);
+        if last > first && code.offsets[last] == range.end {
             last -= 1;
         }
         self.unit_rows(first, last)
+    }
+    /// The rows every caret covers, as runs of lines. Carets on the same
+    /// lines share a run; with `adjacent`, so do runs that touch.
+    fn caret_blocks(&self, carets: &[Caret], adjacent: bool) -> Vec<(usize, usize)> {
+        let mut rows: Vec<(usize, usize)> =
+            carets.iter().map(|c| self.caret_rows(&c.range)).collect();
+        rows.sort_unstable();
+        let mut blocks: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+        for (first, last) in rows {
+            if let Some(block) = blocks.last_mut()
+                && first <= block.1 + usize::from(adjacent)
+            {
+                block.1 = block.1.max(last);
+                continue;
+            }
+            blocks.push((first, last));
+        }
+        blocks
     }
 
     pub(in crate::input) fn expand_selection(
@@ -610,6 +634,9 @@ impl Input {
         steps
     }
 
+    /// Duplicate Line for every caret: a selection inside one line is
+    /// repeated after itself, otherwise the caret's lines are, once for all
+    /// the carets on them. Each caret moves into its copy.
     pub(in crate::input) fn duplicate_line(
         &mut self,
         _: &DuplicateLine,
@@ -620,38 +647,55 @@ impl Input {
             cx.propagate();
             return;
         }
-        self.collapse_carets();
-        let selection = self.selection.clone();
+        let carets = self.all_carets();
         let code = self.code.as_ref().unwrap();
-        let within_line = code.row(selection.start) == code.row(selection.end);
-        let (edit, after) = if !selection.is_empty() && within_line {
-            let text = self.content[selection.clone()].to_owned();
-            let len = text.len();
-            (
-                (selection.end..selection.end, text),
-                selection.start + len..selection.end + len,
-            )
-        } else {
-            let (first, last) = self.selected_rows();
-            let code = self.code.as_ref().unwrap();
-            let lines = code.offsets[first]..self.line_end(last);
-            let shift = lines.len() + 1;
-            let text = format!("\n{}", &self.content[lines.clone()]);
-            (
-                (lines.end..lines.end, text),
-                selection.start + shift..selection.end + shift,
-            )
+        let within_line =
+            |c: &Caret| !c.range.is_empty() && code.row(c.range.start) == code.row(c.range.end);
+        let whole: Vec<Caret> = carets.iter().filter(|c| !within_line(c)).cloned().collect();
+        let blocks = self.caret_blocks(&whole, false);
+        let copied = |row: usize| {
+            blocks
+                .iter()
+                .any(|(first, last)| (*first..=*last).contains(&row))
         };
-        let reversed = self.reversed;
-        self.splice_carets(
-            vec![edit],
-            vec![Caret {
-                range: after,
-                reversed,
-            }],
-            EditKind::Other,
-            cx,
+        // The copy goes above, so a caret in the lines lands in the lower one.
+        let mut edits: Vec<Splice> = blocks
+            .iter()
+            .map(|(first, last)| {
+                let lines = code.offsets[*first]..self.line_end(*last);
+                (
+                    lines.start..lines.start,
+                    format!("{}\n", &self.content[lines]),
+                )
+            })
+            .collect();
+        let inline: Vec<Range<usize>> = carets
+            .iter()
+            .filter(|c| within_line(c) && !copied(code.row(c.range.start)))
+            .map(|c| c.range.clone())
+            .collect();
+        edits.extend(
+            inline
+                .iter()
+                .map(|r| (r.end..r.end, self.content[r.clone()].to_owned())),
         );
+        edits.sort_by_key(|(range, _)| range.start);
+        let after = carets
+            .iter()
+            .map(|caret| {
+                let range = if inline.contains(&caret.range) {
+                    let end = map_through(&edits, caret.range.end);
+                    end - caret.range.len()..end
+                } else {
+                    map_through(&edits, caret.range.start)..map_through(&edits, caret.range.end)
+                };
+                Caret {
+                    range,
+                    reversed: caret.reversed,
+                }
+            })
+            .collect();
+        self.splice_carets(edits, after, EditKind::Other, cx);
     }
     pub(in crate::input) fn move_line_up(
         &mut self,
@@ -677,71 +721,93 @@ impl Input {
         }
         self.move_lines(false, cx);
     }
-    /// Swaps the selected lines with the line (or folded region) above or
-    /// below them. Folded regions on either side stay folded.
+    /// Swaps the lines of every caret with the line (or folded region)
+    /// above or below them; nothing moves when one run is at the edge.
+    /// Folded regions on either side stay folded.
     fn move_lines(&mut self, up: bool, cx: &mut Context<Self>) {
-        self.collapse_carets();
-        let (first, last) = self.selected_rows();
+        let carets = self.all_carets();
+        let blocks = self.caret_blocks(&carets, true);
         let code = self.code.as_ref().unwrap();
         let rows = code.offsets.len();
-        let (other_first, other_last) = if up {
-            if first == 0 {
-                return;
-            }
-            self.unit_rows(first - 1, first - 1)
+        let at_edge = if up {
+            blocks.first().is_none_or(|(first, _)| *first == 0)
         } else {
-            if last + 1 >= rows {
-                return;
-            }
-            self.unit_rows(last + 1, last + 1)
+            blocks.last().is_none_or(|(_, last)| last + 1 >= rows)
         };
-        let moved = code.offsets[first]..self.line_end(last);
-        let other = code.offsets[other_first]..self.line_end(other_last);
-        let (region, text, shift_moved, shift_other) = if up {
-            (
-                other.start..moved.end,
-                format!(
-                    "{}\n{}",
-                    &self.content[moved.clone()],
-                    &self.content[other.clone()]
-                ),
-                -(other.len() as isize + 1),
-                moved.len() as isize + 1,
-            )
-        } else {
-            (
-                moved.start..other.end,
-                format!(
-                    "{}\n{}",
-                    &self.content[other.clone()],
-                    &self.content[moved.clone()]
-                ),
-                other.len() as isize + 1,
-                -(moved.len() as isize + 1),
-            )
-        };
+        if at_edge {
+            return;
+        }
         let shift = |at: usize, by: isize| (at as isize + by) as usize;
-        let folds: Vec<_> = code
-            .folded
+        let mut edits: Vec<Splice> = Vec::with_capacity(blocks.len());
+        let mut moves: Vec<(Range<usize>, isize)> = Vec::with_capacity(blocks.len());
+        let mut folds = Vec::new();
+        for (first, last) in blocks {
+            let (other_first, other_last) = if up {
+                self.unit_rows(first - 1, first - 1)
+            } else {
+                self.unit_rows(last + 1, last + 1)
+            };
+            let moved = code.offsets[first]..self.line_end(last);
+            let other = code.offsets[other_first]..self.line_end(other_last);
+            let (region, text, shift_moved, shift_other) = if up {
+                (
+                    other.start..moved.end,
+                    format!(
+                        "{}\n{}",
+                        &self.content[moved.clone()],
+                        &self.content[other.clone()]
+                    ),
+                    -(other.len() as isize + 1),
+                    moved.len() as isize + 1,
+                )
+            } else {
+                (
+                    moved.start..other.end,
+                    format!(
+                        "{}\n{}",
+                        &self.content[other.clone()],
+                        &self.content[moved.clone()]
+                    ),
+                    other.len() as isize + 1,
+                    -(moved.len() as isize + 1),
+                )
+            };
+            folds.extend(
+                code.folded
+                    .iter()
+                    .filter(|f| f.from >= region.start && f.to <= region.end)
+                    .map(|f| {
+                        let by = if moved.contains(&f.from) {
+                            shift_moved
+                        } else {
+                            shift_other
+                        };
+                        crate::editor_analysis::Fold {
+                            from: shift(f.from, by),
+                            to: shift(f.to, by),
+                        }
+                    }),
+            );
+            moves.push((moved, shift_moved));
+            edits.push((region, text));
+        }
+        // Each swap keeps its length, so a caret only moves with its lines.
+        let after = carets
             .iter()
-            .filter(|f| f.from >= region.start && f.to <= region.end)
-            .map(|f| {
-                let by = if moved.contains(&f.from) {
-                    shift_moved
-                } else {
-                    shift_other
-                };
-                crate::editor_analysis::Fold {
-                    from: shift(f.from, by),
-                    to: shift(f.to, by),
+            .map(|caret| {
+                let by = moves
+                    .iter()
+                    .find(|(moved, _)| {
+                        moved.start <= caret.range.start && caret.range.start <= moved.end
+                    })
+                    .map_or(0, |(_, by)| *by);
+                Caret {
+                    range: shift(caret.range.start, by)..shift(caret.range.end, by),
+                    reversed: caret.reversed,
                 }
             })
             .collect();
-        let after = Caret {
-            range: shift(self.selection.start, shift_moved)..shift(self.selection.end, shift_moved),
-            reversed: self.reversed,
-        };
-        if self.splice_carets(vec![(region, text)], vec![after], EditKind::Other, cx)
+        if self.splice_carets(edits, after, EditKind::Other, cx)
             && let Some(code) = &mut self.code
         {
             code.folded.extend(folds);
@@ -993,6 +1059,205 @@ impl Input {
         self.manual_scroll = false;
         self.reveal_code();
         cx.notify();
+    }
+
+    /// What the occurrence commands look for: the primary selection, or the
+    /// word at a bare caret (then selected), and whether to match only
+    /// whole words, as when the search started from a bare caret.
+    fn occurrence_target(&mut self) -> Option<(String, bool)> {
+        if self.selection.is_empty() {
+            let at = self.cursor();
+            let word = word_around(&self.content, &(at..at))?;
+            let text = self.content[word.clone()].to_owned();
+            let mut carets = self.all_carets();
+            carets[0] = Caret {
+                range: word,
+                reversed: false,
+            };
+            self.set_carets(carets);
+            self.code.as_mut()?.occurrence_word = Some(text.clone());
+            return Some((text, true));
+        }
+        let text = self.content[self.selection.clone()].to_owned();
+        let code = self.code.as_mut()?;
+        let whole = code.occurrence_word.as_deref() == Some(text.as_str());
+        if !whole {
+            code.occurrence_word = None;
+        }
+        Some((text, whole))
+    }
+    /// Every place `needle` is in the buffer, in order.
+    fn occurrences(&self, needle: &str, whole: bool) -> Vec<Range<usize>> {
+        let text = self.content.as_ref();
+        text.match_indices(needle)
+            .map(|(at, _)| at..at + needle.len())
+            .filter(|r| {
+                !whole
+                    || !text[..r.start].chars().next_back().is_some_and(is_word)
+                        && !text[r.end..].chars().next().is_some_and(is_word)
+            })
+            .collect()
+    }
+    /// Leaves `carets` (the primary one first) after an occurrence command.
+    fn select_carets(&mut self, carets: Vec<Caret>, cx: &mut Context<Self>) {
+        for caret in &carets {
+            self.unfold_range(&caret.range);
+        }
+        self.clear_completion();
+        self.history.break_run();
+        self.set_carets(carets);
+        self.manual_scroll = false;
+        self.reveal_code();
+        cx.notify();
+    }
+    /// Select Next Occurrence: the word at a bare caret first, then each
+    /// press adds the next match of the selection after the newest caret,
+    /// wrapping around past the end, as a new primary caret.
+    pub(in crate::input) fn select_next_occurrence(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.code.is_none() {
+            cx.propagate();
+            return;
+        }
+        let bare = self.selection.is_empty();
+        let Some((needle, whole)) = self.occurrence_target() else {
+            return;
+        };
+        let carets = self.all_carets();
+        if bare {
+            self.select_carets(carets, cx);
+            return;
+        }
+        let found = self.occurrences(&needle, whole);
+        let from = self.selection.end;
+        let free = |r: &Range<usize>| {
+            !carets
+                .iter()
+                .any(|c| c.range.start < r.end && r.start < c.range.end)
+        };
+        let next = found
+            .iter()
+            .filter(|r| r.start >= from)
+            .chain(found.iter().filter(|r| r.start < from))
+            .find(|r| free(r))
+            .cloned();
+        let Some(next) = next else {
+            return;
+        };
+        let mut carets = carets;
+        carets.insert(
+            0,
+            Caret {
+                range: next,
+                reversed: false,
+            },
+        );
+        self.select_carets(carets, cx);
+    }
+    /// Select All Occurrences: a caret on every match of the selection (or
+    /// of the word at a bare caret); the primary one stays where it was.
+    pub(in crate::input) fn select_all_occurrences(
+        &mut self,
+        _: &SelectAllOccurrences,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.code.is_none() {
+            cx.propagate();
+            return;
+        }
+        let Some((needle, whole)) = self.occurrence_target() else {
+            return;
+        };
+        let primary = self.selection.clone();
+        let carets = std::iter::once(Caret {
+            range: primary.clone(),
+            reversed: false,
+        })
+        .chain(
+            self.occurrences(&needle, whole)
+                .into_iter()
+                .filter(|r| *r != primary)
+                .map(|range| Caret {
+                    range,
+                    reversed: false,
+                }),
+        )
+        .collect();
+        self.select_carets(carets, cx);
+    }
+
+    /// Accepting a completion with several carets: the item goes in at
+    /// every caret as one undo step. A caret after the same prefix as the
+    /// primary one has that prefix replaced (and the rest of the word, when
+    /// it matches too); a selection is replaced; elsewhere the text is put
+    /// in as it is. The item's other edits (an import) are made once.
+    pub(in crate::input) fn complete_at_carets(
+        &mut self,
+        item: CompletionItem,
+        cx: &mut Context<Self>,
+    ) {
+        let head = self.cursor();
+        let replace = self.clip_range(item.replace.clone());
+        let (prefix, suffix) = if replace.start <= head && head <= replace.end {
+            (
+                self.content[replace.start..head].to_owned(),
+                self.content[head..replace.end].to_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let carets = self.all_carets();
+        let text = self.content.as_ref();
+        let ranges: Vec<Range<usize>> = carets
+            .iter()
+            .enumerate()
+            .map(|(n, caret)| {
+                if n == 0 {
+                    return replace.clone();
+                }
+                if !caret.range.is_empty() {
+                    return caret.range.clone();
+                }
+                let at = caret.head();
+                let Some(start) = at.checked_sub(prefix.len()) else {
+                    return at..at;
+                };
+                if !text.is_char_boundary(start)
+                    || text[start..at] != *prefix
+                    || text[..start].chars().next_back().is_some_and(is_word)
+                {
+                    return at..at;
+                }
+                let end = if text[at..].starts_with(suffix.as_str()) {
+                    at + suffix.len()
+                } else {
+                    at
+                };
+                start..end
+            })
+            .collect();
+        let mut edits: Vec<Splice> = item
+            .additional_edits
+            .iter()
+            .map(|edit| (self.clip_range(edit.range.clone()), edit.text.clone()))
+            .chain(ranges.iter().map(|r| (r.clone(), item.insert.clone())))
+            .collect();
+        edits.sort_by_key(|(range, _)| range.start);
+        let cursor = item
+            .cursor
+            .unwrap_or(item.insert.len())
+            .min(item.insert.len());
+        let after = ranges
+            .iter()
+            .map(|r| Caret::at(map_through(&edits, r.end) - item.insert.len() + cursor))
+            .collect();
+        self.clear_completion();
+        self.splice_carets(edits, after, EditKind::Other, cx);
     }
 }
 

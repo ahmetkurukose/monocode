@@ -381,6 +381,10 @@ impl Input {
         })
     }
     pub(super) fn apply_completion(&mut self, item: CompletionItem, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.complete_at_carets(item, cx);
+            return;
+        }
         let cursor = item.cursor.unwrap_or(item.insert.len());
         if !item.additional_edits.is_empty() {
             let mut edits = item.additional_edits;

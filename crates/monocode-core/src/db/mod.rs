@@ -13,6 +13,7 @@ pub mod introspect;
 pub mod lexer;
 pub mod mongo;
 pub mod params;
+pub mod plan;
 pub mod runtime;
 pub mod source;
 pub mod split;
@@ -26,4 +27,5 @@ pub use introspect::{
     CatalogEntry, ColumnInfo, ConstraintInfo, IndexInfo, RoutineInfo, RoutineKind, SchemaObjects,
     SequenceInfo, TableDetails, TableInfo, TableKind, TriggerInfo,
 };
+pub use plan::{Plan, PlanNode, PlanRow};
 pub use source::{DataSource, DataSourceStore, DbColor, DbKind, McpAccess, Tunnel, TunnelKind};
