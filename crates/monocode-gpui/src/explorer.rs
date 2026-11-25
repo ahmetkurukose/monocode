@@ -2003,7 +2003,11 @@ mod tests {
                 explorer.list.scroll_to(scrolled);
                 // What a right click on a row does to the tree.
                 explorer.rebuild(cx);
-                assert_eq!(explorer.list.logical_scroll_top(), scrolled);
+                let top = explorer.list.logical_scroll_top();
+                assert_eq!(
+                    (top.item_ix, top.offset_in_item),
+                    (scrolled.item_ix, scrolled.offset_in_item)
+                );
             })
             .unwrap();
     }
