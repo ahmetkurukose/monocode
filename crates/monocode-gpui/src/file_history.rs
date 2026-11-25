@@ -1,6 +1,7 @@
 //! One file's history: its versions down the left, and what the chosen
 //! version changed beside them, the version before on the left of the diff
-//! and the version itself on the right.
+//! and the version itself on the right. The same window lists the commits
+//! that touched some lines, and compares two texts with no list at all.
 use crate::{
     dialog_resize::{self, DialogResize},
     diff_view::{DiffFile, DiffView},
@@ -14,9 +15,9 @@ use gpui::{
 };
 use monocode_core::{
     diff,
-    scm::{self, FileVersion},
+    scm::{self, CommitInfo, CommitRef, FileVersion, Landing},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 /// More than anyone reads through; the list says when it stopped there.
 const LIMIT: usize = 500;
@@ -24,6 +25,48 @@ const LIST_WIDTH: f32 = 300.;
 
 pub(crate) enum Event {
     Close,
+    /// Show everything a commit changed, in a tab of its own: the commit a
+    /// version came from, or the merge that brought it into the main branch.
+    OpenCommit {
+        cwd: String,
+        sha: String,
+        short_sha: String,
+        subject: String,
+    },
+}
+
+/// What a history window shows instead of all of a file's versions.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Request {
+    /// The commits that touched lines `first..=last` (one-based, of `text`
+    /// when given, else of the committed file).
+    Lines {
+        first: usize,
+        last: usize,
+        text: Option<String>,
+    },
+    /// The file's versions, with this commit's chosen.
+    Commit(String),
+    /// `left` against `right`, read-only, under `title`.
+    Compare {
+        title: String,
+        left: String,
+        right: String,
+    },
+}
+
+/// What one window is showing.
+enum Mode {
+    File,
+    Lines {
+        first: usize,
+        last: usize,
+        text: Option<String>,
+    },
+    Compare {
+        left: String,
+        right: String,
+    },
 }
 
 pub(crate) struct FileHistoryDialog {
@@ -31,6 +74,10 @@ pub(crate) struct FileHistoryDialog {
     /// The file as it was asked for, absolute.
     path: String,
     label: String,
+    mode: Mode,
+    title: SharedString,
+    /// The commit to choose once the versions are in.
+    choose: Option<String>,
     versions: Vec<FileVersion>,
     loading: bool,
     error: Option<String>,
@@ -39,6 +86,10 @@ pub(crate) struct FileHistoryDialog {
     diff_request: u64,
     _history_task: Option<Task<()>>,
     _diff_task: Option<Task<()>>,
+    /// What is known of the commits looked at so far, by sha: the message,
+    /// and how each reached the main branch. Absent while it loads.
+    commits: HashMap<String, Result<CommitInfo, String>>,
+    _commit_tasks: Vec<Task<()>>,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
     size: DialogResize,
@@ -68,6 +119,15 @@ impl FileHistoryDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_request(cwd, path, None, window, cx)
+    }
+    pub(crate) fn with_request(
+        cwd: String,
+        path: String,
+        request: Option<Request>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let diff_view = cx.new(DiffView::new);
         diff_view.update(cx, |view, cx| {
             view.allow_split = true;
@@ -75,11 +135,28 @@ impl FileHistoryDialog {
         });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let label = monocode_core::files::display_path(&path, Some(&cwd));
+        let file = monocode_core::files::display_path(&path, Some(&cwd));
+        let (mode, title, label, choose) = match request {
+            None => (Mode::File, "History", file, None),
+            Some(Request::Commit(sha)) => (Mode::File, "History", file, Some(sha)),
+            Some(Request::Lines { first, last, text }) => {
+                let lines = match first == last {
+                    true => format!("{file}: line {first}"),
+                    false => format!("{file}: lines {first}–{last}"),
+                };
+                (Mode::Lines { first, last, text }, "History", lines, None)
+            }
+            Some(Request::Compare { title, left, right }) => {
+                (Mode::Compare { left, right }, "Compare", title, None)
+            }
+        };
         let mut this = Self {
             cwd,
             path,
             label,
+            mode,
+            title: title.into(),
+            choose,
             versions: Vec::new(),
             loading: true,
             error: None,
@@ -88,6 +165,8 @@ impl FileHistoryDialog {
             diff_request: 0,
             _history_task: None,
             _diff_task: None,
+            commits: HashMap::new(),
+            _commit_tasks: Vec::new(),
             scroll: UniformListScrollHandle::new(),
             focus,
             size: DialogResize::new(&REMEMBERED_SIZE),
@@ -100,9 +179,25 @@ impl FileHistoryDialog {
 
     fn load(&mut self, cx: &mut Context<Self>) {
         let (cwd, path) = (PathBuf::from(&self.cwd), self.path.clone());
-        let work = cx
-            .background_executor()
-            .spawn(async move { scm::file_history(&cwd, &path, LIMIT) });
+        let work = match &self.mode {
+            Mode::Compare { left, right } => {
+                self.loading = false;
+                return self.load_comparison(left.clone(), right.clone(), cx);
+            }
+            Mode::File => cx
+                .background_executor()
+                .spawn(async move { scm::file_history(&cwd, &path, LIMIT) }),
+            Mode::Lines { first, last, text } => {
+                let (first, last, text) = (*first, *last, text.clone());
+                cx.background_executor().spawn(async move {
+                    let path = monocode_core::files::document::resolve_path(
+                        std::path::Path::new(&path),
+                        &cwd,
+                    );
+                    scm::line_history(&path, first, last, text.as_deref(), LIMIT)
+                })
+            }
+        };
         self._history_task = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -111,7 +206,16 @@ impl FileHistoryDialog {
                     Ok(versions) => this.versions = versions,
                     Err(error) => this.error = Some(error),
                 }
-                this.selected = 0;
+                let chosen = this.choose.take().and_then(|sha| {
+                    this.versions
+                        .iter()
+                        .position(|v| !v.sha.is_empty() && v.sha.starts_with(&sha))
+                });
+                this.selected = chosen.unwrap_or(0);
+                if chosen.is_some() {
+                    this.scroll
+                        .scroll_to_item(this.selected, gpui::ScrollStrategy::Center);
+                }
                 this.load_diff(cx);
                 cx.notify();
             });
@@ -136,6 +240,7 @@ impl FileHistoryDialog {
                 .update(cx, |view, cx| view.set_files(vec![], cx));
             return;
         };
+        self.load_commit(&version.sha, cx);
         self.diff_request += 1;
         let request = self.diff_request;
         let cwd = PathBuf::from(&self.cwd);
@@ -212,11 +317,240 @@ impl FileHistoryDialog {
         }));
     }
 
+    /// Asks Git about a commit once: its message and how it was merged.
+    fn load_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+        if sha.is_empty() || self.commits.contains_key(sha) {
+            return;
+        }
+        let (cwd, sha) = (PathBuf::from(&self.cwd), sha.to_owned());
+        let asked = sha.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { scm::commit_info(&cwd, &asked) });
+        self._commit_tasks.push(cx.spawn(async move |this, cx| {
+            let info = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.commits.insert(sha, info);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn open_commit(&mut self, commit: &CommitRef, cx: &mut Context<Self>) {
+        cx.emit(Event::OpenCommit {
+            cwd: self.cwd.clone(),
+            sha: commit.sha.clone(),
+            short_sha: commit.short_sha.clone(),
+            subject: commit.subject.clone(),
+        });
+    }
+
+    /// The chosen version's commit, from the list alone until Git answers.
+    fn chosen_commit(&self) -> Option<CommitRef> {
+        let version = self.versions.get(self.selected)?;
+        if version.sha.is_empty() {
+            return None;
+        }
+        match self.commits.get(&version.sha) {
+            Some(Ok(info)) => Some(info.commit.clone()),
+            _ => Some(CommitRef {
+                sha: version.sha.clone(),
+                short_sha: version.short_sha.clone(),
+                subject: version.subject.clone(),
+                author: version.author.clone(),
+                time: version.time,
+                date: String::new(),
+            }),
+        }
+    }
+
+    /// Above the diff: the chosen commit in full, how it reached the main
+    /// branch, and the way to everything it (or its merge) changed.
+    fn commit_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let commit = self.chosen_commit()?;
+        let info = self.commits.get(&commit.sha);
+        let body = match info {
+            Some(Ok(info)) if !info.body.is_empty() => Some(info.body.clone()),
+            _ => None,
+        };
+        let now = monocode_core::time::now_ms();
+        let when = |commit: &CommitRef| {
+            let ago = monocode_core::time::relative(commit.time * 1000, now);
+            match commit.date.is_empty() {
+                true => ago,
+                false => format!("{} ({ago})", commit.date),
+            }
+        };
+        let byline = [
+            commit.short_sha.clone(),
+            commit.author.clone(),
+            when(&commit),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let (landing, merge) = match info {
+            None => ("Looking up how it was merged…".to_owned(), None),
+            Some(Err(error)) => (error.clone(), None),
+            Some(Ok(info)) => match &info.landing {
+                Landing::Direct { branch } if info.parents > 1 => {
+                    (format!("A merge into {branch}"), None)
+                }
+                Landing::Direct { branch } => (format!("Committed on {branch}"), None),
+                Landing::NotMerged { branch } => (format!("Not in {branch} yet"), None),
+                Landing::Unknown => (String::new(), None),
+                Landing::Merged { branch, merge } => (
+                    format!(
+                        "Merged into {branch} · {} · {} · {} · {}",
+                        when(merge),
+                        merge.short_sha,
+                        merge.author,
+                        merge.subject
+                    ),
+                    Some(merge.clone()),
+                ),
+            },
+        };
+        let small = |id: &'static str, label: &'static str| {
+            modal::ghost_button(id, label)
+                .debug_selector(move || id.into())
+                .h(px(24.))
+                .px_2()
+                .text_size(px(12.))
+                .flex_shrink_0()
+        };
+        let sha = commit.sha.clone();
+        let shown = commit.clone();
+        Some(
+            div()
+                .id("file-history-commit")
+                .debug_selector(|| "file-history-commit".into())
+                .role(Role::Group)
+                .aria_label("Commit")
+                .flex_shrink_0()
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .border_b_1()
+                .border_color(stroke())
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(content(0.95))
+                        .child(commit.subject.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(content(0.5))
+                        .child(byline),
+                )
+                .when_some(body, |d, body| {
+                    d.child(
+                        div()
+                            .id("file-history-commit-body")
+                            .max_h(px(84.))
+                            .overflow_y_scroll()
+                            .mt_1()
+                            .text_size(px(12.))
+                            .line_height(px(17.))
+                            .text_color(content(0.7))
+                            .child(body),
+                    )
+                })
+                .when(!landing.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "file-history-landing".into())
+                            .mt_1()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(content(0.6))
+                            .child(landing),
+                    )
+                })
+                // On a line of their own, wrapping: the diff's side can be
+                // dragged narrower than the three of them.
+                .child(
+                    div()
+                        .mt_1()
+                        .ml(px(-8.))
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(small("file-history-show-commit", "Show commit").on_click(
+                            cx.listener(move |this, _, _, cx| this.open_commit(&shown, cx)),
+                        ))
+                        .when_some(merge, |d, merge| {
+                            d.child(small("file-history-show-merge", "Show merge").on_click(
+                                cx.listener(move |this, _, _, cx| this.open_commit(&merge, cx)),
+                            ))
+                        })
+                        .child(small("file-history-copy-sha", "Copy ID").on_click(
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone()))
+                            },
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Two texts, the left one before the right: no versions to choose.
+    fn load_comparison(&mut self, left: String, right: String, cx: &mut Context<Self>) {
+        let (path, label) = (self.path.clone(), self.label.clone());
+        let work = cx
+            .background_executor()
+            .spawn(async move { diff::build_unified_file(&left, &right, diff::CONTEXT_DEFAULT) });
+        self._diff_task = Some(cx.spawn(async move |this, cx| {
+            let unified = work.await;
+            let _ = this.update(cx, |this, cx| {
+                let shown = DiffFile {
+                    id: "compare".into(),
+                    path,
+                    label,
+                    binary: false,
+                    too_large: false,
+                    empty_message: unified
+                        .blocks
+                        .is_empty()
+                        .then(|| "The contents are the same.".to_owned()),
+                    additions: unified.additions,
+                    deletions: unified.deletions,
+                    blocks: Arc::new(unified.blocks),
+                    can_stage: false,
+                    can_discard: false,
+                    can_stage_hunk: false,
+                };
+                #[cfg(test)]
+                {
+                    this.shown = Some((shown.label.clone(), shown.additions, shown.deletions));
+                }
+                this.diff_view
+                    .update(cx, |view, cx| view.set_files(vec![shown], cx));
+                cx.notify();
+            });
+        }));
+    }
+
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let last = self.versions.len().saturating_sub(1);
         let next = match event.keystroke.key.as_str() {
             "escape" => {
                 cx.emit(Event::Close);
+                cx.stop_propagation();
+                return;
+            }
+            "enter" => {
+                if let Some(commit) = self.chosen_commit() {
+                    self.open_commit(&commit, cx);
+                }
                 cx.stop_propagation();
                 return;
             }
@@ -331,6 +665,8 @@ impl Render for FileHistoryDialog {
             note("Loading…".into())
         } else if let Some(error) = &self.error {
             note(error.clone())
+        } else if count == 0 && matches!(self.mode, Mode::Lines { .. }) {
+            note("Git has no history for these lines.".into())
         } else if count == 0 {
             note("Git has no history for this file.".into())
         } else {
@@ -345,8 +681,10 @@ impl Render for FileHistoryDialog {
             .min_h_0()
             .into_any_element()
         };
+        let comparing = matches!(self.mode, Mode::Compare { .. });
+        let commit = self.commit_strip(cx);
         let summary = match count {
-            _ if self.loading || self.error.is_some() => String::new(),
+            _ if self.loading || self.error.is_some() || comparing => String::new(),
             0 => String::new(),
             1 => "1 version".into(),
             n if n >= LIMIT => format!("the newest {n} versions"),
@@ -372,7 +710,7 @@ impl Render for FileHistoryDialog {
                     .gap_2()
                     .border_b_1()
                     .border_color(stroke())
-                    .child(modal::title("History"))
+                    .child(modal::title(self.title.clone()))
                     .child(
                         div()
                             .min_w_0()
@@ -406,34 +744,39 @@ impl Render for FileHistoryDialog {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(
-                        div()
-                            .id("file-history-versions")
-                            .debug_selector(|| "file-history-versions".into())
-                            .role(Role::List)
-                            .aria_label("Versions")
-                            .w(px(list_width))
-                            .flex_shrink_0()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .border_r_1()
-                            .border_color(stroke())
-                            .child(list),
-                    )
-                    .child(dialog_resize::side_handle(
-                        "file-history-split",
-                        list_width,
-                        width,
-                        cx,
-                    ))
+                    .when(!comparing, |d| {
+                        d.child(
+                            div()
+                                .id("file-history-versions")
+                                .debug_selector(|| "file-history-versions".into())
+                                .role(Role::List)
+                                .aria_label("Versions")
+                                .w(px(list_width))
+                                .flex_shrink_0()
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .border_r_1()
+                                .border_color(stroke())
+                                .child(list),
+                        )
+                        .child(dialog_resize::side_handle(
+                            "file-history-split",
+                            list_width,
+                            width,
+                            cx,
+                        ))
+                    })
                     .child(
                         div()
                             .debug_selector(|| "file-history-diff".into())
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.diff_view.clone()),
+                            .flex()
+                            .flex_col()
+                            .children(commit)
+                            .child(div().flex_1().min_h_0().child(self.diff_view.clone())),
                     ),
             )
             .child(dialog_resize::corner_grip(
@@ -594,5 +937,174 @@ mod tests {
             })
         });
         assert_eq!(remembered, list(visual));
+    }
+
+    #[gpui::test]
+    fn a_version_names_its_commit_and_the_merge_that_brought_it_and_opens_either(
+        cx: &mut TestAppContext,
+    ) {
+        // Another test may have left the diff's side dragged narrow.
+        *REMEMBERED_SIZE.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-m", "first"]);
+        git(dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "bee\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &["commit", "-m", "on the branch", "-m", "Why it was needed."],
+        );
+        git(dir, &["checkout", "-q", "main"]);
+        git(dir, &["merge", "--no-ff", "-m", "Merge feature", "feature"]);
+        let cwd = dir.to_string_lossy().into_owned();
+        let path = format!("{cwd}/a.txt");
+        let window = cx.update(|cx| {
+            let bounds =
+                gpui::Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(1400.), px(900.)));
+            let options = gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            };
+            cx.open_window(options, |window, cx| {
+                cx.new(|cx| FileHistoryDialog::new(cwd.clone(), path.clone(), window, cx))
+            })
+            .unwrap()
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        let _events = window
+            .update(visual, |_, _, cx| {
+                cx.subscribe(&cx.entity(), move |_, _, event: &Event, _| {
+                    if let Event::OpenCommit { subject, .. } = event {
+                        seen.borrow_mut().push(subject.clone());
+                    }
+                })
+            })
+            .unwrap();
+        let choose = |visual: &mut VisualTestContext, subject: &str| {
+            window
+                .update(visual, |dialog, _, cx| {
+                    let ix = (dialog.versions.iter())
+                        .position(|v| v.subject == subject)
+                        .unwrap();
+                    dialog.select(ix, cx);
+                    dialog.load_commit(&dialog.versions[ix].sha.clone(), cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+        };
+        // The branch's commit: the merge is not one of the file's versions,
+        // yet it is named as what brought it in.
+        choose(visual, "on the branch");
+        window
+            .update(visual, |dialog, _, _| {
+                let sha = &dialog.versions[dialog.selected].sha;
+                let info = dialog.commits[sha].as_ref().unwrap();
+                assert_eq!(info.body, "Why it was needed.");
+                let Landing::Merged { branch, merge } = &info.landing else {
+                    panic!("{:?}", info.landing);
+                };
+                assert_eq!(
+                    (branch.as_str(), merge.subject.as_str()),
+                    ("main", "Merge feature")
+                );
+            })
+            .unwrap();
+        assert!(visual.debug_bounds("file-history-landing").is_some());
+        for button in ["file-history-show-commit", "file-history-show-merge"] {
+            let at = visual.debug_bounds(button).unwrap().center();
+            // The pointer arrives before it presses, as a hand's does.
+            visual.simulate_mouse_move(at, None, gpui::Modifiers::none());
+            visual.run_until_parked();
+            visual.simulate_click(at, gpui::Modifiers::none());
+            visual.run_until_parked();
+        }
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        assert_eq!(
+            *opened.borrow(),
+            ["on the branch", "Merge feature", "on the branch"]
+        );
+        // A commit of the main branch itself has no merge to show.
+        choose(visual, "first");
+        assert!(visual.debug_bounds("file-history-show-commit").is_some());
+        assert!(visual.debug_bounds("file-history-show-merge").is_none());
+    }
+
+    #[gpui::test]
+    fn a_window_lists_one_lines_commits_starts_at_a_commit_or_compares_two_texts(
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        git(dir, &["init"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git(dir, &["commit", "-am", "second"]);
+        let cwd = dir.to_string_lossy().into_owned();
+        let path = format!("{cwd}/a.txt");
+        let open = |cx: &mut TestAppContext, asked: Request| {
+            let (cwd, path) = (cwd.clone(), path.clone());
+            let window = cx.update(|cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| FileHistoryDialog::with_request(cwd, path, Some(asked), window, cx))
+                })
+                .unwrap()
+            });
+            cx.run_until_parked();
+            window
+                .update(cx, |dialog, _, _| {
+                    let subjects: Vec<String> =
+                        dialog.versions.iter().map(|v| v.subject.clone()).collect();
+                    (
+                        dialog.title.to_string(),
+                        dialog.label.clone(),
+                        subjects,
+                        dialog.selected,
+                        dialog.shown.clone(),
+                    )
+                })
+                .unwrap()
+        };
+        let lines = Request::Lines {
+            first: 2,
+            last: 2,
+            text: None,
+        };
+        let (title, label, subjects, ..) = open(cx, lines);
+        assert_eq!(
+            (title.as_str(), label.as_str()),
+            ("History", "a.txt: line 2")
+        );
+        assert_eq!(subjects, ["second"]);
+        // A commit's request starts on that commit.
+        let first = monocode_core::scm::file_history(dir, &path, 10).unwrap()[1]
+            .sha
+            .clone();
+        let (.., subjects, selected, shown) = open(cx, Request::Commit(first[..7].into()));
+        assert_eq!((subjects.len(), selected), (2, 1));
+        assert_eq!(shown, Some(("a.txt".into(), 1, 0)));
+        // Two texts compare with no list.
+        let compare = Request::Compare {
+            title: "Clipboard ↔ a.txt".into(),
+            left: "one\n".into(),
+            right: "one\ntwo\n".into(),
+        };
+        let (title, label, subjects, _, shown) = open(cx, compare);
+        assert_eq!(
+            (title.as_str(), label.as_str()),
+            ("Compare", "Clipboard ↔ a.txt")
+        );
+        assert!(subjects.is_empty());
+        assert_eq!(shown, Some(("Clipboard ↔ a.txt".into(), 1, 0)));
     }
 }

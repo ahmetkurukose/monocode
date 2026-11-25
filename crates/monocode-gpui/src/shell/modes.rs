@@ -1573,7 +1573,7 @@ impl Shell {
     /// removes it, and appends what it did to `<file>.log`:
     /// `mode dev|browser`, `tab <url>`, `favorite`, `tint <name>`,
     /// `hold <position>` (holds the rail mid-swipe, as fingers would),
-    /// `release`, `compact on|off`, `layout` (toggles the layout) and `shot <png>`, a picture of the window
+    /// `release`, `compact on|off` and `shot <png>`, a picture of the window
     /// drawn off screen (Chromium's pages are not in it).
     pub(super) fn start_modes_dev_hook(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(file) = std::env::var_os("MONOCODE_MODES_DEV").filter(|f| !f.is_empty()) else {
@@ -1731,7 +1731,6 @@ impl Shell {
                 self.workspace.project_rail_open = arg != "on";
                 self.invalidate_chrome(cx);
             }
-            "layout" => self.toggle_layout(cx),
             "group" => {
                 self.new_browser_pane(Some(arg.to_string()), window, cx);
             }

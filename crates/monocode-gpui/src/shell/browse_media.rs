@@ -231,6 +231,7 @@ impl Shell {
         card.header = 0.;
         card.animation = None;
         card.collapse = None;
+        self.invalidate_chrome(cx);
         cx.notify();
     }
 
@@ -264,6 +265,8 @@ impl Shell {
         let generation = card.generation;
         if cx.reduce_motion() || from == to {
             card.header = to;
+            // The card is drawn in the cached sidebar.
+            self.invalidate_chrome(cx);
             cx.notify();
             return;
         }
@@ -282,6 +285,7 @@ impl Shell {
                             return false;
                         }
                         card.header = from + (to - from) * eased;
+                        this.invalidate_chrome(cx);
                         cx.notify();
                         t < 1.
                     })
@@ -443,6 +447,7 @@ impl Shell {
                 card.header = 0.;
                 card.animation = None;
                 card.collapse = None;
+                this.invalidate_chrome(cx);
                 cx.notify();
             }))
             .child(icon("close", 16.).text_color(ink));

@@ -3,11 +3,12 @@
 //! its file into its editor, installs the registered providers, walks the
 //! navigation history, and draws the header's arrows, crumbs, problem count
 //! and contributed buttons. The features themselves live elsewhere.
-use super::{FileEditor, OpenPath};
+use super::{FileEditor, FileEvent, OpenPath};
 use crate::{
     code_editor::{
         self, Crumb, DocumentInfo, GutterSlot, HeaderAction, HeaderClick, HeaderProvider, HubEvent,
         Location, Severity,
+        refactor::FileMoved,
         symbols::{self, Symbol},
     },
     editor_analysis::Edit,
@@ -46,6 +47,9 @@ pub(super) struct Extensions {
     pub(super) outline: Arc<Vec<Symbol>>,
     menu: Option<HeaderMenu>,
     _hub: Subscription,
+    _moves: Subscription,
+    /// Presses in this editor's blame column that it answers itself.
+    _blame: Subscription,
 }
 
 /// What the extension points add to the header, built per draw.
@@ -83,18 +87,7 @@ impl Extensions {
         let hub = code_editor::hub(cx);
         let providers = code_editor::providers_for(&doc, cx);
         let header = providers.header.clone();
-        let editor = cx.weak_entity();
-        input.update(cx, |input, cx| {
-            input.set_editor_document(
-                doc.clone(),
-                Some(Rc::new(move |cx| {
-                    editor
-                        .update(cx, |this, cx| this.sync_document(cx))
-                        .unwrap_or(0)
-                })),
-            );
-            input.set_editor_providers(providers, cx);
-        });
+        install(&doc, providers, input, cx);
         cx.on_release(|this, cx| this.close_document(cx)).detach();
         Self {
             doc,
@@ -107,11 +100,78 @@ impl Extensions {
             _hub: cx.subscribe(&hub, |this, _, event: &HubEvent, cx| {
                 this.hub_event(event, cx)
             }),
+            _moves: cx.subscribe(&hub, |this, _, event: &FileMoved, cx| {
+                this.file_moved(event, cx)
+            }),
+            _blame: super::git_actions::watch_blame(cx),
         }
     }
 }
 
+/// Tells the editor which document it shows and installs its providers.
+fn install(
+    doc: &Rc<DocumentInfo>,
+    providers: code_editor::Providers,
+    input: &Entity<crate::input::Input>,
+    cx: &mut Context<FileEditor>,
+) {
+    let editor = cx.weak_entity();
+    input.update(cx, |input, cx| {
+        input.set_editor_document(
+            doc.clone(),
+            Some(Rc::new(move |cx| {
+                editor
+                    .update(cx, |this, cx| this.sync_document(cx))
+                    .unwrap_or(0)
+            })),
+        );
+        input.set_editor_providers(providers, cx);
+    });
+}
+
 impl FileEditor {
+    /// Follows a file a code action renamed (the file or a folder above it),
+    /// keeping the buffer, and says so when it was deleted.
+    fn file_moved(&mut self, event: &FileMoved, cx: &mut Context<Self>) {
+        let path = std::path::PathBuf::from(&self.path);
+        match event {
+            FileMoved::Renamed { from, to } if path.starts_with(from) => {
+                let Ok(rest) = path.strip_prefix(from) else {
+                    return;
+                };
+                let moved = if rest.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    to.join(rest)
+                };
+                let moved = moved.to_string_lossy().into_owned();
+                self.relocate(moved.clone(), cx);
+                cx.emit(FileEvent::Moved(moved));
+            }
+            FileMoved::Deleted(gone) if path.starts_with(gone) => cx.emit(FileEvent::Deleted),
+            _ => {}
+        }
+    }
+    /// Shows the same buffer under `path`: the hub's document and the
+    /// language servers follow, and saving writes there.
+    fn relocate(&mut self, path: String, cx: &mut Context<Self>) {
+        let was_open = self.extensions.opened;
+        self.close_document(cx);
+        let root = self.extensions.doc.root.clone();
+        self.path = path.clone();
+        self.input
+            .update(cx, |input, _| input.set_editor_path(path.clone()));
+        let doc = Rc::new(DocumentInfo::new(&path, root));
+        let providers = code_editor::providers_for(&doc, cx);
+        self.extensions.header = providers.header.clone();
+        install(&doc, providers, &self.input, cx);
+        self.extensions.doc = doc;
+        self.extensions.reported = None;
+        if was_open {
+            self.document_loaded(cx);
+        }
+        cx.notify();
+    }
     /// The file's symbols as of the last analysis pass.
     #[allow(dead_code)] // The outline panel reads it; it lands separately.
     pub(crate) fn outline(&self) -> Arc<Vec<Symbol>> {
@@ -137,6 +197,7 @@ impl FileEditor {
             self.mirror_gutter(slot, cx);
         }
         self.mirror_decorations(cx);
+        self.mirror_annotations(cx);
     }
     /// Reports the buffer if it differs from the last report. Returns the
     /// document's version.
@@ -199,6 +260,25 @@ impl FileEditor {
             }
             HubEvent::Gutter { path: file, slot } if file == path => self.mirror_gutter(*slot, cx),
             HubEvent::Decorations(file) if file == path => self.mirror_decorations(cx),
+            HubEvent::Annotations(file) if file == path => self.mirror_annotations(cx),
+            HubEvent::Apply {
+                path: file,
+                base,
+                edits,
+            } if file == path => {
+                let applied = self
+                    .input
+                    .update(cx, |input, cx| input.apply_text_edits(base, edits, cx));
+                if !applied {
+                    self.show_notice(
+                        format!(
+                            "{} changed before the edits arrived; it was left as it is",
+                            self.relative_path()
+                        ),
+                        cx,
+                    );
+                }
+            }
             HubEvent::Reveal { path: file, row } if file == path => {
                 let row = *row;
                 self.input.update(cx, |input, cx| input.reveal_row(row, cx));
@@ -246,6 +326,13 @@ impl FileEditor {
             input.set_line_decorations(lines, cx);
             input.set_inline_notes(notes, cx);
         });
+    }
+
+    fn mirror_annotations(&mut self, cx: &mut Context<Self>) {
+        let path = &self.extensions.doc.path;
+        let annotations = code_editor::hub(cx).read(cx).annotations(path).cloned();
+        self.input
+            .update(cx, |input, cx| input.set_annotations(annotations, cx));
     }
 
     fn location(&self, cx: &App) -> Location {

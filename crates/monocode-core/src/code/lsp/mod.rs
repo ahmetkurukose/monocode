@@ -24,7 +24,8 @@ pub use manager::{
 pub use position::{Encoding, LineIndex, Point, Position, Span};
 pub use registry::{Language, Registry, Role, ServerSpec, Strictness};
 pub use types::{
-    CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentSymbol, Hover, Location,
-    LspError, LspEvent, ParameterInfo, ServerId, ServerState, ServerStatus, Severity,
-    SignatureHelp, SignatureInfo, SymbolKind, TextEdit, Triggers,
+    CodeAction, CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentChange,
+    DocumentSymbol, Hover, Location, LspError, LspEvent, ParameterInfo, RenameTarget, ServerId,
+    ServerState, ServerStatus, Severity, SignatureHelp, SignatureInfo, SymbolKind, TextEdit,
+    Triggers, WorkspaceEdit,
 };

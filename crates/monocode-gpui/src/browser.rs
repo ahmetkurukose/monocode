@@ -3545,6 +3545,9 @@ trait Swept {
     /// not shown (K23).
     fn keep(&self, kept: bool);
 
+    /// The page's picture is drawn in its place, under an overlay.
+    fn stands_in(&self) -> bool;
+
     /// Notes the user's input if `event` went to this page (K34).
     #[cfg(target_os = "macos")]
     fn note_input(&self, event: &objc2_app_kit::NSEvent, now: Instant);
@@ -3564,6 +3567,10 @@ impl<V: NativeView> Swept for Host<V> {
         let kept = self.shared.leases.get() > 0;
         let next = shown(painted == epoch, bounds, covers, kept);
         Some((self.shown.get(), next, bounds))
+    }
+
+    fn stands_in(&self) -> bool {
+        self.shown.get() == Placement::Covered && self.snapshot.borrow().is_some()
     }
 
     fn keep(&self, kept: bool) {
@@ -4104,10 +4111,15 @@ pub(crate) fn sweep() -> impl IntoElement {
                     }
                 }
                 SWITCHING.with(|s| *s.borrow_mut() = switching);
+                let mut stands_in = false;
                 for host in live {
-                    host.sweep(id, epoch, &covers, window, cx);
+                    host.clone().sweep(id, epoch, &covers, window, cx);
+                    stands_in |= host.stands_in();
                 }
                 SWITCHING.with(|s| *s.borrow_mut() = Default::default());
+                // What floats in the next frame is drawn over a page's
+                // picture, and so over the page's colours, not the app's.
+                crate::popover::set_over_page(stands_in);
             },
         )
         .size_0(),

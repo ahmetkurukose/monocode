@@ -310,7 +310,8 @@ struct Keyring;
 
 impl Backend for Keyring {
     fn get(&self, account: &str) -> Result<Option<String>, String> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
+        let entry =
+            crate::credentials::entry(KEYRING_SERVICE, account).map_err(|e| e.to_string())?;
         match entry.get_password() {
             Ok(password) => Ok(Some(password)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -319,7 +320,7 @@ impl Backend for Keyring {
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
-        keyring::Entry::new(KEYRING_SERVICE, account)
+        crate::credentials::entry(KEYRING_SERVICE, account)
             .map_err(|e| e.to_string())?
             .set_password(value)
             .map_err(|e| e.to_string())

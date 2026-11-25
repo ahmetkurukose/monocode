@@ -29,13 +29,6 @@ pub(crate) struct Preferences {
     pub close_to_tray: bool,
     /// Running an action shows the terminal it runs in.
     pub action_opens_terminal: bool,
-    /// Legacy: the new layout opens the terminal as a right panel tab, not a
-    /// dock. Read when `terminal_placement` is unset, and kept in step with it.
-    pub terminal_in_panel: bool,
-    /// Where terminals open: "bottom" (the dock), "panel" (the right panel's
-    /// Terminal tab) or "title" (their own title bar tabs). Empty falls back
-    /// to `terminal_in_panel`.
-    pub terminal_placement: String,
     /// The terminal's text size in points.
     pub terminal_font_size: u32,
     /// Lines of history each new terminal keeps above the screen.
@@ -64,8 +57,6 @@ pub(crate) struct Preferences {
     pub chat_background_empty: u32,
     pub chat_background_session: u32,
     pub collapsed_project_rail: String,
-    /// Classic layout's project list: "list" (one row per project) or "tree".
-    pub project_rail_view: String,
     /// The apps offered under each project in the tree: "inbox", "notes", "database".
     pub project_apps: Vec<String>,
     /// Which apps `project_apps` was last updated for, so an app added later is
@@ -186,8 +177,6 @@ impl Default for Preferences {
             working_agents: true,
             close_to_tray: true,
             action_opens_terminal: true,
-            terminal_in_panel: false,
-            terminal_placement: String::new(),
             terminal_font_size: 13,
             terminal_scrollback: 2000,
             terminal_copy_on_select: false,
@@ -209,7 +198,6 @@ impl Default for Preferences {
             chat_background_empty: 24,
             chat_background_session: 24,
             collapsed_project_rail: "compact".into(),
-            project_rail_view: "list".into(),
             project_apps: vec![
                 "inbox".into(),
                 "notes".into(),
@@ -285,7 +273,6 @@ impl Preferences {
         Self {
             notifications: true,
             close_session_tab: "archive".into(),
-            terminal_placement: "title".into(),
             terminal_font_size: 12,
             terminal_scrollback: 100_000,
             terminal_copy_on_select: true,
@@ -293,7 +280,6 @@ impl Preferences {
             theme_hue: 217,
             theme_saturation: 37,
             theme_dark_lightness: 7,
-            project_rail_view: "tree".into(),
             ui_scale: 90,
             show_excluded_files: true,
             monos: false,
@@ -319,11 +305,6 @@ impl Preferences {
         self.browser_external_cdp_rev = BROWSER_EXTERNAL_CDP_REV;
     }
 
-    /// Unknown values fall back to the plain list.
-    pub(crate) fn project_rail_tree(&self) -> bool {
-        self.project_rail_view == "tree"
-    }
-
     /// Whether the tree offers this app ("inbox", "notes", "database") under each project.
     pub(crate) fn project_app_shown(&self, app: &str) -> bool {
         self.project_apps.iter().any(|a| a == app)
@@ -341,20 +322,6 @@ impl Preferences {
                 .position(|x| x == a)
         };
         self.project_apps.sort_by_key(rank);
-    }
-
-    /// "bottom", "panel" or "title".
-    pub(crate) fn terminal_placement(&self) -> &str {
-        match self.terminal_placement.as_str() {
-            placement @ ("bottom" | "panel" | "title") => placement,
-            _ if self.terminal_in_panel => "panel",
-            _ => "bottom",
-        }
-    }
-
-    pub(crate) fn set_terminal_placement(&mut self, placement: &str) {
-        self.terminal_placement = placement.to_owned();
-        self.terminal_in_panel = placement == "panel";
     }
 
     pub(crate) fn apply_workspace_theme(&mut self, id: String) {
@@ -407,7 +374,6 @@ impl Preferences {
         self.chat_background = d.chat_background;
         self.ui_scale = d.ui_scale;
         self.collapsed_project_rail = d.collapsed_project_rail;
-        self.project_rail_view = d.project_rail_view;
         self.project_apps = d.project_apps;
     }
 }

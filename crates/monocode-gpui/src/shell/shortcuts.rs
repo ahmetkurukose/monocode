@@ -470,8 +470,10 @@ mod tests {
         });
         let (window, _, _) = super::super::tests::window(cx);
         cx.refresh().unwrap();
+        // In Classic, Toggle Sidebar shows and hides the project rail.
         let orphan = window
-            .update(cx, |_, window, cx| {
+            .update(cx, |shell, window, cx| {
+                shell.workspace.project_rail_open = true;
                 let orphan = cx.focus_handle();
                 window.focus(&orphan, cx);
                 orphan
@@ -485,7 +487,9 @@ mod tests {
         cx.simulate_keystrokes(window.into(), &format!("{modifier}-b"));
         cx.run_until_parked();
         window
-            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
+            .update(cx, |shell, _, _| {
+                assert!(!shell.workspace.project_rail_open)
+            })
             .unwrap();
         for (binding, stroke, expected) in [
             (None, format!("{modifier}-b"), false),
@@ -520,7 +524,7 @@ mod tests {
             cx.run_until_parked();
             window
                 .update(cx, |shell, _, _| {
-                    assert_eq!(shell.workspace.sidebar_visible, expected)
+                    assert_eq!(shell.workspace.project_rail_open, expected)
                 })
                 .unwrap();
         }

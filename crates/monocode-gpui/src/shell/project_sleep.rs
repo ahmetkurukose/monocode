@@ -720,40 +720,6 @@ impl Shell {
     }
 }
 
-impl Shell {
-    /// The right panel's Terminal tab while its project sleeps.
-    pub(super) fn sleeping_terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .id("panel-terminal-asleep")
-            .debug_selector(|| "panel-terminal-asleep".into())
-            .role(Role::Region)
-            .aria_label("Terminal, asleep")
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .px_4()
-            .child(icon("moon", 20.).text_color(rgb(SLEEP_TINT)))
-            .child(
-                div()
-                    .text_center()
-                    .text_size(px(12.))
-                    .text_color(content(0.55))
-                    .child("Terminals sleep with the project."),
-            )
-            .child(
-                crate::modal::ghost_button("panel-terminal-wake", "Wake project")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.wake_current_project(window, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-}
-
 /// The moon's soft indigo, the same in light and dark themes.
 const SLEEP_TINT: u32 = 0x818cf8;
 
@@ -788,6 +754,8 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
+                // The dock (remote projects' terminals) holds the shell.
+                shell.terminals_in_dock = true;
                 shell.open(a, w, cx);
                 shell.focus_active(w, cx);
             })
@@ -1046,7 +1014,6 @@ mod tests {
             .update(&mut visual, |shell, w, cx| {
                 shell.workspace.classic_layout = true;
                 shell.workspace.project_rail_open = true;
-                shell.workspace.preferences.project_rail_view = "tree".into();
                 shell.workspace.project_rail_expanded.insert(ANOTHER.into());
                 // Sleep this project from the other one.
                 shell.select_project(MONOCODE.into(), w, cx);

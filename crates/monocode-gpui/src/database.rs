@@ -8,6 +8,7 @@ mod dialog;
 mod external;
 mod grid;
 mod mongo;
+mod plan;
 mod render;
 mod send;
 mod sql;
@@ -49,7 +50,7 @@ pub(crate) enum Event {
 pub(crate) use external::LinkState;
 #[cfg(test)]
 pub(crate) use send::write_sources;
-pub(crate) use send::{MAX_SEND_BYTES, Origin, Target, send_targets};
+pub(crate) use send::{MAX_SEND_BYTES, Origin, RunMode, Target, send_targets};
 
 const LIMITS: [usize; 4] = [100, 500, 1000, 5000];
 const TREE_ROW: f32 = 26.;
@@ -364,6 +365,8 @@ struct Console {
     widths: Vec<f32>,
     numeric: Vec<bool>,
     error: Option<(DbError, String)>,
+    /// A PostgreSQL plan shown in place of the result, until the next run.
+    plan: Option<plan::PlanView>,
     running: bool,
     selected: Option<(usize, usize)>,
     scroll_x: f32,
@@ -375,6 +378,12 @@ struct Console {
     task: Option<Task<()>>,
     saver: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What an explain returned.
+enum Explained {
+    Text(String),
+    Tree(monocode_core::db::Plan),
 }
 
 /// A statement to run and where it sits in the editor (to mark its outcome).
@@ -568,6 +577,8 @@ pub(crate) struct DatabaseView {
     results_hidden: bool,
     send_target: Option<String>,
     sent: HashMap<String, u32>,
+    /// The console a file's statement just ran in, until the view shows it.
+    ran: Option<(String, u32)>,
     /// With project tabs, the project whose data sources the tree lists.
     scope: Option<String>,
     /// The workspace's projects, for the dialog's Projects list.
@@ -739,6 +750,7 @@ impl DatabaseView {
             results_hidden: saved.results_hidden,
             send_target: saved.send_target,
             sent: saved.sent,
+            ran: None,
             scope: None,
             projects: Vec::new(),
             selected_by_scope: saved.selected_by_scope,
@@ -1051,6 +1063,7 @@ impl DatabaseView {
             widths: Vec::new(),
             numeric: Vec::new(),
             error: None,
+            plan: None,
             running: false,
             selected: None,
             scroll_x: 0.,
@@ -1488,6 +1501,7 @@ impl DatabaseView {
         let existing = self.consoles[ix].conn.clone().filter(|c| !c.is_closed());
         self.consoles[ix].running = true;
         self.consoles[ix].error = None;
+        self.consoles[ix].plan = None;
         self.results_hidden = false;
         // What the editor holds, to tell later whether a statement was bound.
         let originals: Vec<String> = statements
@@ -2368,7 +2382,15 @@ impl DatabaseView {
                     .map_err(|e| (None, e))?,
                 ),
             };
-            match conn.explain(&statement, analyze).await {
+            // PostgreSQL plans come as a tree; MongoDB's as text.
+            let plan = if kind == DbKind::Postgres {
+                conn.explain_plan(&statement, analyze)
+                    .await
+                    .map(Explained::Tree)
+            } else {
+                conn.explain(&statement, analyze).await.map(Explained::Text)
+            };
+            match plan {
                 Ok(plan) => Ok((conn, plan)),
                 Err(error) => Err((Some(conn), error)),
             }
@@ -2380,12 +2402,17 @@ impl DatabaseView {
             this.consoles[ix].running = false;
             this.consoles[ix].task = None;
             match out {
-                Some(Ok((conn, plan))) => {
+                Some(Ok((conn, Explained::Text(plan)))) => {
                     this.consoles[ix].conn = Some(conn);
                     this.preview = Some((
                         if analyze { "Plan (analyzed)" } else { "Plan" }.to_owned(),
                         plan,
                     ));
+                }
+                Some(Ok((conn, Explained::Tree(plan)))) => {
+                    this.consoles[ix].conn = Some(conn);
+                    this.results_hidden = false;
+                    this.consoles[ix].plan = Some(plan::PlanView::new(plan));
                 }
                 Some(Err((conn, error))) => {
                     if conn.is_some() {

@@ -278,12 +278,6 @@ impl Shell {
         add("View", "Toggle Files and Changes", "panel-right", || {
             Box::new(ToggleRightPanel)
         });
-        add("View", "Switch Workspace Layout", "dashboard", || {
-            Box::new(ToggleLayout)
-        });
-        add("View", "Switch Rounded or Boxy Workspace", "square", || {
-            Box::new(ToggleWorkspaceStyle)
-        });
         add("View", "Zoom In", "add-01", || Box::new(ZoomIn));
         add("View", "Zoom Out", "minus-sign", || Box::new(ZoomOut));
         add("View", "Reset Zoom", "rotate-ccw", || Box::new(ResetZoom));
@@ -944,7 +938,8 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         let before = window
-            .update(cx, |shell, _, _| shell.workspace.sidebar_visible)
+            // In Classic, Toggle Sidebar shows and hides the project rail.
+            .update(cx, |shell, _, _| shell.workspace.project_rail_open)
             .unwrap();
         window
             .update(cx, |shell, _, cx| {
@@ -958,7 +953,7 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert!(shell.palette.is_none());
-                assert_ne!(shell.workspace.sidebar_visible, before);
+                assert_ne!(shell.workspace.project_rail_open, before);
                 let history = cx.global::<everywhere::ActionHistory>();
                 assert_eq!(history.0[0].as_ref(), "View: Toggle Sidebar");
             })

@@ -2204,62 +2204,34 @@ mod tests {
         let (window, _, _) = super::super::tests::window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
-            .unwrap();
-        visual.run_until_parked();
+        // The tree lists the sessions, so the workspace follows the rail.
         let projects = visual.debug_bounds("project-rail-frame").unwrap();
-        let sessions = visual.debug_bounds("sidebar-frame").unwrap();
         let main = visual.debug_bounds("main-pane-frame").unwrap();
         assert_eq!(projects.left(), px(0.));
-        assert_eq!(sessions.left(), projects.right());
-        assert_eq!(main.left(), sessions.right());
+        assert!(visual.debug_bounds("sidebar-frame").is_none());
+        assert!(main.left() >= projects.right());
+        let gap = main.left() - projects.right();
         let grip = visual.debug_bounds("project-rail-resize").unwrap().center();
         let end = grip + gpui::point(px(28.), px(0.));
         visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
         visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
         visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
         visual.run_until_parked();
+        let resized = visual.debug_bounds("project-rail-frame").unwrap();
+        assert_eq!(resized.size.width, projects.size.width + px(28.));
         assert_eq!(
-            visual
-                .debug_bounds("project-rail-frame")
-                .unwrap()
-                .size
-                .width,
-            projects.size.width + px(28.)
+            visual.debug_bounds("main-pane-frame").unwrap().left(),
+            resized.right() + gap
         );
-        assert_eq!(
-            visual.debug_bounds("sidebar-frame").unwrap().size.width,
-            sessions.size.width
-        );
+        // Collapsed, the rail keeps the project icons.
         let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
         visual.simulate_click(toggle.center(), Default::default());
         visual.run_until_parked();
-        assert_eq!(
-            visual
-                .debug_bounds("project-rail-frame")
-                .unwrap()
-                .size
-                .width,
-            px(48.)
-        );
-        assert!(visual.debug_bounds("sidebar-frame").is_some());
-        window
-            .update(visual, |shell, w, cx| shell.toggle_sidebar(w, cx))
-            .unwrap();
-        visual.run_until_parked();
-        assert!(visual.debug_bounds("sidebar-frame").is_none());
-        assert_eq!(
-            visual
-                .debug_bounds("project-rail-frame")
-                .unwrap()
-                .size
-                .width,
-            px(48.)
-        );
+        let collapsed = visual.debug_bounds("project-rail-frame").unwrap();
+        assert_eq!(collapsed.size.width, px(48.));
         assert_eq!(
             visual.debug_bounds("main-pane-frame").unwrap().left(),
-            px(48.)
+            collapsed.right() + gap
         );
         window
             .update(visual, |shell, w, cx| {
@@ -2267,7 +2239,6 @@ mod tests {
             })
             .unwrap();
         visual.run_until_parked();
-        assert!(visual.debug_bounds("sidebar-frame").is_none());
         assert!(visual.debug_bounds("settings-nav-appearance").is_some());
         window
             .update(visual, |shell, w, cx| shell.close_settings(w, cx))
@@ -2384,11 +2355,13 @@ mod tests {
                 shell.focus_workspace(w, cx);
             })
             .unwrap();
-        let a = visual.debug_bounds("rail-project-button-0").unwrap();
-        let b = visual.debug_bounds("rail-project-button-1").unwrap();
-        visual.simulate_mouse_down(a.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(b.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(b.center(), MouseButton::Left, Default::default());
+        // On the names, clear of the tree's app icons at the rows' ends.
+        let name = |row: Bounds<Pixels>| gpui::point(row.left() + px(40.), row.center().y);
+        let a = name(visual.debug_bounds("rail-project-button-0").unwrap());
+        let b = name(visual.debug_bounds("rail-project-button-1").unwrap());
+        visual.simulate_mouse_down(a, MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(b, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(b, MouseButton::Left, Default::default());
         visual.run_until_parked();
         window
             .update(visual, |shell, _, _| {
@@ -2435,7 +2408,7 @@ mod tests {
                         .workspace
                         .add_project(&format!("/projects/project-{i}"));
                 }
-                shell.toggle_layout(cx);
+                shell.invalidate_chrome(cx);
                 shell.sessions.len()
             })
             .unwrap();
@@ -2456,10 +2429,6 @@ mod tests {
         let (window, _, active) = super::super::tests::window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
-            .unwrap();
-        visual.run_until_parked();
         for compact in [false, true] {
             window
                 .update(visual, |shell, _, cx| {
@@ -2469,19 +2438,15 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
-            let (projects, sidebar, transcript) = window
+            let (projects, transcript) = window
                 .update(visual, |shell, _, cx| {
                     (
                         shell.projects_frame.clone(),
-                        shell.sidebar_frame.clone(),
                         shell.sessions[&active].read(cx).transcript.clone(),
                     )
                 })
                 .unwrap();
-            let before = [
-                projects.read_with(visual, |v, _| v.renders),
-                sidebar.read_with(visual, |v, _| v.renders),
-            ];
+            let before = [projects.read_with(visual, |v, _| v.renders)];
             assert!(before.iter().all(|count| *count > 0));
             window
                 .update(visual, |shell, w, cx| {
@@ -2512,14 +2477,13 @@ mod tests {
                 before[0],
                 "streaming must reuse the project rail"
             );
-            assert_eq!(sidebar.read_with(visual, |v, _| v.renders), before[1]);
             let before = transcript.read_with(visual, |v, _| v.render_passes);
             if !compact {
-                let inbox = visual.debug_bounds("sidebar-navigation-Inbox").unwrap();
-                visual.simulate_mouse_move(inbox.center(), None, Default::default());
+                let first = visual.debug_bounds("rail-project-button-0").unwrap();
+                visual.simulate_mouse_move(first.center(), None, Default::default());
                 visual.run_until_parked();
-                let notes = visual.debug_bounds("sidebar-navigation-Notes").unwrap();
-                visual.simulate_mouse_move(notes.center(), None, Default::default());
+                let second = visual.debug_bounds("rail-project-button-1").unwrap();
+                visual.simulate_mouse_move(second.center(), None, Default::default());
                 visual.run_until_parked();
                 assert_eq!(
                     transcript.read_with(visual, |v, _| v.render_passes),
@@ -2528,30 +2492,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[gpui::test]
-    fn new_boxy_style_is_independent_of_the_navigation_layout(cx: &mut TestAppContext) {
-        let (window, _, active) = super::super::tests::window(cx);
-        window
-            .update(cx, |shell, w, cx| {
-                shell.open_settings(crate::settings::Section::Appearance, w, cx);
-                shell.settings.clone().unwrap().update(cx, |_, cx| {
-                    cx.emit(crate::settings::SettingsEvent::NewLayoutBoxy(true))
-                });
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, cx| {
-                assert!(!shell.workspace.classic_layout);
-                assert!(shell.workspace.new_layout_boxy);
-                shell.toggle_layout(cx);
-                assert!(shell.workspace.classic_layout);
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.classic_layout && shell.workspace.new_layout_boxy);
-                assert!(shell.sessions.contains_key(&active));
-            })
-            .unwrap();
     }
 }

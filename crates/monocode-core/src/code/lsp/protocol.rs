@@ -5,8 +5,9 @@
 use super::client::uri_to_path;
 use super::position::{Encoding, LineIndex, Point, Position, Span};
 use super::types::{
-    CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentSymbol, Hover, Location,
-    ParameterInfo, ServerId, Severity, SignatureHelp, SignatureInfo, SymbolKind, TextEdit,
+    CodeAction, CompletionItem, CompletionKind, CompletionList, Diagnostic, DocumentChange,
+    DocumentSymbol, Hover, Location, ParameterInfo, RenameTarget, ServerId, Severity,
+    SignatureHelp, SignatureInfo, SymbolKind, TextEdit, WorkspaceEdit,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -67,6 +68,76 @@ impl<'a> Converter<'a> {
             // An unreadable file: the count is the best there is.
             None => direct,
         })
+    }
+
+    /// Takes `edits` (in points of the text it holds for `path`) as made,
+    /// so later positions in the file are counted on the new text.
+    fn edited(&mut self, path: &Path, edits: &[TextEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        let Some((text, index)) = self.indexed(path).clone() else {
+            return;
+        };
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for edit in edits {
+            let start = index.offset_of(&text, edit.range.start).max(at);
+            let end = index.offset_of(&text, edit.range.end).max(start);
+            out.push_str(&text[at..start]);
+            out.push_str(&edit.text);
+            at = end;
+        }
+        out.push_str(&text[at..]);
+        let index = LineIndex::new(&out);
+        self.texts
+            .insert(path.to_path_buf(), Some((Arc::from(out), index)));
+    }
+
+    /// Takes a file operation as made: a created file is empty, a renamed
+    /// one (or everything in a renamed folder) is found at its new place, a
+    /// deleted one is gone.
+    fn operated(&mut self, operation: &DocumentChange) {
+        match operation {
+            DocumentChange::Create {
+                path,
+                overwrite,
+                ignore_if_exists,
+            } => {
+                let exists = self.indexed(path).is_some() || path.exists();
+                if !(exists && *ignore_if_exists && !overwrite) {
+                    let empty = Some((Arc::from(""), LineIndex::new("")));
+                    self.texts.insert(path.clone(), empty);
+                }
+            }
+            DocumentChange::Rename { from, to, .. } => {
+                self.indexed(from);
+                let moved: Vec<PathBuf> = (self.texts.keys())
+                    .filter(|known| known.starts_with(from))
+                    .cloned()
+                    .collect();
+                for old in moved {
+                    let text = self.texts.remove(&old).flatten();
+                    let new = match old.strip_prefix(from) {
+                        Ok(rest) if !rest.as_os_str().is_empty() => to.join(rest),
+                        _ => to.clone(),
+                    };
+                    self.texts.insert(old, None);
+                    self.texts.insert(new, text);
+                }
+            }
+            DocumentChange::Delete { path, .. } => {
+                let gone: Vec<PathBuf> = (self.texts.keys())
+                    .filter(|known| known.starts_with(path))
+                    .cloned()
+                    .collect();
+                for known in gone {
+                    self.texts.insert(known, None);
+                }
+                self.texts.insert(path.clone(), None);
+            }
+            DocumentChange::Edit { path, edits } => self.edited(path, edits),
+        }
     }
 
     pub(crate) fn span(&mut self, path: &Path, range: &Value) -> Option<Span> {
@@ -166,6 +237,7 @@ pub(crate) fn diagnostics(
                 server: server.to_string(),
                 unnecessary: has_tag(1),
                 deprecated: has_tag(2),
+                raw: item.clone(),
                 related: list(item.get("relatedInformation"))
                     .iter()
                     .filter_map(|related| {
@@ -181,6 +253,156 @@ pub(crate) fn diagnostics(
         .collect();
     found.sort_by_key(|diagnostic| (diagnostic.range, diagnostic.severity));
     found
+}
+
+/// One file's `TextEdit[]`, also `AnnotatedTextEdit[]`, by position.
+fn text_edits(converter: &mut Converter, path: &Path, edits: &[Value]) -> Vec<TextEdit> {
+    let mut found: Vec<TextEdit> = edits
+        .iter()
+        .filter_map(|edit| {
+            Some(TextEdit {
+                range: converter.span(path, edit.get("range")?)?,
+                text: edit.get("newText")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|edit| edit.range);
+    found
+}
+
+/// A `WorkspaceEdit`: `documentChanges` when the server sends them (text
+/// edits and file operations, in order), else the `changes` map. Each step
+/// is counted on the text the steps before it left, which the converter
+/// keeps from then on, so an edit read after this one (a command's next
+/// round) is counted on that text too.
+pub(crate) fn workspace_edit(converter: &mut Converter, value: &Value) -> WorkspaceEdit {
+    let mut edit = WorkspaceEdit::default();
+    fn add(
+        edit: &mut WorkspaceEdit,
+        converter: &mut Converter,
+        path: PathBuf,
+        edits: Vec<TextEdit>,
+    ) {
+        converter.edited(&path, &edits);
+        edit.changes.push(DocumentChange::Edit { path, edits });
+    }
+    if let Some(changes) = value.get("documentChanges").and_then(Value::as_array) {
+        for change in changes {
+            let path_of = |name: &str| change.get(name)?.as_str().and_then(uri_to_path);
+            let flag = |name: &str| {
+                change
+                    .get("options")
+                    .and_then(|options| options.get(name))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            let operation = match change.get("kind").and_then(Value::as_str) {
+                Some("create") => path_of("uri").map(|path| DocumentChange::Create {
+                    path,
+                    overwrite: flag("overwrite"),
+                    ignore_if_exists: flag("ignoreIfExists"),
+                }),
+                Some("rename") => path_of("oldUri").zip(path_of("newUri")).map(|(from, to)| {
+                    DocumentChange::Rename {
+                        from,
+                        to,
+                        overwrite: flag("overwrite"),
+                        ignore_if_exists: flag("ignoreIfExists"),
+                    }
+                }),
+                Some("delete") => path_of("uri").map(|path| DocumentChange::Delete {
+                    path,
+                    recursive: flag("recursive"),
+                    ignore_if_not_exists: flag("ignoreIfNotExists"),
+                }),
+                _ => {
+                    let uri = change.get("textDocument").and_then(|doc| doc.get("uri"));
+                    let Some(path) = uri.and_then(Value::as_str).and_then(uri_to_path) else {
+                        continue;
+                    };
+                    let edits = text_edits(converter, &path, list(change.get("edits")));
+                    add(&mut edit, converter, path, edits);
+                    continue;
+                }
+            };
+            if let Some(operation) = operation {
+                converter.operated(&operation);
+                edit.changes.push(operation);
+            }
+        }
+    } else if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            let Some(path) = uri_to_path(uri) else {
+                continue;
+            };
+            let edits = text_edits(
+                converter,
+                &path,
+                edits.as_array().map_or(&[], Vec::as_slice),
+            );
+            add(&mut edit, converter, path, edits);
+        }
+    }
+    edit
+}
+
+/// `(Command | CodeAction)[]`. A bare command is kept as an action that
+/// only runs a command, so it can be shown as one that is not available.
+pub(crate) fn code_actions(
+    converter: &mut Converter,
+    result: &Value,
+    server: ServerId,
+) -> Vec<CodeAction> {
+    list(Some(result))
+        .iter()
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            // A `Command` has its command name as a string here; a
+            // `CodeAction`'s `command` is an object.
+            let bare = item.get("command").is_some_and(Value::is_string);
+            Some(CodeAction {
+                title,
+                kind: text_of(item.get("kind")),
+                preferred: item.get("isPreferred").and_then(Value::as_bool) == Some(true),
+                disabled: item
+                    .get("disabled")
+                    .and_then(|disabled| disabled.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                edit: item
+                    .get("edit")
+                    .filter(|edit| edit.is_object())
+                    .map(|edit| workspace_edit(converter, edit)),
+                command: bare || item.get("command").is_some_and(Value::is_object),
+                server,
+                raw: item.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `prepareRename`'s answer: `Range`, `{ range, placeholder }`,
+/// `{ defaultBehavior }` or null (nothing to rename there).
+pub(crate) fn rename_target(
+    converter: &mut Converter,
+    path: &Path,
+    result: &Value,
+) -> Option<RenameTarget> {
+    if result.is_null() {
+        return None;
+    }
+    if result.get("start").is_some() {
+        return Some(RenameTarget {
+            range: converter.span(path, result),
+            placeholder: None,
+        });
+    }
+    Some(RenameTarget {
+        range: result
+            .get("range")
+            .and_then(|range| converter.span(path, range)),
+        placeholder: text_of(result.get("placeholder")),
+    })
 }
 
 /// `Location`, `Location[]` or `LocationLink[]`, without repeats.

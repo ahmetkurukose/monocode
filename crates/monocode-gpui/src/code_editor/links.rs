@@ -81,6 +81,43 @@ pub(crate) trait LinkProvider {
     fn targets(&self, at: Position, cx: &mut App) -> Task<Vec<LinkTarget>>;
 }
 
+/// The other places "Go To" leads from a symbol, besides its definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Navigation {
+    Declaration,
+    TypeDefinition,
+    Implementation,
+}
+impl Navigation {
+    /// The title of the list when there are several, and of the note when
+    /// there are none.
+    pub(crate) fn plural(self) -> &'static str {
+        match self {
+            Self::Declaration => "Declarations",
+            Self::TypeDefinition => "Type Definitions",
+            Self::Implementation => "Implementations",
+        }
+    }
+    pub(crate) fn singular(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::TypeDefinition => "type definition",
+            Self::Implementation => "implementation",
+        }
+    }
+}
+
+pub(crate) trait NavigationProvider {
+    /// Where `kind` leads from the symbol at the position. An error says
+    /// why it cannot be asked, such as a server that does not offer it.
+    fn locate(
+        &self,
+        kind: Navigation,
+        at: Position,
+        cx: &mut App,
+    ) -> Task<Result<Vec<LinkTarget>, String>>;
+}
+
 pub(crate) trait ReferencesProvider {
     fn references(&self, at: Position, cx: &mut App) -> Task<Vec<LinkTarget>>;
 }

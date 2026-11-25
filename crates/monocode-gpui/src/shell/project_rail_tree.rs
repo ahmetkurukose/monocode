@@ -41,9 +41,9 @@ impl Render for RailTip {
 }
 
 impl Shell {
-    /// The tree is a Classic-layout option; Focused has no project rail.
+    /// The project rail always lists each project's sessions as a tree.
     pub(super) fn project_rail_tree_on(&self) -> bool {
-        self.workspace.classic_layout && self.workspace.preferences.project_rail_tree()
+        true
     }
 
     pub(super) fn project_rail_expanded(&self, path: &str) -> bool {
@@ -767,25 +767,18 @@ impl Shell {
         if self.workspace.project != project {
             return;
         }
-        let in_panel = self.terminal_in_panel(cx);
         let Some(dock) = self.workspace.docks.get_mut(project) else {
             return;
         };
         dock.active = ix.min(dock.terminals.len().saturating_sub(1));
         let (active, was_open) = (dock.active, dock.open);
-        if !in_panel {
-            dock.open = true;
-        }
+        dock.open = true;
         self.dock_tab_scroll.scroll_to_item(active);
-        if in_panel {
-            self.show_panel_terminal(window, cx);
-        } else {
-            self.ensure_terminals(project, cx);
-            if !was_open {
-                self.slide_dock(true, cx);
-            }
-            self.focus_terminal(window, cx);
+        self.ensure_terminals(project, cx);
+        if !was_open {
+            self.slide_dock(true, cx);
         }
+        self.focus_terminal(window, cx);
         self.fit_sidebar(cx);
         self.persist(cx);
         cx.notify();
@@ -805,7 +798,6 @@ mod tests {
                 shell.workspace.classic_layout = true;
                 shell.workspace.project_rail_open = true;
                 shell.workspace.preferences.monos = false;
-                shell.workspace.preferences.project_rail_view = "tree".into();
                 shell.workspace.project_rail_expanded =
                     expanded.iter().map(|p| p.to_string()).collect();
                 shell.invalidate_chrome(cx);
@@ -1021,9 +1013,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_chevron_toggles_a_project_and_the_list_view_never_shows_children(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_chevron_toggles_a_project(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, a, _) = window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
@@ -1043,18 +1033,6 @@ mod tests {
         visual.simulate_click(chevron.center(), Default::default());
         visual.run_until_parked();
         assert!(at(visual, format!("rail-session-{a}")).is_none());
-        // Expanded but in the plain list view: nothing changes.
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.project_rail_expanded.insert(other.into());
-                shell.workspace.preferences.project_rail_view = "list".into();
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert!(at(visual, format!("rail-session-{a}")).is_none());
-        assert!(at(visual, format!("rail-project-chevron-{ix}")).is_none());
     }
 
     #[gpui::test]
@@ -1165,7 +1143,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_tree_replaces_the_workspace_column_and_the_list_keeps_it(cx: &mut TestAppContext) {
+    fn the_tree_replaces_the_workspace_column(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, _) = window(cx);
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
@@ -1175,15 +1153,6 @@ mod tests {
             "sessions live in the tree, so the middle column is gone"
         );
         assert!(visual.debug_bounds("project-rail-frame").is_some());
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.project_rail_view = "list".into();
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert!(visual.debug_bounds("sidebar-frame").is_some());
     }
 
     #[gpui::test]
@@ -1381,17 +1350,6 @@ mod tests {
             at(visual, format!("rail-app-notes-{ix}")).is_none(),
             "none left, none shown"
         );
-        // The plain list never shows them.
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.project_apps = vec!["notes".into()];
-                shell.workspace.preferences.project_rail_view = "list".into();
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        visual.run_until_parked();
-        assert!(at(visual, format!("rail-app-notes-{ix}")).is_none());
     }
 
     #[gpui::test]
@@ -1641,13 +1599,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows(visual), [true, false, true]);
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.project_rail_view = "list".into();
-                shell.invalidate_chrome(cx);
-            })
-            .unwrap();
-        assert_eq!(rows(visual), [true, true, true]);
     }
 
     #[gpui::test]
@@ -1677,15 +1628,5 @@ mod tests {
             let previous = at(visual, format!("rail-card-top-{}", ix - 1)).unwrap();
             assert!(top.top() >= previous.bottom() + px(CARD_GAP) - px(0.5));
         }
-        // The list view has no cards.
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.preferences.project_rail_view = "list".into();
-                shell.invalidate_chrome(cx);
-            })
-            .unwrap();
-        visual.refresh().unwrap();
-        visual.run_until_parked();
-        assert!(at(visual, format!("rail-card-top-{ix}")).is_none());
     }
 }

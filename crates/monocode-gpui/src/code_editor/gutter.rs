@@ -1,6 +1,7 @@
-//! What outside code can draw beside and behind the editor's lines: marks in
-//! two gutter columns left of the line number (breakpoint, then run marker),
-//! line highlights with an optional arrow, and short notes after a line's end.
+//! What outside code can draw beside and behind the editor's lines: an
+//! annotation column at the gutter's left edge (blame), marks in two gutter
+//! columns left of the line number (breakpoint, then run marker), line
+//! highlights with an optional arrow, and short notes after a line's end.
 //! All of it is keyed by zero-based row and follows the rows through edits.
 use super::{DocumentInfo, ExternalDiagnostic};
 use crate::editor_analysis::Edit;
@@ -9,6 +10,10 @@ use std::ops::Range;
 
 /// Width one gutter column takes once it is in use.
 pub(crate) const SLOT_WIDTH: f32 = 14.;
+/// Space around and between the parts of an annotation.
+pub(crate) const ANNOTATION_PAD: f32 = 6.;
+/// The annotation column's text size.
+pub(crate) const ANNOTATION_TEXT: f32 = 11.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GutterSlot {
@@ -92,6 +97,104 @@ pub(crate) trait GutterProvider {
     fn moved(&self, _doc: &DocumentInfo, _marks: &[GutterMark], _cx: &mut App) {}
 }
 
+/// What the rows of an annotation column can show; rows point into a list
+/// of these, as many lines share one commit.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Annotation {
+    /// What the provider knows it by, such as a commit's sha.
+    pub id: SharedString,
+    /// Drawn left to right, each part in a column as wide as its widest.
+    pub parts: Vec<SharedString>,
+    pub tooltip: SharedString,
+    /// How strongly the row is tinted, from 0 (not at all) to 1.
+    pub tint: f32,
+}
+
+/// A row of the annotation column and the entry (an index into
+/// [`Annotations::entries`]) it shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineAnnotation {
+    pub row: usize,
+    pub entry: usize,
+}
+
+/// A press in the annotation column; `entry` is the row's, when it has one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnnotationClick {
+    pub row: usize,
+    pub entry: Option<Annotation>,
+    pub button: GutterButton,
+    pub position: Point<Pixels>,
+    /// The editor that was pressed, for a provider that answers only it.
+    pub editor: gpui::EntityId,
+}
+
+/// Owns an annotation column: presses in it come here.
+pub(crate) trait AnnotationProvider {
+    fn click(&self, doc: &DocumentInfo, click: &AnnotationClick, window: &mut Window, cx: &mut App);
+    /// Asked before `click`: a menu to open for this press in its place.
+    fn menu(
+        &self,
+        _doc: &DocumentInfo,
+        _click: &AnnotationClick,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<GutterMenu> {
+        None
+    }
+}
+
+/// One file's annotation column, pushed through `Hub::set_annotations`.
+#[derive(Clone)]
+pub(crate) struct Annotations {
+    pub source: SharedString,
+    pub entries: std::rc::Rc<Vec<Annotation>>,
+    /// Sorted by row; a row without one is blank.
+    pub rows: Vec<LineAnnotation>,
+    pub provider: Option<std::rc::Rc<dyn AnnotationProvider>>,
+}
+impl Annotations {
+    pub(crate) fn entry(&self, row: usize) -> Option<&Annotation> {
+        let at = self.rows.partition_point(|line| line.row < row);
+        let line = self.rows.get(at).filter(|line| line.row == row)?;
+        self.entries.get(line.entry)
+    }
+}
+impl std::fmt::Debug for Annotations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Annotations")
+            .field("source", &self.source)
+            .field("rows", &self.rows.len())
+            .finish()
+    }
+}
+
+/// The annotation column as one editor draws it: the rows and how wide
+/// each part's column is, measured when they were set.
+#[derive(Clone, Debug)]
+pub(crate) struct AnnotationColumn {
+    pub annotations: Annotations,
+    pub widths: Vec<f32>,
+}
+impl AnnotationColumn {
+    pub(crate) fn width(&self) -> f32 {
+        let parts: f32 = self.widths.iter().sum();
+        parts + ANNOTATION_PAD * (self.widths.len() as f32 + 1.)
+    }
+    /// Left edges of the parts, from the column's left.
+    pub(crate) fn part_lefts(&self) -> Vec<f32> {
+        let mut x = ANNOTATION_PAD;
+        self.widths
+            .iter()
+            .map(|width| {
+                let left = x;
+                x += width + ANNOTATION_PAD;
+                left
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LineStyle {
     /// Where the debugged program is stopped.
@@ -133,6 +236,8 @@ pub(crate) struct RowShift {
     shift_from: usize,
     old_last: usize,
     new_last: usize,
+    /// The row the edit starts in, when it changed that row's own text.
+    first_changed: Option<usize>,
 }
 impl RowShift {
     /// `old` and `new` are the line start offsets before and after `edit`.
@@ -148,11 +253,16 @@ impl RowShift {
             && old.get(first) == Some(&edit.start)
             && new_text.as_bytes().get(edit.new_end.wrapping_sub(1)) == Some(&b'\n');
         let old_last = row(old, edit.old_end);
+        // Starting at a line's end only adds after it.
+        let at_end = old
+            .get(first + 1)
+            .is_some_and(|next| *next == edit.start + 1);
         Self {
             keep_below: if pushes { first } else { first + 1 },
             shift_from: if pushes { first } else { old_last + 1 },
             old_last,
             new_last: row(new, edit.new_end),
+            first_changed: (!pushes && !at_end).then_some(first),
         }
     }
     pub(crate) fn map(&self, row: usize) -> usize {
@@ -166,6 +276,10 @@ impl RowShift {
     }
     fn unchanged(&self) -> bool {
         self.old_last == self.new_last
+    }
+    /// Whether the edit replaced this row rather than keeping or moving it.
+    fn replaces(&self, row: usize) -> bool {
+        (row >= self.keep_below && row < self.shift_from) || self.first_changed == Some(row)
     }
 }
 
@@ -185,8 +299,19 @@ pub(crate) struct Decor {
     pub link: Option<Range<usize>>,
     /// Where a breakpoint would go: the hovered row of its empty column.
     pub hover: Option<usize>,
+    /// The annotation column left of everything else, while one is set.
+    pub annotations: Option<AnnotationColumn>,
 }
 impl Decor {
+    /// Width of the annotation column, 0 without one.
+    pub(crate) fn annotation_width(&self) -> f32 {
+        self.annotations
+            .as_ref()
+            .map_or(0., AnnotationColumn::width)
+    }
+    pub(crate) fn annotation(&self, row: usize) -> Option<&Annotation> {
+        self.annotations.as_ref()?.annotations.entry(row)
+    }
     pub(crate) fn slot_visible(&self, slot: GutterSlot) -> bool {
         let n = slot.index();
         self.slots[n]
@@ -196,20 +321,23 @@ impl Decor {
     /// Left edge of a column inside the gutter, when it is shown.
     pub(crate) fn slot_left(&self, slot: GutterSlot) -> Option<f32> {
         self.slot_visible(slot).then(|| {
-            4. + GutterSlot::ALL
-                .iter()
-                .take(slot.index())
-                .filter(|before| self.slot_visible(**before))
-                .count() as f32
-                * SLOT_WIDTH
+            self.annotation_width()
+                + 4.
+                + GutterSlot::ALL
+                    .iter()
+                    .take(slot.index())
+                    .filter(|before| self.slot_visible(**before))
+                    .count() as f32
+                    * SLOT_WIDTH
         })
     }
     pub(crate) fn width(&self) -> f32 {
-        GutterSlot::ALL
-            .iter()
-            .filter(|slot| self.slot_visible(**slot))
-            .count() as f32
-            * SLOT_WIDTH
+        self.annotation_width()
+            + GutterSlot::ALL
+                .iter()
+                .filter(|slot| self.slot_visible(**slot))
+                .count() as f32
+                * SLOT_WIDTH
     }
     pub(crate) fn mark(&self, slot: GutterSlot, row: usize) -> Option<&GutterMark> {
         let marks = &self.marks[slot.index()];
@@ -232,6 +360,7 @@ impl Decor {
             && self.lines.is_empty()
             && self.notes.is_empty()
             && self.link.is_none()
+            && self.annotations.is_none()
     }
     /// Carries everything through an edit. Returns which gutter columns had a
     /// mark change rows, so their providers can be told.
@@ -257,6 +386,15 @@ impl Decor {
         }
         for note in &mut self.notes {
             note.row = rows.map(note.row);
+        }
+        if let Some(column) = &mut self.annotations {
+            // Replaced lines are not the committed ones any more.
+            let lines = &mut column.annotations.rows;
+            lines.retain(|line| !rows.replaces(line.row));
+            for line in lines.iter_mut() {
+                line.row = rows.map(line.row);
+            }
+            lines.dedup_by_key(|line| line.row);
         }
         moved
     }
@@ -315,5 +453,64 @@ mod tests {
         assert_eq!(decor.slot_left(GutterSlot::Run), Some(4. + SLOT_WIDTH));
         assert!(decor.mark(GutterSlot::Run, 3).is_some());
         assert!(decor.mark(GutterSlot::Run, 2).is_none());
+        // An annotation column comes first and pushes the slots right.
+        decor.annotations = Some(column(&[(0, 0), (2, 1)]));
+        assert_eq!(decor.annotation_width(), 30. + 3. * ANNOTATION_PAD);
+        assert_eq!(
+            decor.slot_left(GutterSlot::Breakpoint),
+            Some(decor.annotation_width() + 4.)
+        );
+        assert_eq!(decor.width(), decor.annotation_width() + 2. * SLOT_WIDTH);
+        assert_eq!(decor.annotation(2).map(|a| a.id.as_ref()), Some("b"));
+        assert!(decor.annotation(1).is_none());
+    }
+
+    fn column(rows: &[(usize, usize)]) -> AnnotationColumn {
+        let entry = |id: &str| Annotation {
+            id: id.to_owned().into(),
+            parts: vec!["24.02.2026".into(), "Ann".into()],
+            tooltip: id.to_owned().into(),
+            tint: 1.,
+        };
+        AnnotationColumn {
+            annotations: Annotations {
+                source: "test".into(),
+                entries: std::rc::Rc::new(vec![entry("a"), entry("b")]),
+                rows: rows
+                    .iter()
+                    .map(|(row, entry)| LineAnnotation {
+                        row: *row,
+                        entry: *entry,
+                    })
+                    .collect(),
+                provider: None,
+            },
+            widths: vec![20., 10.],
+        }
+    }
+
+    #[test]
+    fn annotations_follow_moved_lines_and_leave_replaced_ones_blank() {
+        let old = "a\nb\nc\nd\n";
+        let mut decor = Decor {
+            annotations: Some(column(&[(0, 0), (1, 0), (2, 1), (3, 1)])),
+            ..Default::default()
+        };
+        let rows = |decor: &Decor| -> Vec<usize> {
+            let column = decor.annotations.as_ref().unwrap();
+            column
+                .annotations
+                .rows
+                .iter()
+                .map(|line| line.row)
+                .collect()
+        };
+        let new = "a\nnew\nb\nc\nd\n";
+        decor.remap(Edit::between(old, new).unwrap(), shift(old, new));
+        assert_eq!(rows(&decor), [0, 2, 3, 4], "a typed line has none");
+        // Replacing `b` and `c` by one line blanks it; `d` moves up.
+        let newer = "a\nnew\nX\nd\n";
+        decor.remap(Edit::between(new, newer).unwrap(), shift(new, newer));
+        assert_eq!(rows(&decor), [0, 3]);
     }
 }

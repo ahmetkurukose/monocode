@@ -15,7 +15,6 @@ pub(crate) struct Overview {
     manager: WeakEntity<Monos>,
     focus: gpui::FocusHandle,
     top_inset: f32,
-    original_chrome: bool,
     stack: PanelStack,
     native_content: bool,
     _observation: Subscription,
@@ -27,7 +26,6 @@ impl Overview {
             manager: manager.downgrade(),
             focus: cx.focus_handle(),
             top_inset: 0.,
-            original_chrome: false,
             stack: PanelStack::default(),
             native_content: false,
             _observation: cx.observe(&manager, |_, _, cx| cx.notify()),
@@ -39,14 +37,6 @@ impl Overview {
             self.top_inset = inset;
             cx.notify();
         }
-    }
-
-    pub(crate) fn set_original_chrome(&mut self, original: bool, cx: &mut Context<Self>) {
-        if self.original_chrome == original {
-            return;
-        }
-        self.original_chrome = original;
-        cx.notify();
     }
 
     pub(crate) fn native_content(&self) -> bool {
@@ -116,22 +106,10 @@ impl Render for Overview {
             self.native_content = frame.pages.iter().any(|page| {
                 matches!(&page.route, Route::Document(id) if mono.documents.iter().any(|d| &d.id == id && d.kind == "html"))
             });
-            let original = self.original_chrome;
             let _ = self.manager.update(cx, |m, cx| {
-                let content = m.overview_panel(&mono, window, cx);
-                let base = if original {
-                    div()
-                        .size_full()
-                        .min_w_0()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .child(m.original_overview_header(window, cx))
-                        .child(div().flex_1().min_w_0().min_h_0().child(content))
-                        .into_any_element()
-                } else {
-                    content
-                };
+                // The shell's title-bar corner draws the overview tabs over
+                // the panel's top inset, above every page.
+                let base = m.overview_panel(&mono, window, cx);
                 layers.push(layer(
                     "mono-detail-base".into(),
                     frame.base,

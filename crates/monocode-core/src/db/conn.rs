@@ -459,6 +459,32 @@ impl Connection {
         }
     }
 
+    /// The plan of `statement` as a tree, from `EXPLAIN (FORMAT JSON)`.
+    /// `analyze` runs it and adds buffers. PostgreSQL only.
+    pub async fn explain_plan(
+        &self,
+        statement: &str,
+        analyze: bool,
+    ) -> Result<super::plan::Plan, DbError> {
+        match self {
+            Self::Postgres(c) => {
+                let sql = format!(
+                    "explain (format json{}) {statement}",
+                    if analyze { ", analyze, buffers" } else { "" }
+                );
+                let result = c.execute(&sql, 10_000).await?;
+                let json: String = result
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.first().cloned().flatten())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                super::plan::Plan::parse(&json).map_err(DbError::plain)
+            }
+            Self::Mongo(_) => Err(DbError::plain("A plan tree is only made for PostgreSQL")),
+        }
+    }
+
     pub async fn catalog(&self) -> Result<Vec<CatalogEntry>, DbError> {
         match self {
             Self::Postgres(c) => c.catalog().await,
@@ -568,6 +594,24 @@ pub(crate) mod tests {
     fn debug_output_never_shows_a_password() {
         let source = DataSource::new("x");
         assert!(!format!("{source:?}").to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn plans_come_as_a_tree_on_a_server() {
+        let Some(source) = test_source() else {
+            return;
+        };
+        runtime().block_on(async {
+            let conn = Connection::connect(&source, None).await.unwrap();
+            let sql = "select g from generate_series(1, 100) g where g > 50 order by g desc";
+            let plan = conn.explain_plan(sql, false).await.unwrap();
+            assert!(!plan.analyzed);
+            assert_eq!(plan.root.operation, "Sort");
+            assert_eq!(plan.root.children[0].operation, "Function Scan");
+            let plan = conn.explain_plan(sql, true).await.unwrap();
+            assert!(plan.analyzed && plan.execution_ms.is_some());
+            assert_eq!(plan.root.actual.unwrap().rows, 50.);
+        });
     }
 
     #[test]

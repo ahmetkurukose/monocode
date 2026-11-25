@@ -219,6 +219,11 @@ struct Shared {
     capabilities: OnceLock<Value>,
     /// Capabilities registered after the handshake: id to method and options.
     registrations: Mutex<HashMap<String, (String, Value)>>,
+    /// The edits the server asks the client to apply (`workspace/applyEdit`)
+    /// while a command the editor asked for runs; `None` between commands.
+    applied: Mutex<Option<Vec<Value>>>,
+    /// One command at a time, so each gets its own edits.
+    command: Mutex<()>,
     handler: EventHandler,
 }
 
@@ -253,8 +258,15 @@ fn client_capabilities() -> Value {
     json!({
         "general": { "positionEncodings": ["utf-8", "utf-16"] },
         "workspace": {
+            "applyEdit": true,
+            "executeCommand": {},
             "configuration": true,
             "workspaceFolders": true,
+            "workspaceEdit": {
+                "documentChanges": true,
+                "resourceOperations": ["create", "rename", "delete"],
+                "failureHandling": "abort",
+            },
             "didChangeConfiguration": { "dynamicRegistration": true },
             "diagnostics": { "refreshSupport": true },
         },
@@ -269,6 +281,9 @@ fn client_capabilities() -> Value {
             },
             "diagnostic": { "dynamicRegistration": true, "relatedDocumentSupport": false },
             "definition": { "linkSupport": true },
+            "typeDefinition": { "linkSupport": true },
+            "implementation": { "linkSupport": true },
+            "declaration": { "linkSupport": true },
             "references": {},
             "hover": { "contentFormat": markup },
             "completion": {
@@ -293,6 +308,22 @@ fn client_capabilities() -> Value {
                 },
             },
             "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+            "rename": { "prepareSupport": true },
+            "codeAction": {
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {
+                        "valueSet": [
+                            "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                            "refactor.rewrite", "source", "source.organizeImports",
+                            "source.fixAll",
+                        ],
+                    },
+                },
+                "isPreferredSupport": true,
+                "disabledSupport": true,
+                "dataSupport": true,
+                "resolveSupport": { "properties": ["edit"] },
+            },
         },
     })
 }
@@ -515,6 +546,18 @@ impl Shared {
                 Ok(Value::Null)
             }
             "window/workDoneProgress/create" => Ok(Value::Null),
+            // Taken as applied: the editor carries the edits out once the
+            // command is over (`Client::execute_command`).
+            "workspace/applyEdit" => Ok(match lock(&self.applied).as_mut() {
+                Some(edits) => {
+                    edits.push(params.get("edit").cloned().unwrap_or(Value::Null));
+                    json!({ "applied": true })
+                }
+                None => json!({
+                    "applied": false,
+                    "failureReason": "Edits are applied only while a command the editor started runs",
+                }),
+            }),
             "workspace/workspaceFolders" => Ok(json!([{
                 "uri": path_to_uri(&self.options.root),
                 "name": folder_name(&self.options.root),
@@ -535,10 +578,6 @@ impl Shared {
                 Ok(Value::Null)
             }
             "window/showDocument" => Ok(json!({ "success": false })),
-            "workspace/applyEdit" => Ok(json!({
-                "applied": false,
-                "failureReason": "Edits from the server are not supported.",
-            })),
             _ => Err((METHOD_NOT_FOUND, format!("Method not found: {method}"))),
         }
     }
@@ -622,6 +661,8 @@ impl Client {
             log: Mutex::new(VecDeque::new()),
             capabilities: OnceLock::new(),
             registrations: Mutex::new(HashMap::new()),
+            applied: Mutex::new(None),
+            command: Mutex::new(()),
             handler,
         });
         let pid = lock(&shared.process).as_ref().map(Child::id);
@@ -702,6 +743,26 @@ impl Client {
 
     /// Asks and waits for the answer, for at most `timeout`. Giving up, by
     /// timeout or through `cancel`, also tells the server to stop.
+    /// Runs a server command (`Command`: its name and arguments) and
+    /// returns the edits the server asked to apply while it ran, as the
+    /// server wrote them. Blocks.
+    pub fn execute_command(
+        &self,
+        command: &Value,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Value>, LspError> {
+        let _one = lock(&self.shared.command);
+        *lock(&self.shared.applied) = Some(Vec::new());
+        let params = json!({
+            "command": command.get("command").cloned().unwrap_or(Value::Null),
+            "arguments": command.get("arguments").cloned().unwrap_or_else(|| json!([])),
+        });
+        let result = self.request("workspace/executeCommand", params, timeout, cancel);
+        let edits = lock(&self.shared.applied).take().unwrap_or_default();
+        result.map(|_| edits)
+    }
+
     pub fn request(
         &self,
         method: &str,

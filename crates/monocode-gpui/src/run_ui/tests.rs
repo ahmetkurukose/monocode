@@ -112,9 +112,7 @@ impl Fixture {
         });
         cx.update(|cx| cx.set_reduce_motion(true));
         window
-            .update(cx, |shell, _, _| {
-                shell.workspace.preferences.set_terminal_placement("bottom")
-            })
+            .update(cx, |shell, _, _| shell.terminals_in_dock = true)
             .unwrap();
         cx.refresh().unwrap();
         let visual = VisualTestContext::from_window(window.into(), cx);

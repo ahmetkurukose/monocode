@@ -12,9 +12,11 @@ use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod code;
+pub(crate) use code::EditorNotice;
 mod command;
 mod comment;
 mod context_menu;
+pub(crate) use context_menu::MenuDelegate;
 mod history;
 mod image_pills;
 mod mention;
@@ -80,9 +82,29 @@ actions!(
         GoToDefinition,
         FindUsages,
         ShowHover,
-        ShowSignature
+        ShowSignature,
+        ShowContextActions,
+        RenameSymbol,
+        GoToDeclaration,
+        GoToTypeDefinition,
+        GoToImplementation,
+        ExpandSelection,
+        ShrinkSelection,
+        DuplicateLine,
+        MoveLineUp,
+        MoveLineDown,
+        ToggleColumnSelection,
+        AddCaretAbove,
+        AddCaretBelow,
+        SelectNextOccurrence,
+        SelectAllOccurrences
     ]
 );
+/// The code actions of one kind at the caret, such as `refactor.extract`
+/// or `source.organizeImports`: the code menu's Refactor rows.
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = composer, no_json)]
+pub(crate) struct CodeActionsOfKind(pub SharedString);
 pub struct Submitted;
 /// Cmd/Ctrl+Enter in a composer that sends either way, asking for the
 /// opposite of its usual follow-up behavior.
@@ -143,9 +165,27 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-/", ToggleComment, Some("CodeEditor")),
         KeyBinding::new("f12", GoToDefinition, Some("CodeEditor")),
         KeyBinding::new("shift-f12", FindUsages, Some("CodeEditor")),
+        KeyBinding::new("alt-enter", ShowContextActions, Some("CodeEditor")),
+        KeyBinding::new("shift-f6", RenameSymbol, Some("CodeEditor")),
+        KeyBinding::new("cmd-f12", GoToImplementation, Some("CodeEditor")),
+        KeyBinding::new("ctrl-f12", GoToImplementation, Some("CodeEditor")),
+        KeyBinding::new("alt-up", ExpandSelection, Some("CodeEditor")),
+        KeyBinding::new("alt-down", ShrinkSelection, Some("CodeEditor")),
+        KeyBinding::new("alt-shift-up", MoveLineUp, Some("CodeEditor")),
+        KeyBinding::new("alt-shift-down", MoveLineDown, Some("CodeEditor")),
+        KeyBinding::new("cmd-shift-8", ToggleColumnSelection, Some("CodeEditor")),
+        KeyBinding::new("ctrl-shift-8", ToggleColumnSelection, Some("CodeEditor")),
         KeyBinding::new("f1", ShowHover, Some("CodeEditor")),
         // Not Cmd+Shift+Space: the quick composer takes that system-wide.
         KeyBinding::new("ctrl-shift-space", ShowSignature, Some("CodeEditor")),
+    ]);
+    let [duplicate, above, below, next, all] = caret_keys();
+    cx.bind_keys([
+        KeyBinding::new(duplicate, DuplicateLine, Some("CodeEditor")),
+        KeyBinding::new(above, AddCaretAbove, Some("CodeEditor")),
+        KeyBinding::new(below, AddCaretBelow, Some("CodeEditor")),
+        KeyBinding::new(next, SelectNextOccurrence, Some("CodeEditor")),
+        KeyBinding::new(all, SelectAllOccurrences, Some("CodeEditor")),
     ]);
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-z"), Undo, Some("Composer")),
@@ -217,8 +257,37 @@ pub fn bind(cx: &mut App) {
     ]);
 }
 
+/// The code editor's keys for duplicating lines, adding carets and adding
+/// occurrences: IntelliJ's where the app leaves them free. Its ⌘D (and
+/// Windows' Ctrl+D) split a pane here, ⌥⌥↑ is a double tap no binding can
+/// hold, and the arrow chords are taken on Windows and Linux by sessions,
+/// panes, line moves and changes.
+/// In order: Duplicate Line, Add Caret Above and Below, Select Next and
+/// All Occurrences.
+pub(crate) fn caret_keys() -> [&'static str; 5] {
+    if cfg!(target_os = "macos") {
+        [
+            "alt-shift-d",
+            "ctrl-shift-up",
+            "ctrl-shift-down",
+            "ctrl-g",
+            "ctrl-cmd-g",
+        ]
+    } else {
+        [
+            "alt-shift-d",
+            "alt-pageup",
+            "alt-pagedown",
+            "alt-j",
+            "ctrl-alt-shift-j",
+        ]
+    }
+}
+
 pub struct Input {
     context_menu: Option<context_menu::EditingMenu>,
+    /// Right-clicks open the owner's menu instead of the shared one.
+    delegate_menu: Option<MenuDelegate>,
     code: Option<code::Code>,
     history: history::History,
     /// Set by Backspace/Delete so the edit they make joins a deleting run,
@@ -283,6 +352,7 @@ impl Input {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             context_menu: None,
+            delegate_menu: None,
             code: None,
             history: Default::default(),
             edit_kind: None,
@@ -533,6 +603,7 @@ impl Input {
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let range = self.clip_range(range);
+        self.collapse_carets();
         self.unfold_range(&range);
         self.reveal_code();
         self.selection = range;
@@ -593,17 +664,6 @@ impl Input {
     }
     pub(crate) fn selection_dragging(&self) -> bool {
         self.selecting
-    }
-    pub(crate) fn selection_anchor(&self) -> Option<Bounds<Pixels>> {
-        if self.selection.is_empty() {
-            return None;
-        }
-        let bounds = self.bounds?;
-        let origin =
-            bounds.origin + self.position(self.cursor()) - point(self.scroll_x, self.scroll_y);
-        bounds
-            .contains(&origin)
-            .then(|| Bounds::new(origin, size(px(1.), self.line_height())))
     }
     pub(crate) fn cursor_anchor(&self) -> Option<Bounds<Pixels>> {
         let bounds = self.bounds?;
@@ -706,6 +766,7 @@ impl Input {
         self.reveal_pending = self.reveal_in_parent;
         self.reveal_code();
         self.clear_completion();
+        self.forget_block();
         let offset = self.clip_offset(offset);
         // The caret never rests inside an image pill.
         let offset = self.image_around(offset).map_or(offset, |range| {
@@ -725,6 +786,7 @@ impl Input {
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         self.reveal_code();
+        self.forget_block();
         let offset = self.clip_offset(offset);
         // A selection takes an image pill whole.
         let offset = self.outside_image(offset, offset >= self.cursor());
@@ -910,63 +972,74 @@ impl Input {
             .min(self.content.len())
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(
-            if self.selection.is_empty() {
-                self.prev(self.cursor())
-            } else {
-                self.selection.start
-            },
-            cx,
-        );
+        self.for_each_caret(cx, |i, cx| {
+            i.move_to(
+                if i.selection.is_empty() {
+                    i.prev(i.cursor())
+                } else {
+                    i.selection.start
+                },
+                cx,
+            )
+        });
     }
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(
-            if self.selection.is_empty() {
-                self.next(self.cursor())
-            } else {
-                self.selection.end
-            },
-            cx,
-        );
+        self.for_each_caret(cx, |i, cx| {
+            i.move_to(
+                if i.selection.is_empty() {
+                    i.next(i.cursor())
+                } else {
+                    i.selection.end
+                },
+                cx,
+            )
+        });
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.prev(self.cursor()), cx);
+        if !self.column_select(0, -1, cx) {
+            self.for_each_caret(cx, |i, cx| i.select_to(i.prev(i.cursor()), cx));
+        }
     }
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.next(self.cursor()), cx);
+        if !self.column_select(0, 1, cx) {
+            self.for_each_caret(cx, |i, cx| i.select_to(i.next(i.cursor()), cx));
+        }
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.collapse_carets();
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_edge(false), cx);
+        self.for_each_caret(cx, |i, cx| i.move_to(i.line_edge(false), cx));
     }
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.line_edge(true), cx);
+        self.for_each_caret(cx, |i, cx| i.move_to(i.line_edge(true), cx));
     }
     fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
-        self.select_to(self.line_edge(false), cx);
+        self.for_each_caret(cx, |i, cx| i.select_to(i.line_edge(false), cx));
     }
     fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
-        self.select_to(self.line_edge(true), cx);
+        self.for_each_caret(cx, |i, cx| i.select_to(i.line_edge(true), cx));
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
+        self.collapse_carets();
         self.move_to(0, cx);
     }
     fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
+        self.collapse_carets();
         self.move_to(self.content.len(), cx);
     }
     fn select_document_start(
@@ -978,6 +1051,7 @@ impl Input {
         if self.yields_navigation(cx) {
             return;
         }
+        self.collapse_carets();
         self.select_to(0, cx);
     }
     fn select_document_end(
@@ -989,67 +1063,92 @@ impl Input {
         if self.yields_navigation(cx) {
             return;
         }
+        self.collapse_carets();
         self.select_to(self.content.len(), cx);
     }
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.previous_word(), cx);
+        self.for_each_caret(cx, |i, cx| i.move_to(i.previous_word(), cx));
     }
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.next_word(), cx);
+        self.for_each_caret(cx, |i, cx| i.move_to(i.next_word(), cx));
     }
     fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
-        self.select_to(self.previous_word(), cx);
+        self.for_each_caret(cx, |i, cx| i.select_to(i.previous_word(), cx));
     }
     fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
         if self.yields_navigation(cx) {
             return;
         }
-        self.select_to(self.next_word(), cx);
+        self.for_each_caret(cx, |i, cx| i.select_to(i.next_word(), cx));
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         if !self.completion_step(true, cx) {
-            self.move_to(self.vertical(false), cx);
+            self.for_each_caret(cx, |i, cx| i.move_to(i.vertical(false), cx));
         }
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
         if !self.completion_step(false, cx) {
-            self.move_to(self.vertical(true), cx);
+            self.for_each_caret(cx, |i, cx| i.move_to(i.vertical(true), cx));
         }
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.vertical(false), cx);
+        if !self.column_select(-1, 0, cx) {
+            self.for_each_caret(cx, |i, cx| i.select_to(i.vertical(false), cx));
+        }
     }
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.vertical(true), cx);
+        if !self.column_select(1, 0, cx) {
+            self.for_each_caret(cx, |i, cx| i.select_to(i.vertical(true), cx));
+        }
     }
     fn delete_word_left(&mut self, _: &DeleteWordLeft, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Other, cx, Self::previous_word);
+            return;
+        }
         if self.selection.is_empty() {
             self.select_to(self.previous_word(), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn delete_word_right(&mut self, _: &DeleteWordRight, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Other, cx, Self::next_word);
+            return;
+        }
         if self.selection.is_empty() {
             self.select_to(self.next_word(), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn delete_to_home(&mut self, _: &DeleteToHome, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Other, cx, |i| i.line_edge(false));
+            return;
+        }
         if self.selection.is_empty() {
             self.select_to(self.line_edge(false), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn delete_to_end(&mut self, _: &DeleteToEnd, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Other, cx, |i| i.line_edge(true));
+            return;
+        }
         if self.selection.is_empty() {
             self.select_to(self.line_edge(true), cx);
         }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn backspace(&mut self, _: &Backspace, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Deleting, cx, |i| i.prev(i.cursor()));
+            return;
+        }
         if self.selection == (0..0)
             && self.inline_commands
             && Command::leading(&self.content).is_none()
@@ -1065,6 +1164,10 @@ impl Input {
         self.replace_text_in_range(None, "", w, cx);
     }
     fn delete(&mut self, _: &Delete, w: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.delete_at_carets(EditKind::Deleting, cx, |i| i.next(i.cursor()));
+            return;
+        }
         if self.selection.is_empty() {
             self.edit_kind = Some((EditKind::Deleting, Some(self.cursor())));
             self.select_to(self.next(self.cursor()), cx);
@@ -1081,7 +1184,9 @@ impl Input {
             return;
         }
         if self.secondary_submit {
-            if self.code.is_some() {
+            if self.has_carets() {
+                self.newline_at_carets(cx);
+            } else if self.code.is_some() {
                 let at = self.selection.start;
                 let start = self.content[..at].rfind('\n').map_or(0, |n| n + 1);
                 let indent: String = self.content[start..at]
@@ -1111,12 +1216,22 @@ impl Input {
     }
     fn paste(&mut self, _: &Paste, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            if self.has_carets() {
+                self.paste_at_carets(&text.replace("\r\n", "\n"), cx);
+                return;
+            }
             // A pasted character is not part of a typing run.
             self.edit_kind = Some((EditKind::Other, None));
             self.replace_text_in_range(None, &text.replace("\r\n", "\n"), w, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            if let Some(text) = self.carets_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         if !self.secret && !self.selection.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selection.clone()].into(),
@@ -1125,6 +1240,12 @@ impl Input {
     }
     fn cut(&mut self, _: &Cut, w: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, w, cx);
+        if self.has_carets() {
+            self.edit_each_caret(EditKind::Other, cx, |_, caret| {
+                (!caret.range.is_empty()).then(|| (caret.range.clone(), String::new()))
+            });
+            return;
+        }
         self.replace_text_in_range(None, "", w, cx);
     }
     fn mouse_down(&mut self, e: &MouseDownEvent, w: &mut Window, cx: &mut Context<Self>) {
@@ -1145,6 +1266,17 @@ impl Input {
         self.selecting = true;
         self.drag_position = Some(e.position);
         let ix = self.mouse_index(e.position);
+        if self.code.is_some() {
+            if e.modifiers.alt && e.modifiers.shift && e.click_count == 1 {
+                self.selecting = false;
+                self.toggle_caret_at(ix, cx);
+                return;
+            }
+            if e.click_count == 1 && self.column_mouse_down(e.position, e.modifiers.shift, cx) {
+                return;
+            }
+            self.collapse_carets();
+        }
         if e.modifiers.shift {
             self.select_to(ix, cx)
         } else if e.click_count >= 3 {
@@ -1216,6 +1348,9 @@ impl Input {
             return;
         };
         let y = p.y.max(b.top()).min(b.bottom() - px(1.));
+        if self.column_drag(point(p.x, y), cx) {
+            return;
+        }
         self.select_to(self.mouse_index(point(p.x, y)), cx);
     }
     /// How far the dragging pointer is above (negative) or below the field.
@@ -1346,6 +1481,14 @@ impl EntityInputHandler for Input {
         if self.read_only {
             return;
         }
+        if self.has_carets() {
+            // Typing goes to every caret; an IME or a given range, to one.
+            if r.is_none() && self.marked.is_none() {
+                self.type_at_carets(text, edit_kind.map(|(kind, _)| kind), cx);
+                return;
+            }
+            self.collapse_carets();
+        }
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let mut r = self.replacement_range(r);
@@ -1455,6 +1598,7 @@ impl EntityInputHandler for Input {
         if self.read_only {
             return;
         }
+        self.collapse_carets();
         self.manual_scroll = false;
         self.reveal_pending = self.reveal_in_parent;
         let r = self.replacement_range(r);
@@ -1997,6 +2141,22 @@ impl Render for Input {
             .on_action(cx.listener(Self::find_usages))
             .on_action(cx.listener(Self::show_hover))
             .on_action(cx.listener(Self::show_signature))
+            .on_action(cx.listener(Self::show_context_actions))
+            .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::go_to_declaration))
+            .on_action(cx.listener(Self::go_to_type_definition))
+            .on_action(cx.listener(Self::go_to_implementation))
+            .on_action(cx.listener(Self::code_actions_of_kind))
+            .on_action(cx.listener(Self::expand_selection))
+            .on_action(cx.listener(Self::shrink_selection))
+            .on_action(cx.listener(Self::duplicate_line))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::toggle_column_selection))
+            .on_action(cx.listener(Self::add_caret_above))
+            .on_action(cx.listener(Self::add_caret_below))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::select_all_occurrences))
             .on_modifiers_changed(cx.listener(Self::code_modifiers))
             .on_action(cx.listener(Self::start_completion))
             .on_action(cx.listener(Self::dismiss_completion))
@@ -2062,6 +2222,7 @@ impl Render for Input {
             .children(self.completion_popup(cx))
             .children(self.hunk_actions(cx))
             .children(self.code_popovers(cx))
+            .children(self.refactor_popovers(cx))
             .children(self.editing_menu(cx))
     }
 }

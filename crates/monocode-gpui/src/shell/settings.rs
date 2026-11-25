@@ -237,17 +237,6 @@ impl Shell {
                     this.invalidate_chrome(cx);
                     cx.notify();
                 }
-                SettingsEvent::NewLayout(on) => {
-                    if this.workspace.classic_layout == *on {
-                        this.toggle_layout(cx);
-                    }
-                    this.sync_settings(cx);
-                }
-                SettingsEvent::NewLayoutBoxy(boxy) => {
-                    this.workspace.new_layout_boxy = *boxy;
-                    this.layout_changed(cx);
-                    this.sync_settings(cx);
-                }
                 SettingsEvent::OpenSession(id) => {
                     this.close_settings(window, cx);
                     this.open(*id, window, cx);
@@ -700,14 +689,12 @@ mod tests {
             header.bottom() <= px(40.),
             "breadcrumb and search live in the title bar"
         );
+        // Classic's workspace is boxy: no card inset or border around it.
         assert!(
-            (page.left()
-                - card.left()
-                - (card.size.width - px(8.) - px(1024.)).max(px(0.)) / 2.
-                - px(33.))
-            .abs()
+            (page.left() - card.left() - (card.size.width - px(1024.)).max(px(0.)) / 2. - px(32.))
+                .abs()
                 < px(1.),
-            "React's 32px page padding plus the card border: page={page:?}, frame={card:?}"
+            "React's 32px page padding: page={page:?}, frame={card:?}"
         );
         assert!(visual.debug_bounds("settings-toggle-sounds").is_some());
         assert!(visual.debug_bounds("sidebar-content").is_none());
@@ -752,11 +739,11 @@ mod tests {
                 assert_eq!(shell.workspace.tabs.len(), 2);
             })
             .unwrap();
-        assert!(visual.debug_bounds("sidebar-content").is_some());
+        assert!(visual.debug_bounds("project-rail-frame").is_some());
     }
 
     #[gpui::test]
-    fn settings_nav_collapses_with_search_on_top_and_back_at_the_bottom(cx: &mut TestAppContext) {
+    fn settings_nav_has_search_on_top_and_back_at_the_bottom(cx: &mut TestAppContext) {
         cx.update(super::super::bind_keys);
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, _, _) = window(cx);
@@ -776,32 +763,13 @@ mod tests {
         );
         assert!(general.bottom() <= back.top(), "Back sits below the pages");
         assert!(search.right() <= header.left(), "search lives in the nav");
-
-        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
-        visual.simulate_click(toggle.center(), Default::default());
+        // Classic's settings fill the project rail, which stays: the
+        // sidebar toggle steps aside and Toggle Sidebar leaves the nav.
+        visual.simulate_keystrokes("cmd-b");
         visual.run_until_parked();
+        assert!(visual.debug_bounds("settings-nav-general").is_some());
         window
-            .update(visual, |shell, _, _| {
-                assert!(shell.settings.is_some());
-                assert_eq!(shell.sidebar_fraction, 0.);
-                assert!(
-                    shell.workspace.sidebar_visible,
-                    "the project sidebar is untouched"
-                );
-            })
-            .unwrap();
-        let search = visual.debug_bounds("settings-search").unwrap();
-        let header = visual.debug_bounds("settings-header").unwrap();
-        assert!(
-            search.left() >= header.left() && search.bottom() <= header.bottom(),
-            "collapsed, search moves to the title bar"
-        );
-
-        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
-        visual.simulate_click(toggle.center(), Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, _, _| assert_eq!(shell.sidebar_fraction, 1.))
+            .update(visual, |shell, _, _| assert!(shell.settings.is_some()))
             .unwrap();
     }
 

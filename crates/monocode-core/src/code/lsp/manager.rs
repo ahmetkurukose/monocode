@@ -370,6 +370,8 @@ impl Drop for Shared {
 /// A server and document picked for one question.
 struct Target {
     id: ServerId,
+    /// The server's registry id, as its diagnostics are tagged.
+    name: &'static str,
     client: Arc<Client>,
     text: Arc<str>,
     uri: String,
@@ -1026,6 +1028,7 @@ impl Shared {
                     Some(client) if client.provides(provider) => {
                         found = Some(Target {
                             id: *id,
+                            name: entry.spec.id,
                             client: client.clone(),
                             text: document.text.clone(),
                             uri: path_to_uri(path),
@@ -1063,6 +1066,35 @@ impl Shared {
 
     /// Asks `target`'s server `method` and reads the answer with `read`,
     /// which gets a converter that knows the document's current text.
+    /// Every running server of the document that offers `provider`, of
+    /// any role, without waiting for those still starting.
+    fn targets(&self, path: &Path, provider: &str) -> Vec<Target> {
+        let now = (self.clock)();
+        let mut state = self.state();
+        let Some(document) = state.documents.get(path) else {
+            return Vec::new();
+        };
+        let (servers, text) = (document.servers.clone(), document.text.clone());
+        let mut found = Vec::new();
+        for id in servers {
+            let Some(entry) = state.entries.get_mut(&id) else {
+                continue;
+            };
+            let Some(client) = entry.running().filter(|c| c.provides(provider)).cloned() else {
+                continue;
+            };
+            entry.last_used = now;
+            found.push(Target {
+                id,
+                name: entry.spec.id,
+                client,
+                text: text.clone(),
+                uri: path_to_uri(path),
+            });
+        }
+        found
+    }
+
     fn ask<T>(
         &self,
         path: &Path,

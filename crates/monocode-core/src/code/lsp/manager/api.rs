@@ -1,6 +1,8 @@
 //! The manager's public face: the calls the editor and the agents' tools
 //! make. What happens behind them is in the parent module.
 use super::*;
+use crate::code::lsp::position::{LineIndex, Span};
+use crate::code::lsp::types::{CodeAction, RenameTarget, WorkspaceEdit};
 
 /// Which servers a file gets are running, by registry id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -382,6 +384,60 @@ impl Manager {
         )
     }
 
+    /// Where the type of the symbol at byte `offset` of `path` is defined.
+    /// Blocks.
+    pub fn type_definition(
+        &self,
+        path: &Path,
+        offset: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Location>, LspError> {
+        self.locations(
+            path,
+            offset,
+            "typeDefinitionProvider",
+            "textDocument/typeDefinition",
+            None,
+            cancel,
+        )
+    }
+
+    /// What implements the interface, trait or abstract member at byte
+    /// `offset` of `path`. Blocks.
+    pub fn implementation(
+        &self,
+        path: &Path,
+        offset: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Location>, LspError> {
+        self.locations(
+            path,
+            offset,
+            "implementationProvider",
+            "textDocument/implementation",
+            None,
+            cancel,
+        )
+    }
+
+    /// Where the symbol at byte `offset` of `path` is declared, as opposed
+    /// to defined (a header, an import, a forward declaration). Blocks.
+    pub fn declaration(
+        &self,
+        path: &Path,
+        offset: usize,
+        cancel: &CancelToken,
+    ) -> Result<Vec<Location>, LspError> {
+        self.locations(
+            path,
+            offset,
+            "declarationProvider",
+            "textDocument/declaration",
+            None,
+            cancel,
+        )
+    }
+
     /// Every use of the symbol at byte `offset` of `path`. Blocks.
     pub fn references(
         &self,
@@ -401,6 +457,228 @@ impl Manager {
             )),
             cancel,
         )
+    }
+
+    /// What a rename of the symbol at byte `offset` would replace, or `None`
+    /// when there is nothing to rename there. A server that cannot say
+    /// leaves the range to the caller. Blocks.
+    pub fn prepare_rename(
+        &self,
+        path: &Path,
+        offset: usize,
+        cancel: &CancelToken,
+    ) -> Result<Option<RenameTarget>, LspError> {
+        let target = self.shared.target(path, "renameProvider")?;
+        let prepares = target.client.capabilities()["renameProvider"]["prepareProvider"]
+            .as_bool()
+            .unwrap_or(false);
+        if !prepares {
+            return Ok(Some(RenameTarget {
+                range: None,
+                placeholder: None,
+            }));
+        }
+        self.shared.ask(
+            path,
+            &target,
+            "textDocument/prepareRename",
+            |converter| {
+                json!({
+                    "textDocument": { "uri": target.uri },
+                    "position": converter.position(path, offset),
+                })
+            },
+            cancel,
+            |converter, result| protocol::rename_target(converter, path, result),
+        )
+    }
+
+    /// The edits, across the project, that rename the symbol at byte
+    /// `offset` of `path` to `new_name`. Nothing is applied. Blocks.
+    pub fn rename(
+        &self,
+        path: &Path,
+        offset: usize,
+        new_name: &str,
+        cancel: &CancelToken,
+    ) -> Result<WorkspaceEdit, LspError> {
+        let target = self.shared.target(path, "renameProvider")?;
+        self.shared.ask(
+            path,
+            &target,
+            "textDocument/rename",
+            |converter| {
+                json!({
+                    "textDocument": { "uri": target.uri },
+                    "position": converter.position(path, offset),
+                    "newName": new_name,
+                })
+            },
+            cancel,
+            protocol::workspace_edit,
+        )
+    }
+
+    /// What the servers offer to do over bytes `range` of `path`: fixes for
+    /// the diagnostics there, refactorings and source actions. Every server
+    /// of the file that has them is asked, linters too, and is given its own
+    /// diagnostics that touch the range. With `only` (a kind such as
+    /// `refactor.extract`) just the actions of that kind or one under it
+    /// come back, whether or not the server heeds the request. Blocks.
+    pub fn code_actions(
+        &self,
+        path: &Path,
+        range: std::ops::Range<usize>,
+        only: Option<&str>,
+        cancel: &CancelToken,
+    ) -> Result<Vec<CodeAction>, LspError> {
+        let mut targets = self.shared.targets(path, "codeActionProvider");
+        if targets.is_empty() {
+            // Waits for a server that is starting, or says why there is none.
+            targets.push(self.shared.target(path, "codeActionProvider")?);
+        }
+        let diagnostics = self.shared.state().merged(path);
+        let mut found = Vec::new();
+        let mut failure = None;
+        for target in targets {
+            let text = &target.text;
+            let index = LineIndex::new(text);
+            let (start, end) = (range.start.min(text.len()), range.end.min(text.len()));
+            let span = Span {
+                start: index.point_at(text, start),
+                end: index.point_at(text, end),
+            };
+            let context: Vec<Value> = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.server == target.name
+                        && diagnostic.range.start <= span.end
+                        && span.start <= diagnostic.range.end
+                })
+                .map(|diagnostic| diagnostic.raw.clone())
+                .collect();
+            let asked = self.shared.ask(
+                path,
+                &target,
+                "textDocument/codeAction",
+                |converter| {
+                    let mut context = json!({ "diagnostics": context, "triggerKind": 1 });
+                    if let Some(kind) = only {
+                        context["only"] = json!([kind]);
+                    }
+                    json!({
+                        "textDocument": { "uri": target.uri },
+                        "range": {
+                            "start": converter.position(path, start),
+                            "end": converter.position(path, end),
+                        },
+                        "context": context,
+                    })
+                },
+                cancel,
+                |converter, result| protocol::code_actions(converter, result, target.id),
+            );
+            match asked {
+                Ok(actions) => found.extend(actions.into_iter().filter(|action| {
+                    only.is_none_or(|only| {
+                        action.kind.as_deref().is_some_and(|kind| {
+                            kind == only
+                                || kind
+                                    .strip_prefix(only)
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                        })
+                    })
+                })),
+                Err(LspError::Cancelled) => return Err(LspError::Cancelled),
+                Err(error) => failure = Some(error),
+            }
+        }
+        match failure {
+            Some(error) if found.is_empty() => Err(error),
+            _ => Ok(found),
+        }
+    }
+
+    /// `action` with its edit filled in: as it is when it has one, else as
+    /// the server that offered it resolves it. Blocks.
+    pub fn resolve_code_action(
+        &self,
+        path: &Path,
+        action: &CodeAction,
+        cancel: &CancelToken,
+    ) -> Result<CodeAction, LspError> {
+        // A bare `Command` is not a code action and is not resolved.
+        if action.edit.is_some() || action.raw.get("command").is_some_and(Value::is_string) {
+            return Ok(action.clone());
+        }
+        let target = self
+            .shared
+            .targets(path, "codeActionProvider")
+            .into_iter()
+            .find(|target| target.id == action.server)
+            .ok_or(LspError::Closed)?;
+        let resolves = target.client.capabilities()["codeActionProvider"]["resolveProvider"]
+            .as_bool()
+            .unwrap_or(false);
+        if !resolves {
+            return Ok(action.clone());
+        }
+        self.shared.ask(
+            path,
+            &target,
+            "codeAction/resolve",
+            |_| action.raw.clone(),
+            cancel,
+            |converter, result| {
+                protocol::code_actions(converter, &json!([result]), target.id)
+                    .pop()
+                    .unwrap_or_else(|| action.clone())
+            },
+        )
+    }
+
+    /// Runs the command of `action` on the server that offered it and
+    /// returns the changes the server asked for while it ran, nothing
+    /// applied. An action with an edit of its own runs its command once
+    /// that edit is applied and the document's new text is with the
+    /// manager, as the server counts on it. Rounds of edits come back in
+    /// order, each counted on the text the ones before it left. Blocks.
+    pub fn run_code_action_command(
+        &self,
+        path: &Path,
+        action: &CodeAction,
+        cancel: &CancelToken,
+    ) -> Result<WorkspaceEdit, LspError> {
+        // A bare `Command` is the action itself; a `CodeAction` holds one.
+        let command = match action.raw.get("command") {
+            Some(Value::String(_)) => action.raw.clone(),
+            Some(command @ Value::Object(_)) => command.clone(),
+            _ => return Ok(WorkspaceEdit::default()),
+        };
+        let target = self
+            .shared
+            .targets(path, "codeActionProvider")
+            .into_iter()
+            .find(|target| target.id == action.server)
+            .ok_or(LspError::Closed)?;
+        let edits =
+            target
+                .client
+                .execute_command(&command, self.shared.options.request_timeout, cancel)?;
+        // One converter for every round, so each is read on the text the
+        // rounds before it left.
+        let mut converter = Converter::new(target.client.encoding(), |other: &Path| {
+            if other == path {
+                return Some(target.text.clone());
+            }
+            self.shared.text_of(other)
+        });
+        let mut change = WorkspaceEdit::default();
+        for edit in edits {
+            let edit = protocol::workspace_edit(&mut converter, &edit);
+            change.changes.extend(edit.changes);
+        }
+        Ok(change)
     }
 
     /// What the server knows about the symbol at byte `offset`. Blocks.
@@ -603,6 +881,27 @@ impl Manager {
             .documents
             .get(path)
             .map(|document| document.text.clone())
+    }
+
+    /// Waits up to `timeout` for the open document `path` to hold `text`,
+    /// as the editor reports its edits a moment after making them. True at
+    /// once for a file the manager does not have open. Blocks.
+    pub fn await_document_text(
+        &self,
+        path: &Path,
+        text: &str,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.document_text(path) {
+                None => return true,
+                Some(held) if &*held == text => return true,
+                Some(_) if cancel.is_cancelled() || Instant::now() >= deadline => return false,
+                Some(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     /// Which servers of the kinds `path` gets are running (or starting) now

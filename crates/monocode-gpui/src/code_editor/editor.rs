@@ -46,6 +46,12 @@ pub(super) struct Ext {
     pub(super) navigation: Option<Task<()>>,
     pub(super) picker: Option<popups::Picker>,
     pub(super) gutter_menu: Option<popups::GutterMenuState>,
+    /// The code actions list (⌥↩), while it is open.
+    pub(super) actions_menu: Option<refactor_ui::ActionsMenu>,
+    /// The rename field (⇧F6), while it is open.
+    pub(super) rename: Option<refactor_ui::RenameField>,
+    /// The rename or code action waiting on its provider.
+    pub(super) refactor_task: Option<Task<()>>,
     pub(super) gutter_tip: Option<(SharedString, f32)>,
     /// Where the mouse last was over the text and whether the link
     /// modifier was held, to tell a real move from a replayed one.
@@ -375,6 +381,10 @@ impl Input {
         })
     }
     pub(super) fn apply_completion(&mut self, item: CompletionItem, cx: &mut Context<Self>) {
+        if self.has_carets() {
+            self.complete_at_carets(item, cx);
+            return;
+        }
         let cursor = item.cursor.unwrap_or(item.insert.len());
         if !item.additional_edits.is_empty() {
             let mut edits = item.additional_edits;

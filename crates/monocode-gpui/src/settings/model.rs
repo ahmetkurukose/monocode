@@ -333,12 +333,6 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "actions commands run script dock background",
     ),
     (
-        "terminal-placement",
-        Section::General,
-        "Terminal",
-        "terminal placement dock bottom side right panel title bar tab shell focused layout",
-    ),
-    (
         "browser-all-links",
         Section::Browser,
         "Open all links in Monocode",
@@ -482,12 +476,6 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         Section::Appearance,
         "Main pane glass",
         "translucent transparency body window",
-    ),
-    (
-        "inset-layout",
-        Section::Appearance,
-        "Layout",
-        "classic focused new preview sidebar navigation tabs inset workspace card rounded floating linear frame",
     ),
     (
         "interface-scale",

@@ -16,8 +16,13 @@ mod ext;
 mod ext_tests;
 #[path = "../code_editor/editor_gutter.rs"]
 mod gutter;
+#[path = "../code_editor/editor_lines.rs"]
+mod lines;
 #[path = "../code_editor/editor_popups.rs"]
 mod popups;
+#[path = "../code_editor/editor_refactor.rs"]
+mod refactor_ui;
+pub(crate) use refactor_ui::EditorNotice;
 
 const TOP_PADDING: f32 = 8.;
 const BOTTOM_PADDING: f32 = 32.;
@@ -70,6 +75,52 @@ pub(super) struct Code {
     decor: Option<Rc<Decor>>,
     /// Providers and the state of their popovers, likewise absent by default.
     ext: Option<Box<ext::Ext>>,
+    /// The carets besides the primary `Input::selection`, in no order.
+    carets: Vec<Caret>,
+    /// Set by an edit made for every caret, so the change keeps them.
+    keep_carets: bool,
+    /// Shift+arrows and dragging select a rectangle.
+    column_mode: bool,
+    /// The rectangle being selected in column mode.
+    block: Option<Block>,
+    /// Width of one character of the editor font, as last measured.
+    char_width: f32,
+    /// The word Select Next Occurrence started from at a bare caret; while
+    /// it is what is selected, only whole words match.
+    occurrence_word: Option<String>,
+    /// What Extend Selection grew from, for Shrink Selection.
+    expansion: Option<lines::Expansion>,
+    /// A parse for Extend Selection, made the first time it is used.
+    structure: Option<Box<crate::editor_syntax::Structure>>,
+}
+/// A caret other than the primary one, with the text it selects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Caret {
+    pub(super) range: Range<usize>,
+    pub(super) reversed: bool,
+}
+impl Caret {
+    pub(super) fn at(at: usize) -> Self {
+        Self {
+            range: at..at,
+            reversed: false,
+        }
+    }
+    /// Where the caret itself is, at one end of its selection.
+    pub(super) fn head(&self) -> usize {
+        if self.reversed {
+            self.range.start
+        } else {
+            self.range.end
+        }
+    }
+}
+/// A column selection's corners as (row, column) pairs, columns counted in
+/// characters and allowed past a line's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Block {
+    pub(super) anchor: (usize, usize),
+    pub(super) head: (usize, usize),
 }
 impl Code {
     /// The file this editor shows, as it was opened.
@@ -108,6 +159,14 @@ impl Code {
             affinity: Cell::new(None),
             decor: None,
             ext: None,
+            carets: Vec::new(),
+            keep_carets: false,
+            column_mode: false,
+            block: None,
+            char_width: 7.5,
+            occurrence_word: None,
+            expansion: None,
+            structure: None,
         }
     }
     fn row(&self, offset: usize) -> usize {
@@ -293,6 +352,7 @@ impl Input {
         cx.notify();
     }
     pub(crate) fn schedule_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
+        // With several carets the popup follows the primary one.
         if self.is_composing() || !self.selection.is_empty() {
             return;
         }
@@ -425,7 +485,12 @@ impl Input {
             return;
         };
         if code.completions.is_empty() && code.completion_task.is_none() {
-            cx.propagate();
+            // Escape leaves one caret, then goes to whoever is outside.
+            if self.collapse_carets() {
+                cx.notify();
+            } else {
+                cx.propagate();
+            }
             return;
         }
         code.completions.clear();
@@ -604,6 +669,8 @@ impl Input {
             if self.selection.end > fold.from && self.selection.start < fold.to {
                 self.selection = fold.from..fold.from;
             }
+            code.carets.clear();
+            code.block = None;
             code.folded.push(fold);
         }
         code.layout_width = None;
@@ -646,6 +713,8 @@ impl Input {
             }
         });
         code.layout_width = None;
+        code.carets.clear();
+        code.block = None;
         self.selection = 0..0;
         cx.notify();
     }
@@ -830,6 +899,11 @@ impl Input {
             }
             code.markers.clear();
             code.affinity.set(None);
+            // Only an edit made for every caret knows where the others go.
+            if !std::mem::take(&mut code.keep_carets) {
+                code.carets.clear();
+            }
+            code.block = None;
         }
     }
     pub(super) fn reveal_code(&mut self) {
@@ -845,6 +919,10 @@ impl Input {
         if self.accept_completion(cx) {
             return;
         }
+        if self.has_carets() {
+            self.indent_carets(false, cx);
+            return;
+        }
         if self.selection.is_empty() {
             if self.expand_emmet(cx) {
                 return;
@@ -857,6 +935,10 @@ impl Input {
     pub(super) fn outdent(&mut self, _: &Outdent, w: &mut Window, cx: &mut Context<Self>) {
         if self.code.is_none() {
             cx.propagate();
+            return;
+        }
+        if self.has_carets() {
+            self.indent_carets(true, cx);
             return;
         }
         self.indent_lines(true, w, cx);
@@ -1676,6 +1758,7 @@ impl Element for CodeElement {
                     }],
                     None,
                 );
+                let char_width = sample.width.as_f32();
                 for row in 0..code.offsets.len() {
                     while deletion_changes
                         .peek()
@@ -1746,6 +1829,7 @@ impl Element for CodeElement {
                 }
                 tops.push(y);
                 let code = i.code.as_mut().unwrap();
+                code.char_width = char_width;
                 code.tops = tops;
                 code.deleted_rows = deleted_rows;
                 code.layout_width = Some(width);
@@ -1836,8 +1920,14 @@ impl Element for CodeElement {
         let i = self.input.read(cx);
         let code = i.code.as_ref().unwrap();
         let lh = i.line_height();
-        let cursor = i.cursor();
-        let selected = i.selection.clone();
+        // The primary caret first, then the others.
+        let primary = (i.selection.clone(), i.cursor());
+        let carets: Vec<(Range<usize>, usize)> = std::iter::once(primary)
+            .chain(code.carets.iter().map(|c| {
+                let range = i.clip_range(c.range.clone());
+                (range, i.clip_offset(c.head()))
+            }))
+            .collect();
         let focused = i.focus.is_focused(w);
         let line_height = i.line_height;
         let code_affinity = code.affinity.get();
@@ -1875,16 +1965,12 @@ impl Element for CodeElement {
             if let Some(decor) = &code.decor {
                 let left = state.text_bounds.left() - px(code.gutter());
                 for ((row, line), top) in state.lines.iter().zip(&tops) {
-                    gutter::paint_row(
-                        decor,
-                        *row,
-                        Bounds::new(
-                            point(left, bounds.top() + px(*top) - state.scroll.y),
-                            size(bounds.right() - px(WIDTH) - left, line.size(lh).height),
-                        ),
-                        lh,
-                        w,
+                    let row_bounds = Bounds::new(
+                        point(left, bounds.top() + px(*top) - state.scroll.y),
+                        size(bounds.right() - px(WIDTH) - left, line.size(lh).height),
                     );
+                    gutter::paint_row(decor, *row, row_bounds, lh, w);
+                    gutter::paint_annotation(decor, *row, row_bounds, lh, w, cx);
                 }
             }
             if code.diff {
@@ -2045,7 +2131,11 @@ impl Element for CodeElement {
                 for (((row, line), &start), top) in state.lines.iter().zip(&starts).zip(&tops) {
                     let y = bounds.top() + px(*top) - state.scroll.y;
                     let x = state.text_bounds.left() - state.scroll.x;
-                    if cursor >= start && cursor <= code.source_end(*row, content_len) {
+                    let row_end = code.source_end(*row, content_len);
+                    if carets
+                        .iter()
+                        .any(|(_, cursor)| *cursor >= start && *cursor <= row_end)
+                    {
                         w.paint_quad(fill(
                             Bounds::new(
                                 point(state.text_bounds.left(), y),
@@ -2071,30 +2161,35 @@ impl Element for CodeElement {
                             }
                         }
                     }
-                    let a = code.display_offset(*row, selected.start).min(line.len());
-                    let b = code.display_offset(*row, selected.end).min(line.len());
-                    if a < b
-                        || (selected.start <= start + line.len()
-                            && selected.end > start + line.len())
-                    {
-                        let a = line_position(line, a, lh, false);
-                        let b = line.position_for_index(b, lh).unwrap_or_default();
-                        let mut sy = a.y;
-                        while sy <= b.y {
-                            let left = if sy == a.y { a.x } else { px(0.) };
-                            let right = if sy == b.y && selected.end <= start + line.len() {
-                                b.x
-                            } else {
-                                state.text_bounds.size.width
-                            };
-                            w.paint_quad(fill(
-                                Bounds::new(
-                                    point(x + left, y + sy),
-                                    size((right - left).max(px(2.)), lh),
-                                ),
-                                crate::theme::text_selection(),
-                            ));
-                            sy += lh;
+                    for (selected, _) in &carets {
+                        if selected.is_empty() || selected.end < start || selected.start > row_end {
+                            continue;
+                        }
+                        let a = code.display_offset(*row, selected.start).min(line.len());
+                        let b = code.display_offset(*row, selected.end).min(line.len());
+                        if a < b
+                            || (selected.start <= start + line.len()
+                                && selected.end > start + line.len())
+                        {
+                            let a = line_position(line, a, lh, false);
+                            let b = line.position_for_index(b, lh).unwrap_or_default();
+                            let mut sy = a.y;
+                            while sy <= b.y {
+                                let left = if sy == a.y { a.x } else { px(0.) };
+                                let right = if sy == b.y && selected.end <= start + line.len() {
+                                    b.x
+                                } else {
+                                    state.text_bounds.size.width
+                                };
+                                w.paint_quad(fill(
+                                    Bounds::new(
+                                        point(x + left, y + sy),
+                                        size((right - left).max(px(2.)), lh),
+                                    ),
+                                    crate::theme::text_selection(),
+                                ));
+                                sy += lh;
+                            }
                         }
                     }
                     let _ = line.paint(point(x, y), lh, TextAlign::Left, None, w, cx);
@@ -2165,21 +2260,26 @@ impl Element for CodeElement {
                             cx,
                         );
                     }
-                    if focused
-                        && selected.is_empty()
-                        && cursor >= start
-                        && cursor <= code.source_end(*row, content_len)
-                    {
-                        let p = line_position(
-                            line,
-                            code.display_offset(*row, cursor),
-                            lh,
-                            code_affinity == Some((cursor, true)),
-                        );
-                        w.paint_quad(fill(
-                            Bounds::new(point(x + p.x, y + p.y), size(px(1.5), lh)),
-                            crate::theme::content(1.),
-                        ));
+                    for (selected, cursor) in &carets {
+                        let cursor = *cursor;
+                        // One caret draws only without a selection; several
+                        // show where each of them is.
+                        if focused
+                            && (selected.is_empty() || carets.len() > 1)
+                            && cursor >= start
+                            && cursor <= row_end
+                        {
+                            let p = line_position(
+                                line,
+                                code.display_offset(*row, cursor),
+                                lh,
+                                code_affinity == Some((cursor, true)),
+                            );
+                            w.paint_quad(fill(
+                                Bounds::new(point(x + p.x, y + p.y), size(px(1.5), lh)),
+                                crate::theme::content(1.),
+                            ));
+                        }
                     }
                 }
             },

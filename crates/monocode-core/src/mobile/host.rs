@@ -566,7 +566,7 @@ impl MobileHost {
             }
             !inner.config.devices.is_empty()
         };
-        let entry = keyring::Entry::new("com.monocode.mobile", &keyring_account(&self.path))
+        let entry = crate::credentials::entry("com.monocode.mobile", &keyring_account(&self.path))
             .map_err(|e| e.to_string())?;
         let identity = match entry.get_password() {
             Ok(value) => serde_json::from_str(&value)

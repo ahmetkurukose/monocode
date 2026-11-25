@@ -4,7 +4,7 @@
 use super::position::Span;
 use serde_json::Value;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Names one server process for as long as the manager knows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,6 +80,9 @@ pub struct Diagnostic {
     /// Deprecated code, to be drawn struck through.
     pub deprecated: bool,
     pub related: Vec<(Location, String)>,
+    /// The diagnostic as the server sent it, handed back in the context of
+    /// a code action request so the server can find its own fixes.
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +181,95 @@ coded_kind!(
 pub struct TextEdit {
     pub range: Span,
     pub text: String,
+}
+
+/// Changes a server asks for across files, as steps to take in order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceEdit {
+    pub changes: Vec<DocumentChange>,
+}
+
+/// One step of a `WorkspaceEdit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentChange {
+    /// Edits to a file in its positions as the steps before left its text,
+    /// by position, none overlapping.
+    Edit { path: PathBuf, edits: Vec<TextEdit> },
+    /// A new empty file. One that exists is emptied with `overwrite`, left
+    /// alone with `ignore_if_exists`, else the edit fails.
+    Create {
+        path: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    /// A file or folder moved; `overwrite` and `ignore_if_exists` are about
+    /// `to` as for `Create`.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    /// A file, or with `recursive` a folder and all it holds.
+    Delete {
+        path: PathBuf,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    },
+}
+
+impl WorkspaceEdit {
+    pub fn is_empty(&self) -> bool {
+        self.changes.iter().all(|change| match change {
+            DocumentChange::Edit { edits, .. } => edits.is_empty(),
+            _ => false,
+        })
+    }
+
+    /// The text edits, file by file, in the order they come.
+    pub fn text_edits(&self) -> impl Iterator<Item = (&Path, &[TextEdit])> {
+        self.changes.iter().filter_map(|change| match change {
+            DocumentChange::Edit { path, edits } => Some((path.as_path(), edits.as_slice())),
+            _ => None,
+        })
+    }
+
+    /// How many steps create, rename or delete files.
+    pub fn file_operations(&self) -> usize {
+        (self.changes.iter())
+            .filter(|change| !matches!(change, DocumentChange::Edit { .. }))
+            .count()
+    }
+}
+
+/// Something a server offers to do at a place: a quick fix for a
+/// diagnostic, a refactoring, or a source action such as organizing imports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    /// `quickfix`, `refactor.extract`, `source.organizeImports`, ...
+    pub kind: Option<String>,
+    /// The fix the server would apply without asking.
+    pub preferred: bool,
+    /// Why the action cannot be taken now, when the server lists it anyway.
+    pub disabled: Option<String>,
+    /// The changes, when the server sent them; `Manager::resolve_code_action`
+    /// asks for them otherwise.
+    pub edit: Option<WorkspaceEdit>,
+    /// The action (also) runs a server command: after its edit, when it
+    /// has one (`Manager::run_code_action_command`).
+    pub command: bool,
+    pub server: ServerId,
+    pub raw: Value,
+}
+
+/// What a rename at a place would replace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameTarget {
+    /// The symbol's range, when the server says; else the word there.
+    pub range: Option<Span>,
+    /// The name to start from, when the server suggests one.
+    pub placeholder: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

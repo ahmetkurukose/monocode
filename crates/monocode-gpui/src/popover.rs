@@ -553,6 +553,21 @@ fn glass(tint: Hsla, radius: f32) -> impl IntoElement {
     .absolute()
     .size_full()
 }
+thread_local! {
+    /// A browser page's picture was painted in this frame, under what floats.
+    static OVER_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Says whether a browser page's picture stands under the popovers painted
+/// from here on. The glass takes its darkness from the app behind it; a web
+/// page is as often white, and white text on blurred white cannot be read,
+/// so the surfaces are painted as the opaque card for as long as that lasts.
+pub(crate) fn set_over_page(over: bool) {
+    OVER_PAGE.with(|cell| cell.set(over));
+}
+/// Whether a browser page's picture stands under what is painted now.
+pub(crate) fn over_page() -> bool {
+    OVER_PAGE.with(std::cell::Cell::get)
+}
 /// The popover surface: `tint` over a backdrop blur, or the opaque card.
 pub(crate) fn paint_glass(
     bounds: Bounds<Pixels>,
@@ -562,7 +577,9 @@ pub(crate) fn paint_glass(
 ) {
     let opaque = crate::theme::floating_fill();
     let id = window.window_handle().window_id();
-    let light = crate::theme::is_light() || OPAQUE_GLASS.with(|ids| ids.borrow().contains(&id));
+    let light = crate::theme::is_light()
+        || over_page()
+        || OPAQUE_GLASS.with(|ids| ids.borrow().contains(&id));
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let quad = if light {
         gpui::fill(bounds, opaque)
@@ -783,6 +800,9 @@ pub(crate) enum MenuStyle {
     /// Browser mode's tab menus, as SOCode's and macOS's own: 24px rows of
     /// text without icons, the chosen one blue with white ink.
     Native,
+    /// The code editor's context menu: dense 26px rows, an icon column kept
+    /// even for rows without one so labels line up, shortcuts on the right.
+    Code,
 }
 impl MenuStyle {
     fn padding(self) -> f32 {
@@ -803,6 +823,7 @@ impl MenuStyle {
                 | Self::Filter
                 | Self::Recent
                 | Self::Native
+                | Self::Code
         )
     }
 }
@@ -1289,18 +1310,24 @@ impl Menu {
             MenuStyle::Composer | MenuStyle::Git => content(0.1),
             // The row turns blue as the pointer makes it the chosen one.
             MenuStyle::Native => gpui::transparent_black(),
+            MenuStyle::Code => content(0.08),
             _ => content(0.05),
         };
         let icon_size = self
             .row_metrics
             .map(|(_, size)| size)
             .unwrap_or_else(|| match style {
-                MenuStyle::Group | MenuStyle::Access | MenuStyle::Git | MenuStyle::Filter => 14.,
+                MenuStyle::Group
+                | MenuStyle::Access
+                | MenuStyle::Git
+                | MenuStyle::Filter
+                | MenuStyle::Code => 14.,
                 _ => 16.,
             });
         let icon_ink = action.icon_color.unwrap_or(match style {
             MenuStyle::Group | MenuStyle::Switcher => content(0.55),
             MenuStyle::Access => content(0.7),
+            MenuStyle::Code => content(0.65),
             _ => content(1.),
         });
         let has_submenu = !action.submenu.is_empty() || action.flyout.is_some();
@@ -1381,6 +1408,12 @@ impl Menu {
                     .h(px(24.))
                     .px(px(10.))
                     .line_height(px(16.)),
+                MenuStyle::Code => d
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(6.))
+                    .line_height(px(16.))
+                    .h(px(26.)),
                 MenuStyle::Composer | MenuStyle::Access => {
                     d.items_start().gap(px(10.)).rounded(px(8.)).py_2()
                 }
@@ -1409,6 +1442,13 @@ impl Menu {
             .when_some(action.image, |d, provider| {
                 d.child(provider_icon(provider, icon_size))
             })
+            .when(
+                style == MenuStyle::Code
+                    && action.icon.is_none()
+                    && action.icon_artwork.is_none()
+                    && action.image.is_none(),
+                |d| d.child(div().size(px(icon_size)).flex_shrink_0()),
+            )
             .child(self.row_text(action, style))
             .when_some(action.value.clone(), |d, value| {
                 d.child(match style {
@@ -1482,8 +1522,13 @@ impl Menu {
                     d.child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(content(0.4))
+                            .when(style == MenuStyle::Code, |d| d.pl_4())
+                            .text_size(px(if style == MenuStyle::Code { 12. } else { 11. }))
+                            .text_color(content(if action.disabled && style == MenuStyle::Code {
+                                0.2
+                            } else {
+                                0.4
+                            }))
                             .child(shortcut),
                     )
                 } else {
@@ -1676,8 +1721,8 @@ impl Render for Menu {
                     self.row(
                         sub,
                         item,
-                        if self.style == MenuStyle::Native {
-                            MenuStyle::Native
+                        if matches!(self.style, MenuStyle::Native | MenuStyle::Code) {
+                            self.style
                         } else {
                             MenuStyle::Explorer
                         },
@@ -1825,6 +1870,8 @@ fn separator(ix: usize, style: MenuStyle) -> AnyElement {
             } else if style == MenuStyle::Git {
                 // `mx-1 border-t border-content/10`.
                 d.mx_1().bg(content(0.1))
+            } else if style == MenuStyle::Code {
+                d.mx(px(10.)).bg(content(0.08))
             } else {
                 d.bg(content(0.1))
             }

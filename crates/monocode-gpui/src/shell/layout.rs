@@ -153,46 +153,14 @@ impl Shell {
             && !self.workspace.project_rail_open
             && self.settings.is_none()
     }
-    /// Switch navigation layouts without changing the new layout's frame style.
-    pub(super) fn toggle_layout(&mut self, cx: &mut Context<Self>) {
-        // Someone leaving the original layout before answering the new-layout
-        // notice has never picked a frame, so they land on the boxy default.
-        // Those who already went through it keep the frame they had.
-        if self.workspace.classic_layout && !self.workspace.new_layout_prompt_dismissed {
-            self.workspace.new_layout_boxy = true;
-            self.workspace.new_layout_prompt_dismissed = true;
-        }
-        self.workspace.classic_layout = !self.workspace.classic_layout;
-        self.project_resize = None;
-        self.layout_changed(cx);
-        self.sync_settings(cx);
-    }
-    /// Flip the Focused layout between its rounded card and boxy frame.
-    /// Classic has no frame choice, so the shortcut does nothing there.
-    pub(super) fn toggle_workspace_style(&mut self, cx: &mut Context<Self>) {
-        if self.workspace.classic_layout {
-            return;
-        }
-        self.workspace.new_layout_boxy = !self.workspace.new_layout_boxy;
-        self.layout_changed(cx);
-        self.sync_settings(cx);
-    }
+    /// Tests switch the layout fields directly, then apply them.
+    #[cfg(test)]
     pub(super) fn layout_changed(&mut self, cx: &mut Context<Self>) {
-        let classic = self.workspace.boxy_layout();
-        for search in self.search_views() {
-            search.update(cx, |v, cx| v.set_classic(classic, cx));
-        }
-        self.usage_footer
-            .update(cx, |footer, cx| footer.set_classic(classic, cx));
-        self.resources
-            .update(cx, |monitor, cx| monitor.set_classic(classic, cx));
+        self.usage_footer.update(cx, |footer, cx| {
+            footer.set_classic(self.workspace.boxy_layout(), cx)
+        });
         self.invalidate_chrome(cx);
         self.drop_peek();
-        if !self.workspace.classic_layout && !self.query.is_empty() {
-            self.query.clear();
-            self.classic_session_search
-                .update(cx, |input, cx| input.set_text(String::new(), cx));
-        }
         self.sync_right_panel(cx);
         self.fit_sidebar(cx);
         self.persist(cx);
@@ -417,7 +385,7 @@ impl Shell {
             .right_panel
             .clone()
             .filter(|_| right_shown && self.settings.is_none())
-            .map(|panel| self.right_panel_frame(panel, right_width, full, window, cx));
+            .map(|panel| self.right_panel_frame(panel, right_width, full, cx));
         let footer = (!self.classic_surface_open(cx)).then(|| self.footer_row(cx));
         // The strips along the top are the title bar: no row above them, and
         // the navigation floats over the sidebar's header as in the new layout.
@@ -649,17 +617,6 @@ impl Shell {
                 RightTab::Worktrees,
             ),
         ];
-        if self.terminal_in_panel(cx) {
-            tabs.insert(
-                1,
-                (
-                    "right-panel-terminal",
-                    "Terminal",
-                    "terminal",
-                    RightTab::Terminal,
-                ),
-            );
-        }
         // The tabs code features are showing follow the panel's own.
         if let Some(panel) = &self.right_panel {
             tabs.extend(panel.read(cx).extra_tabs());
@@ -823,7 +780,7 @@ impl Shell {
                 ),
             )
             .when_some(panel, |d, panel| {
-                d.child(self.right_panel_frame(panel, right_width, full, window, cx))
+                d.child(self.right_panel_frame(panel, right_width, full, cx))
             })
     }
     /// The usage chips with the terminal controls at the far end.
@@ -994,7 +951,8 @@ mod tests {
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        for boxy in [false, true] {
+        // Classic, the only layout, has the boxy frame's panel buttons.
+        for boxy in [true] {
             let selectors = if boxy {
                 ["right-panel-explorer", "right-panel-history"]
             } else {
@@ -1065,7 +1023,8 @@ mod tests {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (window, manager, mono, session) = mixed_window(cx);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        for classic in [false, true] {
+        // Classic is the only layout.
+        for classic in [true] {
             window
                 .update(visual, |shell, _, cx| {
                     shell.workspace.classic_layout = classic;
@@ -1136,33 +1095,22 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
-            if classic {
-                assert!(visual.debug_bounds("right-panel-frame").is_none());
-            } else {
-                // The session's group strips are the title bar, so the card
-                // rises to the window's top; the panel keeps its column.
-                let frame = visual.debug_bounds("right-panel-frame").unwrap();
-                assert_eq!(frame.left(), mono_bounds.left());
-                assert_eq!(frame.size.width, mono_bounds.size.width);
-                assert_eq!(frame.bottom(), mono_bounds.bottom());
-            }
+            // The tree's Classic layout keeps the panel's column for the
+            // session's tools.
+            let frame = visual.debug_bounds("right-panel-frame").unwrap();
+            assert_eq!(frame.left(), mono_bounds.left());
+            assert_eq!(frame.size.width, mono_bounds.size.width);
+            assert_eq!(frame.bottom(), mono_bounds.bottom());
             assert!(visual.debug_bounds("mono-overview-panel").is_none());
-            if !classic {
-                let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
-                visual.simulate_click(toggle.center(), Default::default());
-                visual.run_until_parked();
-            }
+            let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
+            visual.simulate_click(toggle.center(), Default::default());
+            visual.run_until_parked();
             window
                 .update(visual, |_, w, cx| {
                     manager.update(cx, |m, cx| m.open(&mono, w, cx))
                 })
                 .unwrap();
             visual.run_until_parked();
-            if classic {
-                let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
-                visual.simulate_click(toggle.center(), Default::default());
-                visual.run_until_parked();
-            }
             assert!(visual.debug_bounds("right-panel-frame").is_none());
             window
                 .update(visual, |shell, _, _| {

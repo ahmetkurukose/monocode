@@ -182,8 +182,6 @@ actions!(
         NewTerminal,
         NewBrowser,
         SplitTerminal,
-        ToggleLayout,
-        ToggleWorkspaceStyle,
         OpenSettings,
         GoToFile,
         OpenCommandPalette,
@@ -331,10 +329,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-shift-j"), SplitTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
         KeyBinding::new(&format!("{modifier}-alt-n"), NewBrowser, context),
-        // Switch between the original two-sidebar layout and the new layout.
-        KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
-        // Switch the Focused layout between its rounded and boxy workspace.
-        KeyBinding::new(&format!("{modifier}-alt-l"), ToggleWorkspaceStyle, context),
         KeyBinding::new(&format!("{modifier}-shift-d"), SplitDown, context),
         KeyBinding::new(&format!("{modifier}-="), ZoomIn, context),
         KeyBinding::new(&format!("{modifier}-+"), ZoomIn, context),
@@ -909,7 +903,7 @@ pub(crate) struct Shell {
     /// is at hand.
     pending_explorer_reveal: Option<String>,
     /// A file tab asked for its file's versions (folder, path).
-    pending_file_history: Option<(String, String)>,
+    pending_file_history: Option<(String, String, Option<crate::file_history::Request>)>,
     /// The open file history window.
     file_history: Option<(Entity<crate::file_history::FileHistoryDialog>, Subscription)>,
     /// Text and files on their way to a data source's console, handled on the
@@ -975,6 +969,10 @@ pub(crate) struct Shell {
     observations: Vec<Subscription>,
     /// Terminals whose shell ended, closed on the next frame.
     exited_terminals: Vec<gpui::EntityId>,
+    /// Tests that exercise the dock open new terminals there, not as title
+    /// bar tabs.
+    #[cfg(test)]
+    pub(crate) terminals_in_dock: bool,
     generation: Arc<AtomicU64>,
     latest_state: Arc<Mutex<String>>,
     pub(crate) render_passes: usize,
@@ -1229,7 +1227,8 @@ impl Shell {
             browse_overlay_opening: false,
             browse_page_popover: false,
             browse_live: Default::default(),
-            menu_rename_host: session_groups::RenameHost::Sidebar,
+            // The project tree lists the sessions; open_menu updates this.
+            menu_rename_host: session_groups::RenameHost::Rail,
             link_dialog: None,
             action_dialog: None,
             actions_anchor: AnchorSlot::default(),
@@ -1365,6 +1364,8 @@ impl Shell {
             viewport_width: 1200.,
             viewport_height: 800.,
             exited_terminals: Vec::new(),
+            #[cfg(test)]
+            terminals_in_dock: false,
             code: Default::default(),
             observations: vec![
                 git_observation,
@@ -1909,11 +1910,9 @@ impl Shell {
                 && self.settings.is_none())
             .then(|| self.classic_sidebar_tab.tool_tab())
             .flatten();
-            let terminal_tab = self.terminal_in_panel(cx);
             panel.update(cx, |p, cx| {
                 p.set_shown(shown, cx);
                 p.set_sidebar_tab(sidebar_tab, cx);
-                p.set_terminal_tab(terminal_tab, cx);
             });
         }
     }
@@ -2187,10 +2186,8 @@ impl Shell {
             self.workspace.right_panel_tabs.clone(),
         );
         let strip = self.workspace.right_panel_strip.clone();
-        let terminal_tab = self.terminal_in_panel(cx);
         let panel = cx.new(|cx| {
             let mut panel = RightPanel::new(git, tab, order, window, cx);
-            panel.set_terminal_tab(terminal_tab, cx);
             panel.set_strip(strip, cx);
             panel
         });
@@ -2227,7 +2224,7 @@ impl Shell {
             &explorer,
             window,
             |this, _, event: &crate::explorer::ShowFileHistory, window, cx| {
-                this.open_file_history(event.cwd.clone(), event.path.clone(), window, cx);
+                this.open_file_history(event.cwd.clone(), event.path.clone(), None, window, cx);
             },
         ));
         self.observations.push(cx.subscribe_in(
@@ -2330,9 +2327,6 @@ impl Shell {
                 match event {
                     PanelEvent::Tab(tab) => {
                         this.workspace.right_panel_tab = *tab;
-                        if *tab == crate::right_panel::RightTab::Terminal {
-                            this.ensure_panel_terminal(cx);
-                        }
                     }
                     PanelEvent::Reordered(order) => this.workspace.right_panel_tabs = order.clone(),
                     PanelEvent::Strip(strip) => this.workspace.right_panel_strip = strip.clone(),
@@ -2555,8 +2549,9 @@ impl Shell {
                         this.pending_explorer_reveal = Some(path.clone());
                         cx.notify();
                     }
-                    ReviewEvent::FileHistory { cwd, path } => {
-                        this.pending_file_history = Some((cwd.clone(), path.clone()));
+                    ReviewEvent::FileHistory { cwd, path, request } => {
+                        this.pending_file_history =
+                            Some((cwd.clone(), path.clone(), request.clone()));
                         cx.notify();
                     }
                     ReviewEvent::Comment(text) => {
@@ -2569,6 +2564,7 @@ impl Shell {
                         text,
                         first_line,
                         last_line,
+                        run,
                     } => {
                         this.pending_database_sends
                             .push(database_send::DbSend::Text {
@@ -2576,6 +2572,7 @@ impl Shell {
                                 source: source.clone(),
                                 text: text.clone(),
                                 lines: Some((*first_line, *last_line)),
+                                run: *run,
                             });
                         cx.notify();
                     }
@@ -3313,14 +3310,6 @@ impl Shell {
         self.dock_tab_scroll.scroll_to_item(added);
         let terminal = self.spawn_terminal(cwd, cx);
         self.terminals.entry(project).or_default().push(terminal);
-        if self.terminal_in_panel(cx) {
-            if let Some(dock) = self.workspace.docks.get_mut(&self.workspace.project) {
-                dock.open = false;
-            }
-            self.show_panel_terminal(window, cx);
-            self.persist(cx);
-            return;
-        }
         if !was_open {
             self.slide_dock(true, cx);
         }
@@ -3338,14 +3327,6 @@ impl Shell {
         }
         let project = self.workspace.project.clone();
         self.wake_project(&project, cx);
-        if self.terminal_in_panel(cx) {
-            if self.panel_terminal_shown(cx) {
-                self.set_right_panel_open(false, window, cx);
-            } else {
-                self.show_panel_terminal(window, cx);
-            }
-            return;
-        }
         let project = self.workspace.project.clone();
         let Some(dock) = self
             .workspace
@@ -3393,32 +3374,6 @@ impl Shell {
             let t = terminal.read(cx);
             (t.foreground.clone(), project_name(&t.cwd))
         };
-        // The panel's last terminal stays: closing it hides the panel, and
-        // stops whatever it was running.
-        if self.terminal_in_panel(cx) && self.terminals.get(&project).is_some_and(|t| t.len() == 1)
-        {
-            let Some(process) = process else {
-                self.set_right_panel_open(false, window, cx);
-                return;
-            };
-            let answer = window.prompt(
-                gpui::PromptLevel::Warning,
-                &format!("\"{process}\" is still running in {label}. Stop it and close the panel?"),
-                None,
-                &["Stop", "Cancel"],
-                cx,
-            );
-            cx.spawn_in(window, async move |this, cx| {
-                if matches!(answer.await, Ok(0)) {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        terminal.update(cx, |t, cx| t.stop_foreground(cx));
-                        this.set_right_panel_open(false, window, cx);
-                    });
-                }
-            })
-            .detach();
-            return;
-        }
         let Some(process) = process else {
             self.remove_terminal(&project, ix, window, cx);
             return;
@@ -3532,9 +3487,8 @@ impl Shell {
                 terminal.update(cx, |t, _| t.visible = shown);
             }
         }
-        // The right panel's Terminal tab hosts the shells instead, and a
-        // sleeping project has none until it wakes.
-        if self.terminal_in_panel(cx) || self.project_asleep(&project) {
+        // A sleeping project has no shells until it wakes.
+        if self.project_asleep(&project) {
             return body;
         }
         let Some(dock) = self.workspace.docks.get(&project).cloned() else {
@@ -4301,18 +4255,40 @@ impl Shell {
         &mut self,
         cwd: String,
         path: String,
+        request: Option<crate::file_history::Request>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.close_menu(cx);
         self.close_preview(cx);
-        let view = cx.new(|cx| crate::file_history::FileHistoryDialog::new(cwd, path, window, cx));
+        let view = cx.new(|cx| {
+            crate::file_history::FileHistoryDialog::with_request(cwd, path, request, window, cx)
+        });
         let events = cx.subscribe_in(
             &view,
             window,
-            |this, _, _: &crate::file_history::Event, window, cx| {
+            |this, _, event: &crate::file_history::Event, window, cx| {
                 this.file_history = None;
                 this.focus_workspace(window, cx);
+                if let crate::file_history::Event::OpenCommit {
+                    cwd,
+                    sha,
+                    short_sha,
+                    subject,
+                } = event
+                {
+                    this.open_review_tab(
+                        crate::review::ReviewTab::Commit {
+                            cwd: cwd.clone(),
+                            sha: sha.clone(),
+                            short_sha: short_sha.clone(),
+                            subject: subject.clone(),
+                        },
+                        OpenIn::PREVIEW,
+                        window,
+                        cx,
+                    );
+                }
                 cx.notify();
             },
         );
@@ -5098,7 +5074,6 @@ impl Shell {
         panel: Entity<RightPanel>,
         width: f32,
         full: f32,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content =
@@ -5115,10 +5090,6 @@ impl Shell {
                         .cached(StyleRefinement::default().size_full())
                         .into_any_element()
                 }
-            } else if self.terminal_in_panel(cx)
-                && panel.read(cx).tab() == crate::right_panel::RightTab::Terminal
-            {
-                self.panel_terminal(window, cx)
             } else {
                 panel
                     .cached(StyleRefinement::default().size_full())
@@ -5599,11 +5570,9 @@ impl Shell {
                 crate::right_panel::tabs_width(self.right_tab_count(cx)),
             )
     }
-    /// Explorer, History and Worktrees, and Terminal when it lives in the panel.
-    /// Changes opens from the diff stat instead.
+    /// Explorer, History and Worktrees. Changes opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        3 + usize::from(self.terminal_in_panel(cx))
-            + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
+        3 + (self.right_panel.as_ref()).map_or(0, |panel| panel.read(cx).extra_tabs().len())
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
     fn toggle_room(&self, cx: &App) -> f32 {
@@ -5708,7 +5677,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_preview(cx);
-        self.menu_rename_host = session_groups::RenameHost::Sidebar;
+        self.menu_rename_host = self.list_rename_host(cx);
         // Close the previous menu first, so the new one remembers the focus
         // that was there before either opened.
         self.menu = None;
@@ -7807,7 +7776,16 @@ impl Render for Shell {
         if !self.pending_database_sends.is_empty() {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
-                this.update(cx, |this, cx| this.flush_database_sends(window, cx));
+                this.update(cx, |this, cx| {
+                    this.flush_database_sends(window, cx);
+                    // A statement a file ran: show the console with its result.
+                    if let Some(view) = this.database.clone()
+                        && view.read(cx).has_run_to_show()
+                    {
+                        this.open_database(window, cx);
+                        view.update(cx, |view, cx| view.show_run(cx));
+                    }
+                });
             });
         }
         if !self.exited_terminals.is_empty() {
@@ -7836,8 +7814,8 @@ impl Render for Shell {
         if let Some(path) = self.pending_explorer_reveal.take() {
             self.show_in_explorer(&path, window, cx);
         }
-        if let Some((cwd, path)) = self.pending_file_history.take() {
-            self.open_file_history(cwd, path, window, cx);
+        if let Some((cwd, path, request)) = self.pending_file_history.take() {
+            self.open_file_history(cwd, path, request, window, cx);
         }
         if let Some(id) = self.pending_chat_reveal.take()
             && self.sessions.contains_key(&id)
@@ -8124,7 +8102,9 @@ impl Render for Shell {
                 monos.set_original_chrome(self.workspace.classic_layout, cx)
             });
             let details = monos.read(cx).details.clone();
-            let inset = if self.workspace.boxy_layout() && !self.workspace.classic_layout {
+            // The title-bar corner's overview tabs sit over the panel's top,
+            // in Classic too, so every Mono page starts below them.
+            let inset = if self.workspace.boxy_layout() {
                 TITLE_BAR_HEIGHT
             } else {
                 0.
@@ -8581,7 +8561,9 @@ impl Render for Shell {
                 this.toggle_primary_sidebar(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
-                if this.workspace.classic_layout {
+                // The tree's Classic layout shows the right panel, not the
+                // sessions column the list view's tools lived in.
+                if this.workspace.classic_layout && !this.project_rail_tree_on() {
                     this.toggle_sidebar(window, cx)
                 } else {
                     this.toggle_right_panel(window, cx)
@@ -8593,7 +8575,7 @@ impl Render for Shell {
                 }
                 this.close_app_search(window, cx);
                 this.ensure_right_panel(window, cx);
-                if this.workspace.classic_layout {
+                if this.workspace.classic_layout && !this.project_rail_tree_on() {
                     this.select_classic_sidebar_tab(
                         classic_sidebar::ClassicSidebarTab::Files,
                         window,
@@ -8638,12 +8620,6 @@ impl Render for Shell {
                     this.new_terminal(window, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleLayout, _, cx| this.toggle_layout(cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleWorkspaceStyle, _, cx| {
-                    this.toggle_workspace_style(cx)
-                }),
-            )
             .on_action(
                 cx.listener(|this, _: &SplitRight, _, cx| this.split_session(SplitDir::Right, cx)),
             )
@@ -8828,63 +8804,6 @@ mod tests {
             .unwrap();
     }
     #[gpui::test]
-    fn hovering_archive_preserves_history_and_does_not_select_the_row(cx: &mut TestAppContext) {
-        let (window, a, b) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&a].update(cx, |session, _| {
-                    session.summary.cwd = "/work/monocode".into();
-                    session.summary.has_messages = true;
-                });
-                shell.sessions[&b].update(cx, |session, _| session.summary.has_messages = true);
-                shell.invalidate_chrome(cx);
-            })
-            .unwrap();
-        cx.refresh().unwrap();
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        let row = visual.debug_bounds("sidebar-session-1").unwrap();
-        visual.simulate_mouse_move(row.center(), None, Default::default());
-        visual.run_until_parked();
-        visual.refresh().unwrap();
-        let archive = visual
-            .debug_bounds("archive-session-1")
-            .expect("hover reveals Archive");
-        visual.simulate_click(archive.center(), Default::default());
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, window, cx| {
-                assert_eq!(
-                    shell.workspace.active,
-                    Some(b),
-                    "the archive click must not select its row"
-                );
-                assert!(!shell.workspace.tabs.contains(&a));
-                assert!(shell.sessions[&a].read(cx).summary.archived);
-                assert!(!shell.sidebar_session_ids(cx).contains(&a));
-                assert!(
-                    !locked(&shell.store)
-                        .unwrap()
-                        .load(a)
-                        .unwrap()
-                        .rows
-                        .is_empty()
-                );
-                shell.run_menu(MenuTarget::SessionFilter, "archived", None, window, cx);
-                assert!(shell.sidebar_session_ids(cx).contains(&a));
-                shell.toggle_archive(a, cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        window
-            .update(visual, |shell, window, cx| {
-                assert!(!shell.sessions[&a].read(cx).summary.archived);
-                shell.run_menu(MenuTarget::SessionFilter, "clear", None, window, cx);
-                assert!(shell.sidebar_session_ids(cx).contains(&a));
-                assert_eq!(shell.workspace.active, Some(b));
-            })
-            .unwrap();
-    }
-    #[gpui::test]
     fn working_marks_animate_independently_and_completed_replies_clear_when_seen(
         cx: &mut TestAppContext,
     ) {
@@ -8975,94 +8894,6 @@ mod tests {
             .unwrap();
     }
 
-    #[gpui::test]
-    fn sidebar_rows_have_a_gap_and_preview_survives_crossing_into_the_card(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, a, b) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&a].update(cx, |session, _| {
-                    session.summary.cwd = "/work/monocode".into();
-                    session.summary.has_messages = true;
-                });
-                shell.sessions[&b].update(cx, |session, _| session.summary.has_messages = true);
-                shell.invalidate_chrome(cx);
-            })
-            .unwrap();
-        cx.refresh().unwrap();
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        let first = visual
-            .debug_bounds(Box::leak(format!("sidebar-session-{b}").into_boxed_str()))
-            .unwrap();
-        let second = visual
-            .debug_bounds(Box::leak(format!("sidebar-session-{a}").into_boxed_str()))
-            .unwrap();
-        assert_eq!(first.size.height, px(32.));
-        assert_eq!(
-            second.top() - first.bottom(),
-            px(1.),
-            "rows retain their 1px gap"
-        );
-        let move_to = |position, cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.simulate_mouse_move(position, cx)
-            })
-            .unwrap();
-            cx.run_until_parked();
-            cx.refresh().unwrap();
-        };
-        move_to(first.origin + gpui::point(px(20.), px(16.)), cx);
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(130));
-        cx.run_until_parked();
-        cx.refresh().unwrap();
-        let (first, surface) = window
-            .update(cx, |shell, _, _| {
-                let preview = shell
-                    .session_preview
-                    .as_ref()
-                    .expect("hover opens a preview");
-                assert_eq!(preview.id, b);
-                (
-                    preview.anchor.get().unwrap(),
-                    preview.surface.get().unwrap(),
-                )
-            })
-            .unwrap();
-        // The close timer lets the pointer cross the 8px gap into the preview.
-        move_to(
-            gpui::point(first.right() + px(4.), first.top() + px(16.)),
-            cx,
-        );
-        move_to(surface.center(), cx);
-        window
-            .update(cx, |shell, _, _| {
-                assert!(shell.session_preview.is_some());
-                assert!(
-                    shell.preview_close.is_none(),
-                    "entering the card cancels the close timer"
-                );
-            })
-            .unwrap();
-        move_to(second.origin + gpui::point(px(20.), px(16.)), cx);
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(130));
-        cx.run_until_parked();
-        cx.refresh().unwrap();
-        window
-            .update(cx, |shell, window, cx| {
-                let preview = shell.session_preview.as_ref().unwrap();
-                assert_eq!(preview.id, a, "another row replaces the old preview");
-                assert_eq!(preview.anchor.get().unwrap().top() - first.bottom(), px(1.));
-                shell.open(a, window, cx);
-                assert!(
-                    shell.session_preview.is_none(),
-                    "selection dismisses the card"
-                );
-            })
-            .unwrap();
-    }
     #[gpui::test]
     fn high_usage_chip_opens_running_work_and_escape_closes_it(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
@@ -10004,12 +9835,16 @@ mod tests {
         } else {
             "ctrl"
         };
-        for visible in [false, true, false, true] {
+        // In Classic the shortcut shows and hides the project rail.
+        let open = window
+            .update(cx, |shell, _, _| shell.workspace.project_rail_open)
+            .unwrap();
+        for open in [!open, open, !open, open] {
             cx.simulate_keystrokes(window.into(), &format!("{m}-b"));
             cx.run_until_parked();
             window
                 .update(cx, |shell, _, _| {
-                    assert_eq!(shell.workspace.sidebar_visible, visible)
+                    assert_eq!(shell.workspace.project_rail_open, open)
                 })
                 .unwrap();
         }
@@ -10051,35 +9886,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn layout_shortcut_toggles_from_the_focused_composer(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        cx.update(|cx| {
-            cx.set_reduce_motion(true);
-            bind_keys(cx);
-            crate::input::bind(cx);
-        });
-        window
-            .update(cx, |shell, w, cx| shell.focus_active(w, cx))
-            .unwrap();
-        cx.refresh().unwrap();
-        let m = if cfg!(target_os = "macos") {
-            "cmd"
-        } else {
-            "ctrl"
-        };
-        for classic in [true, false] {
-            cx.simulate_keystrokes(window.into(), &format!("{m}-shift-l"));
-            cx.run_until_parked();
-            window
-                .update(cx, |shell, _, _| {
-                    assert_eq!(shell.workspace.classic_layout, classic);
-                    assert!(!shell.workspace.right_panel_open);
-                })
-                .unwrap();
-        }
-    }
-
-    #[gpui::test]
     fn title_tabs_draw_their_own_session_marks(cx: &mut TestAppContext) {
         let (window, a, _) = window(cx);
         window
@@ -10103,81 +9909,6 @@ mod tests {
             })
             .unwrap();
     }
-    #[gpui::test]
-    fn switching_layout_with_working_session_marks_keeps_cached_paint_valid(
-        cx: &mut TestAppContext,
-    ) {
-        use std::time::Duration;
-        let (window, a, b) = window(cx);
-        cx.update(|cx| {
-            bind_keys(cx);
-            crate::input::bind(cx);
-        });
-        window
-            .update(cx, |shell, w, cx| {
-                for id in [a, b] {
-                    shell.sessions[&id].update(cx, |session, cx| {
-                        session.summary.cwd = "/work/monocode".into();
-                        session.summary.has_messages = true;
-                        cx.emit(SessionChanged);
-                    });
-                }
-                shell.sessions[&a].update(cx, |session, cx| {
-                    session.busy = true;
-                    cx.emit(SessionChanged);
-                });
-                shell.focus_active(w, cx);
-                shell.toggle_right_panel(w, cx);
-                for _ in 0..30 {
-                    shell.workspace.tabs.extend([a, b]);
-                }
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, w, cx| {
-                w.simulate_next_frame(cx);
-                w.draw(cx).clear(cx);
-            })
-            .unwrap();
-        };
-        draw(cx);
-        // Reusing the sidebar after an earlier sibling shrinks relocates its
-        // text cache. A subsequent uncached slide must not replay old indices.
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.tabs.truncate(2);
-                cx.notify();
-            })
-            .unwrap();
-        draw(cx);
-        window
-            .update(cx, |shell, w, cx| shell.toggle_sidebar(w, cx))
-            .unwrap();
-        draw(cx);
-        for step in 0..20 {
-            for _ in 0..5 {
-                cx.executor().advance_clock(Duration::from_millis(20));
-                cx.run_until_parked();
-                cx.update_window(window.into(), |_, w, cx| {
-                    w.simulate_next_frame(cx);
-                    w.draw(cx).clear(cx);
-                })
-                .unwrap();
-            }
-            window
-                .update(cx, |shell, w, cx| {
-                    if step % 3 == 0 {
-                        shell.toggle_sidebar(w, cx);
-                    }
-                    shell.toggle_layout(cx);
-                })
-                .unwrap();
-            cx.run_until_parked();
-        }
-    }
 
     #[gpui::test]
     fn titlebar_panel_buttons_keep_window_bounds_for_single_and_double_clicks(
@@ -10198,7 +9929,7 @@ mod tests {
                 let before = window
                     .update(cx, |shell, _, _| {
                         (
-                            shell.workspace.sidebar_visible,
+                            shell.workspace.project_rail_open,
                             shell.workspace.right_panel_open,
                         )
                     })
@@ -10221,7 +9952,7 @@ mod tests {
                     .update(cx, |shell, w, _| {
                         assert_eq!(w.window_bounds(), original);
                         if selector == "toggle-sidebar" {
-                            assert_eq!(shell.workspace.sidebar_visible, !before.0);
+                            assert_eq!(shell.workspace.project_rail_open, !before.0);
                         } else {
                             assert_eq!(shell.workspace.right_panel_open, !before.1);
                         }
@@ -10254,59 +9985,11 @@ mod tests {
             .unwrap();
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         cx.run_until_parked();
-        for width in [
-            crate::right_panel::WIDTH_MIN,
-            420.,
-            crate::right_panel::WIDTH_DEFAULT,
-        ] {
-            window
-                .update(cx, |shell, _, cx| {
-                    shell.workspace.right_panel_width = width;
-                    cx.notify();
-                })
-                .unwrap();
-            cx.run_until_parked();
-            assert_eq!(
-                cx.debug_bounds("project-tabs-separator").unwrap().left(),
-                cx.debug_bounds("right-panel-frame").unwrap().left(),
-                "the title-bar rule follows the panel's divider"
-            );
-        }
-        let handle = cx.debug_bounds("titlebar-right-panel-resize").unwrap();
-        let start = handle.center();
-        let end = start - gpui::point(px(40.), px(0.));
-        cx.simulate_event(MouseDownEvent {
-            position: start,
-            button: MouseButton::Left,
-            click_count: 1,
-            first_mouse: false,
-            modifiers: Default::default(),
-        });
-        cx.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
-        cx.simulate_event(gpui::MouseUpEvent {
-            position: end,
-            button: MouseButton::Left,
-            click_count: 1,
-            modifiers: Default::default(),
-        });
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| {
-                assert_eq!(
-                    shell.workspace.right_panel_width,
-                    crate::right_panel::WIDTH_DEFAULT + 40.
-                );
-                assert!(shell.right_resize.is_none());
-            })
-            .unwrap();
-        assert_eq!(
-            cx.debug_bounds("project-tabs-separator").unwrap().left(),
-            cx.debug_bounds("right-panel-frame").unwrap().left()
-        );
+        // Classic's boxy frame shows the panel's tabs as corner buttons.
         for (selector, header) in [
-            ("right-panel-tab-History", "history-toolbar"),
+            ("right-panel-history", "history-toolbar"),
             ("project-diff-stat", "changes-header"),
-            ("right-panel-tab-Explorer", "explorer-header"),
+            ("right-panel-explorer", "explorer-header"),
         ] {
             let tab = cx.debug_bounds(selector).unwrap();
             cx.simulate_click(tab.center(), Default::default());
@@ -10317,18 +10000,6 @@ mod tests {
                 cx.debug_bounds("title-tab-strip").unwrap().bottom(),
                 "tool headers start where the panes' bodies do"
             );
-            window
-                .update(cx, |shell, w, cx| {
-                    assert!(
-                        shell
-                            .right_panel
-                            .as_ref()
-                            .unwrap()
-                            .focus_handle(cx)
-                            .contains_focused(w, cx)
-                    );
-                })
-                .unwrap();
         }
         cx.update(|_, cx| cx.set_reduce_motion(false));
         let m = if cfg!(target_os = "macos") {
@@ -10348,557 +10019,6 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    fn sidebar_toggle_holds_still_and_history_follows_the_sidebar(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        let width = window
-            .update(cx, |shell, _, _| {
-                assert!(shell.workspace.sidebar_visible);
-                shell.workspace.sidebar_width
-            })
-            .unwrap();
-        let open_toggle = cx.debug_bounds("toggle-sidebar").unwrap();
-        let open_forward = cx.debug_bounds("visit-forward").unwrap();
-        window
-            .update(cx, |shell, window, cx| shell.toggle_sidebar(window, cx))
-            .unwrap();
-        cx.run_until_parked();
-        let closed_toggle = cx.debug_bounds("toggle-sidebar").unwrap();
-        let closed_back = cx.debug_bounds("visit-back").unwrap();
-        let closed_forward = cx.debug_bounds("visit-forward").unwrap();
-        // The toggle sits just past the traffic lights either way.
-        assert_eq!(open_toggle.origin, closed_toggle.origin);
-        assert_eq!(open_toggle.left(), px(TRAFFIC_LIGHTS));
-        // Open, history rides the sidebar's edge, inside its `pr-1.5`.
-        assert_eq!(open_forward.right(), px(width - 6.));
-        // Closed, it follows the toggle directly.
-        assert_eq!(closed_back.left(), closed_toggle.right());
-        assert_eq!(closed_forward.right(), px(TRAFFIC_LIGHTS + 72.));
-        // Fullscreen hides the native buttons, and the toggle takes their room.
-        window
-            .update(cx, |_, window, _| window.toggle_fullscreen())
-            .unwrap();
-        cx.run_until_parked();
-        window.update(cx, |_, window, _| window.refresh()).unwrap();
-        cx.run_until_parked();
-        assert_eq!(
-            cx.debug_bounds("toggle-sidebar").unwrap().left(),
-            px(NO_TRAFFIC_LIGHTS)
-        );
-        assert_eq!(
-            cx.debug_bounds("visit-forward").unwrap().right(),
-            px(NO_TRAFFIC_LIGHTS + 72.)
-        );
-    }
-    #[gpui::test]
-    fn collapsed_sidebar_peeks_from_the_edge_and_the_toggle(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, window, cx| shell.toggle_sidebar(window, cx))
-            .unwrap();
-        cx.run_until_parked();
-        let width = window
-            .update(cx, |shell, _, _| shell.workspace.sidebar_width)
-            .unwrap();
-        let open = |cx: &mut gpui::VisualTestContext| {
-            window.update(cx, |shell, _, _| shell.peek_open()).unwrap()
-        };
-        assert!(cx.debug_bounds("sidebar-peek").is_none());
-        // The window's left edge peeks it out, below the title bar.
-        cx.simulate_mouse_move(gpui::point(px(2.), px(20.)), None, Default::default());
-        assert!(!open(cx));
-        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
-        cx.run_until_parked();
-        assert!(open(cx));
-        let panel = cx.debug_bounds("sidebar-peek").unwrap();
-        assert_eq!(panel.left(), px(6.));
-        assert_eq!(panel.top(), px(TITLE_BAR_HEIGHT));
-        assert_eq!(panel.size.width, px(width));
-        // Crossing onto the panel keeps it out; leaving it puts it away after
-        // a grace period.
-        cx.simulate_mouse_move(gpui::point(px(100.), px(300.)), None, Default::default());
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(500));
-        cx.run_until_parked();
-        assert!(open(cx));
-        cx.simulate_mouse_move(
-            gpui::point(px(width + 200.), px(300.)),
-            None,
-            Default::default(),
-        );
-        cx.run_until_parked();
-        assert!(open(cx));
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(200));
-        cx.run_until_parked();
-        assert!(!open(cx));
-        assert!(cx.debug_bounds("sidebar-peek").is_none());
-        // Hovering the toggle peeks it too, and a click elsewhere dismisses it.
-        let toggle = cx.debug_bounds("toggle-sidebar").unwrap();
-        cx.simulate_mouse_move(toggle.center(), None, Default::default());
-        cx.run_until_parked();
-        assert!(open(cx));
-        cx.simulate_click(gpui::point(px(width + 200.), px(300.)), Default::default());
-        cx.run_until_parked();
-        assert!(!open(cx));
-        // Docking the sidebar drops the peek, and an open sidebar never peeks.
-        cx.simulate_mouse_move(toggle.center(), None, Default::default());
-        cx.run_until_parked();
-        assert!(open(cx));
-        cx.simulate_click(toggle.center(), Default::default());
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| {
-                assert!(shell.workspace.sidebar_visible);
-                assert!(shell.sidebar_peek.is_none());
-            })
-            .unwrap();
-        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
-        cx.run_until_parked();
-        assert!(!open(cx));
-    }
-    #[gpui::test]
-    fn boxy_collapsed_sidebar_peeks_too(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, window, cx| {
-                shell.workspace.new_layout_boxy = true;
-                shell.layout_changed(cx);
-                shell.toggle_sidebar(window, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let open = |cx: &mut gpui::VisualTestContext| {
-            window.update(cx, |shell, _, _| shell.peek_open()).unwrap()
-        };
-        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
-        cx.run_until_parked();
-        assert!(open(cx));
-        assert!(cx.debug_bounds("sidebar-peek").is_some());
-        // The classic layout never peeks.
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.layout_changed(cx);
-            })
-            .unwrap();
-        cx.simulate_mouse_move(gpui::point(px(300.), px(300.)), None, Default::default());
-        cx.simulate_mouse_move(gpui::point(px(2.), px(300.)), None, Default::default());
-        cx.run_until_parked();
-        assert!(!open(cx));
-    }
-    #[gpui::test]
-    fn original_sidebar_geometry_matches_tauri_chrome(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, _) = window(cx);
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_resize(gpui::size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.project_rail_open = true;
-                shell.classic_sidebar_tab = classic_sidebar::ClassicSidebarTab::Sessions;
-                shell.layout_changed(cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-
-        let projects = visual.debug_bounds("project-rail-frame").unwrap();
-        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
-        let header = visual.debug_bounds("classic-workspace-header").unwrap();
-        let tabs = visual.debug_bounds("classic-workspace-tabs").unwrap();
-        let search = visual.debug_bounds("classic-conversation-search").unwrap();
-        assert_eq!(projects.size.width, px(220.));
-        assert_eq!(sidebar.size.width, px(260.));
-        assert_eq!(projects.top(), px(0.));
-        assert_eq!(sidebar.top(), px(0.));
-        assert_eq!(sidebar.left(), projects.right());
-        assert_eq!(header.top(), sidebar.top());
-        assert_eq!(header.size.height, px(40.));
-        assert_eq!(tabs.top(), header.bottom());
-        assert_eq!(tabs.size.height, px(36.));
-        assert_eq!(search.top(), tabs.bottom());
-        assert_eq!(search.size.height, px(36.));
-        assert_eq!(
-            visual.debug_bounds("sidebar-sessions").unwrap().top(),
-            search.bottom()
-        );
-        assert_eq!(
-            visual.debug_bounds("main-pane-frame").unwrap().left(),
-            sidebar.right()
-        );
-
-        let back = visual.debug_bounds("visit-back").unwrap();
-        let forward = visual.debug_bounds("visit-forward").unwrap();
-        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
-        assert_eq!(back.right(), forward.left());
-        assert_eq!(toggle.left(), px(TRAFFIC_LIGHTS));
-        assert!(toggle.right() <= back.left());
-        assert_eq!(forward.right(), projects.right() - px(6.));
-        assert_eq!(toggle.center().y, header.center().y);
-        assert!(visual.debug_bounds("sidebar-project-button").is_none());
-    }
-
-    #[gpui::test]
-    fn original_sidebar_tools_replace_sessions_in_the_left_column(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, _) = window(cx);
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_resize(gpui::size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.project_rail_open = true;
-                shell.layout_changed(cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
-        let tabs = visual.debug_bounds("classic-workspace-tabs").unwrap();
-
-        for (id, selector) in [("files", "explorer-header"), ("changes", "changes-header")] {
-            let tab = visual
-                .debug_bounds(if id == "files" {
-                    "classic-workspace-tab-files"
-                } else {
-                    "classic-workspace-tab-changes"
-                })
-                .unwrap();
-            visual.simulate_click(tab.center(), Default::default());
-            visual.run_until_parked();
-            let tool = visual.debug_bounds(selector).unwrap();
-            assert_eq!(tool.top(), tabs.bottom());
-            assert_eq!(tool.left(), sidebar.left());
-            assert!(tool.right() <= sidebar.right());
-            assert!(visual.debug_bounds("right-panel-frame").is_none());
-            assert!(visual.debug_bounds("classic-conversation-search").is_none());
-            window
-                .update(visual, |shell, _, _| {
-                    assert_eq!(shell.classic_sidebar_tab.id(), id);
-                    assert_eq!(
-                        shell
-                            .workspace
-                            .classic_sidebar_tabs
-                            .get(&shell.workspace.project)
-                            .map(String::as_str),
-                        Some(id)
-                    );
-                })
-                .unwrap();
-        }
-        let sessions = visual
-            .debug_bounds("classic-workspace-tab-sessions")
-            .unwrap();
-        visual.simulate_click(sessions.center(), Default::default());
-        visual.run_until_parked();
-        assert!(visual.debug_bounds("classic-conversation-search").is_some());
-        assert!(visual.debug_bounds("explorer-header").is_none());
-        assert!(visual.debug_bounds("changes-header").is_none());
-    }
-
-    #[gpui::test]
-    fn original_sidebar_compact_rail_uses_vertical_workspace_tabs(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, _) = window(cx);
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_resize(gpui::size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.project_rail_open = true;
-                shell.layout_changed(cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
-        visual.simulate_click(toggle.center(), Default::default());
-        visual.run_until_parked();
-
-        let projects = visual.debug_bounds("project-rail-frame").unwrap();
-        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
-        let header = visual.debug_bounds("classic-workspace-header").unwrap();
-        assert_eq!(projects.size.width, px(48.));
-        assert_eq!(sidebar.left(), projects.right());
-        assert_eq!(sidebar.size.width, px(260.));
-        assert!(visual.debug_bounds("classic-workspace-tabs").is_none());
-        assert!(visual.debug_bounds("rail-workspace-sessions").is_some());
-        assert!(visual.debug_bounds("rail-workspace-files").is_some());
-        assert!(visual.debug_bounds("rail-workspace-changes").is_some());
-        assert_eq!(
-            visual
-                .debug_bounds("classic-conversation-search")
-                .unwrap()
-                .top(),
-            header.bottom()
-        );
-        #[cfg(target_os = "macos")]
-        {
-            let strip = visual.debug_bounds("title-tab-strip").unwrap();
-            assert_eq!(strip.top(), px(0.));
-            assert_eq!(strip.size.height, px(40.));
-            assert_eq!(projects.top(), px(40.));
-            assert_eq!(header.top(), px(40.));
-        }
-
-        let expand = visual.debug_bounds("toggle-sidebar").unwrap();
-        assert_eq!(expand.origin, toggle.origin);
-        assert!(visual.debug_bounds("rail-expand-projects").is_none());
-        assert_eq!(
-            visual.debug_bounds("visit-back").unwrap().left(),
-            expand.right(),
-            "collapsed history follows the toggle, independent of the sessions sidebar"
-        );
-        assert_eq!(
-            visual.debug_bounds("visit-forward").unwrap().right(),
-            px(TRAFFIC_LIGHTS + 72.)
-        );
-        visual.simulate_click(expand.center(), Default::default());
-        visual.run_until_parked();
-        assert_eq!(
-            visual
-                .debug_bounds("project-rail-frame")
-                .unwrap()
-                .size
-                .width,
-            px(220.)
-        );
-        assert!(visual.debug_bounds("classic-workspace-tabs").is_some());
-    }
-
-    #[gpui::test]
-    fn original_sidebar_workspace_tabs_reorder_and_persist(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
-        let (window, _, _) = window(cx);
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_resize(gpui::size(px(1500.), px(900.)));
-        window
-            .update(visual, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.project_rail_open = true;
-                shell.layout_changed(cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        let sessions = visual
-            .debug_bounds("classic-workspace-tab-sessions")
-            .unwrap();
-        let changes = visual
-            .debug_bounds("classic-workspace-tab-changes")
-            .unwrap();
-        visual.simulate_mouse_down(sessions.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_move(changes.center(), MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(changes.center(), MouseButton::Left, Default::default());
-        visual.run_until_parked();
-        let files = visual.debug_bounds("classic-workspace-tab-files").unwrap();
-        let changes = visual
-            .debug_bounds("classic-workspace-tab-changes")
-            .unwrap();
-        let sessions = visual
-            .debug_bounds("classic-workspace-tab-sessions")
-            .unwrap();
-        assert!(files.left() < changes.left() && changes.left() < sessions.left());
-        window
-            .update(visual, |shell, _, _| {
-                assert_eq!(
-                    shell.workspace.classic_sidebar_tab_order,
-                    ["files", "changes", "sessions"]
-                );
-                assert_eq!(
-                    shell.classic_sidebar_tab,
-                    classic_sidebar::ClassicSidebarTab::Sessions
-                );
-                let saved = shell.latest_state.lock().unwrap().clone();
-                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
-                assert_eq!(
-                    restored.classic_sidebar_tab_order,
-                    ["files", "changes", "sessions"]
-                );
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn new_boxy_layout_runs_the_sidebar_and_workspace_full_height(cx: &mut TestAppContext) {
-        crate::theme::configure(&crate::settings::Preferences::default(), false);
-        let (window, _, _) = window(cx);
-        let frames = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, w, cx| {
-                w.simulate_next_frame(cx);
-                w.draw(cx).clear(cx);
-            })
-            .unwrap();
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            window
-                .update(cx, |_, w, _| {
-                    let (blur, radius) = (24., 11.);
-                    let marker = gpui::backdrop_blur_marker(blur * w.scale_factor());
-                    assert!(
-                        w.painted_quads().iter().any(|q| q.border_color == marker
-                            && q.corner_radii.top_left.0 == radius * w.scale_factor()),
-                        "composer frosting keeps the same blur and radius in both layouts"
-                    );
-                })
-                .unwrap();
-            let shown = window
-                .read_with(cx, |shell, _| {
-                    let active = shell.workspace.active.unwrap();
-                    shell.workspace.visible_of(active).unwrap()
-                })
-                .unwrap();
-            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-            let strip = visual.debug_bounds("title-tab-strip").unwrap();
-            // The strip's own controls end where the corner's room begins.
-            let more = visual
-                .debug_bounds(Box::leak(format!("group-more-{shown}").into_boxed_str()))
-                .unwrap();
-            (
-                visual.debug_bounds("sidebar-frame"),
-                visual.debug_bounds("main-pane-frame").unwrap(),
-                Bounds::from_corners(strip.origin, gpui::point(more.right(), strip.bottom())),
-            )
-        };
-        let (sidebar, main, tabs) = frames(cx);
-        let sidebar = sidebar.unwrap();
-        // Inset: no title row. The sidebar's header sits under the
-        // navigation, and the card's top strip is the title bar.
-        assert_eq!(sidebar.top(), px(0.));
-        assert_eq!(main.top(), px(0.));
-        assert_eq!(tabs.top(), px(group_strip::CARD_TOP_GAP + 1.));
-        assert_eq!(tabs.bottom(), px(TITLE_BAR_HEIGHT));
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.new_layout_boxy = true;
-                shell.layout_changed(cx)
-            })
-            .unwrap();
-        let (sidebar, main, tabs) = frames(cx);
-        let sidebar = sidebar.unwrap();
-        assert_eq!(sidebar.top(), px(0.));
-        assert_eq!(main.top(), px(0.));
-        assert_eq!(main.left(), sidebar.right());
-        // The strip lives in the workspace column, beside the sidebar.
-        assert!(tabs.left() >= main.left());
-        // The right panel toggle holds the window's corner, and the strip
-        // runs up to it.
-        let corner = |cx: &mut TestAppContext| {
-            gpui::VisualTestContext::from_window(window.into(), cx)
-                .debug_bounds("toggle-right-panel")
-                .unwrap()
-        };
-        let closed_corner = corner(cx);
-        assert_eq!(closed_corner.top(), px(TITLE_BAR_HEIGHT / 2. - 12.));
-        assert!(tabs.right() <= closed_corner.left());
-        window
-            .update(cx, |shell, w, cx| {
-                cx.set_reduce_motion(true);
-                shell.toggle_right_panel(w, cx);
-            })
-            .unwrap();
-        let (_, main_open, _) = frames(cx);
-        assert_eq!(corner(cx), closed_corner);
-        assert!(main_open.right() < main.right());
-        // Open, the tools start at the panel's left edge as it is resized;
-        // the toggle stays at the window's right edge.
-        for width in [
-            crate::right_panel::WIDTH_MIN,
-            420.,
-            crate::right_panel::WIDTH_MAX,
-        ] {
-            window
-                .update(cx, |shell, _, cx| {
-                    shell.workspace.right_panel_width = width;
-                    cx.notify();
-                })
-                .unwrap();
-            let (_, main, tabs) = frames(cx);
-            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-            let explorer = visual.debug_bounds("right-panel-explorer").unwrap();
-            assert!(visual.debug_bounds("right-panel-changes").is_none());
-            let history = visual.debug_bounds("right-panel-history").unwrap();
-            assert_eq!(explorer.left(), main.right() + px(6.));
-            assert_eq!(explorer.center().y, closed_corner.center().y);
-            assert_eq!(history.top(), explorer.top());
-            assert!(explorer.right() <= history.left());
-            assert!(history.right() <= closed_corner.left());
-            assert!(tabs.right() <= explorer.left());
-            assert_eq!(corner(cx), closed_corner);
-        }
-        let history = gpui::VisualTestContext::from_window(window.into(), cx)
-            .debug_bounds("right-panel-history")
-            .expect("the panel's pane buttons show beside the toggle");
-        assert!(history.right() <= closed_corner.left());
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        visual.simulate_click(history.center(), Default::default());
-        visual.run_until_parked();
-        window
-            .update(cx, |shell, _, cx| {
-                let panel = shell.right_panel.clone().unwrap();
-                assert_eq!(panel.read(cx).tab(), crate::right_panel::RightTab::Graph);
-                assert_eq!(
-                    shell.workspace.right_panel_tab,
-                    crate::right_panel::RightTab::Graph
-                );
-            })
-            .unwrap();
-        window
-            .update(cx, |shell, w, cx| {
-                shell.toggle_right_panel(w, cx);
-                cx.set_reduce_motion(false);
-            })
-            .unwrap();
-        frames(cx);
-        assert!(
-            gpui::VisualTestContext::from_window(window.into(), cx)
-                .debug_bounds("right-panel-history")
-                .is_none(),
-            "closed, the corner holds only the toggle"
-        );
-        // The visit arrows stay at the open sidebar's edge, not in the strip.
-        let forward = gpui::VisualTestContext::from_window(window.into(), cx)
-            .debug_bounds("visit-forward")
-            .unwrap();
-        assert!(forward.right() <= sidebar.right());
-        assert!(forward.right() > sidebar.right() - px(16.));
-        // The sidebar toggle holds still as the sidebar closes and reopens.
-        let toggle = |cx: &mut TestAppContext| {
-            gpui::VisualTestContext::from_window(window.into(), cx)
-                .debug_bounds("toggle-sidebar")
-                .unwrap()
-        };
-        let open = toggle(cx);
-        cx.update(|cx| cx.set_reduce_motion(true));
-        for visible in [false, true] {
-            window
-                .update(cx, |shell, w, cx| {
-                    shell.toggle_sidebar(w, cx);
-                    assert_eq!(shell.workspace.sidebar_visible, visible);
-                })
-                .unwrap();
-            let (_, main, _) = frames(cx);
-            assert_eq!(main.left() == px(0.), !visible);
-            assert_eq!(toggle(cx), open);
-        }
-        cx.update(|cx| cx.set_reduce_motion(false));
-        window
-            .update(cx, |shell, _, cx| {
-                assert!(shell.workspace.new_layout_boxy);
-                let saved = serde_json::to_string(&shell.workspace).unwrap();
-                assert!(Workspace::restore(Some(&saved), &[], "/work/monocode").new_layout_boxy);
-                shell.workspace.new_layout_boxy = !shell.workspace.new_layout_boxy;
-                shell.layout_changed(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-            })
-            .unwrap();
-    }
     #[gpui::test]
     fn toggling_the_sidebar_after_its_cached_frames_does_not_replay_stale_paint(
         cx: &mut TestAppContext,
@@ -10937,168 +10057,6 @@ mod tests {
             .unwrap();
         draw(cx);
         draw(cx);
-    }
-    #[gpui::test]
-    fn main_pane_covers_a_fixed_sidebar_with_a_clipped_fade(cx: &mut TestAppContext) {
-        use std::time::Duration;
-        let (window, _, active) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&active].update(cx, |session, _| {
-                    session.summary.has_messages = true;
-                });
-                shell.invalidate_chrome(cx);
-                cx.notify();
-            })
-            .unwrap();
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_next_frame(cx);
-            w.draw(cx).clear(cx);
-        })
-        .unwrap();
-        let row = window
-            .update(cx, |shell, w, _| {
-                w.painted_quads()
-                    .into_iter()
-                    .find(|q| {
-                        q.background == content(0.1).into()
-                            && q.bounds.size.height.0 == 32. * w.scale_factor()
-                            && q.bounds.size.width.0
-                                > shell.workspace.sidebar_width / 2. * w.scale_factor()
-                            && q.bounds.right().0 < shell.workspace.sidebar_width * w.scale_factor()
-                    })
-                    .expect("selected session has a painted background")
-                    .bounds
-            })
-            .unwrap();
-        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        let toggle = visual.debug_bounds("toggle-sidebar").unwrap();
-        for visible in [false, true] {
-            window
-                .update(visual, |shell, w, cx| {
-                    shell.toggle_sidebar(w, cx);
-                    assert_eq!(shell.workspace.sidebar_visible, visible);
-                })
-                .unwrap();
-            let mut previous = if visible { 0. } else { 1. };
-            for ms in [30, 65, 110, 170] {
-                window
-                    .update(visual, |shell, _, cx| {
-                        shell
-                            .sidebar_slide
-                            .as_ref()
-                            .unwrap()
-                            .freeze_elapsed(Duration::from_millis(ms));
-                        cx.notify();
-                    })
-                    .unwrap();
-                visual
-                    .update_window(window.into(), |_, w, cx| {
-                        w.simulate_next_frame(cx);
-                        w.draw(cx).clear(cx);
-                    })
-                    .unwrap();
-                let clip = visual.debug_bounds("sidebar-frame").unwrap();
-                let content = visual.debug_bounds("sidebar-content").unwrap();
-                let main = visual.debug_bounds("main-pane-frame").unwrap();
-                assert_eq!(
-                    visual.debug_bounds("toggle-sidebar").unwrap().origin,
-                    toggle.origin
-                );
-                assert_eq!(content.left(), px(0.));
-                assert!((clip.right() - main.left()).abs() < px(1.));
-                window
-                    .update(visual, |shell, w, _| {
-                        let fraction = shell.sidebar_fraction;
-                        assert!(if visible {
-                            fraction > previous
-                        } else {
-                            fraction < previous
-                        });
-                        previous = fraction;
-                        assert_eq!(content.size.width, px(shell.workspace.sidebar_width));
-                        let quad = w.painted_quads().into_iter().find(|q| q.bounds == row);
-                        if clip.right().as_f32() * w.scale_factor() <= row.left().0 {
-                            assert!(quad.is_none(), "fully covered rows are culled");
-                            return;
-                        }
-                        let quad = quad.expect("exposed sidebar row paints at its full size");
-                        let alpha = quad.background.as_solid().unwrap().a;
-                        assert!(
-                            (alpha - 0.1 * fraction).abs() < 0.0001,
-                            "painted alpha {alpha} follows {fraction}"
-                        );
-                        assert!(
-                            (quad.content_mask.bounds.right().0
-                                - main.left().as_f32() * w.scale_factor())
-                            .abs()
-                                < w.scale_factor()
-                        );
-                    })
-                    .unwrap();
-            }
-            window
-                .update(visual, |shell, _, cx| {
-                    shell
-                        .sidebar_slide
-                        .as_ref()
-                        .unwrap()
-                        .elapsed(Duration::from_secs(1));
-                    cx.notify();
-                })
-                .unwrap();
-            visual
-                .update_window(window.into(), |_, w, cx| {
-                    w.simulate_next_frame(cx);
-                    w.draw(cx).clear(cx);
-                })
-                .unwrap();
-            window
-                .update(visual, |shell, _, _| {
-                    assert!(shell.sidebar_slide.is_none());
-                    assert_eq!(shell.sidebar_fraction, if visible { 1. } else { 0. });
-                })
-                .unwrap();
-        }
-        // Reopening the sidebar reverses its closing motion without jumping its edge.
-        window
-            .update(visual, |shell, w, cx| {
-                shell.toggle_sidebar(w, cx);
-                shell
-                    .sidebar_slide
-                    .as_ref()
-                    .unwrap()
-                    .elapsed(Duration::from_millis(65));
-                let before = shell
-                    .sidebar_slide
-                    .as_ref()
-                    .unwrap()
-                    .at(std::time::Instant::now())
-                    .0;
-                shell.toggle_sidebar(w, cx);
-                assert!(shell.workspace.sidebar_visible);
-                let after = shell
-                    .sidebar_slide
-                    .as_ref()
-                    .unwrap()
-                    .at(std::time::Instant::now())
-                    .0;
-                assert!((after - before).abs() < 0.01);
-            })
-            .unwrap();
-        visual.update(|_, cx| cx.set_reduce_motion(true));
-        visual
-            .update_window(window.into(), |_, w, cx| {
-                w.simulate_next_frame(cx);
-                w.draw(cx).clear(cx);
-            })
-            .unwrap();
-        window
-            .update(visual, |shell, _, _| {
-                assert!(shell.sidebar_slide.is_none());
-                assert_eq!(shell.sidebar_fraction, 1.);
-            })
-            .unwrap();
     }
     #[gpui::test]
     fn switching_session_in_current_tab_keeps_its_slot_and_selection_settled(
@@ -11343,27 +10301,6 @@ mod tests {
         assert_eq!(copied, Some(original));
     }
     #[gpui::test]
-    fn sidebar_hover_updates_labels_without_rebuilding_the_chat(cx: &mut TestAppContext) {
-        let (window, _, active) = window(cx);
-        let root = window.root(cx).unwrap();
-        let transcript =
-            root.read_with(cx, |s, cx| s.sessions[&active].read(cx).transcript.clone());
-        let before = transcript.read_with(cx, |t, _| t.render_passes);
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(133.)), cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Inbox"));
-        cx.update_window(window.into(), |_, w, cx| {
-            w.simulate_mouse_move(gpui::point(px(40.), px(166.)), cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert_eq!(root.read_with(cx, |s, _| s.sidebar_hover), Some("Notes"));
-        assert_eq!(transcript.read_with(cx, |t, _| t.render_passes), before);
-    }
-    #[gpui::test]
     fn many_blank_tabs_fit_without_creating_sidebar_conversations(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
         window
@@ -11478,46 +10415,6 @@ mod tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         (window, ids.0, ids.1)
-    }
-    #[gpui::test]
-    fn leaving_the_original_layout_defaults_to_boxy_only_before_the_notice(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, _, _) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
-                shell.workspace.new_layout_boxy = false;
-                shell.workspace.new_layout_prompt_dismissed = false;
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.classic_layout);
-                assert!(shell.workspace.new_layout_boxy);
-                assert!(shell.workspace.new_layout_prompt_dismissed);
-
-                shell.workspace.classic_layout = true;
-                shell.workspace.new_layout_boxy = false;
-                shell.toggle_layout(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-            })
-            .unwrap();
-    }
-    #[gpui::test]
-    fn workspace_style_shortcut_only_switches_the_focused_layout(cx: &mut TestAppContext) {
-        let (window, _, _) = window(cx);
-        window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = false;
-                shell.workspace.new_layout_boxy = false;
-                shell.toggle_workspace_style(cx);
-                assert!(shell.workspace.new_layout_boxy);
-                shell.toggle_workspace_style(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-
-                shell.workspace.classic_layout = true;
-                shell.toggle_workspace_style(cx);
-                assert!(!shell.workspace.new_layout_boxy);
-            })
-            .unwrap();
     }
     #[gpui::test]
     fn slash_menu_stays_below_tabs_with_centered_and_docked_input(cx: &mut TestAppContext) {
@@ -11864,8 +10761,9 @@ mod tests {
             })
             .unwrap();
 
-        // A sidebar session dropped on a pane's lower half stacks under it,
-        // and the tab that held it closes.
+        // A session dragged from a list (as the operator rail's cards do)
+        // and dropped on a pane's lower half stacks under it, and the tab
+        // that held it closes.
         window
             .update(cx, |shell, _, cx| {
                 shell.sessions[&a].update(cx, |s, _| {
@@ -11876,12 +10774,20 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        let row = cx
-            .debug_bounds(Box::leak(format!("sidebar-session-{a}").into_boxed_str()))
-            .unwrap()
-            .center();
+        let row = point(px(40.), px(300.));
         let below = point(right.center().x, right.bottom() - px(20.));
-        cx.simulate_mouse_down(row, MouseButton::Left, Modifiers::default());
+        window
+            .update(cx, |shell, _, _| {
+                shell.pane_drag = Some(PaneDrag {
+                    source: DragSource::Session(a),
+                    start: row,
+                    position: row,
+                    active: false,
+                    over: None,
+                    group: None,
+                });
+            })
+            .unwrap();
         cx.simulate_mouse_move(
             row + point(px(20.), px(0.)),
             MouseButton::Left,
@@ -12163,7 +11069,7 @@ mod tests {
                         shell.workspace.active.unwrap()
                     }
                     ClosingKind::Terminal => {
-                        shell.workspace.preferences.set_terminal_placement("title");
+                        shell.terminals_in_dock = false;
                         shell.split_title_terminal(w, cx);
                         shell.workspace.active.unwrap()
                     }
@@ -12328,63 +11234,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_crowding_pane_collapses_the_sidebar_and_its_room_brings_it_back(cx: &mut TestAppContext) {
-        let (window, _, b) = window(cx);
-        cx.update(|cx| {
-            bind_keys(cx);
-            cx.set_reduce_motion(true);
-        });
-        cx.simulate_window_resize(window.into(), gpui::size(px(1000.), px(800.)));
-        window
-            .update(cx, |shell, w, cx| {
-                shell.open(b, w, cx);
-                shell.focus_active(w, cx);
-            })
-            .unwrap();
-        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| {
-                assert!(shell.workspace.sidebar_visible);
-                assert_eq!(shell.viewport_width, 1000.);
-            })
-            .unwrap();
-        cx.simulate_keystrokes("cmd-d");
-        cx.run_until_parked();
-        let new = window
-            .update(cx, |shell, _, cx| {
-                // Two panes beside a 260px sidebar would be ~365px each.
-                assert!(!shell.workspace.sidebar_visible);
-                assert!(shell.narrowest_chat(false, cx) >= MIN_CHAT_WIDTH);
-                shell.workspace.active.unwrap()
-            })
-            .unwrap();
-        window
-            .update(cx, |shell, w, cx| shell.close_pane(new, w, cx))
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
-            .unwrap();
-        // A sidebar the user hid stays hidden when room comes back.
-        cx.simulate_keystrokes("cmd-d");
-        cx.run_until_parked();
-        // Collapsed for the split; shown, then hidden again by hand.
-        cx.simulate_keystrokes("cmd-b cmd-b");
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, w, cx| {
-                assert!(!shell.workspace.sidebar_visible);
-                let pane = shell.workspace.active.unwrap();
-                shell.close_pane(pane, w, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
-            .unwrap();
-    }
-    #[gpui::test]
     fn a_split_session_starts_with_the_default_access(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         cx.update(|cx| {
@@ -12422,56 +11271,6 @@ mod tests {
                 })
                 .unwrap();
         }
-    }
-    #[gpui::test]
-    fn the_sidebar_follows_the_room_however_it_changes(cx: &mut TestAppContext) {
-        let (window, _, b) = window(cx);
-        cx.update(|cx| {
-            bind_keys(cx);
-            cx.set_reduce_motion(true);
-        });
-        cx.simulate_window_resize(window.into(), gpui::size(px(1400.), px(800.)));
-        window
-            .update(cx, |shell, w, cx| {
-                shell.open(b, w, cx);
-                shell.focus_active(w, cx);
-            })
-            .unwrap();
-        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
-        // Wide enough for two panes beside the sidebar.
-        cx.simulate_keystrokes("cmd-d");
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
-            .unwrap();
-        // Narrowing the window crowds the panes; the sidebar makes room.
-        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
-            .unwrap();
-        // Widening it again brings the sidebar back.
-        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
-            .unwrap();
-        // Shown by hand while crowded, it stays until the room changes again.
-        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
-        cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-b");
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(shell.workspace.sidebar_visible))
-            .unwrap();
-        // Hidden by hand, it stays hidden however wide the window grows.
-        cx.simulate_keystrokes("cmd-b");
-        cx.simulate_resize(gpui::size(px(1600.), px(800.)));
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| assert!(!shell.workspace.sidebar_visible))
-            .unwrap();
     }
     #[gpui::test]
     fn reordered_tabs_slide_into_place_instead_of_jumping(cx: &mut TestAppContext) {
@@ -12543,6 +11342,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
+                shell.terminals_in_dock = true;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
             })
@@ -12589,14 +11389,13 @@ mod tests {
                 assert_eq!(shell.terminals[&project].len(), 1);
             })
             .unwrap();
-        // Docked right, it takes width: a narrow window gives up its sidebar.
+        // Docked right, it takes width.
         cx.simulate_resize(gpui::size(px(1000.), px(800.)));
         cx.run_until_parked();
         window
             .update(cx, |shell, _, cx| {
                 shell.workspace.docks.get_mut(&project).unwrap().size = 360.;
                 shell.set_dock_side(DockSide::Right, cx);
-                assert!(!shell.workspace.sidebar_visible);
             })
             .unwrap();
         cx.run_until_parked();
@@ -12612,7 +11411,6 @@ mod tests {
             .update(cx, |shell, w, cx| {
                 assert!(!shell.workspace.docks[&project].open);
                 assert_eq!(shell.dock_focused(w, cx), None);
-                assert!(shell.workspace.sidebar_visible);
             })
             .unwrap();
         assert!(cx.debug_bounds("terminal-dock").is_none());
@@ -12728,9 +11526,13 @@ mod tests {
     fn typing_and_streaming_do_not_rebuild_the_sidebar(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         let root = window.root(cx).unwrap();
-        let sidebar = root.read_with(cx, |s, _| s.sidebar_frame.clone());
+        // The project rail's tree lists the sessions.
+        let sidebar = root.read_with(cx, |s, _| s.projects_frame.clone());
         let before = sidebar.read_with(cx, |v, _| v.renders);
-        assert!(before > 0, "the cached sidebar must have actually rendered");
+        assert!(
+            before > 0,
+            "the cached project rail must have actually rendered"
+        );
         window
             .update(cx, |shell, w, cx| {
                 shell.sessions[&b].update(cx, |v, cx| {
@@ -12758,71 +11560,7 @@ mod tests {
         assert_eq!(
             sidebar.read_with(cx, |v, _| v.renders),
             before,
-            "chat changes must reuse the sidebar"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[gpui::test]
-    fn title_particle_frames_only_invalidate_the_sidebar(cx: &mut TestAppContext) {
-        let (window, _, id) = window(cx);
-        cx.update(|cx| cx.set_reduce_motion(false));
-        // Blank tabs deliberately have no sidebar card. Mount a conversation
-        // before changing its title, so this exercises an existing label.
-        window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&id].update(cx, |session, cx| {
-                    session.summary.has_messages = true;
-                    session.rename("Original session title".into(), cx);
-                });
-            })
-            .unwrap();
-        cx.run_until_parked();
-        cx.refresh().unwrap();
-        window
-            .update(cx, |shell, _, cx| {
-                shell.sessions[&id].update(cx, |session, cx| {
-                    session.rename("Matching the generated title effect".into(), cx);
-                });
-            })
-            .unwrap();
-        cx.run_until_parked();
-        cx.refresh().unwrap();
-        // Deliver the title-change frame's deferred layout/hover work before
-        // measuring the subsequent decorative animation frames in isolation.
-        cx.update_window(window.into(), |_, window, cx| {
-            window.simulate_next_frame(cx);
-            window.draw(cx).clear(cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        let (sidebar, transcript) = window
-            .read_with(cx, |shell, cx| {
-                (
-                    shell.sidebar_frame.clone(),
-                    shell.sessions[&id].read(cx).transcript.clone(),
-                )
-            })
-            .unwrap();
-        let before = (
-            sidebar.read_with(cx, |view, _| view.renders),
-            transcript.read_with(cx, |view, _| view.render_passes),
-        );
-        for _ in 0..3 {
-            cx.update_window(window.into(), |_, window, cx| {
-                assert!(
-                    window.simulate_next_frame(cx) > 0,
-                    "title requested its next frame"
-                );
-                window.draw(cx).clear(cx);
-            })
-            .unwrap();
-            cx.run_until_parked();
-        }
-        assert!(sidebar.read_with(cx, |view, _| view.renders) > before.0);
-        assert_eq!(
-            transcript.read_with(cx, |view, _| view.render_passes),
-            before.1
+            "chat changes must reuse the project rail"
         );
     }
 }

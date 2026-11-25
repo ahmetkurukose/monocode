@@ -1645,7 +1645,7 @@ impl Shell {
                         copy(monocode_core::files::display_path(&path, Some(&cwd)), cx)
                     }
                     "copy-name" => copy(path.rsplit('/').next().unwrap_or(&path).to_owned(), cx),
-                    "git-history" => self.pending_file_history = Some((cwd, path)),
+                    "git-history" => self.pending_file_history = Some((cwd, path, None)),
                     "show-in-explorer" => self.pending_explorer_reveal = Some(path),
                     _ => {
                         let path = std::path::PathBuf::from(path);

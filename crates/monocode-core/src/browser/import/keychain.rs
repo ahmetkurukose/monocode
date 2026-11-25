@@ -28,7 +28,7 @@ impl SafeStorage for Keychain {
     #[cfg(target_os = "macos")]
     fn password(&self, browser: SourceBrowser) -> Result<Vec<u8>, KeychainError> {
         let (service, account) = browser.keychain_item();
-        let entry = keyring::Entry::new(service, account)
+        let entry = crate::credentials::entry(service, account)
             .map_err(|e| KeychainError::Other(e.to_string()))?;
         match entry.get_secret() {
             Ok(secret) => Ok(secret),

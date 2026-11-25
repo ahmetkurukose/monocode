@@ -200,11 +200,6 @@ impl Shell {
         {
             dock.open = false;
             self.slide_dock(false, cx);
-            // The panel's Terminal tab is never left empty: a fresh shell
-            // takes the place of the one pulled out, and the panel stays.
-            if self.terminal_in_panel(cx) {
-                self.ensure_panel_terminal(cx);
-            }
         }
         let cwd = terminal.read(cx).cwd.clone();
         let pane = self.workspace.next_pane_id();
@@ -388,6 +383,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
+                shell.terminals_in_dock = true;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
             })
@@ -433,7 +429,7 @@ mod tests {
         });
         let pane = window
             .update(cx, |shell, w, cx| {
-                shell.workspace.preferences.set_terminal_placement("title");
+                shell.terminals_in_dock = false;
                 shell.open(owner, w, cx);
                 if split {
                     shell.split_title_terminal(w, cx);
@@ -743,47 +739,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pulling_the_panels_last_terminal_out_leaves_a_fresh_one_behind(cx: &mut TestAppContext) {
-        use crate::right_panel::RightTab;
-        let (window, _, b) = window(cx);
-        for edge in [None, Some(Edge::Right)] {
-            window
-                .update(cx, |shell, w, cx| {
-                    cx.set_reduce_motion(true);
-                    shell.workspace.classic_layout = false;
-                    shell.workspace.new_layout_boxy = true;
-                    shell.layout_changed(cx);
-                    shell.workspace.preferences.set_terminal_placement("panel");
-                    shell.open(b, w, cx);
-                    shell.show_panel_terminal(w, cx);
-                    let project = shell.workspace.project.clone();
-                    assert_eq!(shell.terminals[&project].len(), 1);
-                    let pulled = shell.terminals[&project][0].clone();
-                    // Onto the chat's strip, then onto the chat's right edge.
-                    match edge {
-                        None => {
-                            let drop = super::super::group_strip::GroupDrop::Strip {
-                                group: shell.workspace.visible_of(b).unwrap(),
-                                index: shell.workspace.group_tabs(b).len(),
-                            };
-                            shell.drop_into_group(DragSource::DockTerminal(0), drop, w, cx);
-                        }
-                        Some(edge) => shell.drop_dock_terminal(0, Some((b, edge)), w, cx),
-                    }
-                    assert!(shell.terminal_pane_views.values().any(|t| *t == pulled));
-                    // The panel stays open on a new shell.
-                    assert!(shell.workspace.right_panel_open);
-                    let panel = shell.right_panel.clone().unwrap();
-                    assert_eq!(panel.read(cx).tab(), RightTab::Terminal);
-                    assert_eq!(shell.terminals[&project].len(), 1);
-                    assert_ne!(shell.terminals[&project][0], pulled);
-                    assert_eq!(shell.workspace.docks[&project].terminals.len(), 1);
-                })
-                .unwrap();
-        }
-    }
-
-    #[gpui::test]
     fn cmd_shift_j_splits_a_title_bar_terminal_beside_the_chat(cx: &mut TestAppContext) {
         let (window, _, b) = window(cx);
         cx.update(|cx| {
@@ -793,7 +748,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
-                shell.workspace.preferences.set_terminal_placement("title");
+                shell.terminals_in_dock = false;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
             })
@@ -827,7 +782,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
-                shell.workspace.preferences.set_terminal_placement("title");
+                shell.terminals_in_dock = false;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
             })
@@ -884,7 +839,7 @@ mod tests {
                         .all(|p| shell.workspace.terminal_panes.contains_key(p))
                 );
                 // Back at the bottom, cmd-j toggles the dock again.
-                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.terminals_in_dock = true;
                 assert!(!shell.terminal_in_title());
             })
             .unwrap();
@@ -902,7 +857,7 @@ mod tests {
         });
         window
             .update(cx, |shell, w, cx| {
-                shell.workspace.preferences.set_terminal_placement("title");
+                shell.terminals_in_dock = false;
                 shell.open(b, w, cx);
                 shell.focus_active(w, cx);
                 // Only the Inbox is open: the session has history and its tab is
@@ -946,7 +901,7 @@ mod tests {
         // The dock's New terminal (cmd-`) works from the Inbox too.
         window
             .update(&mut visual, |shell, window, cx| {
-                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.terminals_in_dock = true;
                 shell.open_inbox(window, cx);
                 assert!(shell.app_view_open());
                 shell.new_terminal(window, cx);
@@ -956,17 +911,6 @@ mod tests {
                 assert!(shell.app_view_open(), "the Inbox stays in front");
             })
             .unwrap();
-    }
-
-    #[test]
-    fn terminal_placement_falls_back_to_the_legacy_panel_flag() {
-        let mut p = crate::settings::Preferences::default();
-        assert_eq!(p.terminal_placement(), "bottom");
-        p.terminal_in_panel = true;
-        assert_eq!(p.terminal_placement(), "panel");
-        p.set_terminal_placement("title");
-        assert_eq!(p.terminal_placement(), "title");
-        assert!(!p.terminal_in_panel);
     }
 
     #[gpui::test]

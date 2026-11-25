@@ -934,6 +934,111 @@ impl Session {
     }
 }
 
+/// A file's parse kept only for structure queries such as Extend Selection:
+/// no highlighting, and an edit reparses against the previous tree.
+pub(crate) struct Structure {
+    path: String,
+    parser: Parser,
+    tree: Option<Tree>,
+    text: String,
+}
+
+impl Structure {
+    pub(crate) fn new(path: &str) -> Option<Self> {
+        let grammar = grammar(language_for_path(path)?)?;
+        let mut parser = Parser::new();
+        parser.set_language(&grammar.language).ok()?;
+        Some(Self {
+            path: path.to_owned(),
+            parser,
+            tree: None,
+            text: String::new(),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn tree(&mut self, text: &str) -> Option<&Tree> {
+        if self.tree.is_some() && self.text == text {
+            return self.tree.as_ref();
+        }
+        let mut old = self.tree.take();
+        if let (Some(old), Some(edit)) = (&mut old, Edit::between(&self.text, text)) {
+            old.edit(&InputEdit {
+                start_byte: edit.start,
+                old_end_byte: edit.old_end,
+                new_end_byte: edit.new_end,
+                start_position: point(text, edit.start),
+                old_end_position: point(&self.text, edit.old_end),
+                new_end_position: point(text, edit.new_end),
+            });
+        }
+        self.tree = Some(self.parser.parse(text, old.as_ref())?);
+        self.text = text.to_owned();
+        self.tree.as_ref()
+    }
+
+    /// The syntax around `range`, innermost first: each enclosing node, and
+    /// before it what lies inside its quotes or brackets.
+    pub(crate) fn enclosing(&mut self, text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+        let Some(tree) = self.tree(text) else {
+            return Vec::new();
+        };
+        enclosing(tree, text, range)
+    }
+}
+
+fn enclosing(tree: &Tree, text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let Some(mut node) = tree
+        .root_node()
+        .descendant_for_byte_range(range.start, range.end)
+    else {
+        return out;
+    };
+    loop {
+        let whole = node.byte_range();
+        let count = node.child_count();
+        let inner = if count >= 2 {
+            let (first, last) = (
+                node.child(0).unwrap(),
+                node.child((count - 1) as u32).unwrap(),
+            );
+            let quoted = node.kind().contains("string") || node.kind().contains("template");
+            let delimited = !first.is_named()
+                && !last.is_named()
+                && matches!(first.kind(), "(" | "[" | "{" | "<")
+                && matches!(last.kind(), ")" | "]" | "}" | ">");
+            (quoted && first.end_byte() - first.start_byte() <= 3 || delimited)
+                .then(|| first.end_byte()..last.start_byte())
+        } else if count == 0 && whole.len() >= 2 {
+            // A string with no children of its own, quotes included.
+            let bytes = text.as_bytes();
+            let (a, b) = (bytes[whole.start], bytes[whole.end - 1]);
+            (matches!(a, b'"' | b'\'' | b'`') && a == b).then(|| whole.start + 1..whole.end - 1)
+        } else {
+            None
+        };
+        if let Some(inner) = inner.filter(|inner| inner.start <= inner.end) {
+            let body = &text[inner.clone()];
+            let lead = body.len() - body.trim_start().len();
+            let trail = body.len() - body.trim_end().len();
+            if lead + trail < body.len() {
+                out.push(inner.start + lead..inner.end - trail);
+            }
+            out.push(inner);
+        }
+        out.push(whole);
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => break,
+        }
+    }
+    out
+}
+
 /// Analyses `text` in the session held for a file, starting one for `path`
 /// (or replacing a renamed file's) as needed.
 pub(crate) fn analyze(
@@ -1025,6 +1130,32 @@ export function Counter({ start }: { start: number }) {
             }
         }
         out
+    }
+
+    #[test]
+    fn structure_grows_from_string_contents_to_the_call_and_the_statement() {
+        let text = "def f():\n    run(1, \"a b\")\n";
+        let at = text.find("a b").unwrap();
+        let mut structure = Structure::new("a.py").unwrap();
+        let found: Vec<_> = structure
+            .enclosing(text, at..at)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect();
+        for expected in [
+            "a b",
+            "\"a b\"",
+            "1, \"a b\"",
+            "(1, \"a b\")",
+            "run(1, \"a b\")",
+        ] {
+            assert!(found.contains(&expected), "{expected} in {found:?}");
+        }
+        // An edit reparses against the previous tree.
+        let edited = text.replace("run", "go");
+        let at = edited.find("a b").unwrap();
+        let found = structure.enclosing(&edited, at..at);
+        assert!(found.iter().any(|r| &edited[r.clone()] == "go(1, \"a b\")"));
     }
 
     #[test]

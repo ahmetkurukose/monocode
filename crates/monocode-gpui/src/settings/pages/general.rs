@@ -150,20 +150,6 @@ impl SettingsView {
                 |this, on, cx| this.update(cx, |p| p.action_opens_terminal = on),
             )],
         ));
-        workspace.push(self.row(
-            Some("terminal-placement"),
-            false,
-            "Terminal",
-            Some("Where new terminals open: docked below the chat, as a tab in the right panel (Focused layout), or as their own tabs in the title bar.".into()),
-            vec![self.segmented(
-                "terminal-placement",
-                "Terminal",
-                p.terminal_placement(),
-                &[("bottom", "Bottom"), ("panel", "Side panel"), ("title", "Title bar")],
-                cx,
-                |this, v, cx| this.update(cx, |p| p.set_terminal_placement(v)),
-            )],
-        ));
         if cfg!(target_os = "windows") {
             workspace.push(self.row(
                 Some("close-to-tray"),

@@ -57,15 +57,14 @@ pub(crate) fn tabular() -> FontFeatures {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RightTab {
+    /// The panel's retired Terminal tab was saved as "terminal".
     #[default]
+    #[serde(alias = "terminal")]
     Files,
     Changes,
     Graph,
     /// The project's worktrees and where each stands against its base.
     Worktrees,
-    /// The project's terminal, when it opens in the panel. Always last and
-    /// never part of the saved order.
-    Terminal,
     /// A tab a code feature added (`code_shell::panel_tabs`), by its id. It
     /// is there only while the feature shows it, so it is never saved as
     /// the open tab.
@@ -84,7 +83,6 @@ impl Serialize for RightTab {
             Self::Changes => "changes",
             Self::Graph => "graph",
             Self::Worktrees => "worktrees",
-            Self::Terminal => "terminal",
         })
     }
 }
@@ -95,7 +93,6 @@ impl RightTab {
             Self::Changes => "Changes",
             Self::Graph => "History",
             Self::Worktrees => "Worktrees",
-            Self::Terminal => "Terminal",
             Self::Extra(tab) => tab.0,
         }
     }
@@ -106,7 +103,6 @@ impl RightTab {
             Self::Changes => "changes",
             Self::Graph => "graph",
             Self::Worktrees => "worktrees",
-            Self::Terminal => "terminal",
             Self::Extra(tab) => tab.0,
         }
     }
@@ -118,8 +114,7 @@ impl RightTab {
             .iter()
             .chain(&[Self::Files, Self::Graph, Self::Worktrees])
         {
-            if !matches!(tab, Self::Terminal | Self::Changes | Self::Extra(_)) && !out.contains(tab)
-            {
+            if !matches!(tab, Self::Changes | Self::Extra(_)) && !out.contains(tab) {
                 out.push(*tab);
             }
         }
@@ -298,8 +293,6 @@ pub(crate) struct RightPanel {
     order: Vec<RightTab>,
     shown: bool,
     sidebar_tab: Option<RightTab>,
-    /// Whether the Terminal tab follows the others; the shell draws its pane.
-    terminal_tab: bool,
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
@@ -358,7 +351,6 @@ impl RightPanel {
             order: RightTab::normalize(&order),
             shown: false,
             sidebar_tab: None,
-            terminal_tab: false,
             top_inset: 0.,
             tab_width: tabs_width(4),
             drag: None,
@@ -436,32 +428,13 @@ impl RightPanel {
     pub(crate) fn tab(&self) -> RightTab {
         self.tab
     }
-    /// The tabs in strip order: the saved two, with Terminal between them
-    /// when enabled.
+    /// The tabs in strip order.
     pub(crate) fn tabs(&self) -> Vec<RightTab> {
-        let mut tabs = self.order.clone();
-        if self.terminal_tab {
-            tabs.insert(1.min(tabs.len()), RightTab::Terminal);
-        }
-        tabs
-    }
-    /// Adds or removes the Terminal tab; Explorer takes over when it goes.
-    pub(crate) fn set_terminal_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.terminal_tab == enabled {
-            return;
-        }
-        self.terminal_tab = enabled;
-        if !enabled && self.tab == RightTab::Terminal {
-            self.select(RightTab::Files, cx);
-        }
-        cx.notify();
+        self.order.clone()
     }
     pub(crate) fn set_show_excluded(&mut self, show: bool, cx: &mut Context<Self>) {
         self.explorer
             .update(cx, |explorer, cx| explorer.set_show_excluded(show, cx));
-    }
-    pub(crate) fn top_inset(&self) -> f32 {
-        self.top_inset
     }
     pub(crate) fn set_top_inset(&mut self, height: f32, cx: &mut Context<Self>) {
         if self.top_inset != height {
@@ -557,14 +530,13 @@ impl RightPanel {
         }
         drag.active = true;
         // Swap with a neighbour once the dragged tab's centre crosses its centre.
-        // Terminal holds its slot, outside the reorderable tabs.
         let Some(from) = tabs.iter().position(|t| *t == drag.tab) else {
             return;
         };
         let bounds: Vec<Option<Bounds<Pixels>>> = tabs
             .iter()
             .zip(&self.tab_bounds)
-            .map(|(tab, slot)| slot.get().filter(|_| *tab != RightTab::Terminal))
+            .map(|(_, slot)| slot.get())
             .collect();
         if let Some(Some(own)) = bounds.get(from) {
             let centre = own.center().x + drag.offset;
@@ -641,7 +613,6 @@ impl RightPanel {
                     RightTab::Worktrees => {
                         ("right-panel-tab-Worktrees", "git-branch-2", tab.label())
                     }
-                    RightTab::Terminal => ("right-panel-tab-Terminal", "terminal", tab.label()),
                     RightTab::Extra(ExtraTab(id)) => match self.extra(tab) {
                         Some(extra) => (id, extra.icon, extra.title),
                         None => (id, "file-script", tab.label()),
@@ -750,8 +721,6 @@ impl Render for RightPanel {
                 .clone()
                 .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
                 .into_any_element(),
-            // The shell paints the terminal over this pane.
-            RightTab::Terminal => div().into_any_element(),
             tab @ RightTab::Extra(_) => div()
                 .flex_1()
                 .min_h_0()

@@ -71,9 +71,7 @@ fn shell(cx: &mut TestAppContext) -> (WindowHandle<Shell>, VisualTestContext, i6
     let (window, _, session) = window(cx);
     cx.update(|cx| cx.set_reduce_motion(true));
     window
-        .update(cx, |shell, _, _| {
-            shell.workspace.preferences.set_terminal_placement("bottom")
-        })
+        .update(cx, |shell, _, _| shell.terminals_in_dock = true)
         .unwrap();
     let visual = VisualTestContext::from_window(window.into(), cx);
     visual.run_until_parked();

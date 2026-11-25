@@ -1320,7 +1320,8 @@ fn details_tabs_share_the_session_titlebar_in_both_layouts(cx: &mut TestAppConte
         })
         .unwrap();
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
-    for classic in [false, true] {
+    // Classic, the only layout, is boxy.
+    for classic in [true] {
         s.window
             .update(visual, |shell, _, cx| {
                 shell.workspace.new_layout_boxy = classic;
@@ -1447,15 +1448,11 @@ fn titlebar_details_tabs_switch_pages_and_keep_activity_and_habit_actions(cx: &m
 }
 
 #[gpui::test]
-fn titlebar_divider_resizes_mono_details_and_closed_panels_keep_the_corner(
-    cx: &mut TestAppContext,
-) {
+fn mono_details_fit_the_panel_and_closed_panels_keep_the_corner(cx: &mut TestAppContext) {
     let s = setup(cx);
     cx.update(|cx| cx.set_reduce_motion(true));
     s.window
-        .update(cx, |shell, _, cx| {
-            // The titlebar divider belongs to the rounded frame.
-            shell.workspace.new_layout_boxy = false;
+        .update(cx, |_, _, cx| {
             s.manager.update(cx, |m, cx| {
                 m.settings = None;
                 cx.notify();
@@ -1472,13 +1469,6 @@ fn titlebar_divider_resizes_mono_details_and_closed_panels_keep_the_corner(
             })
             .unwrap();
         visual.run_until_parked();
-        assert_eq!(
-            visual
-                .debug_bounds("project-tabs-separator")
-                .unwrap()
-                .left(),
-            visual.debug_bounds("right-panel-frame").unwrap().left()
-        );
         let activity = visual.debug_bounds("mono-activity").unwrap();
         let toggle = visual.debug_bounds("toggle-right-panel").unwrap();
         assert!(
@@ -1486,28 +1476,9 @@ fn titlebar_divider_resizes_mono_details_and_closed_panels_keep_the_corner(
             "Mono controls fit the session sidebar's minimum width"
         );
     }
-    let start = visual
-        .debug_bounds("titlebar-right-panel-resize")
-        .unwrap()
-        .center();
-    let end = start - gpui::point(px(40.), px(0.));
-    visual.simulate_mouse_down(start, MouseButton::Left, Default::default());
-    visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
-    visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
-    visual.run_until_parked();
-    s.window
-        .update(visual, |shell, _, _| {
-            assert_eq!(shell.workspace.right_panel_width, 540.);
-        })
-        .unwrap();
-    assert_eq!(
-        visual
-            .debug_bounds("project-tabs-separator")
-            .unwrap()
-            .left(),
-        visual.debug_bounds("right-panel-frame").unwrap().left()
-    );
-    for classic in [false, true] {
+    // Classic, the only layout, is boxy: its panel resizes from its own
+    // edge, not a title bar divider.
+    for classic in [true] {
         s.window
             .update(visual, |shell, _, cx| {
                 shell.workspace.new_layout_boxy = classic;
@@ -1959,8 +1930,10 @@ fn sidebar_mono_only_marks_unread_replies_and_swaps_the_mark_for_options_on_hove
     post("assistant", "A new reply", visual);
     let unread = visual
         .debug_bounds(unread_selector)
-        .expect("an unseen assistant reply has an accent circle");
-    assert_eq!(unread.size, gpui::size(px(6.), px(6.)));
+        .expect("an unseen assistant reply has an accent badge");
+    // Classic's original chrome counts the unread replies in a 16px badge.
+    assert_eq!(unread.size.height, px(16.));
+    assert!(unread.size.width >= px(16.));
     assert!(visual.debug_bounds(options_selector).is_none());
     let before_hover = visual.debug_bounds(row_selector).unwrap();
     visual.simulate_mouse_move(before_hover.center(), None, Default::default());

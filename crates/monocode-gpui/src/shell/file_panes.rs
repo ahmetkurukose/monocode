@@ -109,7 +109,7 @@ mod tests {
                 shell.open(session, w, cx);
                 // What a file tab's "Git History" leaves for the next frame.
                 shell.pending_file_history =
-                    Some(("/work/monocode".into(), "/work/monocode/a.rs".into()));
+                    Some(("/work/monocode".into(), "/work/monocode/a.rs".into(), None));
                 cx.notify();
             })
             .unwrap();

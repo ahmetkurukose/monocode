@@ -575,6 +575,12 @@ mod interaction_tests {
         let (window, other, session) = window(cx);
         window
             .update(cx, |shell, w, cx| {
+                // The project tree lists the project's sessions.
+                shell.workspace.project_rail_open = true;
+                shell
+                    .workspace
+                    .project_rail_expanded
+                    .insert("/work/monocode".into());
                 for id in [other, session] {
                     shell.sessions[&id].update(cx, |view, _| {
                         view.summary.cwd = "/work/monocode".into();
@@ -600,7 +606,7 @@ mod interaction_tests {
             .update(cx, |shell, _, _| shell.mono_tab(id.clone()))
             .unwrap();
         let mono_row = format!("mono-rail-{id}");
-        let session_row = format!("sidebar-session-{session}");
+        let session_row = format!("rail-session-{session}");
         assert!(sidebar_highlight(window, session_row.clone(), cx));
         assert!(!sidebar_highlight(window, mono_row.clone(), cx));
         let click = |selector: &str, cx: &mut TestAppContext| {
@@ -659,7 +665,7 @@ mod interaction_tests {
         assert!(!sidebar_highlight(window, session_row, cx));
         assert!(!sidebar_highlight(
             window,
-            format!("sidebar-session-{other}"),
+            format!("rail-session-{other}"),
             cx
         ));
     }
