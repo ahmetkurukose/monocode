@@ -4211,9 +4211,28 @@ impl Shell {
         let events = cx.subscribe_in(
             &view,
             window,
-            |this, _, _: &crate::file_history::Event, window, cx| {
+            |this, _, event: &crate::file_history::Event, window, cx| {
                 this.file_history = None;
                 this.focus_workspace(window, cx);
+                if let crate::file_history::Event::OpenCommit {
+                    cwd,
+                    sha,
+                    short_sha,
+                    subject,
+                } = event
+                {
+                    this.open_review_tab(
+                        crate::review::ReviewTab::Commit {
+                            cwd: cwd.clone(),
+                            sha: sha.clone(),
+                            short_sha: short_sha.clone(),
+                            subject: subject.clone(),
+                        },
+                        OpenIn::PREVIEW,
+                        window,
+                        cx,
+                    );
+                }
                 cx.notify();
             },
         );

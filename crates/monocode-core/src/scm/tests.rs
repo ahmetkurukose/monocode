@@ -2226,3 +2226,85 @@ fn pr_parent_fetch_url_keeps_the_main_remote_transport() {
         "ssh://git@ghe.corp:2222/up/proj.git"
     );
 }
+
+#[test]
+fn a_commit_says_how_it_reached_the_main_branch_and_a_merge_lists_what_it_brought() {
+    let dir = tmp();
+    let root = dir.path();
+    assert!(init_git_commit(root, &[("a.txt", "one\n")]));
+    let head = |root: &Path| git_stdout(root, &["rev-parse", "HEAD"]).unwrap();
+    let first = head(root);
+    // A branch with two commits, merged with a merge commit.
+    assert!(git(root, &["checkout", "-q", "-b", "feature"]));
+    std::fs::write(root.join("b.txt"), "bee\n").unwrap();
+    assert!(git(root, &["add", "."]) && git(root, &["commit", "-m", "add b", "-m", "Why b."]));
+    let on_branch = head(root);
+    std::fs::write(root.join("c.txt"), "sea\n").unwrap();
+    assert!(git(root, &["add", "."]) && git(root, &["commit", "-m", "add c"]));
+    assert!(git(root, &["checkout", "-q", "main"]));
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+    assert!(git(root, &["commit", "-am", "main moves on"]));
+    let direct = head(root);
+    assert!(git(
+        root,
+        &["merge", "--no-ff", "-m", "Merge feature", "feature"]
+    ));
+    let merge = head(root);
+    std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    assert!(git(root, &["commit", "-am", "later"]));
+    // And one that main does not have.
+    assert!(git(root, &["checkout", "-q", "-b", "open", &first]));
+    std::fs::write(root.join("d.txt"), "dee\n").unwrap();
+    assert!(git(root, &["add", "."]) && git(root, &["commit", "-m", "not merged"]));
+    let open = head(root);
+    assert!(git(root, &["checkout", "-q", "main"]));
+
+    let info = commit_info(root, &on_branch).unwrap();
+    assert_eq!(
+        (
+            info.commit.subject.as_str(),
+            info.body.as_str(),
+            info.parents
+        ),
+        ("add b", "Why b.", 1)
+    );
+    assert_eq!(info.commit.author, "MonoCode");
+    assert_eq!(info.commit.date.len(), "2026-11-25 14:03".len());
+    match info.landing {
+        Landing::Merged { branch, merge: by } => {
+            assert_eq!(branch, "main");
+            assert_eq!(
+                (by.sha, by.subject.as_str()),
+                (merge.clone(), "Merge feature")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let main = || Landing::Direct {
+        branch: "main".into(),
+    };
+    assert_eq!(commit_info(root, &direct).unwrap().landing, main());
+    assert_eq!(commit_info(root, &first).unwrap().landing, main());
+    assert_eq!(commit_info(root, &head(root)).unwrap().landing, main());
+    let merged = commit_info(root, &merge).unwrap();
+    assert_eq!((merged.parents, merged.landing), (2, main()));
+    assert_eq!(
+        commit_info(root, &open).unwrap().landing,
+        Landing::NotMerged {
+            branch: "main".into()
+        }
+    );
+    assert!(commit_info(root, "not-a-sha").is_err());
+
+    // The merge lists the branch's files, not nothing.
+    let brought: Vec<_> = (commit_files(root, &merge).unwrap().into_iter())
+        .map(|f| (f.relative, f.status, f.additions))
+        .collect();
+    assert_eq!(
+        brought,
+        [
+            ("b.txt".to_owned(), "added".to_owned(), 1),
+            ("c.txt".to_owned(), "added".to_owned(), 1)
+        ]
+    );
+}
