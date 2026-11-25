@@ -956,6 +956,7 @@ impl BrowserPage {
                 }
             }
             BrowserEvent::GrabAt { x, y } => self.grab_at(x, y, cx),
+            BrowserEvent::Focused if self.out_of_sight() => self.decline_focus(),
             BrowserEvent::Focused => self.follow_page_focus(cx),
             other => self.on_page_event(other, cx),
         }
@@ -972,6 +973,20 @@ impl BrowserPage {
             self.address.focus_handle(cx).is_focused(window),
             find.is_some_and(|f| f.field.focus_handle(cx).is_focused(window)),
         )
+    }
+
+    /// No tab shows the page: an agent's background tab, or one parked
+    /// before its tab was ever selected.
+    fn out_of_sight(&self) -> bool {
+        matches!(self.host.shown.get(), Placement::Hidden | Placement::Away)
+    }
+
+    /// Chromium focuses a page it loads, shown or not. A page out of sight
+    /// (an agent's new tab) gives the keyboard straight back, and GPUI focus
+    /// stays where the user is typing (a chat's input in another session).
+    fn decline_focus(&self) {
+        self.host.release_keyboard();
+        self.host.with_view(|view| view.set_focus(false));
     }
 
     /// A click in the page gives Chromium the keyboard without GPUI seeing
