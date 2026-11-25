@@ -805,6 +805,7 @@ impl Shell {
                     .cached(StyleRefinement::default().flex_1().min_w_0().h(px(height))),
             )
             .map(|d| {
+                let harness = self.harness_updates_button(cx);
                 let keep_awake = self.keep_awake_button(cx);
                 let databases = self.databases_button(cx);
                 let branch = self.git_branch_button(cx);
@@ -812,7 +813,8 @@ impl Shell {
                 let chips = self.code_chips(cx);
                 let terminal = self.terminal_footer(cx);
                 let between = (pressure.is_some() || !chips.is_empty()) && terminal.is_some();
-                d.child(keep_awake)
+                d.children(harness)
+                    .child(keep_awake)
                     .children(databases)
                     .children(branch)
                     .children(pressure)

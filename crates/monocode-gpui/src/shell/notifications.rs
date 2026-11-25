@@ -188,7 +188,7 @@ impl Shell {
                     }
                     this.sync_settings(cx);
                 }
-                cx.notify();
+                this.harness_updates_changed(cx);
             },
         ));
         self.observations.push(cx.subscribe(
@@ -1073,9 +1073,6 @@ impl Shell {
                         .max_w_full()
                         .child(state.reminders.clone()),
                 )
-            })
-            .when(state.harness.read(cx).is_visible(), |d| {
-                d.child(div().w(px(340.)).max_w_full().child(state.harness.clone()))
             })
             .when(!state.approvals.read(cx).is_empty(), |d| {
                 d.child(

@@ -32,6 +32,7 @@ mod code_shell_tests;
 mod command_bar;
 mod overlay_window;
 mod database_footer;
+mod harness_footer;
 mod database_send;
 mod empty_workspace;
 mod everywhere;
@@ -476,6 +477,8 @@ pub(crate) enum MenuTarget {
     Databases,
     /// The footer Keep computer awake button's modes.
     KeepAwake,
+    /// The footer harness updates chip's list of waiting updates.
+    HarnessUpdates,
     /// Connections found elsewhere, offered for import.
     DatabaseImport,
     /// A tab in a group's strip.
@@ -787,6 +790,7 @@ pub(crate) struct Shell {
     actions_anchor: AnchorSlot,
     databases_anchor: AnchorSlot,
     keep_awake_anchor: AnchorSlot,
+    harness_updates_anchor: AnchorSlot,
     db_footer: database_footer::DbFooter,
     git_anchor: AnchorSlot,
     /// The dock terminal each action last ran in, by project and action id.
@@ -1234,6 +1238,7 @@ impl Shell {
             actions_anchor: AnchorSlot::default(),
             databases_anchor: AnchorSlot::default(),
             keep_awake_anchor: AnchorSlot::default(),
+            harness_updates_anchor: AnchorSlot::default(),
             db_footer: Default::default(),
             git_anchor: AnchorSlot::default(),
             action_terminals: HashMap::new(),
@@ -5654,6 +5659,7 @@ impl Shell {
                             MenuTarget::Databases
                                 | MenuTarget::DatabaseImport
                                 | MenuTarget::KeepAwake
+                                | MenuTarget::HarnessUpdates
                         ),
                         |p| {
                             p.side(Side::Top)
@@ -5803,6 +5809,12 @@ impl Shell {
                 self.keep_awake_menu(cx),
                 300.,
                 MenuStyle::Access,
+            ),
+            MenuTarget::HarnessUpdates => (
+                "Harness updates".into(),
+                self.harness_updates_menu(cx),
+                320.,
+                MenuStyle::Explorer,
             ),
             MenuTarget::DatabaseImport => (
                 "Import connections".into(),
@@ -6168,6 +6180,7 @@ impl Shell {
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
             MenuTarget::Databases => self.run_databases_menu(action, window, cx),
             MenuTarget::KeepAwake => self.run_keep_awake_menu(action, cx),
+            MenuTarget::HarnessUpdates => self.run_harness_updates_menu(action, cx),
             MenuTarget::DatabaseImport => self.run_database_import_menu(action, window, cx),
             MenuTarget::GroupTab(id) => self.run_group_tab_menu(id, action, window, cx),
             MenuTarget::GroupAdd(visible) => self.run_group_add_menu(visible, action, window, cx),
