@@ -303,6 +303,12 @@ pub(crate) struct BrowseState {
     pub tint: BrowseTint,
     /// Projects whose pages the sidebar folds away, by path key.
     pub folded: BTreeSet<String>,
+    /// Projects' pages in the order the user dragged them into; pages not
+    /// in it follow, oldest first.
+    pub project_pages: Vec<i64>,
+    /// The projects, by path key, in the order the user dragged them into
+    /// in the sidebar; projects not in it follow, in the rail's order.
+    pub project_order: Vec<String>,
     /// Rows chosen together with ⌘- and ⇧-click, for one action on all.
     #[serde(skip)]
     pub selection: Vec<i64>,

@@ -115,7 +115,7 @@ fn files_open_beside_a_chat_and_are_found_again_from_any_group(cx: &mut TestAppC
             };
             shell.open_review(changes.clone(), w, cx);
             let diff = shell.workspace.active.unwrap();
-            assert_eq!(shell.workspace.group_tabs(diff), [a, diff, b]);
+            assert_eq!(shell.workspace.group_tabs(diff), [a, b, diff]);
             shell.open(session, w, cx);
             shell.open_review(changes, w, cx);
             assert_eq!(shell.workspace.active, Some(diff));

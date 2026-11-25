@@ -106,7 +106,7 @@ fn closing_an_app_view_reveals_the_groups_last_used_tab(cx: &mut TestAppContext)
             let notes = shell.workspace.active.unwrap();
             assert_eq!(
                 shell.workspace.group_tabs(session),
-                [session, notes, second]
+                [session, second, notes]
             );
             let view = shell.notes.as_ref().unwrap().entity_id();
             shell.close_app_view(w, cx);

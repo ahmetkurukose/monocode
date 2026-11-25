@@ -63,20 +63,51 @@ pub(super) struct DraggedBrowseTab {
 
 impl Render for DraggedBrowseTab {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(220.))
-            .h(px(28.))
-            .px_2()
-            .rounded(px(7.))
-            .bg(crate::theme::floating_fill())
-            .border_1()
-            .border_color(content(0.15))
-            .shadow_md()
-            .flex()
-            .items_center()
-            .text_size(px(13.))
-            .text_color(content(0.9))
-            .child(div().truncate().child(self.title.clone()))
+        drag_chip(self.title.clone())
+    }
+}
+
+/// What follows the pointer while a sidebar row is dragged: its title.
+fn drag_chip(title: SharedString) -> gpui::Div {
+    div()
+        .max_w(px(220.))
+        .h(px(28.))
+        .px_2()
+        .rounded(px(7.))
+        .bg(crate::theme::floating_fill())
+        .border_1()
+        .border_color(content(0.15))
+        .shadow_md()
+        .flex()
+        .items_center()
+        .text_size(px(13.))
+        .text_color(content(0.9))
+        .child(div().truncate().child(title))
+}
+
+/// A project's page being dragged to another place among its project's.
+#[derive(Clone)]
+pub(super) struct DraggedBrowsePage {
+    pub pane: i64,
+    pub title: SharedString,
+}
+
+impl Render for DraggedBrowsePage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.title.clone())
+    }
+}
+
+/// A project's heading being dragged to another place in the sidebar.
+#[derive(Clone)]
+pub(super) struct DraggedBrowseProject {
+    pub key: String,
+    pub name: SharedString,
+}
+
+impl Render for DraggedBrowseProject {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.name.clone()).font_weight(FontWeight::MEDIUM)
     }
 }
 
@@ -678,10 +709,13 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .text_size(px(12.))
-                .text_color(content(0.45))
+                // The resting strip is 4px tall, so its label would show as a
+                // clipped sliver; it only appears once a tab is dragged over.
+                .text_color(gpui::transparent_black())
                 .child("Drop to add to Favorites")
                 .drag_over::<DraggedBrowseTab>(|style, _, _, _| {
                     style
+                        .text_color(content(0.45))
                         .h(px(FAVORITE_HEIGHT))
                         .mb(px(10.))
                         .border_1()
@@ -957,6 +991,12 @@ impl Shell {
         let label = self.project_label(&path);
         let count = project.panes.len();
         let key = monocode_core::files::path_key(&path);
+        let dragged = DraggedBrowseProject {
+            key: key.clone(),
+            name: label.clone().into(),
+        };
+        let target = key.clone();
+        let panes = project.panes.clone();
         let hover = Self::browse_hover_fill();
         div()
             .id(SharedString::from(format!("browse-project-{key}")))
@@ -1007,6 +1047,24 @@ impl Shell {
                 .text_color(content(0.3)),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.browse_toggle_fold(&path, cx)))
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .drag_over::<DraggedBrowseProject>(|style, _, _, _| style.bg(content(0.08)))
+            .drag_over::<DraggedBrowsePage>(|style, _, _, _| style.bg(content(0.08)))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedBrowseProject, _, cx| {
+                    cx.stop_propagation();
+                    this.browse_move_project(&dragged.key, &target, cx)
+                }),
+            )
+            // A page dropped on its project's heading goes first.
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedBrowsePage, _, cx| {
+                    cx.stop_propagation();
+                    if panes.contains(&dragged.pane) {
+                        this.browse_move_project_page(dragged.pane, None, cx)
+                    }
+                }),
+            )
             .into_any_element()
     }
 
@@ -1201,7 +1259,19 @@ impl Shell {
                 }),
             );
         if !own {
-            return row.into_any_element();
+            // A project's page moves among its project's.
+            return row
+                .on_drag(DraggedBrowsePage { pane, title }, |dragged, _, _, cx| {
+                    cx.new(|_| dragged.clone())
+                })
+                .drag_over::<DraggedBrowsePage>(|style, _, _, _| style.bg(content(0.08)))
+                .on_drop(
+                    cx.listener(move |this, dragged: &DraggedBrowsePage, _, cx| {
+                        cx.stop_propagation();
+                        this.browse_move_project_page(dragged.pane, Some(pane), cx)
+                    }),
+                )
+                .into_any_element();
         }
         let section = tab.section.unwrap_or(BrowseSection::Today);
         row.on_drag(DraggedBrowseTab { pane, title }, |dragged, _, _, cx| {

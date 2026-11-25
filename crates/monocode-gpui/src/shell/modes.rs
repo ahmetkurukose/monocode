@@ -534,12 +534,17 @@ impl Shell {
                 Some((*pane, project))
             })
             .collect();
-        panes.sort_by_key(|(pane, _)| pane.unsigned_abs());
+        let browse = &self.workspace.browse;
+        panes.sort_by_key(|(pane, _)| {
+            let dragged = (browse.project_pages.iter()).position(|p| p == pane);
+            (dragged.unwrap_or(usize::MAX), pane.unsigned_abs())
+        });
         let rank = |path: &str| {
             let key = monocode_core::files::path_key(path);
-            (self.workspace.projects.iter())
-                .position(|p| monocode_core::files::path_key(p) == key)
-                .unwrap_or(usize::MAX)
+            let dragged = (browse.project_order.iter()).position(|p| *p == key);
+            let rail = (self.workspace.projects.iter())
+                .position(|p| monocode_core::files::path_key(p) == key);
+            (dragged.unwrap_or(usize::MAX), rail.unwrap_or(usize::MAX))
         };
         let mut projects: Vec<BrowseProject> = Vec::new();
         for (pane, path) in panes {
@@ -1044,6 +1049,72 @@ impl Shell {
     }
 
     /// A project's pages fold away under its heading or come back.
+    /// A project's page dropped on another page of its project takes that
+    /// page's place (after it, dragged down; before it, dragged up); dropped
+    /// on its project's heading (`onto` `None`), it goes first. Pages stay
+    /// with their project.
+    pub(super) fn browse_move_project_page(
+        &mut self,
+        pane: i64,
+        onto: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut projects = self.browse_projects();
+        let Some(project) = (projects.iter_mut()).find(|p| p.panes.contains(&pane)) else {
+            return;
+        };
+        if onto.is_some_and(|o| o == pane || !project.panes.contains(&o)) {
+            return;
+        }
+        if !Self::reorder(&mut project.panes, pane, onto) {
+            return;
+        }
+        self.workspace.browse.project_pages = projects.into_iter().flat_map(|p| p.panes).collect();
+        self.persist(cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
+
+    /// A project's heading dropped on another's takes its place in the
+    /// sidebar (after it, dragged down; before it, dragged up).
+    pub(super) fn browse_move_project(&mut self, key: &str, onto: &str, cx: &mut Context<Self>) {
+        let mut keys: Vec<String> = (self.browse_projects().iter())
+            .map(|p| monocode_core::files::path_key(&p.path))
+            .collect();
+        if !Self::reorder(&mut keys, key.to_string(), Some(onto.to_string())) {
+            return;
+        }
+        // Projects not on screen now keep their place after these.
+        let order = &mut self.workspace.browse.project_order;
+        order.retain(|k| !keys.contains(k));
+        keys.append(order);
+        self.workspace.browse.project_order = keys;
+        self.persist(cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
+
+    /// Moves `item` to `onto`'s place in `list` (after it when it came from
+    /// above, else before it), or first with no `onto`. Whether it moved.
+    fn reorder<T: PartialEq>(list: &mut Vec<T>, item: T, onto: Option<T>) -> bool {
+        let Some(from) = list.iter().position(|t| *t == item) else {
+            return false;
+        };
+        let to = match onto {
+            Some(onto) => match list.iter().position(|t| *t == onto) {
+                Some(to) => to,
+                None => return false,
+            },
+            None => 0,
+        };
+        if from == to {
+            return false;
+        }
+        let item = list.remove(from);
+        list.insert(to, item);
+        true
+    }
+
     pub(super) fn browse_toggle_fold(&mut self, project: &str, cx: &mut Context<Self>) {
         let key = monocode_core::files::path_key(project);
         let folded = &mut self.workspace.browse.folded;
@@ -1839,6 +1910,52 @@ mod tests {
                 assert!(restored.browse.owns(own));
                 assert!(restored.browser_panes.contains_key(&own));
                 assert_eq!(restored.browser_panes[&own].url, "https://own.test/");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn reorder_takes_the_target_place_from_either_side() {
+        let mut list = vec![1, 2, 3];
+        assert!(Shell::reorder(&mut list, 1, Some(3)));
+        assert_eq!(list, vec![2, 3, 1], "dragged down: after it");
+        assert!(Shell::reorder(&mut list, 1, Some(2)));
+        assert_eq!(list, vec![1, 2, 3], "dragged up: before it");
+        assert!(Shell::reorder(&mut list, 3, None));
+        assert_eq!(list, vec![3, 1, 2], "on the heading: first");
+        assert!(!Shell::reorder(&mut list, 3, Some(3)));
+        assert!(!Shell::reorder(&mut list, 9, Some(1)));
+    }
+
+    #[gpui::test]
+    fn project_pages_keep_the_order_they_are_dragged_into(cx: &mut TestAppContext) {
+        let (window, session) = browse_window(cx);
+        let (first, second) = window
+            .update(cx, |shell, window, cx| {
+                shell.open(session, window, cx);
+                shell.new_browser_pane(Some("https://one.test/".into()), window, cx);
+                let first = shell.workspace.active.unwrap();
+                shell.new_browser_pane(Some("https://two.test/".into()), window, cx);
+                let second = shell.workspace.active.unwrap();
+                shell.set_mode(AppMode::Browser, window, cx);
+                (first, second)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.browse_projects()[0].panes, vec![first, second]);
+                shell.browse_move_project_page(first, Some(second), cx);
+                assert_eq!(shell.browse_projects()[0].panes, vec![second, first]);
+                shell.browse_move_project_page(first, None, cx);
+                assert_eq!(shell.browse_projects()[0].panes, vec![first, second]);
+                // The order is saved with the workspace.
+                shell.browse_move_project_page(second, None, cx);
+                let saved: serde_json::Value = serde_json::to_value(&shell.workspace).unwrap();
+                assert_eq!(
+                    saved["browse"]["project_pages"],
+                    serde_json::json!([second, first])
+                );
             })
             .unwrap();
     }

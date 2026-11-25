@@ -183,7 +183,10 @@ impl Shell {
         match self.spot(&scope, editor, how, cx) {
             Spot::NewTab => return false,
             Spot::Group(visible) => {
-                self.workspace.add_to_group(id, visible, None, true);
+                // A new tab goes after the group's last tab, not beside the
+                // one on screen.
+                self.workspace
+                    .add_to_group(id, visible, Some(usize::MAX), true);
             }
             Spot::Beside(visible) => {
                 let before = self.active_leaves();
