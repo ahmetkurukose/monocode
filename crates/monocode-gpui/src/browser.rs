@@ -36,6 +36,8 @@ use gpui::{
 };
 use monocode_core::browser::{CdpClient, DialogInfo, Scope, log::PageLog};
 
+mod capture;
+mod developer_mode;
 mod discard;
 /// The browser's own extension layer (K69).
 #[cfg(target_os = "macos")]
@@ -44,6 +46,9 @@ pub(crate) mod extensions;
 #[path = "browser/extensions_stub.rs"]
 pub(crate) mod extensions;
 mod grab;
+pub(crate) mod site_controls;
+pub(crate) use capture::{CaptureTo, Captured};
+pub(crate) use site_controls::{ClearSiteData, SiteAsk};
 pub(crate) mod lifecycle;
 pub(crate) use grab::ToggleGrab;
 pub(crate) mod history;
@@ -69,6 +74,9 @@ mod page_passwords;
 pub(crate) use page_passwords::ShowBrowserPasswords;
 #[path = "browser_passkeys.rs"]
 mod passkeys;
+#[path = "browser_playback.rs"]
+mod playback;
+pub(crate) use playback::MediaReturn;
 #[path = "browser_presence.rs"]
 mod presence;
 #[path = "browser_sites.rs"]
@@ -78,41 +86,21 @@ pub(crate) use sites::{all_sites, forget as forget_site_permission};
 actions!(
     workspace,
     [
-        /// ⌥⌘I: the focused page's DevTools, docked under it.
+        /// ⌥⌘I, F12: the focused page's DevTools open or close.
         ToggleBrowserDevTools
     ]
 );
 
-/// DevTools and the page above it each keep at least this many points.
-const DEVTOOLS_MIN: f32 = 120.;
-const PAGE_MIN: f32 = 80.;
-
-/// DevTools' height in a body `available` points tall: the wanted height
-/// (0: 40% of the body), kept clear of both minimums. Unmeasured (0), the
-/// body takes the wanted height as it is.
-pub(crate) fn devtools_height(wanted: u32, available: f32) -> f32 {
-    let wanted = if wanted == 0 {
-        (available * 0.4).max(DEVTOOLS_MIN)
-    } else {
-        wanted as f32
-    };
-    if available <= 0. {
-        return wanted;
-    }
-    let max = (available - PAGE_MIN).max(0.);
-    wanted.clamp(DEVTOOLS_MIN.min(max), max)
-}
-
-/// The DevTools frontend Chromium ships, for the page whose target is
-/// `target`, through the app's endpoint at `base` (`host:port/token`).
-///
-/// Without `can_dock` the frontend has no "Dock side" menu: Chromium's
-/// embedder half (DevToolsUIBindings) runs with its default delegate here,
-/// which ignores dock requests, so the menu could not work. The divider and
-/// the toolbar button are the dock controls.
-fn devtools_frontend_url(base: &str, target: &str) -> String {
-    format!("devtools://devtools/bundled/devtools_app.html?ws={base}/devtools/page/{target}")
-}
+/// SOCode's DevTools: their commands, sides and frontend
+/// (docs/native/modes.md §DevTools).
+mod devtools;
+use devtools::{
+    Answer, FrontendChannel, Operation, Panel, devtools_extent, devtools_frontend_url,
+    dragged_extent,
+};
+pub(crate) use devtools::{
+    DevToolsCommand, DockSide, InspectElements, JavaScriptConsole, NetworkInspector, ViewSource,
+};
 
 /// What becomes of something the docked DevTools ask for. They are not the
 /// page: their links open as ordinary tabs (never as popups that keep a
@@ -429,6 +417,14 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(&format!("{m}-p"), Print, page),
         // Not ⇧⌘G, which is Find Previous.
         KeyBinding::new(&format!("{m}-alt-g"), ToggleGrab, page),
+        // Capture, as SOCode's (browser/capture.rs).
+        KeyBinding::new(&format!("{m}-shift-2"), capture::CapturePage, page),
+        // DevTools (devtools.rs). ⌥⌘U is over the workspace's Git Update
+        // while a page is focused.
+        KeyBinding::new("f12", ToggleBrowserDevTools, page),
+        KeyBinding::new(&format!("{m}-alt-c"), InspectElements, page),
+        KeyBinding::new(&format!("{m}-alt-j"), JavaScriptConsole, page),
+        KeyBinding::new(&format!("{m}-alt-u"), ViewSource, page),
         // The find field is a Composer, whose ⇧Enter would add a newline.
         KeyBinding::new("shift-enter", FindPrevious, Some("BrowserFind > Composer")),
         KeyBinding::new("escape", CloseFind, Some(FIND_CONTEXT)),
@@ -502,6 +498,14 @@ pub(crate) type Profile = monocode_cef::Profile;
 struct DockedDevTools {
     host: Rc<Host<monocode_cef::BrowserView>>,
     url: Option<String>,
+    /// Where they are: beside the page or below it.
+    side: DockSide,
+    /// Their own channel, once their frontend has loaded.
+    channel: Option<FrontendChannel<monocode_cef::DevToolsAttachment>>,
+    /// Asked to pick an element once loaded (Inspect Elements).
+    inspect: bool,
+    /// They take the keyboard once loaded (the user opened them).
+    focus: bool,
 }
 
 /// What a page asks of the pane around it.
@@ -521,6 +525,12 @@ pub(crate) enum PageRequest {
     Grab(grab::GrabResult),
     /// The address bar's "Switch to tab": show the tab of this pane.
     ShowTab(i64),
+    /// A click to another site in a page that peeks (Browser mode's pinned
+    /// tabs and favourites): the shell shows it in Peek.
+    Peek(String),
+    /// The Site Control Center or Capture asks for the shell's part: a
+    /// capture to save or send, Settings.
+    SiteControls(SiteAsk),
 }
 
 /// Something the page waits on the user for, shown as a modal over it.
@@ -540,6 +550,8 @@ pub(crate) struct BrowserPage {
     /// at such an address loads as from Chrome's own UI.
     pub(crate) url_from_app: bool,
     pub title: String,
+    /// The address of the page's icon, as Chromium last reported it.
+    pub(crate) favicon: Option<String>,
     loading: bool,
     can_go_back: bool,
     can_go_forward: bool,
@@ -570,7 +582,8 @@ pub(crate) struct BrowserPage {
     pub(crate) devtools_scope: Option<Scope>,
     /// The docked DevTools, while open.
     devtools: Option<DockedDevTools>,
-    /// DevTools' height in points (0: 40% of the body); the pane saves it.
+    /// DevTools' size along their side in points, a width beside the page
+    /// and a height below it (0: a third of the body); the pane saves it.
     devtools_height: u32,
     /// The user keeps the docked DevTools open; the pane saves it.
     devtools_wanted: bool,
@@ -579,7 +592,8 @@ pub(crate) struct BrowserPage {
     /// GPUI focus while the DevTools have the keyboard, under
     /// [`DEVTOOLS_KEY_CONTEXT`].
     devtools_focus: FocusHandle,
-    /// The divider being dragged: where the drag started, and the height then.
+    /// The divider being dragged: where the drag started along its axis,
+    /// and the DevTools' size then.
     devtools_drag: Option<(f32, f32)>,
     /// The body under the toolbar, as last laid out.
     body_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -618,6 +632,19 @@ pub(crate) struct BrowserPage {
     /// A blank tab's page (K66).
     new_tab: new_tab::NewTab,
     suggest: suggest::Suggestions,
+    /// Back, forward and reload live in Browser mode's sidebar while the
+    /// page shows there: the toolbar leaves them out. The shell sets it.
+    pub(crate) nav_in_sidebar: bool,
+    /// The shell draws the page's popovers (Browser mode's child window):
+    /// the page leaves them out. The shell sets it.
+    pub(crate) popovers_elsewhere: bool,
+    /// Browser mode's Site Control Center.
+    site_controls: site_controls::SiteControls,
+    /// A capture under way.
+    capture: Option<capture::Capture>,
+    /// The site a Browser mode pinned tab keeps to: clicks elsewhere open
+    /// in Peek ([`Self::set_peek_host`]).
+    peek_host: Option<String>,
 }
 
 impl EventEmitter<PageChanged> for BrowserPage {}
@@ -670,6 +697,7 @@ impl BrowserPage {
             url,
             url_from_app: false,
             title,
+            favicon: None,
             loading: false,
             can_go_back: false,
             can_go_forward: false,
@@ -714,14 +742,60 @@ impl BrowserPage {
             links: None,
             new_tab: Default::default(),
             suggest: Default::default(),
+            nav_in_sidebar: false,
+            popovers_elsewhere: false,
+            site_controls: Default::default(),
+            capture: None,
+            peek_host: None,
         }
         .watch_presence(cx)
         .listen_passwords(cx)
         .watch_media_asks(cx)
+        .listen_playback(cx)
     }
 
     pub(crate) fn display_title(&self) -> String {
         page_title(&self.url, &self.title)
+    }
+
+    /// Page history, as the toolbar's Back and Forward buttons.
+    pub(crate) fn go_back(&mut self) {
+        if self.can_go_back {
+            self.next_transition(history::Transition::BackForward);
+            self.host.with_view(|view| view.go_back());
+        }
+    }
+
+    pub(crate) fn go_forward(&mut self) {
+        if self.can_go_forward {
+            self.next_transition(history::Transition::BackForward);
+            self.host.with_view(|view| view.go_forward());
+        }
+    }
+
+    /// Clicks to sites other than `host` open in Peek; `None`: they load.
+    pub(crate) fn set_peek_host(&mut self, host: Option<String>) {
+        if self.peek_host != host {
+            self.peek_host = host.clone();
+            self.host.with_view(|view| view.set_peek_host(host));
+        }
+    }
+
+    pub(crate) fn can_go_back(&self) -> bool {
+        self.can_go_back
+    }
+
+    pub(crate) fn can_go_forward(&self) -> bool {
+        self.can_go_forward
+    }
+
+    /// Reload, or Stop while the page loads, as the toolbar's button.
+    pub(crate) fn reload_or_stop(&mut self) {
+        if self.loading {
+            self.host.with_view(|view| view.stop());
+        } else {
+            self.reload(false);
+        }
     }
 
     /// The address field takes the keyboard while there is nothing to show;
@@ -799,6 +873,9 @@ impl BrowserPage {
         use monocode_cef::BrowserEvent;
         match event {
             BrowserEvent::Address(url) => {
+                // A page made again (after a discard) learns its Peek site.
+                let peek = self.peek_host.clone();
+                self.host.with_view(|view| view.set_peek_host(peek));
                 self.sync_zoom(cx);
                 self.sites_follow_address(&url);
                 self.passwords_follow_address(&url);
@@ -818,15 +895,28 @@ impl BrowserPage {
                     cx.emit(PageChanged);
                 }
             }
-            BrowserEvent::Favicon(favicon) => self.record_favicon(&favicon, cx),
+            BrowserEvent::Favicon(favicon) => {
+                self.record_favicon(&favicon, cx);
+                if self.favicon.as_deref() != Some(favicon.as_str()) {
+                    self.favicon = Some(favicon);
+                    cx.emit(PageChanged);
+                }
+            }
             BrowserEvent::Loading {
                 loading,
                 can_go_back,
                 can_go_forward,
             } => {
+                // Browser mode's sidebar draws the history buttons and the
+                // loading state.
+                let changed = (self.loading, self.can_go_back, self.can_go_forward)
+                    != (loading, can_go_back, can_go_forward);
                 self.loading = loading;
                 self.can_go_back = can_go_back;
                 self.can_go_forward = can_go_forward;
+                if changed {
+                    cx.emit(PageChanged);
+                }
                 if loading {
                     self.failure = None;
                     // A page that loads again after its renderer went has
@@ -1141,6 +1231,7 @@ impl BrowserPage {
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.host.view.borrow().is_some();
+        let nav = !self.nav_in_sidebar;
         div()
             .flex()
             .items_center()
@@ -1150,139 +1241,395 @@ impl BrowserPage {
             .flex_shrink_0()
             .border_b_1()
             .border_color(content(0.08))
-            .child(
-                icon_button_enabled("browser-back", "Back", "arrow-left-2", self.can_go_back)
+            .when(nav, |d| {
+                d.child(
+                    icon_button_enabled("browser-back", "Back", "arrow-left-2", self.can_go_back)
+                        .on_click(cx.listener(|this, _, _, _| {
+                            this.next_transition(history::Transition::BackForward);
+                            this.host.with_view(|view| view.go_back());
+                        })),
+                )
+                .child(
+                    icon_button_enabled(
+                        "browser-forward",
+                        "Forward",
+                        "arrow-right-2",
+                        self.can_go_forward,
+                    )
                     .on_click(cx.listener(|this, _, _, _| {
                         this.next_transition(history::Transition::BackForward);
-                        this.host.with_view(|view| view.go_back());
+                        this.host.with_view(|view| view.go_forward());
                     })),
-            )
-            .child(
-                icon_button_enabled(
-                    "browser-forward",
-                    "Forward",
-                    "arrow-right-2",
-                    self.can_go_forward,
                 )
-                .on_click(cx.listener(|this, _, _, _| {
-                    this.next_transition(history::Transition::BackForward);
-                    this.host.with_view(|view| view.go_forward());
-                })),
-            )
-            .child(
-                icon_button_enabled(
-                    "browser-reload",
-                    if self.loading { "Stop" } else { "Reload" },
-                    if self.loading { "x" } else { "refresh-cw" },
-                    ready,
-                )
-                .on_click(cx.listener(|this, _, _, _| {
-                    if this.loading {
-                        this.host.with_view(|view| view.stop());
-                    } else {
-                        this.reload(false);
-                    }
-                })),
-            )
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .h(px(24.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .rounded_md()
-                    .bg(content(0.05))
-                    .children(self.site_button(cx))
-                    .child(self.suggest.anchor.probe())
-                    .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
-                        if this.step_address(-1, cx) {
-                            cx.stop_propagation();
+                .child(
+                    icon_button_enabled(
+                        "browser-reload",
+                        if self.loading { "Stop" } else { "Reload" },
+                        if self.loading { "x" } else { "refresh-cw" },
+                        ready,
+                    )
+                    .on_click(cx.listener(|this, _, _, _| {
+                        if this.loading {
+                            this.host.with_view(|view| view.stop());
+                        } else {
+                            this.reload(false);
                         }
-                    }))
-                    .capture_action(cx.listener(|this, _: &input::Down, _, cx| {
-                        if this.step_address(1, cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .capture_action(cx.listener(|this, _: &input::Submit, _, cx| {
-                        if this.submit_address(cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .capture_action(cx.listener(|this, _: &crate::shell::DismissMenu, _, cx| {
-                        if this.close_suggestions(cx) {
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .child(self.address.clone())
-                    .children(self.password_key_button(cx)),
-            )
-            .children(self.password_fill_button(cx))
-            .child(
-                icon_button("browser-history", "History", "clock").on_click(cx.listener(
-                    |_, _, window, cx| {
-                        window.dispatch_action(Box::new(history_view::ShowBrowserHistory), cx)
-                    },
-                )),
-            )
-            .children(self.presence_bar(cx))
-            .when(self.zoom != 100, |d| {
-                d.child(
-                    div()
-                        .id("browser-zoom")
-                        .role(gpui::Role::Button)
-                        .aria_label("Reset Zoom")
-                        .flex_shrink_0()
-                        .px_2()
-                        .h(px(24.))
-                        .flex()
-                        .items_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .text_color(content(0.6))
-                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
-                        .child(format!("{}%", self.zoom))
-                        .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
+                    })),
                 )
             })
-            .children(extensions::toolbar::buttons(
-                &self.host.options.borrow().profile,
-                self.host.shared.tab_id.0,
-            ))
-            .child(self.grab_button(ready, cx))
-            .child(
-                icon_button_enabled("browser-devtools", "DevTools", "code", ready)
-                    .when(self.devtools.is_some(), |b| b.bg(content(0.1)))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
-            )
-            .children(self.downloads_button(cx))
+            .when(nav, |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_md()
+                        .bg(content(0.05))
+                        .children(self.site_button(cx))
+                        .child(self.suggest.anchor.probe())
+                        .capture_action(cx.listener(|this, _: &input::Up, _, cx| {
+                            if this.step_address(-1, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &input::Down, _, cx| {
+                            if this.step_address(1, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &input::Submit, _, cx| {
+                            if this.submit_address(cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(
+                            |this, _: &crate::shell::DismissMenu, _, cx| {
+                                if this.close_suggestions(cx) {
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
+                        .child(self.address.clone())
+                        .children(self.password_key_button(cx)),
+                )
+            })
+            .children(self.tools(ready, true, cx))
     }
 
-    /// Opens the page's DevTools docked under it, or closes them. Where
-    /// they cannot dock, they open in a window of their own.
+    /// The toolbar's buttons after the address: saved passwords, history,
+    /// the agent's presence, zoom, extensions, Grab, DevTools, downloads.
+    fn tools(&self, ready: bool, presence: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(self.password_fill_button(cx))
+                .child(
+                    icon_button("browser-history", "History", "clock").on_click(cx.listener(
+                        |_, _, window, cx| {
+                            window.dispatch_action(Box::new(history_view::ShowBrowserHistory), cx)
+                        },
+                    )),
+                )
+                .when(presence, |d| d.children(self.presence_bar(cx)))
+                .when(self.zoom != 100, |d| {
+                    d.child(
+                        div()
+                            .id("browser-zoom")
+                            .role(gpui::Role::Button)
+                            .aria_label("Reset Zoom")
+                            .flex_shrink_0()
+                            .px_2()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(content(0.6))
+                            .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                            .child(format!("{}%", self.zoom))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_zoom(100, cx))),
+                    )
+                })
+                .children(extensions::toolbar::buttons(
+                    &self.host.options.borrow().profile,
+                    self.host.shared.tab_id.0,
+                ))
+                .child(self.grab_button(ready, cx))
+                .child(
+                    icon_button_enabled("browser-devtools", "DevTools", "code", ready)
+                        .when(self.devtools.is_some(), |b| b.bg(content(0.1)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_dev_tools(cx))),
+                )
+                .children(self.downloads_button(cx))
+                .into_any_element(),
+        ]
+    }
+
+    /// Browser mode draws no toolbar: under the pointer the sidebar's
+    /// address field shows Copy URL (the shell's) and the Site Controls
+    /// button, as SOCode's; the toolbar's other buttons are in the Site
+    /// Control Center (`browser/site_controls.rs`).
+    pub(crate) fn address_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(self.site_controls_button(cx))
+            .into_any_element()
+    }
+
+    /// What the sidebar's address field always shows: the agent using the
+    /// page (context.md K47), "Not secure" (K62), "Fill as …" while a
+    /// sign-in field has the focus (K56), the picker while it is up, and
+    /// the downloads while one is coming.
+    pub(crate) fn address_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let presence = self.presence_bar(cx);
+        let unsafe_ = matches!(
+            self.site_security(),
+            Some(sites::SiteSecurity::NotSecure | sites::SiteSecurity::Untrusted)
+        )
+        .then(|| self.site_button(cx))
+        .flatten();
+        let fill = self.password_fill_button(cx);
+        let ready = self.host.view.borrow().is_some();
+        let grab = self
+            .picking()
+            .then(|| self.grab_button(ready, cx).into_any_element());
+        let downloads = (self.downloads_shown_in_field())
+            .then(|| self.downloads_button(cx))
+            .flatten();
+        if presence.is_none()
+            && unsafe_.is_none()
+            && fill.is_none()
+            && grab.is_none()
+            && downloads.is_none()
+        {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .children(unsafe_)
+                .children(fill)
+                .children(grab)
+                .children(downloads)
+                .children(presence)
+                .into_any_element(),
+        )
+    }
+
+    /// ⌥⌘U: the page's source in a new tab beside it, which takes the
+    /// screen; the page stays. Web, file and data pages only.
+    pub(crate) fn view_source(&mut self, cx: &mut Context<Self>) {
+        if let Some(url) = devtools::view_source_url(&self.url) {
+            cx.emit(PageRequest::Open {
+                url,
+                foreground: true,
+                popup: None,
+            });
+        }
+    }
+
+    /// ⌥⌘I: the page's DevTools open on Elements, or close.
     pub(crate) fn toggle_dev_tools(&mut self, cx: &mut Context<Self>) {
+        self.run_dev_tools(DevToolsCommand::Toggle, cx);
+    }
+
+    /// Runs a DevTools command as SOCode's (devtools.rs): Developer Tools
+    /// toggle, Inspect Elements opens on Elements picking an element,
+    /// JavaScript Console and Network Inspector open on their panel or
+    /// close when it shows. They open where the last were put
+    /// ([`devtools::last_side`]); where they cannot dock, in a window of
+    /// their own.
+    pub(crate) fn run_dev_tools(&mut self, command: DevToolsCommand, cx: &mut Context<Self>) {
         let detached = self
             .host
             .view
             .borrow()
             .as_ref()
             .map(|h| h.view.has_dev_tools());
+        // No page yet (or any more): only docked DevTools can be told.
+        if detached.is_none() && self.devtools.is_none() {
+            return;
+        }
+        let detached = detached == Some(true);
         self.devtools_restore = false;
-        if detached == Some(true) {
-            self.host.with_view(|view| view.close_dev_tools());
+        if detached {
+            // Chromium's window: closed by the toggle, else to the front.
+            match command {
+                DevToolsCommand::Toggle => {
+                    self.host.with_view(|view| view.close_dev_tools());
+                }
+                _ => self.open_detached_dev_tools(),
+            }
         } else if self.devtools.is_some() {
-            self.close_docked_dev_tools(cx);
-            self.set_devtools_wanted(false, cx);
-        } else if detached.is_some() {
-            self.open_docked_dev_tools(true, cx);
+            match devtools::on_open(command) {
+                None => self.close_dev_tools_for_user(cx),
+                Some((panel, inspect, closes)) => {
+                    self.show_dev_tools_panel(panel, inspect, closes, cx)
+                }
+            }
+        } else if devtools::last_side() == DockSide::Undocked {
+            self.open_detached_dev_tools();
+        } else if let Operation::Open(panel, inspect) = devtools::operation(command, false, None) {
+            self.open_docked_dev_tools(true, panel, inspect, true, cx);
             self.set_devtools_wanted(self.devtools.is_some(), cx);
         }
         cx.notify();
+    }
+
+    /// Moves the page's DevTools to `side` (the Command Bar's Dock DevTools
+    /// commands), where the next DevTools open too, opening them when
+    /// closed. A side across from the last starts at its default size.
+    pub(crate) fn dock_dev_tools(&mut self, side: DockSide, cx: &mut Context<Self>) {
+        let detached = (self.host.view.borrow().as_ref()).map(|h| h.view.has_dev_tools());
+        if detached.is_none() && self.devtools.is_none() {
+            return;
+        }
+        let detached = detached == Some(true);
+        let was = (self.devtools.as_ref()).map_or(devtools::last_side(), |d| d.side);
+        devtools::set_last_side(side);
+        self.devtools_restore = false;
+        if side == DockSide::Undocked {
+            if self.devtools.is_some() {
+                self.close_dev_tools_for_user(cx);
+            }
+            self.open_detached_dev_tools();
+            cx.notify();
+            return;
+        }
+        if detached {
+            self.host.with_view(|view| view.close_dev_tools());
+        }
+        if was.beside() != side.beside() && self.devtools_height != 0 {
+            self.devtools_height = 0;
+            cx.emit(PageChanged);
+        }
+        match &mut self.devtools {
+            Some(docked) => docked.side = side,
+            None => {
+                self.open_docked_dev_tools(true, Panel::Elements, false, true, cx);
+                self.set_devtools_wanted(self.devtools.is_some(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Where the page's DevTools are: docked, in Chromium's window, or
+    /// closed (`None`).
+    pub(crate) fn dev_tools_side(&self) -> Option<DockSide> {
+        if let Some(docked) = &self.devtools {
+            return Some(docked.side);
+        }
+        let detached = (self.host.view.borrow().as_ref()).is_some_and(|h| h.view.has_dev_tools());
+        detached.then_some(DockSide::Undocked)
+    }
+
+    /// The docked DevTools show `panel` (and pick an element when
+    /// `inspect`), or close when `closes` and it shows already. Their
+    /// frontend answers which it shows.
+    fn show_dev_tools_panel(
+        &mut self,
+        panel: Panel,
+        inspect: bool,
+        closes: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(docked) = &self.devtools else {
+            return;
+        };
+        let Some(channel) = &docked.channel else {
+            // Still loading: it opens at its panel; picking waits for it.
+            if let Some(docked) = &mut self.devtools {
+                docked.inspect |= inspect;
+                docked.focus = true;
+            }
+            return;
+        };
+        let script = devtools::command_script(panel, inspect, closes);
+        let mut answer = None;
+        docked.host.with_view(|view| {
+            answer = Some(channel.evaluate(&script, |message| view.devtools_send(message)));
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        let opened = Rc::downgrade(&docked.host);
+        cx.spawn(async move |this, cx| {
+            let answer = Answer::parse(answer.recv().await.ok().flatten().as_deref());
+            let _ = this.update(cx, |page, cx| {
+                let current = (page.devtools.as_ref())
+                    .is_some_and(|d| std::ptr::eq(opened.as_ptr(), Rc::as_ptr(&d.host)));
+                if !current {
+                    return;
+                }
+                match answer {
+                    Answer::Close => page.close_dev_tools_for_user(cx),
+                    Answer::Shown | Answer::Unready => page.focus_dev_tools(cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The user closes the docked DevTools: closed for the pane too, and
+    /// the page takes the keyboard back when they had it.
+    fn close_dev_tools_for_user(&mut self, cx: &mut Context<Self>) {
+        let had_keyboard = self.devtools_focus.clone();
+        self.close_docked_dev_tools(cx);
+        self.set_devtools_wanted(false, cx);
+        let Some(handle) = self.window else { return };
+        let page = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                if had_keyboard.is_focused(window) {
+                    let _ = page.update(cx, |page, cx| page.focus(window, cx));
+                }
+            });
+        });
+    }
+
+    /// The docked DevTools take the keyboard, Chromium's and GPUI's.
+    fn focus_dev_tools(&self, cx: &mut Context<Self>) {
+        let Some(docked) = &self.devtools else {
+            return;
+        };
+        self.host.with_view(|view| view.set_focus(false));
+        docked.host.with_view(|view| view.set_focus(true));
+        self.follow_dev_tools_focus(cx);
+    }
+
+    /// The docked frontend loaded: its channel attaches, and what waited
+    /// for it runs (picking an element, the keyboard).
+    fn dev_tools_loaded(&mut self, cx: &mut Context<Self>) {
+        let Some(docked) = &mut self.devtools else {
+            return;
+        };
+        if docked.channel.is_none() {
+            let mut channel = None;
+            docked.host.with_view(|view| {
+                channel = FrontendChannel::attach(|sink| view.devtools_attach(sink));
+            });
+            docked.channel = channel;
+        }
+        let (inspect, focus) = (docked.inspect, docked.focus);
+        docked.inspect = false;
+        docked.focus = false;
+        if inspect {
+            self.show_dev_tools_panel(Panel::Elements, true, false, cx);
+        } else if focus {
+            self.focus_dev_tools(cx);
+        }
     }
 
     fn set_devtools_wanted(&mut self, wanted: bool, cx: &mut Context<Self>) {
@@ -1293,7 +1640,7 @@ impl BrowserPage {
     }
 
     /// Whether the docked DevTools are open by the user's choice (or wait to
-    /// open again), and their height (0: the default), as the pane saves
+    /// open again), and their size (0: the default), as the pane saves
     /// them.
     pub(crate) fn dev_tools_saved(&self) -> (bool, u32) {
         (
@@ -1302,7 +1649,7 @@ impl BrowserPage {
         )
     }
 
-    /// The saved docked DevTools: their height now, and, when `open`, they
+    /// The saved docked DevTools: their size now, and, when `open`, they
     /// open once the page shows and can be inspected.
     pub(crate) fn restore_dev_tools(&mut self, open: bool, height: u32) {
         self.devtools_height = height;
@@ -1317,22 +1664,32 @@ impl BrowserPage {
         self.devtools_restore = false;
         if self.devtools.is_none() {
             // Where they cannot dock, they stay closed: no window of their
-            // own opens unasked.
-            self.open_docked_dev_tools(false, cx);
+            // own opens unasked. They do not take the keyboard.
+            self.open_docked_dev_tools(false, Panel::Elements, false, false, cx);
             self.devtools_wanted = self.devtools.is_some();
         }
     }
 
-    /// DevTools in a window of their own (CEF's, Chrome style), when they
-    /// cannot dock.
+    /// DevTools in a window of their own (CEF's, Chrome style): undocked,
+    /// or when they cannot dock.
     fn open_detached_dev_tools(&self) {
         self.host.with_view(|view| view.show_dev_tools());
     }
 
-    /// Docks the DevTools frontend under the page. Its address needs the
-    /// page's target id, which Chromium tells. Where they cannot dock, they
-    /// open in a window of their own when `detached`.
-    fn open_docked_dev_tools(&mut self, detached: bool, cx: &mut Context<Self>) {
+    /// Docks the DevTools frontend beside the page, on `panel`, at the last
+    /// side (right unless moved; a window of their own counts as right
+    /// here). Its address needs the page's target id, which Chromium tells.
+    /// Where they cannot dock, they open in a window of their own when
+    /// `detached`. Once loaded they pick an element when `inspect`, and
+    /// take the keyboard when `focus`.
+    fn open_docked_dev_tools(
+        &mut self,
+        detached: bool,
+        panel: Panel,
+        inspect: bool,
+        focus: bool,
+        cx: &mut Context<Self>,
+    ) {
         let base = (self.devtools_scope.as_ref())
             .ok_or_else(|| "the page has no project".to_owned())
             .and_then(monocode_core::browser::proxy::devtools_base);
@@ -1348,7 +1705,18 @@ impl BrowserPage {
         };
         let host = Host::with_shared(Rc::default());
         let opened = Rc::downgrade(&host);
-        self.devtools = Some(DockedDevTools { host, url: None });
+        let side = match devtools::last_side() {
+            DockSide::Undocked => DockSide::Right,
+            side => side,
+        };
+        self.devtools = Some(DockedDevTools {
+            host,
+            url: None,
+            side,
+            channel: None,
+            inspect,
+            focus,
+        });
         let info = cdp.call("Target.getTargetInfo", serde_json::json!({}), None);
         cx.spawn(async move |this, cx| {
             let target = info
@@ -1364,7 +1732,7 @@ impl BrowserPage {
                     return;
                 };
                 match target {
-                    Some(target) => docked.url = Some(devtools_frontend_url(&base, &target)),
+                    Some(target) => docked.url = Some(devtools_frontend_url(&base, &target, panel)),
                     None => {
                         page.close_docked_dev_tools(cx);
                         page.set_devtools_wanted(false, cx);
@@ -1406,6 +1774,10 @@ impl BrowserPage {
         let current = (self.devtools.as_ref())
             .is_some_and(|d| std::ptr::eq(host.as_ptr(), Rc::as_ptr(&d.host)));
         if !current {
+            return;
+        }
+        if let BrowserEvent::Loading { loading: false, .. } = event {
+            self.dev_tools_loaded(cx);
             return;
         }
         match (devtools_ask(&event), event) {
@@ -1617,23 +1989,28 @@ impl BrowserPage {
         .into_any_element()
     }
 
-    /// The page, with the docked DevTools under a draggable divider.
+    /// The page, with the docked DevTools beside it (right or left) or below
+    /// it, past a draggable divider.
     fn body(
         &mut self,
         page: gpui::AnyElement,
         docked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if !docked {
+        let side = (self.devtools.as_ref()).map(|d| d.side);
+        let (true, Some(side)) = (docked, side) else {
             return div()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .child(page)
                 .into_any_element();
-        }
-        let available = (self.body_bounds.get()).map_or(0., |b| f32::from(b.size.height));
-        let height = devtools_height(self.devtools_height, available);
+        };
+        let beside = side.beside();
+        let available = (self.body_bounds.get()).map_or(0., |b| {
+            f32::from(if beside { b.size.width } else { b.size.height })
+        });
+        let size = devtools_extent(self.devtools_height, available);
         let slot = self.body_bounds.clone();
         // The next render clamps to a new size, so a resize asks for it.
         let probe = canvas(
@@ -1648,44 +2025,63 @@ impl BrowserPage {
         .top_0()
         .left_0()
         .size_full();
+        let line = div().bg(content(0.12));
         let divider = div()
             .id("browser-devtools-divider")
             .role(gpui::Role::Splitter)
             .aria_label("Resize DevTools")
             // Real space, not an overlap: Chromium's views would take the
             // pointer over any part of it they cover.
-            .h(px(5.))
             .flex_shrink_0()
-            .cursor(CursorStyle::ResizeUpDown)
             .flex()
-            .items_center()
-            .child(div().h(px(1.)).w_full().bg(content(0.12)))
+            .map(|d| {
+                if beside {
+                    d.w(px(5.))
+                        .h_full()
+                        .justify_center()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .child(line.w(px(1.)).h_full())
+                } else {
+                    d.h(px(5.))
+                        .w_full()
+                        .items_center()
+                        .cursor(CursorStyle::ResizeUpDown)
+                        .child(line.h(px(1.)).w_full())
+                }
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.devtools_drag = Some((f32::from(event.position.y), height));
+                    let at = if beside {
+                        event.position.x
+                    } else {
+                        event.position.y
+                    };
+                    this.devtools_drag = Some((f32::from(at), size));
                     cx.stop_propagation();
                 }),
             );
+        let devtools = Self::edit_actions(div(), true, cx)
+            .key_context(DEVTOOLS_KEY_CONTEXT)
+            .track_focus(&self.devtools_focus)
+            .flex_shrink_0()
+            .min_w_0()
+            .min_h_0()
+            .map(|d| if beside { d.w(px(size)) } else { d.h(px(size)) })
+            .child(self.devtools_surface(cx));
+        let page = div().flex_1().min_h_0().min_w_0().child(page);
         div()
             .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .flex()
-            .flex_col()
+            .map(|d| if beside { d.flex_row() } else { d.flex_col() })
             .child(probe)
-            .child(div().flex_1().min_h_0().min_w_0().child(page))
-            .child(divider)
-            .child(
-                Self::edit_actions(div(), true, cx)
-                    .key_context(DEVTOOLS_KEY_CONTEXT)
-                    .track_focus(&self.devtools_focus)
-                    .h(px(height))
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .child(self.devtools_surface(cx)),
-            )
+            .map(|d| match side {
+                DockSide::Left => d.child(devtools).child(divider).child(page),
+                _ => d.child(page).child(divider).child(devtools),
+            })
             .when(self.devtools_drag.is_some(), |d| {
                 d.child(self.drag_listener(cx))
             })
@@ -1720,25 +2116,39 @@ impl BrowserPage {
     }
 
     fn drag_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some((start, height)) = self.devtools_drag else {
+        let (Some(start), Some(side)) =
+            (self.devtools_drag, self.devtools.as_ref().map(|d| d.side))
+        else {
             return;
         };
         if event.pressed_button != Some(MouseButton::Left) {
             self.end_divider_drag(cx);
             return;
         }
-        let available = (self.body_bounds.get()).map_or(0., |b| f32::from(b.size.height));
-        let wanted = (height + start - f32::from(event.position.y)).max(1.);
-        let height = devtools_height(wanted.round() as u32, available).round() as u32;
-        if height != self.devtools_height {
-            self.devtools_height = height;
+        let beside = side.beside();
+        let (available, at) = match self.body_bounds.get() {
+            Some(b) if beside => (f32::from(b.size.width), event.position.x),
+            Some(b) => (f32::from(b.size.height), event.position.y),
+            None => (
+                0.,
+                if beside {
+                    event.position.x
+                } else {
+                    event.position.y
+                },
+            ),
+        };
+        let wanted = dragged_extent(side, start, f32::from(at));
+        let size = devtools_extent(wanted.round() as u32, available).round() as u32;
+        if size != self.devtools_height {
+            self.devtools_height = size;
             cx.notify();
         }
     }
 
     fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
         if self.devtools_drag.take().is_some() {
-            // The pane saves the new height.
+            // The pane saves the new size.
             cx.emit(PageChanged);
             cx.notify();
         }
@@ -1804,12 +2214,28 @@ impl Render for BrowserPage {
             )
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.set_zoom(100, cx)))
             .on_action(cx.listener(|this, _: &Print, _, _| this.print()))
+            .on_action(cx.listener(|this, _: &InspectElements, _, cx| {
+                this.run_dev_tools(DevToolsCommand::Elements, cx)
+            }))
+            .on_action(cx.listener(|this, _: &JavaScriptConsole, _, cx| {
+                this.run_dev_tools(DevToolsCommand::Console, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NetworkInspector, _, cx| {
+                this.run_dev_tools(DevToolsCommand::Network, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ViewSource, _, cx| this.view_source(cx)))
             .on_action(cx.listener(|this, _: &ToggleGrab, window, cx| this.toggle_grab(window, cx)))
+            .on_action(cx.listener(|this, _: &capture::CapturePage, _, cx| {
+                this.start_capture(cx);
+            }))
             .on_key_down(cx.listener(|this, event, _, cx| this.grab_key(event, cx)))
             .size_full()
             .flex()
             .flex_col()
-            .child(self.toolbar(cx))
+            // In Browser mode the sidebar holds the toolbar's address and
+            // buttons (`address_actions`).
+            .when(!self.nav_in_sidebar, |d| d.child(self.toolbar(cx)))
+            .children(self.developer_bar(cx))
             .children(self.find_bar(cx))
             .children(self.permission_bar(cx))
             .children(self.password_bar(cx))
@@ -1836,9 +2262,10 @@ impl Render for BrowserPage {
             })
             .child(self.body(body, docked, cx))
             .relative()
-            .children(self.downloads_popover(cx))
-            .children(self.site_popover(cx))
-            .children(self.passwords_popover(cx))
+            // Browser mode's child window draws them over the live page.
+            .when(!self.popovers_elsewhere, |d| {
+                d.children(self.page_popovers(cx))
+            })
             .children(self.suggestions_popover(cx))
             .children(self.prompt_overlay(cx))
     }
@@ -2238,6 +2665,7 @@ impl BrowserPage {
                 popup: Some(id),
             }),
             BrowserEvent::CloseRequested => cx.emit(PageRequest::Close),
+            BrowserEvent::PeekRequested(url) => cx.emit(PageRequest::Peek(url)),
             BrowserEvent::Download(download) => {
                 // The toolbar's indicator shows it; opening the list on its
                 // own would hide the page, which no overlay may cover.
@@ -2884,6 +3312,8 @@ struct Shared {
     generation: Cell<u64>,
     /// The page's sound, and whether the user muted it (`browser_audio.rs`).
     audio: audio::Audio,
+    /// What the page plays, and its PiP (`browser_playback.rs`).
+    playback: playback::Media,
     /// Where the password watcher's reports go (`browser_passwords.rs`).
     passwords:
         RefCell<Option<async_channel::Sender<monocode_core::browser::passwords::watch::Report>>>,
@@ -2995,7 +3425,7 @@ impl Host<monocode_cef::BrowserView> {
         // The old client, if any, is gone already.
         let log = PageLog::start(&cdp);
         discard::watch_edits(&cdp);
-        let audio = self.watch_audio(&cdp);
+        let audio = (self.watch_audio(&cdp), self.watch_playback(&cdp));
         let passwords = self.watch_passwords(&cdp);
         let passkeys = self.watch_passkeys(&cdp);
         let media = self.watch_media(&cdp);
@@ -3020,6 +3450,7 @@ impl<V> Host<V> {
     fn end_agent(&self) {
         // A page that went plays nothing.
         self.shared.audio.set_audible(false, &self.shared);
+        self.shared.playback.gone(&self.shared);
         self.shared.passkeys.clear();
         let link = self.agent.borrow_mut().take();
         if let Some(link) = link {
@@ -3077,8 +3508,30 @@ impl<V> Hosted<V> {
 #[cfg(target_os = "macos")]
 const AWAY: f64 = -100_000.;
 
+/// How long a page leaving at a tab switch stays up over the page taking
+/// its place: Chromium shows a page it hid with the frame it had then, or
+/// none (it may have let it go), until it draws again a frame or two
+/// later. Hidden at once, the switch flashed that frame or the bare card.
+const SWITCH_HOLD: Duration = Duration::from_millis(60);
+
+thread_local! {
+    /// In the sweep under way: where pages leave sight (shown to hidden)
+    /// and where pages come into it (hidden to shown).
+    static SWITCHING: RefCell<(Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Painted last in a window, it settles each host painted there.
 trait Swept {
+    /// What the sweep will make of it: where it was painted, and its
+    /// placement before and after; `None` if it is not this window's.
+    fn plan(
+        &self,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+    ) -> Option<(Placement, Placement, Bounds<Pixels>)>;
+
     fn sweep(
         self: Rc<Self>,
         window_id: WindowId,
@@ -3098,6 +3551,21 @@ trait Swept {
 }
 
 impl<V: NativeView> Swept for Host<V> {
+    fn plan(
+        &self,
+        window_id: WindowId,
+        epoch: u64,
+        covers: &[Bounds<Pixels>],
+    ) -> Option<(Placement, Placement, Bounds<Pixels>)> {
+        let (painted_in, painted, bounds) = self.painted.get()?;
+        if painted_in != window_id || self.view.borrow().is_none() {
+            return None;
+        }
+        let kept = self.shared.leases.get() > 0;
+        let next = shown(painted == epoch, bounds, covers, kept);
+        Some((self.shown.get(), next, bounds))
+    }
+
     fn keep(&self, kept: bool) {
         let prev = self.shown.get();
         let Some(next) = kept_placement(prev, kept, self.window_seen()) else {
@@ -3165,7 +3633,28 @@ impl<V: NativeView> Swept for Host<V> {
         let kept = self.shared.leases.get() > 0;
         let next = shown(painted == epoch, bounds, covers, kept);
         let prev = self.shown.replace(next);
+        // A tab switch: the page leaving stays up a moment over the one
+        // taking its place, which draws under it meanwhile.
+        let (held, lowered) = SWITCHING.with(|s| {
+            let (leaving, revealed) = &*s.borrow();
+            let meets = |all: &[Bounds<Pixels>]| all.iter().any(|b| b.intersects(&bounds));
+            (
+                prev == Placement::Shown && next == Placement::Hidden && meets(revealed),
+                matches!(prev, Placement::Hidden | Placement::Away)
+                    && next == Placement::Shown
+                    && meets(leaving),
+            )
+        });
+        if held {
+            self.follow_playback(prev, next, cx);
+            self.hold_then_hide(cx);
+            return;
+        }
         self.apply(prev, next);
+        if lowered {
+            self.lower_for(SWITCH_HOLD, cx);
+        }
+        self.follow_playback(prev, next, cx);
         let unseen = |p: Placement| matches!(p, Placement::Hidden | Placement::Away);
         match next {
             Placement::Hidden | Placement::Away if !unseen(prev) => {
@@ -3185,6 +3674,56 @@ impl<V: NativeView> Swept for Host<V> {
 }
 
 impl<V: NativeView> Host<V> {
+    /// At a tab switch: the view stays as it is for [`SWITCH_HOLD`], over
+    /// the page coming in, then hides, unless it was shown again meanwhile.
+    fn hold_then_hide(self: &Rc<Self>, cx: &mut App) {
+        let host = Rc::downgrade(self);
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(SWITCH_HOLD).await;
+            cx.update(|cx| {
+                let Some(host) = host.upgrade() else { return };
+                if host.shown.get() == Placement::Hidden {
+                    host.apply(Placement::Shown, Placement::Hidden);
+                    host.set_snapshot(None, None, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// At a tab switch: the view goes under the page leaving for `hold`,
+    /// so that one covers it until it drew a frame.
+    fn lower_for(self: &Rc<Self>, hold: Duration, cx: &mut App) {
+        self.set_depth(-1.);
+        let host = Rc::downgrade(self);
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(hold).await;
+            cx.update(|_| {
+                if let Some(host) = host.upgrade() {
+                    host.set_depth(0.);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The clip's layer's place among the window's other pages.
+    fn set_depth(&self, depth: f64) {
+        #[cfg(target_os = "macos")]
+        if let Some(hosted) = self.view.borrow().as_ref() {
+            use objc2::{msg_send, runtime::AnyObject};
+            // SAFETY: main thread; the clip is ours and layer-backed.
+            unsafe {
+                let layer: *mut AnyObject = msg_send![&*hosted.clip, layer];
+                if !layer.is_null() {
+                    let _: () = msg_send![layer, setZPosition: depth];
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = depth;
+    }
+
     /// Whether the window holding the page's view is on screen, at least in
     /// part. True when it cannot tell.
     fn window_seen(&self) -> bool {
@@ -3497,6 +4036,15 @@ pub(crate) fn cover(bounds: Bounds<Pixels>, window: &Window) {
     FRAMES.with(|f| f.borrow_mut().entry(id).or_default().covers.push(bounds));
 }
 
+/// For a window with no pages of its own (Browser mode's child window):
+/// what its overlays [`cover`]ed is dropped, as no sweep takes it.
+pub(crate) fn forget_covers(window: &Window) {
+    let id = window.window_handle().window_id();
+    FRAMES.with(|f| {
+        f.borrow_mut().remove(&id);
+    });
+}
+
 /// An invisible element that [`cover`]s its own bounds.
 pub(crate) fn cover_element() -> impl IntoElement {
     canvas(|_, _, _| {}, |bounds, _, window, _| cover(bounds, window))
@@ -3543,9 +4091,23 @@ pub(crate) fn sweep() -> impl IntoElement {
                     hosts.retain(|host| host.strong_count() > 0);
                     hosts.iter().filter_map(Weak::upgrade).collect()
                 });
+                // Pages leaving sight and coming into it in this frame: a
+                // tab switch, which `Host::sweep` makes without a flash.
+                let mut switching = (Vec::new(), Vec::new());
+                for (prev, next, bounds) in live.iter().filter_map(|h| h.plan(id, epoch, &covers)) {
+                    match (prev, next) {
+                        (Placement::Shown, Placement::Hidden) => switching.0.push(bounds),
+                        (Placement::Hidden | Placement::Away, Placement::Shown) => {
+                            switching.1.push(bounds)
+                        }
+                        _ => {}
+                    }
+                }
+                SWITCHING.with(|s| *s.borrow_mut() = switching);
                 for host in live {
                     host.sweep(id, epoch, &covers, window, cx);
                 }
+                SWITCHING.with(|s| *s.borrow_mut() = Default::default());
             },
         )
         .size_0(),
@@ -3663,6 +4225,7 @@ mod monocode_cef {
     #[allow(dead_code)]
     pub enum BrowserEvent {
         Address(String),
+        PeekRequested(String),
         Title(String),
         Favicon(String),
         Loading {
@@ -3895,6 +4458,7 @@ mod monocode_cef {
             0.
         }
         pub fn set_audio_muted(&self, _: bool) {}
+        pub fn set_peek_host(&self, _: Option<String>) {}
         pub fn is_audio_muted(&self) -> bool {
             false
         }
@@ -3922,23 +4486,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn devtools_keep_their_height_clear_of_both_minimums() {
-        // Unset: 40% of the body.
-        assert_eq!(devtools_height(0, 1000.), 400.);
-        assert_eq!(devtools_height(0, 250.), DEVTOOLS_MIN);
-        // Dragged: as wanted, within both minimums.
-        assert_eq!(devtools_height(300, 1000.), 300.);
-        assert_eq!(devtools_height(10, 1000.), DEVTOOLS_MIN);
-        assert_eq!(devtools_height(990, 1000.), 1000. - PAGE_MIN);
-        // Too small for both: the page keeps its minimum.
-        assert_eq!(devtools_height(300, 150.), 150. - PAGE_MIN);
-        assert_eq!(devtools_height(300, 50.), 0.);
-        // Not measured yet.
-        assert_eq!(devtools_height(300, 0.), 300.);
-        assert_eq!(devtools_height(0, 0.), DEVTOOLS_MIN);
-    }
-
-    #[test]
     fn a_page_is_placed_in_points_the_interface_scale_makes_of_its_layout() {
         let at = |x: f32, y: f32, w: f32, h: f32| Bounds {
             origin: gpui::point(px(x), px(y)),
@@ -3956,14 +4503,6 @@ mod tests {
         let (clip, frame) = native_frame(page, at(200., 150., 1000., 432.), 1.);
         assert_eq!(f32::from(clip.size.height), 432.);
         assert_eq!((frame.y, frame.height), (-50., 482.));
-    }
-
-    #[test]
-    fn docked_devtools_load_chromiums_frontend_on_the_apps_endpoint() {
-        assert_eq!(
-            devtools_frontend_url("127.0.0.1:5000/abc", "F00D"),
-            "devtools://devtools/bundled/devtools_app.html?ws=127.0.0.1:5000/abc/devtools/page/F00D"
-        );
     }
 
     #[test]
@@ -4318,7 +4857,7 @@ mod tests {
             DevToolsAsk::GrabSelected
         );
         // No dock-side menu: the frontend is not told it can dock.
-        assert!(!devtools_frontend_url("127.0.0.1:1/t", "A").contains("can_dock"));
+        assert!(!devtools_frontend_url("127.0.0.1:1/t", "A", Panel::Elements).contains("can_dock"));
     }
 
     #[gpui::test]
@@ -4385,6 +4924,142 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(changes.get(), 3);
+    }
+
+    /// Docked DevTools still loading (no view, no channel), at `side`.
+    fn docked_at(side: DockSide) -> DockedDevTools {
+        DockedDevTools {
+            host: Host::with_shared(Rc::default()),
+            url: None,
+            side,
+            channel: None,
+            inspect: false,
+            focus: false,
+        }
+    }
+
+    #[gpui::test]
+    fn devtools_commands_toggle_and_wait_for_the_frontend(cx: &mut gpui::TestAppContext) {
+        let page = cx.new(|cx| {
+            BrowserPage::new(
+                "https://a.test/".into(),
+                String::new(),
+                100,
+                "/tmp".into(),
+                cx,
+            )
+        });
+        page.update(cx, |page, cx| {
+            // No page view yet: nothing opens, nothing is saved.
+            for command in [
+                DevToolsCommand::Toggle,
+                DevToolsCommand::Elements,
+                DevToolsCommand::Console,
+                DevToolsCommand::Network,
+            ] {
+                page.run_dev_tools(command, cx);
+                assert!(page.devtools.is_none());
+            }
+            page.dock_dev_tools(DockSide::Left, cx);
+            assert!(page.devtools.is_none());
+            assert_eq!(page.dev_tools_saved(), (false, 0));
+            assert_eq!(page.dev_tools_side(), None);
+            // Open and loading: a panel command waits for the frontend,
+            // which then takes the keyboard (and picks for Inspect).
+            page.devtools = Some(docked_at(DockSide::Right));
+            page.devtools_wanted = true;
+            page.run_dev_tools(DevToolsCommand::Console, cx);
+            let docked = page.devtools.as_ref().unwrap();
+            assert!(docked.focus && !docked.inspect);
+            page.run_dev_tools(DevToolsCommand::Elements, cx);
+            assert!(page.devtools.as_ref().unwrap().inspect);
+            assert_eq!(page.dev_tools_side(), Some(DockSide::Right));
+            // The toggle closes them, for the pane too.
+            page.run_dev_tools(DevToolsCommand::Toggle, cx);
+            assert!(page.devtools.is_none());
+            assert_eq!(page.dev_tools_saved(), (false, 0));
+        });
+    }
+
+    #[gpui::test]
+    fn devtools_move_sides_and_the_next_open_where_they_were_put(cx: &mut gpui::TestAppContext) {
+        let page = cx.new(|cx| {
+            BrowserPage::new(
+                "https://a.test/".into(),
+                String::new(),
+                100,
+                "/tmp".into(),
+                cx,
+            )
+        });
+        let changes = Rc::new(Cell::new(0));
+        let counted = changes.clone();
+        cx.update(|cx| {
+            cx.subscribe(&page, move |_, _: &PageChanged, _| {
+                counted.set(counted.get() + 1)
+            })
+            .detach()
+        });
+        page.update(cx, |page, cx| {
+            assert_eq!(devtools::last_side(), DockSide::Right);
+            page.devtools = Some(docked_at(DockSide::Right));
+            page.devtools_height = 300;
+            // Right to left: still a width, kept.
+            page.dock_dev_tools(DockSide::Left, cx);
+            assert_eq!(page.dev_tools_side(), Some(DockSide::Left));
+            assert_eq!(page.devtools_height, 300);
+            assert_eq!(devtools::last_side(), DockSide::Left);
+            // Below: a height now, from the default third.
+            page.dock_dev_tools(DockSide::Bottom, cx);
+            assert_eq!(page.dev_tools_side(), Some(DockSide::Bottom));
+            assert_eq!(page.devtools_height, 0);
+            assert_eq!(devtools::last_side(), DockSide::Bottom);
+            // A window of their own: the docked ones close.
+            page.devtools_wanted = true;
+            page.dock_dev_tools(DockSide::Undocked, cx);
+            assert!(page.devtools.is_none());
+            assert_eq!(page.dev_tools_saved(), (false, 0));
+            assert_eq!(devtools::last_side(), DockSide::Undocked);
+            devtools::set_last_side(DockSide::Right);
+        });
+        cx.run_until_parked();
+        // The reset size, and closing for the pane.
+        assert_eq!(changes.get(), 2);
+    }
+
+    #[gpui::test]
+    fn view_source_opens_the_pages_source_in_a_new_tab(cx: &mut gpui::TestAppContext) {
+        let page = cx.new(|cx| {
+            BrowserPage::new(
+                "https://a.test/x".into(),
+                String::new(),
+                100,
+                "/tmp".into(),
+                cx,
+            )
+        });
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let kept = asked.clone();
+        cx.update(|cx| {
+            cx.subscribe(&page, move |_, request: &PageRequest, _| {
+                kept.borrow_mut().push(request.clone())
+            })
+            .detach()
+        });
+        page.update(cx, |page, cx| {
+            page.view_source(cx);
+            page.url = "about:blank".into();
+            page.view_source(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *asked.borrow(),
+            vec![PageRequest::Open {
+                url: "view-source:https://a.test/x".into(),
+                foreground: true,
+                popup: None,
+            }]
+        );
     }
 
     struct NoView;

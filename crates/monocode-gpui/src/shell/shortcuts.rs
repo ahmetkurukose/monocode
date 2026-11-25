@@ -91,9 +91,16 @@ fn devtools_lets_app(action: &dyn Action) -> bool {
         action.name(),
         "workspace::CloseTab"
             | "workspace::ToggleBrowserDevTools"
+            | "browser::InspectElements"
+            | "browser::JavaScriptConsole"
             | "workspace::ActivateTab"
             | "workspace::NextTab"
             | "workspace::PreviousTab"
+            | "workspace::BrowseCloseTab"
+            | "workspace::BrowseActivateTab"
+            | "workspace::BrowseNextTab"
+            | "workspace::BrowsePreviousTab"
+            | "workspace::SwitchMode"
             | "application::Quit"
     )
 }
@@ -110,9 +117,17 @@ enum Keys {
 }
 
 /// Keymap owns precedence, disabled bindings, physical-key matching and chords.
-fn candidates(keys: &[Keystroke], focus: Keys, cx: &App) -> Vec<KeyBinding> {
-    let mut contexts = vec![KeyContext::parse("Workspace").expect("static workspace key context")];
-    if focus == Keys::Page {
+fn candidates(keys: &[Keystroke], focus: Keys, browser_mode: bool, cx: &App) -> Vec<KeyBinding> {
+    // Browser mode's keys (⌘T, ⌘W, ⌘[ …) take over while it is on screen.
+    let workspace = if browser_mode {
+        "Workspace BrowserMode"
+    } else {
+        "Workspace"
+    };
+    let mut contexts = vec![KeyContext::parse(workspace).expect("static workspace key context")];
+    // DevTools are inside their page: its DevTools keys (⌥⌘C, ⌥⌘J, F12)
+    // reach them too.
+    if matches!(focus, Keys::Page | Keys::DevTools) {
         contexts.push(KeyContext::parse(BROWSER_CONTEXT).expect("static browser key context"));
     }
     let keymap = cx.key_bindings();
@@ -191,14 +206,19 @@ pub(super) fn install(owner: WeakEntity<Shell>, window: &Window, cx: &mut App) -
         // GPUI focus follows a browser page, or its docked DevTools, that
         // takes the keyboard, so its context is in the focused stack while
         // Chromium has the keys.
-        let focus = keys_in(&window.context_stack());
+        let stack = window.context_stack();
+        let focus = keys_in(&stack);
+        let browser_mode = owner.read(cx).browser_mode()
+            || stack
+                .iter()
+                .any(|c| c.contains(super::modes::BROWSER_MODE_CONTEXT));
         let mut sequence = pending.borrow_mut();
         sequence.push(event.keystroke.clone());
-        let mut matches = candidates(&sequence, focus, cx);
+        let mut matches = candidates(&sequence, focus, browser_mode, cx);
         if matches.is_empty() && sequence.len() > 1 {
             sequence.clear();
             sequence.push(event.keystroke.clone());
-            matches = candidates(&sequence, focus, cx);
+            matches = candidates(&sequence, focus, browser_mode, cx);
         }
         let action = matches
             .iter()
@@ -325,7 +345,7 @@ mod tests {
                 } else {
                     super::Keys::Workspace
                 };
-                super::candidates(&keys, focus, cx)
+                super::candidates(&keys, focus, false, cx)
                     .first()
                     .map(|b| b.action().name())
             };
@@ -361,6 +381,16 @@ mod tests {
             // Workspace shortcuts keep working from a page.
             assert_eq!(first(&format!("{m}-w"), true), Some("workspace::CloseTab"));
             assert_eq!(first(&format!("{m}-["), true), Some("workspace::VisitBack"));
+            // DevTools and View Source, over the workspace's Git Update.
+            assert_eq!(first("f12", true), Some("workspace::ToggleBrowserDevTools"));
+            assert_eq!(
+                first(&format!("{m}-alt-c"), true),
+                Some("browser::InspectElements")
+            );
+            assert_eq!(
+                first(&format!("{m}-alt-u"), true),
+                Some("browser::ViewSource")
+            );
         });
     }
 
@@ -370,7 +400,7 @@ mod tests {
             super::super::bind_keys(cx);
             let first = |stroke: &str| {
                 let keys = [Keystroke::parse(stroke).unwrap()];
-                super::candidates(&keys, super::Keys::DevTools, cx)
+                super::candidates(&keys, super::Keys::DevTools, false, cx)
                     .first()
                     .map(|b| b.action().name())
             };
@@ -394,6 +424,17 @@ mod tests {
             );
             assert_eq!(first(&format!("{m}-1")), Some("workspace::ActivateTab"));
             assert_eq!(first(&format!("{m}-shift-]")), Some("workspace::NextTab"));
+            // The DevTools commands reach them; View Source does not.
+            assert_eq!(first("f12"), Some("workspace::ToggleBrowserDevTools"));
+            assert_eq!(
+                first(&format!("{m}-alt-c")),
+                Some("browser::InspectElements")
+            );
+            assert_eq!(
+                first(&format!("{m}-alt-j")),
+                Some("browser::JavaScriptConsole")
+            );
+            assert_eq!(first(&format!("{m}-alt-u")), None);
         });
     }
 

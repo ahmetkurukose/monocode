@@ -256,6 +256,27 @@ fn icon_body(path: &str) -> Option<&'static str> {
             "<path d='M14 4H6a2 2 0 0 0-2 2v8'/><rect x='8' y='8' width='12' height='12' rx='2'/>"
         }
         "code" => "<path d='m8 7-5 5 5 5m8-10 5 5-5 5m-3-14-2 18'/>",
+        // The browser's Site Control Center and Capture (lucide's).
+        "scan" => {
+            "<path d='M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2'/>"
+        }
+        "camera" => {
+            "<path d='M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z'/><circle cx='12' cy='13' r='3'/>"
+        }
+        "mic" => {
+            "<path d='M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z'/><path d='M19 10v2a7 7 0 0 1-14 0v-2M12 19v3'/>"
+        }
+        "map-pin" => {
+            "<path d='M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z'/><circle cx='12' cy='10' r='3'/>"
+        }
+        "bell" => {
+            "<path d='M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9'/><path d='M10.3 21a1.94 1.94 0 0 0 3.4 0'/>"
+        }
+        "zoom-glass" => "<circle cx='11' cy='11' r='8'/><path d='m21 21-4.3-4.3M11 8v6M8 11h6'/>",
+        // The modes: a compass for Browser mode's button.
+        "compass" => {
+            "<circle cx='12' cy='12' r='9'/><path d='m15.6 8.4-2.1 5.1-5.1 2.1 2.1-5.1z'/>"
+        }
         // lucide's SquareDashedMousePointer: the browser's element grab.
         "grab" => {
             "<path d='M12.03 12.68a.5.5 0 0 1 .65-.65l9 3.5a.5.5 0 0 1-.03.94l-3.45 1.07a1 1 0 0 0-.66.66l-1.07 3.44a.5.5 0 0 1-.94.03zM5 3a2 2 0 0 0-2 2m16-2a2 2 0 0 1 2 2M5 21a2 2 0 0 1-2-2M9 3h1m-1 18h2m3-18h1M3 9v1m18-1v2M3 14v1'/>"

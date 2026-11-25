@@ -37,10 +37,13 @@ impl Shell {
         crate::browser::history::init(self.browser_history_dir(), cx);
         crate::browser::passwords::init(self.browser_passwords_dir(), cx);
         crate::browser::extensions::init(self.browser_data_dir(), cx);
+        let own = self.workspace.browse.owns(pane);
         let history = crate::browser::history::store_name(&profile).and_then(|store| {
             let folder = (self.session_summaries.get(&state.owner))
                 .map(|owner| owner.cwd.clone())
-                .or_else(|| state.project.clone())?;
+                .or_else(|| state.project.clone())
+                // Browser mode's own tabs keep a history of their own.
+                .or_else(|| own.then(|| super::modes::BROWSE_HISTORY_PROJECT.to_string()))?;
             Some(crate::browser::history::PageHistory {
                 project: monocode_core::files::path_key(&folder),
                 store,
@@ -60,6 +63,7 @@ impl Shell {
                 state.docked_devtools_height.unwrap_or(0),
             );
             page.restore_muted(state.muted);
+            page.favicon = state.favicon.clone();
             page
         });
         // Asked from inside a page's event: handled once that is over, with
@@ -74,8 +78,9 @@ impl Shell {
             .detach();
         })
         .detach();
+        self.watch_media_return(pane, &page, cx);
         let changed = cx.subscribe(&page, move |this, page, _: &PageChanged, cx| {
-            let (url, title, zoom, devtools, devtools_height, muted) = {
+            let (url, title, zoom, devtools, devtools_height, muted, favicon) = {
                 let page = page.read(cx);
                 let zoom = (page.zoom != 100).then_some(page.zoom);
                 let (devtools, height) = page.dev_tools_saved();
@@ -88,15 +93,18 @@ impl Shell {
                     devtools,
                     height,
                     muted,
+                    page.favicon.clone(),
                 )
             };
+            let (url_now, title_now) = (url.clone(), title.clone());
             if let Some(state) = this.workspace.browser_panes.get_mut(&pane)
                 && (state.url != url
                     || state.title != title
                     || state.zoom != zoom
                     || state.docked_devtools != devtools
                     || state.docked_devtools_height != devtools_height
-                    || state.muted != muted)
+                    || state.muted != muted
+                    || (favicon.is_some() && state.favicon != favicon))
             {
                 state.url = url;
                 state.title = title;
@@ -104,8 +112,13 @@ impl Shell {
                 state.docked_devtools = devtools;
                 state.docked_devtools_height = devtools_height;
                 state.muted = muted;
+                if favicon.is_some() {
+                    state.favicon = favicon;
+                }
                 this.persist(cx);
             }
+            // Browser mode's model keeps its tabs' addresses and titles.
+            this.browse_page_changed(pane, &url_now, &title_now);
             this.invalidate_chrome(cx);
             cx.notify();
         });
@@ -147,6 +160,17 @@ impl Shell {
         self.open_browser_pane(pane, window, cx);
     }
 
+    /// The browser pane in front: Browser mode's page, else the focused
+    /// pane when it is a page.
+    pub(super) fn focused_browser_pane(&self) -> Option<i64> {
+        let pane = if self.browser_mode() {
+            self.workspace.browse.active
+        } else {
+            self.workspace.active
+        };
+        pane.filter(|id| self.workspace.browser_panes.contains_key(id))
+    }
+
     /// Focus a browser pane, showing the tab that holds it.
     pub(super) fn open_browser_pane(
         &mut self,
@@ -157,6 +181,11 @@ impl Shell {
         let Some(owner) = self.workspace.browser_panes.get(&pane).map(|b| b.owner) else {
             return;
         };
+        // Browser mode shows the page itself; its own tabs are in no tab.
+        if self.browser_mode() || self.workspace.browse.owns(pane) {
+            self.browse_select(pane, window, cx);
+            return;
+        }
         if self.workspace.tab_of(pane).is_none() {
             return;
         }
@@ -194,11 +223,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(pane) = self
-            .workspace
-            .active
-            .filter(|id| self.workspace.browser_panes.contains_key(id))
-        else {
+        let Some(pane) = self.focused_browser_pane() else {
             return false;
         };
         match self.browser_page(pane, cx) {
@@ -210,11 +235,7 @@ impl Shell {
 
     /// ⌥⌘I: the focused browser pane's DevTools open docked or close.
     pub(super) fn toggle_browser_dev_tools(&mut self, cx: &mut Context<Self>) {
-        let Some(pane) = self
-            .workspace
-            .active
-            .filter(|id| self.workspace.browser_panes.contains_key(id))
-        else {
+        let Some(pane) = self.focused_browser_pane() else {
             return;
         };
         if let Some(page) = self.browser_page(pane, cx) {
@@ -250,6 +271,15 @@ impl Shell {
     /// A browser pane's page, under its group's strip.
     pub(super) fn browser_pane_surface(&mut self, pane: i64, cx: &mut Context<Self>) -> AnyElement {
         let page = self.browser_page(pane, cx);
+        // In a pane, the page's toolbar has its history buttons.
+        if let Some(page) = &page {
+            page.update(cx, |page, cx| {
+                if page.nav_in_sidebar {
+                    page.nav_in_sidebar = false;
+                    cx.notify();
+                }
+            });
+        }
         div()
             .id(("browser-pane", pane.unsigned_abs() as usize))
             .debug_selector(move || format!("browser-pane-{pane}"))
@@ -302,6 +332,9 @@ impl Shell {
         if !self.workspace.browser_panes.contains_key(&pane) {
             return;
         }
+        if self.workspace.browse.owns(pane) {
+            return self.browse_page_request(pane, request, window, cx);
+        }
         match request {
             PageRequest::Open {
                 url,
@@ -310,10 +343,15 @@ impl Shell {
             } => self.open_browser_page_beside(pane, url, foreground, popup, window, cx),
             PageRequest::Close => self.close_pane(pane, window, cx),
             PageRequest::Grab(result) => self.deliver_browser_grab(pane, result, cx),
+            PageRequest::SiteControls(ask) => self.browse_site_ask(pane, ask, window, cx),
             PageRequest::ShowTab(other) => {
                 if self.workspace.browser_panes.contains_key(&other) {
                     self.open_browser_pane(other, window, cx);
                 }
+            }
+            // Only Browser mode's own tabs peek.
+            PageRequest::Peek(url) => {
+                self.open_browser_page_beside(pane, url, true, None, window, cx)
             }
         }
     }

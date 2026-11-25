@@ -212,6 +212,10 @@ impl Shell {
             .update(cx, |footer, cx| footer.set_classic(classic, cx));
         self.resources
             .update(cx, |monitor, cx| monitor.set_classic(classic, cx));
+        // Browser mode: its sidebar and page instead of the workspace.
+        if self.browser_mode() {
+            return vec![self.browse_body(window, cx)];
+        }
         if classic {
             return vec![self.classic_body(
                 sidebar_width,
@@ -437,11 +441,19 @@ impl Shell {
         let corner = (self.settings.is_none()
             && (!original || self.project_rail_tree_on() || self.mono_active(cx)))
         .then(|| self.panel_toggle(window, cx));
+        // A swipe toward Browser mode brings its colour in under the rail.
+        let wash = (self.workspace.classic_layout)
+            .then(|| {
+                let rail = self.project_rail_drawn_width();
+                self.browse_wash_over(self.browser_presence(), Some(rail))
+            })
+            .flatten();
         let body = div()
             .flex_1()
             .min_h_0()
             .flex()
             .relative()
+            .children(wash)
             .when(self.workspace.classic_layout, |d| {
                 d.child(self.project_rail_frame(cx))
             })

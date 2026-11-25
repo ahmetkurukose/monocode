@@ -276,6 +276,12 @@ pub(crate) struct Workspace {
     /// Only filled while saving: see `TitleTab::ProjectApp`.
     #[serde(skip_serializing_if = "ProjectApps::is_empty")]
     pub project_apps: ProjectApps,
+    /// The mode on screen (docs/native/modes.md).
+    pub mode: crate::modes::AppMode,
+    /// The mode bar's buttons, in order.
+    pub mode_bar: crate::modes::ModeBar,
+    /// Browser mode's own tabs and look.
+    pub browse: crate::modes::BrowseState,
 }
 
 /// A saved command the footer runs in a terminal with one click.
@@ -365,6 +371,10 @@ pub(crate) struct BrowserPane {
     /// again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
+    /// The address of the page's icon, for its tab while the page is not
+    /// loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
     /// The agent session that opened it (context.md K21); not saved.
     #[serde(skip)]
     pub opened_by: Option<i64>,
@@ -593,6 +603,9 @@ impl Default for Workspace {
             desktop_project_preferences: None,
             desktop_workspace_snapshot: None,
             desktop_preferences_metadata: None,
+            mode: Default::default(),
+            mode_bar: Default::default(),
+            browse: Default::default(),
         }
     }
 }
@@ -655,6 +668,20 @@ impl Workspace {
             );
             self.projects = projects;
         }
+    }
+
+    /// The mode bar and Browser mode's tabs, consistent with the panes:
+    /// the mode on screen is one the bar shows.
+    pub fn normalize_modes(&mut self) {
+        self.mode_bar.normalize();
+        if !self.mode_bar.shown.contains(&self.mode) {
+            self.mode = self.mode_bar.shown[0];
+        }
+        let panes = &self.browser_panes;
+        self.browse.normalize(
+            |id| panes.contains_key(&id),
+            |id| panes.get(&id).map(|p| (p.url.clone(), p.title.clone())),
+        );
     }
 
     pub fn boxy_layout(&self) -> bool {
@@ -738,12 +765,14 @@ impl Workspace {
             &state.mono_panes,
             &state.terminal_panes,
         );
+        let browse = &state.browse;
         state.browser_panes.retain(|id, pane| {
             *id < 0
                 && !owners.contains_key(id)
                 && !monos.contains_key(id)
                 && !terminals.contains_key(id)
-                && sessions.iter().any(|(known, _)| *known == pane.owner)
+                // Browser mode's own tabs belong to no session.
+                && (browse.owns(*id) || sessions.iter().any(|(known, _)| *known == pane.owner))
         });
         known.extend(state.browser_panes.keys().copied());
         let (owners, monos, terminals, browsers) = (
@@ -827,6 +856,7 @@ impl Workspace {
         state.prune_browser_panes();
         state.prune_view_panes();
         state.normalize_title_order();
+        state.normalize_modes();
         if state
             .desktop_project_preferences
             .as_ref()
@@ -1484,8 +1514,9 @@ impl Workspace {
     /// with them, so the caller drops their views.
     pub fn prune_browser_panes(&mut self) -> Vec<i64> {
         let open: HashSet<_> = self.open_sessions().into_iter().collect();
+        // Browser mode's own tabs live in no tab of the workspace.
         let gone: Vec<_> = (self.browser_panes.keys().copied())
-            .filter(|id| !open.contains(id))
+            .filter(|id| !open.contains(id) && !self.browse.owns(*id))
             .collect();
         for id in &gone {
             self.browser_panes.remove(id);

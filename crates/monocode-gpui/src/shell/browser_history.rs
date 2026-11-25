@@ -61,7 +61,10 @@ impl Shell {
     /// The browser tabs of this window other than `pane`'s.
     fn open_browser_tabs(&self, pane: i64, cx: &App) -> Vec<OpenTab> {
         let mut tabs: Vec<OpenTab> = (self.workspace.browser_panes.iter())
-            .filter(|(id, _)| **id != pane && self.workspace.tab_of(**id).is_some())
+            .filter(|(id, _)| {
+                **id != pane
+                    && (self.workspace.tab_of(**id).is_some() || self.workspace.browse.owns(**id))
+            })
             .map(|(id, state)| {
                 let (url, title) = match self.browser_pages.get(id) {
                     Some((page, _)) => {
@@ -141,8 +144,14 @@ impl Shell {
         crate::browser::history::init(self.browser_history_dir(), cx);
         let restore = window.focused(cx);
         self.close_menu(cx);
-        let project =
-            (!self.workspace.project.is_empty()).then(|| path_key(&self.workspace.project));
+        // Browser mode's own pages first in Browser mode, else the project's.
+        let own = (self.workspace.browse.active)
+            .is_some_and(|pane| self.browser_mode() && self.workspace.browse.owns(pane));
+        let project = if own {
+            Some(super::modes::BROWSE_HISTORY_PROJECT.to_string())
+        } else {
+            (!self.workspace.project.is_empty()).then(|| path_key(&self.workspace.project))
+        };
         let view = cx.new(|cx| HistoryView::new(project, cx));
         let events = cx.subscribe_in(
             &view,
@@ -185,13 +194,15 @@ impl Shell {
 
     /// A page picked in the history: in the focused page, or a new one.
     fn open_history_page(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        let focused =
-            (self.workspace.active).filter(|id| self.workspace.browser_panes.contains_key(id));
-        if let Some(pane) = focused
+        if let Some(pane) = self.focused_browser_pane()
             && let Some(page) = self.browser_page(pane, cx)
         {
             page.update(cx, |page, cx| page.open_address(url, cx));
             self.focus_browser_pane(window, cx);
+            return;
+        }
+        if self.browser_mode() {
+            self.browse_new_tab(Some(url), None, true, window, cx);
             return;
         }
         self.new_browser_pane(Some(url), window, cx);

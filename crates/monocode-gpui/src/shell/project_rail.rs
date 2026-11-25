@@ -415,7 +415,8 @@ impl Shell {
             .h_full()
             .flex_shrink_0()
             .border_r_1()
-            .border_color(content(0.07))
+            // Browser mode's sidebar runs into the frame around its page.
+            .border_color(content(0.07 * (1. - self.browser_presence())))
             .child(
                 self.projects_frame
                     .clone()
@@ -501,30 +502,81 @@ impl Shell {
                 .child(nav)
                 .into_any();
         }
+        // Each mode's body slides beside the others (docs/native/modes.md);
+        // the header, live agents and footer stay put.
+        let width = self.project_rail_drawn_width() - 1.;
+        let body = self.mode_slider(
+            width,
+            |this, mode, cx| match mode {
+                crate::modes::AppMode::Dev => this.project_rail_dev_body(compact, cx),
+                crate::modes::AppMode::Browser => this.browse_sidebar(compact, cx),
+            },
+            cx,
+        );
         if compact {
             return div()
                 .id("project-rail")
                 .debug_selector(|| "project-rail".into())
                 .role(Role::Navigation)
                 .aria_label("Project shortcuts")
+                .relative()
                 .size_full()
                 .flex()
                 .flex_col()
                 .items_center()
                 .overflow_hidden()
                 .when(!cfg!(target_os = "macos"), |d| d.child(header))
+                .child(body)
+                .child(
+                    div()
+                        .w_full()
+                        .py(px(6.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(self.mode_bar(true, cx))
+                        .child(
+                            icon_button("rail-settings", "Settings", "settings")
+                                .size(px(32.))
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.open_settings(crate::settings::Section::General, w, cx)
+                                })),
+                        ),
+                )
+                .child(self.mode_swipe_catcher(cx))
+                .into_any();
+        }
+        div()
+            .id("project-rail")
+            .debug_selector(|| "project-rail".into())
+            .role(Role::Navigation)
+            .aria_label("Projects")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .when(!self.classic_titlebar_spans_window(cx), |d| d.child(header))
+            .child(body)
+            .children(self.live_agents_preview(cx))
+            .child(self.app_update_footer(cx))
+            .child(self.project_rail_footer(compact, cx))
+            .child(self.mode_swipe_catcher(cx))
+            .into_any_element()
+    }
+    /// Dev mode's part of the rail: the navigation and the projects, or the
+    /// compact rail's shortcuts.
+    fn project_rail_dev_body(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        if compact {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
                 .child(self.project_rail_compact_actions(cx))
                 .child(div().min_h(px(8.)).flex_1())
-                .child(
-                    div().w_full().py(px(6.)).flex().justify_center().child(
-                        icon_button("rail-settings", "Settings", "settings")
-                            .size(px(32.))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.open_settings(crate::settings::Section::General, w, cx)
-                            })),
-                    ),
-                )
-                .into_any();
+                .into_any_element();
         }
         self.prepare_project_rail(compact, cx);
         let owner = cx.weak_entity();
@@ -535,16 +587,10 @@ impl Shell {
         })
         .size_full();
         div()
-            .id("project-rail")
-            .debug_selector(|| "project-rail".into())
-            .role(Role::Navigation)
-            .aria_label("Projects")
             .size_full()
             .flex()
             .flex_col()
-            .overflow_hidden()
-            .when(!self.classic_titlebar_spans_window(cx), |d| d.child(header))
-            .when(!compact, |d| d.child(self.original_rail_navigation(cx)))
+            .child(self.original_rail_navigation(cx))
             .child(
                 div()
                     .id("project-rail-scroll")
@@ -553,9 +599,6 @@ impl Shell {
                     .overflow_hidden()
                     .child(rows),
             )
-            .children(self.live_agents_preview(cx))
-            .child(self.app_update_footer(cx))
-            .child(self.project_rail_footer(compact, cx))
             .into_any_element()
     }
     fn prepare_project_rail(&mut self, compact: bool, cx: &App) {
@@ -802,6 +845,7 @@ impl Shell {
                         .map(|prompt| div().mb_1().child(prompt)),
                 )
             })
+            .child(div().mb(px(6.)).child(self.mode_bar(compact, cx)))
             .child(
                 div()
                     .id("rail-settings")
@@ -1894,6 +1938,9 @@ impl Shell {
             .is_some_and(|drag| drag.active)
     }
     pub(super) fn project_rail_animating(&self) -> bool {
+        if self.mode_moving() {
+            return true;
+        }
         self.workspace.classic_layout
             && self.workspace.project_rail_open
             && self

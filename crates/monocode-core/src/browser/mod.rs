@@ -28,6 +28,7 @@ pub mod cdp;
 pub mod control;
 pub mod dev_servers;
 pub mod extensions;
+pub mod favicon;
 pub mod grab;
 pub mod history;
 pub mod host;
@@ -36,8 +37,10 @@ pub mod log;
 pub mod passwords;
 pub mod media;
 pub mod passkeys;
+pub mod playback;
 pub mod proxy;
 pub mod sites;
+pub mod suggest;
 pub mod tools;
 
 pub use cdp::{CdpClient, CdpError, CdpEvent, Subscription};

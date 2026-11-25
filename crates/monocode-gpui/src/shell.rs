@@ -3,6 +3,11 @@ mod actions;
 mod app_commands;
 mod app_views;
 mod automation_runs;
+mod browse_little;
+mod browse_media;
+mod browse_organize;
+mod browse_peek;
+mod browse_split;
 pub(crate) mod browser_agent;
 mod browser_audio;
 pub(crate) mod browser_extensions;
@@ -24,6 +29,8 @@ mod code_selftest;
 mod code_shell;
 #[cfg(test)]
 mod code_shell_tests;
+mod command_bar;
+mod overlay_window;
 mod database_footer;
 mod database_send;
 mod empty_workspace;
@@ -38,6 +45,8 @@ mod keep_awake;
 mod layout;
 mod live_agents;
 mod mobile_host;
+pub(crate) mod modes;
+mod modes_ui;
 mod mono_panes;
 pub(crate) mod monos;
 mod new_chat_choice;
@@ -70,6 +79,7 @@ mod settings;
 mod shortcuts;
 mod sidebar_list;
 mod sidebar_peek;
+mod site_controls;
 mod space_reorder;
 mod tab_router;
 use tab_router::OpenIn;
@@ -345,6 +355,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", FocusNext, context),
         KeyBinding::new("shift-tab", FocusPrevious, context),
     ]);
+    // Last: Browser mode's keys outrank these at the same depth.
+    modes::bind(cx);
+    browse_split::bind(cx);
+    browse_peek::bind(cx);
+    browse_little::bind(cx);
 }
 
 /// Windows has no caption of its own (`appears_transparent`), so the app
@@ -475,6 +490,14 @@ pub(crate) enum MenuTarget {
     GroupAdd(i64),
     /// A group strip's `⋯`, by the group's visible tab.
     GroupMore(i64),
+    /// A mode button of the bar (docs/native/modes.md).
+    Mode(crate::modes::AppMode),
+    /// A tab of Browser mode's sidebar, by its pane.
+    BrowseTab(i64),
+    /// The empty room of Browser mode's sidebar.
+    BrowseSidebar,
+    /// A folder of Browser mode's pinned tabs.
+    BrowseFolder(u64),
 }
 pub(crate) struct ShellMenu {
     pub(crate) target: MenuTarget,
@@ -747,6 +770,21 @@ pub(crate) struct Shell {
     groups: HashMap<String, monocode_core::session_groups::Groups>,
     reminders: Vec<monocode_core::store::Reminder>,
     renaming: Option<session_groups::Renaming>,
+    /// Browser mode's Command Bar, while it is open.
+    command_bar: Option<command_bar::CommandBar>,
+    browse_media: browse_media::MediaCard,
+    /// The window this shell draws in, for actions picked in a child window.
+    main_window: Option<gpui::AnyWindowHandle>,
+    /// Browser mode's child window for menus and the Command Bar, open or
+    /// on its way (`shell/overlay_window.rs`).
+    browse_overlay: Option<overlay_window::BrowseOverlay>,
+    browse_overlay_opening: bool,
+    /// A Browser mode page's popover or Capture is open, as the last frame
+    /// found: it draws in the child window too.
+    browse_page_popover: bool,
+    /// Browser mode's Peek, split drop preview and icon anchors
+    /// (`shell/browse_peek.rs`).
+    browse_live: browse_peek::BrowseLive,
     /// Where the open session menu came from, so its Rename edits the
     /// title in that row rather than in the sidebar.
     menu_rename_host: session_groups::RenameHost,
@@ -894,6 +932,13 @@ pub(crate) struct Shell {
     terminal_pane_views: HashMap<i64, Entity<Terminal>>,
     /// Pages of `workspace.browser_panes`, made when first shown.
     browser_pages: HashMap<i64, (Entity<crate::browser::BrowserPage>, Subscription)>,
+    /// A two-finger swipe over the rail, from touch to lift, and the rail's
+    /// width it moves over; when its last event came.
+    mode_swipe: Option<crate::modes::Swipe>,
+    mode_swipe_width: f32,
+    mode_swipe_at: Option<std::time::Instant>,
+    /// The rail sliding to the mode on screen.
+    mode_slide: Option<crate::modes::ModeSlide>,
     /// The window's one-time services (database footer, selftests) started.
     window_services_started: bool,
     /// What sleeping projects gave back, and the pages to reopen on waking.
@@ -1177,6 +1222,13 @@ impl Shell {
             groups: sidebar_metadata.groups,
             reminders: sidebar_metadata.reminders,
             renaming: None,
+            command_bar: None,
+            browse_media: Default::default(),
+            main_window: None,
+            browse_overlay: None,
+            browse_overlay_opening: false,
+            browse_page_popover: false,
+            browse_live: Default::default(),
             menu_rename_host: session_groups::RenameHost::Sidebar,
             link_dialog: None,
             action_dialog: None,
@@ -1289,6 +1341,10 @@ impl Shell {
             terminals: HashMap::new(),
             terminal_pane_views: HashMap::new(),
             browser_pages: HashMap::new(),
+            mode_swipe: None,
+            mode_swipe_width: 220.,
+            mode_swipe_at: None,
+            mode_slide: None,
             window_services_started: false,
             project_sleep: Default::default(),
             dock_slide: None,
@@ -4282,6 +4338,10 @@ impl Shell {
         }
     }
     pub(crate) fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser_mode() {
+            self.focus_browse_page(window, cx);
+            return;
+        }
         self.keep_visible_idle_agents(cx);
         self.follow_front_file(cx);
         if let Some(search) = &self.app_search {
@@ -4389,6 +4449,15 @@ impl Shell {
     }
 
     pub(crate) fn open(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        // A page shows in Browser mode while it is on screen; anything else
+        // is Dev mode's.
+        if self.browser_mode() {
+            if self.workspace.browser_panes.contains_key(&id) {
+                self.browse_select(id, window, cx);
+                return;
+            }
+            self.set_mode(crate::modes::AppMode::Dev, window, cx);
+        }
         if self.workspace.review_owners.contains_key(&id) {
             self.open_file_pane(id, window, cx);
             return;
@@ -5587,6 +5656,50 @@ impl Shell {
             cx.notify();
         }
     }
+    /// The open menu, at its anchor.
+    pub(super) fn menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.menu.as_ref().map(|open| {
+                let point = matches!(open.anchor, Anchor::Point(_));
+                let beside = matches!(open.target, MenuTarget::Project { .. });
+                // Context menus open at the pointer, as ExplorerMenu
+                // does; TabGroupMenu hangs its top-left corner there.
+                menu_popover(&open.menu, open.anchor.clone(), cx)
+                    .when(
+                        self.workspace.classic_layout && open.target == MenuTarget::SessionFilter,
+                        |p| p.align(Align::End).gap(2.),
+                    )
+                    .when(point, |p| p.gap(0.))
+                    .when(beside, |p| p.side(Side::Right))
+                    .when(open.target == MenuTarget::RailSessions, |p| {
+                        p.side(Side::Right).align(Align::Start).max_height(520.)
+                    })
+                    .when(open.target == MenuTarget::SidebarOptions, |p| {
+                        p.align(Align::Start)
+                    })
+                    .when(open.target == MenuTarget::Actions, |p| {
+                        p.side(Side::Top).align(crate::popover::Align::End)
+                    })
+                    .when(
+                        matches!(
+                            open.target,
+                            MenuTarget::Databases
+                                | MenuTarget::DatabaseImport
+                                | MenuTarget::KeepAwake
+                        ),
+                        |p| {
+                            p.side(Side::Top)
+                                .align(crate::popover::Align::End)
+                                .max_height(560.)
+                        },
+                    )
+                    .when(open.target == MenuTarget::RunningTerminals, |p| {
+                        p.side(Side::Top).align(crate::popover::Align::End)
+                    })
+                    .when(matches!(open.target, MenuTarget::FooterChip(_)), |p| {
+                        p.side(Side::Top).align(crate::popover::Align::End)
+                    })
+            }).map(|popover| popover.into_any_element())
+    }
     pub(crate) fn open_menu(
         &mut self,
         target: MenuTarget,
@@ -5738,6 +5851,10 @@ impl Shell {
             MenuTarget::GroupTab(id) => self.group_tab_menu(*id, cx),
             MenuTarget::GroupAdd(_) => self.group_add_menu(cx),
             MenuTarget::GroupMore(visible) => self.group_more_menu(*visible),
+            MenuTarget::Mode(mode) => self.mode_menu(*mode),
+            MenuTarget::BrowseTab(pane) => self.browse_tab_menu(*pane, cx),
+            MenuTarget::BrowseSidebar => self.browse_sidebar_menu(),
+            MenuTarget::BrowseFolder(id) => self.browse_folder_menu(*id),
             MenuTarget::Session(id) => (
                 format!("Session actions for {}", title(id)).into(),
                 self.session_menu_items(*id, cx),
@@ -6086,6 +6203,10 @@ impl Shell {
             MenuTarget::GroupTab(id) => self.run_group_tab_menu(id, action, window, cx),
             MenuTarget::GroupAdd(visible) => self.run_group_add_menu(visible, action, window, cx),
             MenuTarget::GroupMore(visible) => self.run_group_more_menu(visible, action, window, cx),
+            MenuTarget::Mode(mode) => self.run_mode_menu(mode, action, window, cx),
+            MenuTarget::BrowseTab(pane) => self.run_browse_tab_menu(pane, action, window, cx),
+            MenuTarget::BrowseSidebar => self.run_browse_sidebar_menu(action, window, cx),
+            MenuTarget::BrowseFolder(id) => self.run_browse_folder_menu(id, action, window, cx),
             MenuTarget::TerminalDock => {
                 let side = match action {
                     "top" => DockSide::Top,
@@ -7212,7 +7333,16 @@ impl Shell {
                 ),
             )
             .when(!self.workspace.classic_layout, |d| {
-                d.child(self.project_spaces(cx))
+                // The mode bar (docs/native/modes.md), above the spaces.
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .pl(px(6.))
+                        .pr_2()
+                        .pb_1()
+                        .child(self.mode_bar(false, cx)),
+                )
+                .child(self.project_spaces(cx))
             })
             .when_some(self.session_preview.as_ref(), |d, preview| {
                 let id = preview.id;
@@ -7662,6 +7792,8 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Browser mode's menus and Command Bar draw in a child window.
+        self.sync_browse_overlay(window, cx);
         self.keep_visible_idle_agents(cx);
         self.sync_git_guard(cx);
         // The group strips become the title bar when nothing else needs it.
@@ -7689,8 +7821,8 @@ impl Render for Shell {
         if browser_links::pending(cx) {
             let this = cx.entity();
             window.defer(cx, move |window, cx| {
-                for url in browser_links::take_for(window.window_handle(), cx) {
-                    this.update(cx, |this, cx| this.new_browser_pane(Some(url), window, cx));
+                for (url, opens) in browser_links::take_for(window.window_handle(), cx) {
+                    this.update(cx, |this, cx| this.open_routed_link(url, opens, window, cx));
                 }
             });
         }
@@ -7752,7 +7884,15 @@ impl Render for Shell {
             // For testing the agent layer from outside (development only).
             self.start_browser_agent_dev_hook(cx);
             self.start_browser_grab_dev_hook(window, cx);
+            self.start_modes_dev_hook(window, cx);
+            // Tab icons arriving repaint Browser mode's sidebar.
+            let favicons = crate::favicons::store(cx);
+            self.observations
+                .push(cx.observe(&favicons, |this, _, cx| this.notify_mode_chrome(cx)));
             self.start_browser_lifecycle(cx);
+            // Browser mode's model may hold tabs without panes (a sidebar
+            // saved before it, or panes the restore dropped).
+            self.browse_reconcile(cx);
         }
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
@@ -7994,13 +8134,27 @@ impl Render for Shell {
             });
         }
         self.sync_notices(window, cx);
+        // The rail sliding between modes, or held by a swipe.
+        if self.settle_mode_motion(window, cx) {
+            window.request_animation_frame();
+            self.sidebar_frame.update(cx, |_, cx| cx.notify());
+            self.projects_frame.update(cx, |_, cx| cx.notify());
+        }
+        let browser_mode = self.browser_mode();
         div()
             .id("monocode-workspace")
             .relative()
             .role(Role::Application)
             .aria_label("Monocode Native")
-            .key_context("Workspace")
+            .key_context(if browser_mode {
+                "Workspace BrowserMode"
+            } else {
+                "Workspace"
+            })
             .track_focus(&self.focus)
+            .map(|root| self.browse_actions(root, cx))
+            .map(|root| self.browse_split_actions(root, cx))
+            .map(|root| self.browse_peek_actions(root, cx))
             .capture_key_up(cx.listener(|this, _, _, _| this.archive_shortcut_held = false))
             // ⇧⇧ opens Search Everywhere; any key or click between the taps
             // means Shift was used for something else.
@@ -8204,6 +8358,12 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewCodex, window, cx| {
+                // ⌘N in Browser mode (whose ⌘T is its own): a chat, in Dev.
+                if this.browser_mode() {
+                    this.set_mode(crate::modes::AppMode::Dev, window, cx);
+                    this.new_chat(cx);
+                    return;
+                }
                 // ⌘T in the focused dock opens another terminal there, and
                 // in a browser page a new tab page (K66).
                 let page = (this.workspace.active)
@@ -8401,8 +8561,10 @@ impl Render for Shell {
                         return;
                     }
                 }
-                // `Session: Stop` when no menu is open to close.
+                // `Session: Stop` when no menu is open to close; never from
+                // Browser mode, where the chat is out of sight.
                 if this.menu.is_none()
+                    && !this.browser_mode()
                     && let Some(view) = this.workspace.active.and_then(|id| this.sessions.get(&id))
                 {
                     view.update(cx, |v, cx| v.stop_by_user(cx));
@@ -8556,47 +8718,8 @@ impl Render for Shell {
             .children(self.layout_body(sidebar_width, right_shown, right_width, full, window, cx))
             .children(self.peek_watch(window, cx))
             .child(self.notices_overlay(cx))
-            .children(self.menu.as_ref().map(|open| {
-                let point = matches!(open.anchor, Anchor::Point(_));
-                let beside = matches!(open.target, MenuTarget::Project { .. });
-                // Context menus open at the pointer, as ExplorerMenu
-                // does; TabGroupMenu hangs its top-left corner there.
-                menu_popover(&open.menu, open.anchor.clone(), cx)
-                    .when(
-                        self.workspace.classic_layout && open.target == MenuTarget::SessionFilter,
-                        |p| p.align(Align::End).gap(2.),
-                    )
-                    .when(point, |p| p.gap(0.))
-                    .when(beside, |p| p.side(Side::Right))
-                    .when(open.target == MenuTarget::RailSessions, |p| {
-                        p.side(Side::Right).align(Align::Start).max_height(520.)
-                    })
-                    .when(open.target == MenuTarget::SidebarOptions, |p| {
-                        p.align(Align::Start)
-                    })
-                    .when(open.target == MenuTarget::Actions, |p| {
-                        p.side(Side::Top).align(crate::popover::Align::End)
-                    })
-                    .when(
-                        matches!(
-                            open.target,
-                            MenuTarget::Databases
-                                | MenuTarget::DatabaseImport
-                                | MenuTarget::KeepAwake
-                        ),
-                        |p| {
-                            p.side(Side::Top)
-                                .align(crate::popover::Align::End)
-                                .max_height(560.)
-                        },
-                    )
-                    .when(open.target == MenuTarget::RunningTerminals, |p| {
-                        p.side(Side::Top).align(crate::popover::Align::End)
-                    })
-                    .when(matches!(open.target, MenuTarget::FooterChip(_)), |p| {
-                        p.side(Side::Top).align(crate::popover::Align::End)
-                    })
-            }))
+            // In Browser mode the menu draws in the child window.
+            .children((!self.browse_overlay_wanted()).then(|| self.menu_layer(cx)).flatten())
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children((self.file_history.as_ref()).map(|(dialog, _)| {

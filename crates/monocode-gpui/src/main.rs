@@ -38,6 +38,7 @@ mod editor_scrollbar;
 mod editor_syntax;
 mod everywhere;
 mod explorer;
+mod favicons;
 mod file_editor;
 mod file_history;
 mod file_icons;
@@ -67,6 +68,8 @@ mod memory_log;
 mod metal_tests;
 mod mobile;
 mod modal;
+mod browse_command;
+mod modes;
 mod monos;
 mod notes;
 mod notifications;
@@ -507,9 +510,20 @@ fn main() {
     app_log::init();
     let platform = gpui_platform::current_platform(false);
     let title_raster = particle_text::GlyphRaster(platform.text_system());
-    gpui::Application::with_platform(platform)
-        .with_assets(assets::Assets)
-        .run(move |cx: &mut App| {
+    let app = gpui::Application::with_platform(platform).with_assets(assets::Assets);
+    // Web links other apps hand to Monocode, as their browser (link routing,
+    // docs/native/modes.md): they may come before the first window.
+    let (opened_urls, urls) = async_channel::unbounded::<Vec<String>>();
+    app.on_open_urls(move |list| {
+        let _ = opened_urls.try_send(list);
+    });
+    app.run(move |cx: &mut App| {
+            cx.spawn(async move |cx| {
+                while let Ok(list) = urls.recv().await {
+                    let _ = cx.update(|cx| shell::browser_links::open_external(list, cx));
+                }
+            })
+            .detach();
             #[cfg(debug_assertions)]
             dev_reload::install(cx);
             cx.set_global(title_raster);
