@@ -9,6 +9,9 @@ publish = false
 serde.workspace = true
 serde_json.workspace = true
 monocode-core = { path = "../monocode-core" }
+socode-browser = { path = "../socode-browser" }
+# Link routing rules match parsed addresses (socode_browser::routing).
+url = "2"
 log = "0.4"
 pulldown-cmark = "0.13.5"
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
@@ -100,7 +103,7 @@ parking_lot = "0.12"
 # Experimental native builds resolve separately from the production Tauri app.
 [workspace]
 resolver = "2"
-members = [".", "../monocode-core", "../monocode-cef"]
+members = [".", "../monocode-core", "../monocode-cef", "../socode-browser", "../socode-ai"]
 
 [workspace.package]
 version = "0.16.0"

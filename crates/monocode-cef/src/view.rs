@@ -50,6 +50,10 @@ pub enum BrowserEvent {
         code: i32,
         text: String,
     },
+    /// A click in the main frame would take a page that peeks
+    /// ([`BrowserView::set_peek_host`]) to another site: the navigation was
+    /// stopped, and the host shows `url` in Peek instead.
+    PeekRequested(String),
     /// The page asked for a new window without an opener to keep (a middle
     /// or ⌘-click). No window was created; the host opens the URL as a new
     /// page, and shows it at once when `foreground` (crate::popup).
@@ -932,6 +936,12 @@ impl BrowserView {
     }
 
     /// Chromium's id of the page's browser, unique for the app's run.
+    /// Clicks to sites other than `host` (a pinned tab's own) stop and are
+    /// reported as [`BrowserEvent::PeekRequested`]; `None` lets them load.
+    pub fn set_peek_host(&self, host: Option<String>) {
+        crate::dialogs::set_peek_host(self.browser_id(), host);
+    }
+
     pub fn browser_id(&self) -> i32 {
         self.browser.identifier()
     }

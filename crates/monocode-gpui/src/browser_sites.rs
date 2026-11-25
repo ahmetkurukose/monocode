@@ -881,6 +881,144 @@ impl BrowserPage {
     }
 }
 
+/// A permission the site was allowed or blocked, as the Site Control
+/// Center's Settings list it.
+pub(crate) struct SitePermissionRow {
+    pub name: String,
+    pub title: &'static str,
+    pub allowed: bool,
+    /// Answered for this page only, not remembered.
+    pub once: bool,
+}
+
+/// How the Site Control Center's security button reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SiteSecurity {
+    Secure,
+    /// A local address without encryption.
+    Local,
+    /// Plain http elsewhere.
+    NotSecure,
+    /// An untrusted certificate the user took (K62).
+    Untrusted,
+}
+
+impl SiteSecurity {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Secure => "Secure",
+            Self::Local => "Local",
+            Self::NotSecure | Self::Untrusted => "Not Secure",
+        }
+    }
+}
+
+impl BrowserPage {
+    /// The site's remembered answers, then those for this page only.
+    pub(super) fn site_permission_rows(&self) -> Vec<SitePermissionRow> {
+        let Some(origin) = sites::origin_of(&self.url) else {
+            return Vec::new();
+        };
+        let remembered = store(&self.profiles, &self.site_profile())
+            .borrow()
+            .site(&origin);
+        let mut rows: Vec<SitePermissionRow> = (remembered.into_iter())
+            .map(|(name, setting)| SitePermissionRow {
+                title: sites::title(&name),
+                allowed: setting == Setting::Allow,
+                once: false,
+                name,
+            })
+            .collect();
+        let mut once: Vec<_> = self.sites.once.iter().collect();
+        once.sort_by(|a, b| a.0.cmp(b.0));
+        rows.extend(once.into_iter().map(|(name, setting)| SitePermissionRow {
+            name: name.clone(),
+            title: sites::title(name),
+            allowed: *setting == Setting::Allow,
+            once: true,
+        }));
+        rows
+    }
+
+    /// A Settings row's press: the site is blocked what it was allowed, or
+    /// allowed what it was blocked. Chromium forgets its own answer, so the
+    /// page's next request comes to the app and gets the new one.
+    pub(super) fn flip_site_permission(&mut self, name: &str, once: bool, cx: &mut Context<Self>) {
+        let flip = |setting: Setting| match setting {
+            Setting::Allow => Setting::Block,
+            Setting::Block => Setting::Allow,
+        };
+        if once {
+            if let Some(setting) = self.sites.once.get_mut(name) {
+                *setting = flip(*setting);
+            }
+        } else if let Some(origin) = sites::origin_of(&self.url) {
+            let profile = self.site_profile();
+            let store = store(&self.profiles, &profile);
+            let now = store.borrow().get(&origin, name);
+            if let Some(now) = now {
+                store.borrow_mut().set(&origin, name, flip(now));
+                monocode_cef::reset_site_permission(&profile, &origin, name);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A Settings row's reset: the site is asked again.
+    pub(super) fn reset_site_permission(&mut self, name: &str, once: bool, cx: &mut Context<Self>) {
+        if once {
+            self.sites.once.remove(name);
+        } else if let Some(origin) = sites::origin_of(&self.url) {
+            let profile = self.site_profile();
+            match profile_dir(&self.profiles, &profile) {
+                Some(dir) => forget(&self.profiles, &dir, &origin, name),
+                None => {
+                    store(&self.profiles, &profile)
+                        .borrow_mut()
+                        .remove(&origin, name);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The connection of the page's site; `None` off the web.
+    pub(super) fn site_security(&self) -> Option<SiteSecurity> {
+        let url = &self.url;
+        if !(url.starts_with("https:") || url.starts_with("http:")) {
+            return None;
+        }
+        Some(if insecure(url) || self.sites.cert.is_some() {
+            SiteSecurity::Untrusted
+        } else if url.starts_with("https:") {
+            SiteSecurity::Secure
+        } else if sites::is_local_host(url) {
+            SiteSecurity::Local
+        } else {
+            SiteSecurity::NotSecure
+        })
+    }
+
+    pub(super) fn site_info_open(&self) -> bool {
+        self.sites.info_open
+    }
+
+    /// Opens the site-info list under `at` (the Site Control Center's
+    /// button in Browser mode, where the site's own button is not drawn).
+    pub(super) fn show_site_info(&mut self, at: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
+        if at.is_some() {
+            self.sites.info_anchor.set(at);
+        }
+        self.sites.info_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn close_site_info(&mut self) {
+        self.sites.info_open = false;
+    }
+}
+
 /// The bar's frame (also the passkey bar's).
 pub(super) fn bar() -> gpui::Stateful<gpui::Div> {
     div()

@@ -44,6 +44,8 @@ impl Shell {
                 .is_some_and(|ix| self.workspace.groups[ix].pinned.contains(&pane));
             page.update(cx, |page, cx| page.lifecycle_tick(pinned, &policy, cx));
         }
+        // Browser mode's Today tabs left unseen go to the archive.
+        self.browse_archive_idle(cx);
         policy
     }
 

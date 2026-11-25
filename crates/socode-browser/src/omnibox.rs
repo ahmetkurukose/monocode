@@ -1,0 +1,403 @@
+//! Turns what the user typed into the command bar into a URL to load.
+
+pub mod calculator;
+pub mod search_settings;
+pub mod suggestion_dismissals;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchEngine {
+    #[default]
+    Google,
+    DuckDuckGo,
+    Bing,
+    Yandex,
+    Brave,
+    Perplexity,
+}
+
+/// Isolated profile preference contract for Command Bar search. The Settings
+/// surface can expose this without owning the suggestion transport or UI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommandBarSearchPreferences {
+    pub engine: SearchEngine,
+    pub suggestions: bool,
+    pub notice_dismissed: bool,
+    #[serde(default = "search_settings::default_providers")]
+    pub providers: Vec<search_settings::SearchProvider>,
+    pub custom_default: Option<u64>,
+    #[serde(default = "search_settings::first_custom_id")]
+    pub next_provider_id: u64,
+    pub shortcut_mode: search_settings::ShortcutMode,
+    dismissed_suggestions: Vec<suggestion_dismissals::DismissedSuggestion>,
+}
+impl Default for CommandBarSearchPreferences {
+    fn default() -> Self {
+        Self { engine: SearchEngine::Google, suggestions: true, notice_dismissed: false,
+            providers: search_settings::default_providers(), custom_default: None,
+            next_provider_id: search_settings::first_custom_id(), shortcut_mode: search_settings::ShortcutMode::default(), dismissed_suggestions: Vec::new() }
+    }
+}
+impl SearchEngine {
+    pub const ALL: [Self; 6] = [Self::Google, Self::Bing, Self::DuckDuckGo, Self::Yandex, Self::Brave, Self::Perplexity];
+    pub fn label(self) -> &'static str {
+        match self { Self::Google => "Google", Self::Bing => "Microsoft Bing", Self::DuckDuckGo => "DuckDuckGo", Self::Yandex => "Yandex", Self::Brave => "Brave", Self::Perplexity => "Perplexity" }
+    }
+    pub fn supports_suggestions(self) -> bool { matches!(self, Self::Google | Self::DuckDuckGo | Self::Bing) }
+    pub fn search(self, query: &str) -> Resolved {
+        let endpoint = match self {
+            Self::Google => "https://www.google.com/search?q=",
+            Self::DuckDuckGo => "https://duckduckgo.com/?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+            Self::Yandex => "https://yandex.com/search/?text=",
+            Self::Brave => "https://search.brave.com/search?q=",
+            Self::Perplexity => "https://www.perplexity.ai/search?q=",
+        };
+        Resolved::Search { query: query.into(), url: format!("{endpoint}{}", encode_query(query)) }
+    }
+    pub fn suggest_url(self, query: &str) -> String {
+        let endpoint = match self {
+            Self::Google => "https://suggestqueries.google.com/complete/search?client=chrome&q=",
+            Self::DuckDuckGo => "https://duckduckgo.com/ac/?type=list&q=",
+            Self::Bing => "https://api.bing.com/osjson.aspx?query=",
+            // No verified completion transport exists for these providers yet.
+            Self::Yandex | Self::Brave | Self::Perplexity => return String::new(),
+        };
+        format!("{endpoint}{}", encode_query(query))
+    }
+}
+
+pub fn resolve_with_engine(input: &str, engine: SearchEngine) -> Option<Resolved> {
+    resolve(input).map(|resolved| match resolved {
+        Resolved::Search { query, .. } => engine.search(&query),
+        url => url,
+    })
+}
+
+/// Local catalog of common destinations, using factual names and addresses.
+pub const TOP_DOMAINS: &[(&str, &str)] = &[
+    ("google.com", "Google"), ("youtube.com", "YouTube"),
+    ("linkedin.com", "LinkedIn"), ("wordpress.org", "WordPress"),
+    ("apple.com", "Apple"), ("microsoft.com", "Microsoft"),
+    ("docs.google.com", "Google Docs"), ("maps.google.com", "Google Maps"),
+    ("wikipedia.org", "Wikipedia"), ("cloudflare.com", "Cloudflare"),
+    ("github.com", "GitHub"), ("amazon.com", "Amazon"),
+    ("reddit.com", "Reddit"), ("facebook.com", "Facebook"),
+    ("instagram.com", "Instagram"), ("twitter.com", "Twitter"),
+];
+pub fn top_domain(prefix: &str) -> Option<(&'static str, &'static str)> {
+    let prefix = prefix.to_ascii_lowercase();
+    (prefix.len() >= 2 && !prefix.contains(char::is_whitespace))
+        .then(|| TOP_DOMAINS.iter().copied().find(|(domain, _)| domain.starts_with(&prefix))).flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteSearch { Wikipedia, ChatGpt, Configured(u64), Catalog(usize) }
+
+/// A site Arc can search without configuration: Tab after its name (or the
+/// first letters of it) scopes the Command Bar to the site's own search.
+pub struct CatalogSite { pub name: &'static str, pub domain: &'static str, pub template: &'static str, pub color: u32 }
+/// Arc's built-in site-search catalog, in Arc's order. Wikipedia stays a
+/// managed provider, so it is not repeated here.
+pub const SITE_CATALOG: &[CatalogSite] = &[
+    CatalogSite { name: "YouTube", domain: "youtube.com", template: "https://www.youtube.com/results?search_query=%s", color: 0xff0033 },
+    CatalogSite { name: "Google Drive", domain: "drive.google.com", template: "https://drive.google.com/drive/search?q=%s", color: 0x1fa463 },
+    CatalogSite { name: "Gmail", domain: "mail.google.com", template: "https://mail.google.com/mail/ca/u/0/#apps/%s", color: 0xea4335 },
+    CatalogSite { name: "Google Maps", domain: "maps.google.com", template: "https://www.google.com/maps/search/%s", color: 0x34a853 },
+    CatalogSite { name: "Google Calendar", domain: "calendar.google.com", template: "https://calendar.google.com/calendar/u/0/r/search?q=%s", color: 0x4285f4 },
+    CatalogSite { name: "Google Docs", domain: "docs.google.com", template: "https://docs.google.com/document/u/0/?q=%s", color: 0x4285f4 },
+    CatalogSite { name: "Dropbox", domain: "dropbox.com", template: "https://www.dropbox.com/search/personal?&query=%s", color: 0x0061fe },
+    CatalogSite { name: "Amazon", domain: "amazon.com", template: "https://www.amazon.com/s?k=%s", color: 0xff9900 },
+    CatalogSite { name: "GitHub", domain: "github.com", template: "https://github.com/search?q=%s", color: 0x24292f },
+    CatalogSite { name: "Figma", domain: "figma.com", template: "https://www.figma.com/files/search?q=%s", color: 0xa259ff },
+    CatalogSite { name: "X", domain: "x.com", template: "https://x.com/search?q=%s", color: 0x000000 },
+    CatalogSite { name: "Twitter", domain: "twitter.com", template: "https://twitter.com/search?q=%s", color: 0x1d9bf0 },
+    CatalogSite { name: "Reddit", domain: "reddit.com", template: "https://www.reddit.com/search/?q=%s", color: 0xff4500 },
+    CatalogSite { name: "SoundCloud", domain: "soundcloud.com", template: "https://soundcloud.com/search?q=%s", color: 0xff5500 },
+    CatalogSite { name: "Asana", domain: "asana.com", template: "https://app.asana.com/0/search?q=%s", color: 0xf06a6a },
+    CatalogSite { name: "LinkedIn", domain: "linkedin.com", template: "https://linkedin.com/search/results/all/?keywords=%s", color: 0x0a66c2 },
+    CatalogSite { name: "Apple Music", domain: "music.apple.com", template: "https://music.apple.com/us/search?term=%s", color: 0xfa243c },
+    CatalogSite { name: "Spotify", domain: "open.spotify.com", template: "https://open.spotify.com/search/%s", color: 0x1db954 },
+];
+/// ChatGPT's measured Arc pill and selection fill.
+pub const CHATGPT_COLOR: u32 = 0x64ab9c;
+/// Arc's pill for configured engines and sites without a catalog color.
+pub const SITE_SEARCH_COLOR: u32 = 0xffa000;
+
+impl SiteSearch {
+    /// The site whose name, domain or shortcut begins with what was typed
+    /// (two letters or more), so Tab can scope before the name is complete.
+    /// An exact keyword always wins over a prefix match.
+    pub fn for_prefix(typed: &str, preferences: &CommandBarSearchPreferences, chatgpt: bool) -> Option<Self> {
+        let typed = typed.trim();
+        if typed.chars().count() < 2 || typed.contains(char::is_whitespace) || typed.len() > 256 { return None; }
+        if let Some(site) = Self::for_profile(typed, preferences).filter(|s| chatgpt || *s != Self::ChatGpt) { return Some(site); }
+        let lower = typed.to_lowercase();
+        let starts = |candidate: &str| {
+            let candidate = candidate.to_lowercase();
+            candidate.starts_with(&lower) || candidate.strip_prefix("www.").is_some_and(|c| c.starts_with(&lower))
+        };
+        if chatgpt && starts("chatgpt") { return Some(Self::ChatGpt); }
+        if let Some(p) = preferences.providers.iter().find(|p| p.active && starts(&p.shortcut)) { return Some(Self::Configured(p.id)); }
+        SITE_CATALOG.iter().position(|site| starts(site.name) || starts(site.domain)).map(Self::Catalog)
+    }
+    /// The pill and selected-row fill while this scope is active.
+    pub fn color(self) -> u32 {
+        match self { Self::ChatGpt => CHATGPT_COLOR, Self::Catalog(index) => SITE_CATALOG.get(index).map_or(SITE_SEARCH_COLOR, |s| s.color), _ => SITE_SEARCH_COLOR }
+    }
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        match keyword.trim().to_ascii_lowercase().as_str() {
+            "wikipedia" | "wikipedia.org" | "www.wikipedia.org" => Some(Self::Wikipedia),
+            "chatgpt" => Some(Self::ChatGpt),
+            _ => None,
+        }
+    }
+    pub fn for_profile(keyword: &str, preferences: &CommandBarSearchPreferences) -> Option<Self> {
+        preferences.provider_for_shortcut(keyword).map(|p| Self::Configured(p.id)).or_else(|| {
+            match Self::from_keyword(keyword) {
+                Some(Self::Wikipedia) => preferences.provider(7).filter(|p| p.active && p.shortcut == "wikipedia").map(|p|Self::Configured(p.id)),
+                Some(Self::ChatGpt) => Some(Self::ChatGpt),
+                _ => {
+                    let keyword = keyword.trim().to_lowercase();
+                    let keyword = keyword.strip_prefix("www.").unwrap_or(&keyword);
+                    SITE_CATALOG.iter().position(|s| s.name.eq_ignore_ascii_case(keyword) || s.domain == keyword).map(Self::Catalog)
+                }
+            }
+        })
+    }
+    pub fn name(self, preferences: &CommandBarSearchPreferences) -> Option<&str> {
+        match self { Self::Wikipedia => Some("Wikipedia"), Self::ChatGpt => Some("ChatGPT"),
+            Self::Catalog(index) => SITE_CATALOG.get(index).map(|s| s.name),
+            Self::Configured(id) => preferences.provider(id).filter(|p|p.active).map(|p|p.name.as_str()) }
+    }
+    pub fn search(self, query: &str, preferences: &CommandBarSearchPreferences) -> Option<Resolved> {
+        let url = match self {
+            Self::Configured(id) => return preferences.provider(id)?.search(query),
+            Self::Catalog(index) => SITE_CATALOG.get(index)?.template.replace("%s", &encode_query(query)),
+            Self::Wikipedia => format!("https://en.wikipedia.org/w/index.php?search={}", encode_query(query)),
+            Self::ChatGpt => {
+                // Arc's native handoff opens this URL; the website prefills its
+                // composer and owns the user's explicit Send action.
+                let mut encoded = String::new();
+                for byte in query.bytes() {
+                    match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'?' => encoded.push(byte as char),
+                        _ => encoded.push_str(&format!("%{byte:02X}")),
+                    }
+                }
+                format!("https://chat.openai.com/?q={encoded}")
+            }
+        };
+        Some(Resolved::Search { query: query.into(), url })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// The input is an address.
+    Url(String),
+    /// The input is a search query; `url` is the search results page.
+    Search { query: String, url: String },
+}
+
+impl Resolved {
+    pub fn url(&self) -> &str {
+        match self {
+            Resolved::Url(url) | Resolved::Search { url, .. } => url,
+        }
+    }
+}
+
+const SCHEMES: &[&str] = &["http://", "https://", "file://", "about:", "chrome://", "socode://", "data:", "view-source:"];
+
+const INTERNAL_SCHEME: &str = "socode://";
+const LEGACY_INTERNAL_SCHEME: &str = "browser://";
+
+/// Browser-owned GPUI pages must never be sent to the web engine.
+pub fn is_internal_url(url: &str) -> bool {
+    url.get(..INTERNAL_SCHEME.len()).is_some_and(|scheme| scheme.eq_ignore_ascii_case(INTERNAL_SCHEME))
+}
+
+/// Browser-owned pages moved from `browser://` to `socode://`; an old address,
+/// typed or saved, keeps opening the same page.
+pub fn upgrade_internal_url(url: &str) -> Option<String> {
+    let scheme = url.get(..LEGACY_INTERNAL_SCHEME.len())?;
+    scheme.eq_ignore_ascii_case(LEGACY_INTERNAL_SCHEME).then(|| format!("{INTERNAL_SCHEME}{}", &url[LEGACY_INTERNAL_SCHEME.len()..]))
+}
+
+/// Returns `None` for blank input.
+pub fn resolve(input: &str) -> Option<Resolved> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(url) = upgrade_internal_url(input) {
+        return Some(Resolved::Url(url));
+    }
+    let lower = input.to_ascii_lowercase();
+    if SCHEMES.iter().any(|s| lower.starts_with(s)) {
+        return Some(Resolved::Url(input.to_string()));
+    }
+    if !input.contains(char::is_whitespace) && looks_like_host(&lower) {
+        let scheme = if is_local(&lower) { "http" } else { "https" };
+        return Some(Resolved::Url(format!("{scheme}://{input}")));
+    }
+    Some(SearchEngine::Google.search(input))
+}
+
+fn host_of(input: &str) -> &str {
+    let host_port = input.split(['/', '?', '#']).next().unwrap_or(input);
+    host_port.rsplit_once(':').map_or(host_port, |(host, port)| {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            host
+        } else {
+            host_port
+        }
+    })
+}
+
+fn is_local(input: &str) -> bool {
+    let host = host_of(input);
+    host == "localhost" || host.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn looks_like_host(input: &str) -> bool {
+    let host = host_of(input);
+    if is_local(input) {
+        return true;
+    }
+    let mut labels = host.split('.');
+    let Some(tld) = labels.next_back() else {
+        return false;
+    };
+    let has_dot = host.contains('.');
+    let labels_ok = host
+        .split('.')
+        .all(|l| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-'));
+    has_dot && labels_ok && tld.chars().count() >= 2 && tld.chars().all(char::is_alphabetic)
+}
+
+fn encode_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for byte in query.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_pages_use_socode_and_old_addresses_keep_working() {
+        assert!(is_internal_url("socode://flags"));
+        assert!(is_internal_url("SOCODE://flags"));
+        assert!(!is_internal_url("browser://flags"));
+        assert!(!is_internal_url("https://socode.example"));
+        for typed in ["browser://settings/privacy", "BROWSER://settings/privacy"] {
+            assert_eq!(resolve(typed), Some(Resolved::Url("socode://settings/privacy".into())));
+        }
+        assert_eq!(resolve("socode://flags"), Some(Resolved::Url("socode://flags".into())));
+    }
+
+    #[test]
+    fn profile_engine_routes_search_and_suggest_without_changing_addresses() {
+        assert_eq!(resolve_with_engine("rust language", SearchEngine::DuckDuckGo).unwrap().url(), "https://duckduckgo.com/?q=rust+language");
+        assert_eq!(resolve_with_engine("example.com", SearchEngine::Bing).unwrap().url(), "https://example.com");
+        assert_eq!(SearchEngine::Google.suggest_url("a+b & c"), "https://suggestqueries.google.com/complete/search?client=chrome&q=a%2Bb+%26+c");
+        assert_eq!(SiteSearch::from_keyword("Wikipedia "), Some(SiteSearch::Wikipedia));
+        assert_eq!(SiteSearch::from_keyword("wikipedia.evil"), None);
+        assert_eq!(top_domain("wiki"), Some(("wikipedia.org", "Wikipedia")));
+        assert_eq!(top_domain("w"), None);
+        assert_eq!(top_domain("wiki text"), None);
+    }
+
+    #[test]
+    fn profile_search_preferences_have_compatible_defaults_and_persist() {
+        let mut browser = crate::Browser::new();
+        let mut legacy: serde_json::Value = serde_json::from_str(&crate::session::to_json(&browser)).unwrap();
+        for profile in legacy["profiles"].as_object_mut().unwrap().values_mut() {
+            profile.as_object_mut().unwrap().remove("settings");
+        }
+        let loaded = crate::session::from_json(&legacy.to_string()).unwrap();
+        assert_eq!(loaded.active_user_profile().settings.search.engine, SearchEngine::Google);
+        assert!(loaded.active_user_profile().settings.search.suggestions);
+        browser.active_user_profile_mut().settings.search.engine = SearchEngine::Bing;
+        browser.active_user_profile_mut().settings.search.suggestions = false;
+        let loaded = crate::session::from_json(&crate::session::to_json(&browser)).unwrap();
+        assert_eq!(loaded.active_user_profile().settings.search.engine, SearchEngine::Bing);
+        assert!(!loaded.active_user_profile().settings.search.suggestions);
+    }
+
+    fn url(input: &str) -> String {
+        resolve(input).unwrap().url().to_string()
+    }
+
+    #[test]
+    fn blank_input_resolves_to_nothing() {
+        assert_eq!(resolve("   "), None);
+    }
+
+    #[test]
+    fn addresses_get_a_scheme() {
+        assert_eq!(url("github.com"), "https://github.com");
+        assert_eq!(url("news.ycombinator.com/item?id=1"), "https://news.ycombinator.com/item?id=1");
+        assert_eq!(url("localhost:3000"), "http://localhost:3000");
+        assert_eq!(url("127.0.0.1:8080/x"), "http://127.0.0.1:8080/x");
+        assert_eq!(url("пример.рф"), "https://пример.рф");
+    }
+
+    #[test]
+    fn explicit_schemes_are_kept() {
+        assert_eq!(url("http://example.com"), "http://example.com");
+        assert_eq!(url("about:blank"), "about:blank");
+        assert_eq!(url("view-source:https://example.com/?a=1#part"), "view-source:https://example.com/?a=1#part");
+    }
+
+    #[test]
+    fn everything_else_is_a_search() {
+        assert_eq!(url("rust gpui"), "https://www.google.com/search?q=rust+gpui");
+        assert_eq!(url("arc"), "https://www.google.com/search?q=arc");
+        assert_eq!(url("v1.2"), "https://www.google.com/search?q=v1.2");
+        assert_eq!(url("c++"), "https://www.google.com/search?q=c%2B%2B");
+        assert_eq!(url("привет"), "https://www.google.com/search?q=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82");
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_tests {
+    use super::*;
+    #[test]
+    fn chatgpt_handoff_matches_arc_and_keeps_the_whole_question_in_one_parameter() {
+        assert_eq!(SiteSearch::from_keyword("ChatGPT"), Some(SiteSearch::ChatGpt));
+        let defaults = CommandBarSearchPreferences::default();
+        let youtube = SiteSearch::for_prefix("yo", &defaults, true).unwrap();
+        assert_eq!(youtube.name(&defaults), Some("YouTube"));
+        assert_eq!(youtube.color(), 0xff0033);
+        assert_eq!(youtube.search("lo fi beats", &defaults).unwrap().url(), "https://www.youtube.com/results?search_query=lo+fi+beats");
+        assert_eq!(SiteSearch::for_profile("youtube.com", &defaults), Some(youtube));
+        assert_eq!(SiteSearch::for_prefix("ch", &defaults, true), Some(SiteSearch::ChatGpt));
+        assert_eq!(SiteSearch::ChatGpt.color(), CHATGPT_COLOR);
+        assert_ne!(SiteSearch::for_prefix("ch", &defaults, false), Some(SiteSearch::ChatGpt));
+        assert_eq!(SiteSearch::for_prefix("go", &defaults, true).and_then(|s| s.name(&defaults)), Some("Google"));
+        assert_eq!(SiteSearch::for_prefix("gi", &defaults, true).and_then(|s| s.name(&defaults)), Some("GitHub"));
+        assert_eq!(SiteSearch::for_prefix("y", &defaults, true), None);
+        assert_eq!(SiteSearch::for_prefix("yo tube", &defaults, true), None);
+        assert_eq!(SiteSearch::for_prefix("zzqq", &defaults, true), None);
+        let preferences=CommandBarSearchPreferences::default();
+        assert_eq!(SiteSearch::ChatGpt.search("What is the Rust programming language?",&preferences).unwrap().url(), "https://chat.openai.com/?q=What%20is%20the%20Rust%20programming%20language?");
+        let resolved = SiteSearch::ChatGpt.search("a&b=#c+%? 日本語",&preferences).unwrap();
+        let url = url::Url::parse(resolved.url()).unwrap();
+        assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("q".into(), "a&b=#c+%? 日本語".into())]);
+        assert!(url.fragment().is_none());
+    }
+}

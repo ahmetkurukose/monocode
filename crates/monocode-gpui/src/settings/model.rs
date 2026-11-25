@@ -345,6 +345,12 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "browser web links localhost dev server system default chromium shift click",
     ),
     (
+        "browser-link-routing",
+        Section::Browser,
+        "Link routing",
+        "browser link routing rules air traffic control little window site domain project system default open links",
+    ),
+    (
         "browser-external-cdp",
         Section::Browser,
         "Allow external CDP connections",

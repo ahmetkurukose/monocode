@@ -1,0 +1,236 @@
+//! Saves and restores the browser model between launches.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::{Browser, UserProfileId, history::History};
+
+/// Version 2 is one workspace with an explicit profile registry. Versioned
+/// corruption is an error; it must never authenticate through legacy Default.
+pub fn to_json(browser: &Browser) -> String {
+    let mut value = serde_json::to_value(browser).expect("the model always serializes");
+    value["format_version"] = 2.into();
+    serde_json::to_string_pretty(&value).expect("the model always serializes")
+}
+
+pub fn from_json(json: &str) -> Result<Browser, serde_json::Error> {
+    use serde::de::Error;
+    let mut value: serde_json::Value = serde_json::from_str(json)?;
+    if value.get("downloads").is_some() {
+        return Err(serde_json::Error::custom("download records require explicit profile ownership"));
+    }
+    let new_format = ["format_version", "profiles", "default_user_profile_id", "next_user_profile_id"]
+        .iter().any(|key| value.get(key).is_some());
+    if new_format {
+        if value.get("format_version").and_then(|v| v.as_u64()) != Some(2) {
+            return Err(serde_json::Error::custom("invalid or unsupported workspace format"));
+        }
+    } else {
+        migrate_legacy(&mut value)?;
+    }
+    // Fold the earlier Command Bar preference contract into profile settings.
+    // An explicitly saved canonical value takes precedence over the old field.
+    if let Some(profiles) = value.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+        for profile in profiles.values_mut().filter_map(|v| v.as_object_mut()) {
+            if let Some(search) = profile.remove("command_bar_search") {
+                let settings = profile.entry("settings").or_insert_with(|| serde_json::json!({}));
+                if let Some(settings) = settings.as_object_mut() {
+                    settings.entry("search").or_insert(search);
+                }
+            }
+        }
+    }
+    upgrade_internal_urls(&mut value);
+    let mut browser: Browser = serde_json::from_value(value)?;
+    // Invalid presentation must not discard otherwise valid browsing data.
+    let mut ids = std::collections::HashSet::new();
+    browser.windows.retain(|window| window.valid() && ids.insert(window.id));
+    if browser.default_user_profile_id != crate::UserProfileId::DEFAULT
+        || !browser.profiles.contains_key(&browser.default_user_profile_id)
+        || browser.profiles.iter().any(|(id, profile)| id.0 == 0 || *id != profile.id || profile.name.trim().is_empty())
+        || browser.spaces.iter().any(|space| !browser.profiles.contains_key(&space.user_profile_id))
+        || browser.archive.iter().any(|entry| entry.user_profile_id.0 == 0)
+    { return Err(serde_json::Error::custom("invalid user profile registry or ownership")); }
+    let max_profile = browser.profiles.keys().map(|id| id.0)
+        .chain(browser.archive.iter().map(|entry| entry.user_profile_id.0)).max().unwrap_or(1);
+    if browser.retired_user_profiles.iter().any(|id| id.0 <= 1 || id.0 >= browser.next_user_profile_id || browser.profiles.contains_key(id)) {
+        return Err(serde_json::Error::custom("invalid retired profile identity"));
+    }
+    if browser.next_user_profile_id <= max_profile {
+        // A persisted watermark also covers deleted identities. Never repair it
+        // downward or infer a fresh Default on malformed versioned input.
+        return Err(serde_json::Error::custom("invalid user profile identity watermark"));
+    }
+    if browser.spaces.iter().any(|space| space.theme.as_ref().is_some_and(|theme| !theme.valid())) {
+        return Err(serde_json::Error::custom("invalid Space theme"));
+    }
+    for profile in browser.user_profiles() {
+        profile.boosts.validate().map_err(serde_json::Error::custom)?;
+        profile.easels.validate().map_err(serde_json::Error::custom)?;
+    }
+    browser.validate_downloads().map_err(serde_json::Error::custom)?;
+    browser.repair();
+    Ok(browser)
+}
+
+/// Saved tabs, pins, archive and history may still name `browser://` pages.
+fn upgrade_internal_urls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(url) = crate::omnibox::upgrade_internal_url(text) { *text = url; }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(upgrade_internal_urls),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(upgrade_internal_urls),
+        _ => {}
+    }
+}
+
+fn migrate_legacy(value: &mut serde_json::Value) -> Result<(), serde_json::Error> {
+    use serde::de::Error;
+    use crate::profiles::UserProfile;
+    let object = value.as_object_mut().ok_or_else(|| serde_json::Error::custom("expected workspace object"))?;
+    // Reject partial new ownership without its registry rather than reassigning
+    // potentially authenticated pages to Default.
+    if ["spaces", "archive"].iter().any(|key| object.get(*key).and_then(|v| v.as_array()).is_some_and(|entries| entries.iter().any(|entry| entry.get("user_profile_id").is_some()))) {
+        return Err(serde_json::Error::custom("profile ownership requires a versioned registry"));
+    }
+    let mut profile = serde_json::to_value(UserProfile::default_profile())?;
+    for field in ["favorites", "favorite_splits", "history", "archive_after", "empty_favorites_dismissed", "favicon_cache", "include_favorites_in_ordering"] {
+        if let Some(data) = object.remove(field) { profile[field] = data; }
+    }
+    object.insert("profiles".into(), serde_json::json!({"1": profile}));
+    object.insert("default_user_profile_id".into(), 1.into());
+    object.insert("next_user_profile_id".into(), 2.into());
+    if let Some(spaces) = object.get_mut("spaces").and_then(|v| v.as_array_mut()) {
+        for space in spaces {
+            space.as_object_mut().ok_or_else(|| serde_json::Error::custom("invalid legacy Space"))?.insert("user_profile_id".into(), 1.into());
+        }
+    }
+    if let Some(archive) = object.get_mut("archive").and_then(|v| v.as_array_mut()) {
+        for entry in archive {
+            entry.as_object_mut().ok_or_else(|| serde_json::Error::custom("invalid legacy archive entry"))?.insert("user_profile_id".into(), 1.into());
+        }
+    }
+    Ok(())
+}
+
+/// `Ok(None)` when no session was saved yet.
+pub fn load(path: &Path) -> io::Result<Option<Browser>> {
+    match std::fs::read_to_string(path) {
+        Ok(json) => {
+            let mut browser =
+                from_json(&json).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            load_histories(path, &mut browser);
+            Ok(Some(browser))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Each profile's history is kept beside the session in
+/// `<session>.history/<id>.json`, so the frequently saved session stays small
+/// however long history grows, and sessions sharing a folder stay apart.
+fn history_dir(session: &Path) -> PathBuf {
+    let stem = session.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+    session.with_file_name(format!("{stem}.history"))
+}
+pub fn history_path(session: &Path, id: UserProfileId) -> PathBuf {
+    history_dir(session).join(format!("{}.json", id.0))
+}
+/// Takes every profile's history out of `browser`, for a session without it.
+pub fn take_histories(browser: &mut Browser) -> Vec<(UserProfileId, History)> {
+    browser
+        .profiles
+        .iter_mut()
+        .map(|(id, profile)| (*id, std::mem::take(&mut profile.history)))
+        .collect()
+}
+pub fn save_history(session: &Path, id: UserProfileId, history: &History) -> io::Result<()> {
+    let json = serde_json::to_string(history).map_err(io::Error::other)?;
+    save(&history_path(session, id), &json)
+}
+/// Removes history files of profiles that no longer exist.
+pub fn retain_histories(session: &Path, live: &[UserProfileId]) {
+    let keep: Vec<_> = live.iter().map(|id| history_path(session, *id)).collect();
+    if let Ok(entries) = std::fs::read_dir(history_dir(session)) {
+        for entry in entries.flatten() {
+            if !keep.contains(&entry.path()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+/// A session written inline by an older SOCode keeps its own history; other
+/// profiles read theirs from the history file.
+fn load_histories(session: &Path, browser: &mut Browser) {
+    for (id, profile) in browser.profiles.iter_mut() {
+        if !profile.history.is_empty() {
+            continue;
+        }
+        let Ok(json) = std::fs::read_to_string(history_path(session, *id)) else { continue };
+        match serde_json::from_str::<History>(&json) {
+            Ok(history) => profile.history = history,
+            Err(error) => eprintln!("Cannot read the history of profile {}: {error}", id.0),
+        }
+    }
+}
+
+/// Writes through a temporary file, so a crash never leaves half a session.
+pub fn save(path: &Path, json: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, path)
+}
+
+#[cfg(test)]
+mod history_file_tests {
+    use super::*;
+    #[test]
+    fn history_lives_beside_the_session_and_inline_history_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut browser = Browser::new();
+        let id = browser.active_user_profile_id();
+        browser.record_visit(id, "https://kept.example", std::time::SystemTime::UNIX_EPOCH);
+        // An older SOCode wrote history inline.
+        save(&path, &to_json(&browser)).unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().active_user_profile().history.len(), 1);
+        // Now: the session without history, history in its own file.
+        let mut lean = browser.clone();
+        let histories = take_histories(&mut lean);
+        save(&path, &to_json(&lean)).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("kept.example"));
+        for (id, history) in &histories {
+            save_history(&path, *id, history).unwrap();
+        }
+        let restored = load(&path).unwrap().unwrap();
+        assert_eq!(restored.active_user_profile().history[0].url, "https://kept.example");
+        retain_histories(&path, &[]);
+        assert!(load(&path).unwrap().unwrap().active_user_profile().history.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod empty_favorites_tests {
+    use super::*;
+
+    #[test]
+    fn empty_favorites_dismissal_is_profile_local_and_backward_compatible() {
+        let mut profile = Browser::new();
+        assert!(!profile.active_user_profile().empty_favorites_dismissed);
+        profile.active_user_profile_mut().empty_favorites_dismissed = true;
+        profile.add_space("Work", 100.);
+        profile.switch_space(1);
+        let restored = from_json(&to_json(&profile)).unwrap();
+        assert!(restored.active_user_profile().empty_favorites_dismissed);
+        assert_eq!(restored.spaces.len(), 2);
+        assert!(!Browser::new().active_user_profile().empty_favorites_dismissed);
+        let mut legacy: serde_json::Value = serde_json::from_str(&to_json(&profile)).unwrap();
+        legacy["profiles"]["1"].as_object_mut().unwrap().remove("empty_favorites_dismissed");
+        assert!(!from_json(&legacy.to_string()).unwrap().active_user_profile().empty_favorites_dismissed);
+    }
+}

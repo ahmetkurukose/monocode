@@ -307,6 +307,8 @@ pub(crate) struct SettingsView {
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
     passwords: pages::PasswordsState,
+    /// The link routing rule being made (Settings → Browser).
+    link_draft: pages::LinkDraft,
     extensions: pages::ExtensionsState,
     /// What "Copy endpoint" last said: copied, or why not.
     browser_endpoint: Option<Result<(), String>>,
@@ -464,6 +466,7 @@ impl SettingsView {
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
             passwords: pages::PasswordsState::default(),
+            link_draft: pages::LinkDraft::default(),
             extensions: pages::ExtensionsState::default(),
             browser_endpoint: None,
             browser_import: pages::ImportPanel::default(),

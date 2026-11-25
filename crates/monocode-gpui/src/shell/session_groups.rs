@@ -99,6 +99,10 @@ pub(super) struct FolderDrag {
 pub(super) enum RenameTarget {
     Session(i64),
     Folder(String),
+    /// A tab of Browser mode's own, by its pane.
+    BrowseTab(i64),
+    /// A folder of Browser mode's pinned tabs.
+    BrowseFolder(u64),
 }
 /// Where a rename's field is drawn: the sidebar's row, the project rail's
 /// row, or the title bar's tab. The field is one view, so it shows in one.
@@ -942,6 +946,13 @@ impl Shell {
                 .folder(folder)
                 .map(|f| f.name.clone())
                 .unwrap_or_default(),
+            RenameTarget::BrowseTab(pane) => self
+                .browse_tab(*pane, cx)
+                .map(|tab| tab.title)
+                .unwrap_or_default(),
+            RenameTarget::BrowseFolder(id) => (self.workspace.browse.folder(*id))
+                .map(|f| f.name.clone())
+                .unwrap_or_default(),
         };
         let input = cx.new(|cx| {
             let mut input = input::Input::field(
@@ -983,11 +994,19 @@ impl Shell {
         self.invalidate_chrome(cx);
         cx.notify();
     }
-    fn finish_rename(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn finish_rename(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(renaming) = self.renaming.take() else {
             return;
         };
         let name = renaming.input.read(cx).content.trim().to_string();
+        if commit {
+            self.finish_browse_rename(&renaming.target, &name, cx);
+        }
         if commit && !name.is_empty() {
             match renaming.target {
                 RenameTarget::Session(id) => {
@@ -1008,10 +1027,15 @@ impl Shell {
                 RenameTarget::Folder(folder) => {
                     self.update_groups(cx, |groups| groups.rename_folder(&folder, &name))
                 }
+                RenameTarget::BrowseTab(_) | RenameTarget::BrowseFolder(_) => {}
             }
         }
         if renaming.input.read(cx).focus_handle(cx).is_focused(window) {
-            self.focus_active(window, cx);
+            if self.browser_mode() {
+                self.focus_browse_page(window, cx);
+            } else {
+                self.focus_active(window, cx);
+            }
         }
         self.invalidate_chrome(cx);
         cx.notify();

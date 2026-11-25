@@ -37,6 +37,11 @@ impl BrowserPage {
         self.grab.on
     }
 
+    /// The picker is up (or coming up) over the page.
+    pub(crate) fn picking(&self) -> bool {
+        self.grab.on
+    }
+
     /// Starts picking, or stops.
     pub(crate) fn toggle_grab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.grab.on {

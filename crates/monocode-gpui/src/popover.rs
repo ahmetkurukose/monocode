@@ -523,6 +523,26 @@ impl Popover {
 fn tint() -> Hsla {
     content(0.02)
 }
+thread_local! {
+    /// Windows with nothing drawn under their popovers (Browser mode's
+    /// transparent child window): their glass would show through to the
+    /// window below, so they paint the opaque card.
+    static OPAQUE_GLASS: std::cell::RefCell<std::collections::HashSet<gpui::WindowId>> =
+        std::cell::RefCell::default();
+}
+
+/// Popovers in the window `id` paint the opaque card, or glass again.
+pub(crate) fn set_opaque_glass(id: gpui::WindowId, opaque: bool) {
+    OPAQUE_GLASS.with(|ids| {
+        let mut ids = ids.borrow_mut();
+        if opaque {
+            ids.insert(id);
+        } else {
+            ids.remove(&id);
+        }
+    });
+}
+
 // On macOS the renderer blurs what is already drawn behind this quad.
 // Light themes, and platforms without the blur, paint an opaque card.
 fn glass(tint: Hsla, radius: f32) -> impl IntoElement {
@@ -541,7 +561,8 @@ pub(crate) fn paint_glass(
     window: &mut Window,
 ) {
     let opaque = crate::theme::floating_fill();
-    let light = crate::theme::is_light();
+    let id = window.window_handle().window_id();
+    let light = crate::theme::is_light() || OPAQUE_GLASS.with(|ids| ids.borrow().contains(&id));
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let quad = if light {
         gpui::fill(bounds, opaque)
@@ -759,12 +780,16 @@ pub(crate) enum MenuStyle {
     /// ModelPicker's recent models: 40px rows of harness icon, model name
     /// over its harness, and a muted check on the current one.
     Recent,
+    /// Browser mode's tab menus, as SOCode's and macOS's own: 24px rows of
+    /// text without icons, the chosen one blue with white ink.
+    Native,
 }
 impl MenuStyle {
     fn padding(self) -> f32 {
         match self {
             Self::Group => 8.,
             Self::Composer => 6.,
+            Self::Native => 5.,
             _ => 4.,
         }
     }
@@ -772,7 +797,12 @@ impl MenuStyle {
     fn highlights(self) -> bool {
         matches!(
             self,
-            Self::Explorer | Self::Access | Self::Settings | Self::Filter | Self::Recent
+            Self::Explorer
+                | Self::Access
+                | Self::Settings
+                | Self::Filter
+                | Self::Recent
+                | Self::Native
         )
     }
 }
@@ -1229,11 +1259,18 @@ impl Menu {
             content(1.)
         };
         let open = self.submenu == Some(ix) && !in_submenu;
+        // A Native row is blue under the pointer or keys, its ink white.
+        let native_on = style == MenuStyle::Native
+            && !action.disabled
+            && (highlighted || (open && self.style == MenuStyle::Native));
+        let ink = if native_on { gpui::white() } else { ink };
         let filled = (style.highlights() && highlighted)
+            || native_on
             || (style == MenuStyle::Access && action.checked)
             || (style == MenuStyle::Switcher && open);
         let fill = match style {
             MenuStyle::Switcher => content(0.08),
+            MenuStyle::Native => gpui::hsla(211. / 360., 1., 0.5, 1.),
             _ if action.danger => rgb(RED_500).into(),
             _ => content(0.1),
         };
@@ -1250,6 +1287,8 @@ impl Menu {
             }
             MenuStyle::Switcher => content(0.08),
             MenuStyle::Composer | MenuStyle::Git => content(0.1),
+            // The row turns blue as the pointer makes it the chosen one.
+            MenuStyle::Native => gpui::transparent_black(),
             _ => content(0.05),
         };
         let icon_size = self
@@ -1335,6 +1374,13 @@ impl Menu {
                 }
                 MenuStyle::Settings => d.items_center().gap_2().rounded(px(8.)).h(px(36.)),
                 MenuStyle::Recent => d.items_center().gap_2().rounded(px(8.)).h(px(40.)),
+                MenuStyle::Native => d
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .h(px(24.))
+                    .px(px(10.))
+                    .line_height(px(16.)),
                 MenuStyle::Composer | MenuStyle::Access => {
                     d.items_start().gap(px(10.)).rounded(px(8.)).py_2()
                 }
@@ -1630,7 +1676,11 @@ impl Render for Menu {
                     self.row(
                         sub,
                         item,
-                        MenuStyle::Explorer,
+                        if self.style == MenuStyle::Native {
+                            MenuStyle::Native
+                        } else {
+                            MenuStyle::Explorer
+                        },
                         self.sub_active == Some(sub),
                         true,
                         cx,
@@ -1770,6 +1820,8 @@ fn separator(ix: usize, style: MenuStyle) -> AnyElement {
             if style == MenuStyle::Switcher {
                 // `mx-2 bg-stroke`.
                 d.mx_2().bg(content(0.07))
+            } else if style == MenuStyle::Native {
+                d.mx(px(10.)).my(px(5.)).bg(content(0.12))
             } else if style == MenuStyle::Git {
                 // `mx-1 border-t border-content/10`.
                 d.mx_1().bg(content(0.1))

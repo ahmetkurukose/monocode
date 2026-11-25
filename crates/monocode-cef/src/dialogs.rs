@@ -187,6 +187,34 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        // A click to another site in a page that peeks stops here; the
+        // host shows it in Peek (BrowserView::set_peek_host).
+        fn on_before_browse(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            user_gesture: ::std::os::raw::c_int,
+            is_redirect: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let (Some(browser), Some(frame), Some(request)) = (browser, frame, request) else {
+                return 0;
+            };
+            if user_gesture == 0 || is_redirect != 0 || frame.is_main() == 0 {
+                return 0;
+            }
+            let Some(home) = peek_host(browser.identifier()) else {
+                return 0;
+            };
+            let url = CefString::from(&request.url()).to_string();
+            let method = CefString::from(&request.method()).to_string();
+            if !method.eq_ignore_ascii_case("GET") || !peeks(&home, &url) {
+                return 0;
+            }
+            self.state.send(BrowserEvent::PeekRequested(url));
+            1
+        }
+
         // A middle or ⌘-click on a link opens a new page (crate::popup).
         fn on_open_urlfrom_tab(
             &self,
@@ -316,5 +344,56 @@ wrap_jsdialog_handler! {
             // A navigation voided the page's pending dialogs.
             self.state.send(BrowserEvent::DialogsReset);
         }
+    }
+}
+
+/// The site each peeking page keeps to, by browser id.
+static PEEK_HOSTS: std::sync::LazyLock<Mutex<std::collections::HashMap<i32, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn set_peek_host(browser: i32, host: Option<String>) {
+    if let Ok(mut hosts) = PEEK_HOSTS.lock() {
+        match host {
+            Some(host) => hosts.insert(browser, host),
+            None => hosts.remove(&browser),
+        };
+    }
+}
+
+fn peek_host(browser: i32) -> Option<String> {
+    PEEK_HOSTS.lock().ok()?.get(&browser).cloned()
+}
+
+/// Whether `url` is a web page on another site than `home`; `www.` and the
+/// scheme do not count.
+pub(crate) fn peeks(home: &str, url: &str) -> bool {
+    fn host(url: &str) -> Option<String> {
+        let (scheme, rest) = url.split_once("://")?;
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = authority
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .to_ascii_lowercase();
+        Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+    }
+    let home = home.trim().to_ascii_lowercase();
+    let home = home.strip_prefix("www.").unwrap_or(&home);
+    host(url).is_some_and(|host| !host.is_empty() && host != home)
+}
+
+#[cfg(test)]
+mod peek_tests {
+    #[test]
+    fn only_other_web_sites_peek() {
+        assert!(super::peeks("github.com", "https://example.com/a"));
+        assert!(!super::peeks("github.com", "https://www.github.com/x"));
+        assert!(!super::peeks("www.github.com", "http://github.com:443/"));
+        assert!(!super::peeks("github.com", "mailto:a@b.c"));
+        assert!(super::peeks("github.com", "https://gist.github.com/"));
     }
 }

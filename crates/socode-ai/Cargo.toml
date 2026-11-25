@@ -1,0 +1,20 @@
+[package]
+workspace = "../monocode-gpui"
+name = "socode-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "socode_ai"
+
+[features]
+default = []
+native = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+zeroize = "1"

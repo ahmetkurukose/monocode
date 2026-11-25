@@ -109,6 +109,9 @@ pub(crate) struct Preferences {
     /// pane. Off, only local addresses do and the rest go to the user's own
     /// browser.
     pub browser_all_links: bool,
+    /// Link routing rules (docs/native/modes.md §Link routing), tried in
+    /// order before `browser_all_links` and K19's rule decide.
+    pub browser_link_routes: Vec<crate::shell::browser_links::LinkRoute>,
     /// Tools outside Monocode (Playwright, dev-browser) may connect to the
     /// browser over CDP (docs/native/browser/context.md K27). On by default.
     pub browser_external_cdp: bool,
@@ -127,6 +130,9 @@ pub(crate) struct Preferences {
     /// The browser's password manager (context.md K56, K60): offers to save
     /// sign-ins and suggests saved logins on sign-in forms. On by default.
     pub browser_offer_passwords: bool,
+    /// A video playing with sound opens in Picture in Picture when its tab
+    /// is left, and comes back when the tab shows again. On by default.
+    pub browser_auto_pip: bool,
     /// Experimental: report Monocode instead of `sdk-cli` as Claude's entrypoint.
     pub claude_entrypoint: bool,
     pub binary_paths: HashMap<String, String>,
@@ -234,11 +240,13 @@ impl Default for Preferences {
             claude_chrome: false,
             code_agents: true,
             browser_all_links: false,
+            browser_link_routes: Vec::new(),
             browser_external_cdp: true,
             browser_external_cdp_rev: BROWSER_EXTERNAL_CDP_REV,
             browser_battery_saver: true,
             browser_memory_saver: crate::browser::lifecycle::DEFAULT_DISCARD_MINUTES,
             browser_offer_passwords: true,
+            browser_auto_pip: true,
             claude_entrypoint: false,
             binary_paths: HashMap::new(),
             disabled_skill_paths: Vec::new(),

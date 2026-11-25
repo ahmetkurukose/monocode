@@ -11,6 +11,7 @@ impl SettingsView {
         if cfg!(target_os = "macos") {
             let browsing = self.browsing_rows(cx);
             page.push(self.group(None, true, "Browsing", None, None, browsing));
+            page.push(self.link_routing_group(cx));
             let mut data = self.site_permission_rows(true, cx);
             let first = data.is_empty();
             data.extend(self.browser_import_rows(first, cx));
@@ -69,6 +70,20 @@ impl SettingsView {
                         let minutes = v.parse().unwrap_or(0);
                         this.update(cx, |p| p.browser_memory_saver = minutes)
                     },
+                )],
+            ),
+            self.row(
+                Some("browser-auto-pip"),
+                false,
+                "Picture in Picture when you leave a video tab",
+                Some("A video playing with sound keeps playing in a floating window when you switch to another tab, and comes back when you show its tab again.".into()),
+                vec![self.toggle(
+                    "browser-auto-pip",
+                    "Picture in Picture when you leave a video tab",
+                    p.browser_auto_pip,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.browser_auto_pip = on),
                 )],
             ),
             self.external_cdp_row(&p, cx),

@@ -88,6 +88,11 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 <key>NSMicrophoneUsageDescription</key><string>Websites in the browser can ask to use your microphone.</string>
 <key>NSLocationUsageDescription</key><string>Websites in the browser can ask for your location.</string>
 <key>NSLocationWhenInUseUsageDescription</key><string>Websites in the browser can ask for your location.</string>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>Web site URL</string>
+<key>CFBundleTypeRole</key><string>Viewer</string>
+<key>CFBundleURLSchemes</key><array><string>http</string><string>https</string></array>
+</dict></array>
 </dict></plist>
 PLIST
 # The signing identity: MONOCODE_NATIVE_SIGNING_IDENTITY (a Developer ID for

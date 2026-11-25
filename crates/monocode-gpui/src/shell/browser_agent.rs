@@ -191,7 +191,12 @@ impl Shell {
     /// Shows the page of `pane` (`browser_tab_show`): its tab becomes its
     /// group's shown one. The keyboard stays where it is while what had it
     /// is still on screen.
-    pub(super) fn show_agent_browser_page(&mut self, pane: i64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_agent_browser_page(
+        &mut self,
+        pane: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.workspace.active;
         if self.workspace.tab_of(pane) != self.workspace.active_tab() {
             self.open_browser_pane(pane, window, cx);

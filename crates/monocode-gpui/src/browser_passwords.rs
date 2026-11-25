@@ -680,6 +680,10 @@ impl BrowserPage {
                         cx.notify();
                     }
                 }))
+                // In Browser mode the key is not drawn: its list opens here.
+                .when(self.nav_in_sidebar, |d| {
+                    d.relative().child(self.passwords.key_anchor.probe())
+                })
                 .into_any_element(),
         )
     }
@@ -832,15 +836,47 @@ impl BrowserPage {
                             .text_color(content(0.7))
                             .hover(|s| s.bg(content(0.06)))
                             .child("Manage passwords…")
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.passwords.key_open = false;
-                                window.dispatch_action(Box::new(ShowBrowserPasswords), cx);
+                                // Drawn in Browser mode's child window: the
+                                // action belongs to the page's own.
+                                this.dispatch_in_page_window(Box::new(ShowBrowserPasswords), cx);
                                 cx.notify();
                             })),
                     ),
             )
             .into_any_element(),
         )
+    }
+
+    /// The Site Control Center's Passwords row: how many logins the site
+    /// has saved, and whether an offer to save one waits; `None` where the
+    /// key would not show.
+    pub(super) fn site_passwords(&self, cx: &mut App) -> Option<(usize, bool)> {
+        if self.password_store().is_none() || !vaults::password_manager_enabled(cx) {
+            return None;
+        }
+        let offer = self.passwords.offer.is_some();
+        let count = self.site_logins(cx).len();
+        (offer || count > 0).then_some((count, offer))
+    }
+
+    pub(super) fn passwords_open(&self) -> bool {
+        self.passwords.key_open
+    }
+
+    /// Opens the key's list under `at` (the Site Control Center's button
+    /// in Browser mode, where the key is not drawn).
+    pub(super) fn show_passwords(&mut self, at: Option<Bounds<Pixels>>, cx: &mut Context<Self>) {
+        if at.is_some() {
+            self.passwords.key_anchor.set(at);
+        }
+        self.passwords.key_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn close_passwords(&mut self) {
+        self.passwords.key_open = false;
     }
 
     // ---- Tests ----

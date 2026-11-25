@@ -1,0 +1,25 @@
+[package]
+workspace = "../monocode-gpui"
+name = "socode-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The browser's model without UI or engine: tabs, folders, archive, undo,
+# splits, the command bar's omnibox. Time is passed in, so it is testable.
+[lib]
+name = "socode_browser"
+
+[dependencies]
+socode-ai = { path = "../socode-ai" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+unicode-segmentation = "1"
+mailparse = "0.16"
+lol_html = "2"
+cssparser = "0.36"
+
+[dev-dependencies]
+tempfile = "3"

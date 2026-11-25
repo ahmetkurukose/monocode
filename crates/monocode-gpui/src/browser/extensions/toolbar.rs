@@ -611,14 +611,32 @@ fn button(
         .into_any_element()
 }
 
-/// The window's own AppKit view.
+/// The window's own AppKit view; for Browser mode's child window (the Site
+/// Control Center's buttons), its parent's, which outlives it and lies at
+/// the same place: the popup stays when the child window closes.
 fn window_view(window: &Window) -> Option<*mut std::ffi::c_void> {
+    use objc2::{msg_send, runtime::AnyObject};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = HasWindowHandle::window_handle(window).ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
-        _ => None,
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return None;
+    };
+    let view = h.ns_view.as_ptr();
+    // SAFETY: GPUI keeps its content view and window alive with the window;
+    // a parent window outlives its children.
+    unsafe {
+        let ns_window: *mut AnyObject = msg_send![view.cast::<AnyObject>(), window];
+        if !ns_window.is_null() {
+            let parent: *mut AnyObject = msg_send![ns_window, parentWindow];
+            if !parent.is_null() {
+                let content: *mut AnyObject = msg_send![parent, contentView];
+                if !content.is_null() {
+                    return Some(content.cast());
+                }
+            }
+        }
     }
+    Some(view)
 }
 
 #[cfg(test)]
