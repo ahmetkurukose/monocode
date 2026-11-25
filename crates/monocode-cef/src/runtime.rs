@@ -355,19 +355,53 @@ fn platform_start(config: &RuntimeConfig) -> Result<(), StartError> {
         fido_log: fido_log(),
     });
     let args = cef::args::Args::new();
-    if cef::initialize(
+    let child_signal = ChildSignal::save();
+    let initialized = cef::initialize(
         Some(args.as_main_args()),
         Some(&settings),
         Some(&mut app),
         std::ptr::null_mut(),
-    ) != 1
-    {
+    );
+    child_signal.restore();
+    if initialized != 1 {
         return Err(StartError::Initialize);
     }
     crate::mac::pump::install();
     crate::profile::set_root(config.profiles());
     APP.with(|slot| *slot.borrow_mut() = Some(app));
     Ok(())
+}
+
+/// The host's SIGCHLD handler, kept across `cef_initialize`. Chromium resets
+/// the signals it inherited to their defaults when it starts, SIGCHLD among
+/// them, and it starts long after the host: the host's terminals learn that
+/// a child ended from that signal, and without it a shell or a run that has
+/// exited looks alive for ever, taking no key and no stop.
+#[cfg(target_os = "macos")]
+struct ChildSignal(Option<libc::sigaction>);
+
+#[cfg(target_os = "macos")]
+impl ChildSignal {
+    fn save() -> Self {
+        // SAFETY: reads the current action into a zeroed struct.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            let read = libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) == 0;
+            Self(read.then_some(action))
+        }
+    }
+
+    fn restore(self) {
+        let Some(action) = self.0 else { return };
+        // Nothing of the host's to put back.
+        if action.sa_sigaction == libc::SIG_DFL || action.sa_sigaction == libc::SIG_IGN {
+            return;
+        }
+        // SAFETY: puts back an action this process had installed.
+        unsafe {
+            libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

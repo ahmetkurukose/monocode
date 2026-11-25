@@ -96,6 +96,8 @@ pub(crate) fn surface(radius: f32) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
+            // Glass over a web page takes the page's colours (`popover`).
+            let light = light || crate::popover::over_page();
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let quad = if light {
                 gpui::fill(bounds, opaque)
