@@ -289,20 +289,28 @@ pub fn commit_files(cwd: &Path, sha: &str) -> Result<Vec<ChangedFile>, String> {
     let sha = peel_commit(&root, sha)?;
     let mut files: HashMap<String, FileAcc> = HashMap::new();
     let mut statuses: HashMap<String, &'static str> = HashMap::new();
+    // A merge has no changes of its own to list: what it brought in is its
+    // difference from the first parent, as the file diffs already take it.
+    let merged_from = git_stdout(
+        &root,
+        &["rev-parse", "--verify", "--quiet", &format!("{sha}^2")],
+    )
+    .and_then(|_| git_stdout(&root, &["rev-parse", "--verify", &format!("{sha}^1")]));
     let tree = |kind: &str| {
-        git_run(
-            &root,
-            &[
-                "diff-tree",
-                "-z",
-                "--no-commit-id",
-                "-r",
-                "--root",
-                "--no-renames",
-                kind,
-                &sha,
-            ],
-        )
+        let mut args = vec![
+            "diff-tree",
+            "-z",
+            "--no-commit-id",
+            "-r",
+            "--root",
+            "--no-renames",
+            kind,
+        ];
+        if let Some(parent) = &merged_from {
+            args.push(parent);
+        }
+        args.push(&sha);
+        git_run(&root, &args)
     };
     if let Some(text) = tree("--numstat") {
         add_numstat_map(&text, &mut files);
@@ -593,7 +601,7 @@ pub(super) fn text_diff(
 pub(super) fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
     git_output(root, &["cat-file", "-p", spec])
 }
-fn peel_commit(root: &Path, spec: &str) -> Result<String, String> {
+pub(super) fn peel_commit(root: &Path, spec: &str) -> Result<String, String> {
     let spec = spec.trim();
     if spec.len() < 4 || spec.len() > 40 || !spec.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Invalid commit".into());

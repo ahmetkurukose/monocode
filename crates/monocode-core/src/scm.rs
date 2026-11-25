@@ -1,6 +1,7 @@
 //! Source control for the Changes and History panes, ported from
 //! src-tauri/src/fs.rs. Synchronous: callers run these on a background executor.
 mod blame;
+mod landing;
 mod pull_request;
 mod review;
 pub(crate) mod shell;
@@ -24,6 +25,7 @@ pub use blame::{
     parse_line_log, remote_file_link, remote_url_in_config, remote_web, Blame, BlameCommit,
     BlameLine, LocalRepo, RemoteKind, RemoteWeb,
 };
+pub use landing::{commit_info, CommitInfo, CommitRef, Landing};
 pub(crate) use pull_request::github_enterprise_authenticated;
 pub use pull_request::{
     pr_apply_metadata, pr_base_ref, pr_branch_check, pr_branches, pr_candidates, pr_fetch,
