@@ -70,7 +70,11 @@ pub(crate) struct SearchView {
     cancel: Arc<AtomicBool>,
     listing_cancel: Arc<AtomicBool>,
     debounce: Option<Task<()>>,
+    /// Files and contents are searched in every project open in the rail,
+    /// not only this one.
+    all_projects: bool,
     _changed: Subscription,
+    _projects: Subscription,
 }
 impl EventEmitter<Event> for SearchView {}
 impl Focusable for SearchView {
@@ -103,23 +107,14 @@ impl SearchView {
             this.active = 0;
             this.refresh(cx);
         });
-        let listing_cancel = Arc::new(AtomicBool::new(false));
-        let flag = listing_cancel.clone();
-        let root = cwd.clone();
-        let include_ignored = crate::settings::show_excluded_files(cx);
-        let work = cx.background_executor().spawn(async move {
-            monocode_core::files::list_project_files_with(&root, Some(&flag), include_ignored)
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                if let Ok(files) = result {
-                    this.files = files;
-                    this.rank(cx);
+        let projects_changed =
+            cx.observe_global::<crate::open_projects::OpenProjects>(|this: &mut Self, cx| {
+                if this.all_projects {
+                    this.load_files(cx);
+                    this.refresh(cx);
                 }
             });
-        })
-        .detach();
+        let listing_cancel = Arc::new(AtomicBool::new(false));
         let mut view = Self {
             input,
             cwd,
@@ -151,8 +146,11 @@ impl SearchView {
             cancel: Arc::new(AtomicBool::new(false)),
             listing_cancel,
             debounce: None,
+            all_projects: false,
             _changed: changed,
+            _projects: projects_changed,
         };
+        view.load_files(cx);
         // Recent conversations show at once; recent files join once listed.
         if view.panel {
             view.hits = view.suggestions();
@@ -175,6 +173,83 @@ impl SearchView {
         self.scope = draft.1;
         self.input
             .update(cx, |input, cx| input.set_text(draft.0, cx));
+    }
+    /// Where files and contents are searched: this project, or every open
+    /// project with this one first.
+    fn roots(&self, cx: &App) -> Vec<String> {
+        if self.all_projects {
+            crate::open_projects::local_projects(cx, Some(&self.cwd))
+        } else {
+            vec![self.cwd.clone()]
+        }
+    }
+    pub(crate) fn set_all_projects(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.all_projects != on {
+            self.all_projects = on;
+            self.load_files(cx);
+            self.refresh(cx);
+        }
+    }
+    /// Lists the files whose names are matched. Across projects a file's
+    /// path starts with its project's name, so typing it narrows the list.
+    fn load_files(&mut self, cx: &mut Context<Self>) {
+        self.listing_cancel.store(true, Ordering::Release);
+        self.listing_cancel = Arc::new(AtomicBool::new(false));
+        let flag = self.listing_cancel.clone();
+        let check = flag.clone();
+        let roots = self.roots(cx);
+        let include_ignored = crate::settings::show_excluded_files(cx);
+        let work = cx.background_executor().spawn(async move {
+            if let [root] = roots.as_slice() {
+                return monocode_core::files::list_project_files_with(
+                    root,
+                    Some(&flag),
+                    include_ignored,
+                );
+            }
+            let mut all = Vec::new();
+            for root in &roots {
+                let name = search::project_name(root);
+                let Ok(files) = monocode_core::files::list_project_files_with(
+                    root,
+                    Some(&flag),
+                    include_ignored,
+                ) else {
+                    continue;
+                };
+                all.extend(files.into_iter().map(|mut file| {
+                    file.relative = format!("{name}/{}", file.relative);
+                    file
+                }));
+            }
+            Ok(all)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            if check.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(files) = result {
+                    this.files = files;
+                    this.rank(cx);
+                }
+            });
+        })
+        .detach();
+    }
+    /// "All open projects", beside the scope tabs.
+    fn all_projects_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .ml_auto()
+            .flex_shrink_0()
+            .child(
+                crate::open_projects::toggle("app-search-all-projects", self.all_projects, 0)
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.set_all_projects(!this.all_projects, cx)),
+                    ),
+            )
+            .into_any_element()
     }
     pub(crate) fn select_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         self.scope = scope;
@@ -343,28 +418,52 @@ impl SearchView {
             .detach();
         }
         if self.scope.files() {
-            let cwd = self.cwd.clone();
+            let roots = self.roots(cx);
             let query = self.query.clone();
             let include_ignored = crate::settings::show_excluded_files(cx);
             let flag = self.cancel.clone();
             let check = flag.clone();
             let work = cx.background_executor().spawn(async move {
-                search::project::search_project(
-                    &std::path::PathBuf::from(&cwd),
-                    &search::project::SearchOptions {
-                        cwd: cwd.clone(),
-                        query: query.clone(),
-                        case_sensitive: false,
-                        whole_word: false,
-                        regex: false,
-                        include: None,
-                        exclude: None,
-                        search_id: String::new(),
-                        include_ignored,
-                    },
-                    &flag,
-                )
-                .map(|r| (search::content(r.matches, &query), r.truncated))
+                let several = roots.len() > 1;
+                let mut hits = Vec::new();
+                let mut truncated = false;
+                for cwd in roots {
+                    if flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = search::project::search_project(
+                        &std::path::PathBuf::from(&cwd),
+                        &search::project::SearchOptions {
+                            cwd: cwd.clone(),
+                            query: query.clone(),
+                            case_sensitive: false,
+                            whole_word: false,
+                            regex: false,
+                            include: None,
+                            exclude: None,
+                            search_id: String::new(),
+                            include_ignored,
+                        },
+                        &flag,
+                    );
+                    let result = match result {
+                        Ok(result) => result,
+                        // One project failing leaves the others' results.
+                        Err(_) if several => continue,
+                        Err(error) => return Err(error),
+                    };
+                    truncated |= result.truncated;
+                    let name = search::project_name(&cwd);
+                    hits.extend(search::content(result.matches, &query).into_iter().map(
+                        |mut hit| {
+                            if several {
+                                hit.meta = format!("{name}/{}", hit.meta);
+                            }
+                            hit
+                        },
+                    ));
+                }
+                Ok((hits, truncated))
             });
             cx.spawn(async move |this, cx| {
                 let result = work.await;
@@ -965,7 +1064,8 @@ impl SearchView {
                                         this.select_scope(scope, cx);
                                     }))
                             }),
-                    ),
+                    )
+                    .child(self.all_projects_toggle(cx)),
             )
             .child(if self.query.is_empty() {
                 empty_state()
@@ -1164,7 +1264,8 @@ impl SearchView {
                                         this.select_scope(scope, cx);
                                     }))
                             }),
-                    ),
+                    )
+                    .child(self.all_projects_toggle(cx)),
             )
             .child(
                 div()
@@ -1464,5 +1565,79 @@ mod tests {
         window
             .update(visual, |view, _, _| assert_eq!(view.scope, Scope::All))
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn all_open_projects_are_searched_from_app_search(cx: &mut TestAppContext) {
+        let (one, two) = (TempDir::new(), TempDir::new());
+        std::fs::write(one.path().join("here.ts"), "const quokka = 1;\n").unwrap();
+        std::fs::write(two.path().join("there.ts"), "// quokka too\n").unwrap();
+        let (a, b) = (
+            one.path().to_string_lossy().into_owned(),
+            two.path().to_string_lossy().into_owned(),
+        );
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let window = cx.update(|cx| {
+            input::bind(cx);
+            crate::open_projects::publish(&[a.clone(), b.clone()], cx);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    SearchView::new(
+                        a.clone(),
+                        Arc::new(Mutex::new(store)),
+                        Sources::default(),
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        let view = window.root(cx).unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("app-search-all-projects").is_some());
+        cx.update(|cx| {
+            view.update(cx, |v, cx| {
+                v.select_scope(Scope::Files, cx);
+                v.set_all_projects(true, cx);
+                v.input.update(cx, |i, cx| i.set_text("quokka".into(), cx));
+            })
+        });
+        let paths = |cx: &mut TestAppContext| -> Vec<String> {
+            cx.update(|cx| {
+                view.read(cx)
+                    .hits
+                    .iter()
+                    .filter_map(|h| match &h.target {
+                        Target::File {
+                            path,
+                            location: Some(_),
+                        } => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        };
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+            if paths(cx).len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let found = paths(cx);
+        assert!(found.iter().any(|p| p.starts_with(&a)), "{found:?}");
+        assert!(found.iter().any(|p| p.starts_with(&b)), "{found:?}");
+        cx.update(|cx| view.update(cx, |v, cx| v.set_all_projects(false, cx)));
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+            if paths(cx).len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(paths(cx).len(), 1, "only this project once it is off");
     }
 }

@@ -161,15 +161,19 @@ impl Changes {
         let form = cx.new(|cx| CommitForm::new(git.clone(), window, cx));
         let cross = cx.new(|cx| CrossChanges::new(git.read(cx).project().to_owned(), cx));
         let subscriptions = vec![
-            cx.subscribe(&cross, |_, _, event: &CrossChangesEvent, cx| match event {
-                CrossChangesEvent::OpenDiff { cwd, path } => cx.emit(ChangesEvent::OpenDiff {
-                    cwd: cwd.clone(),
-                    path: Some(path.clone()),
-                    staged: None,
-                }),
-                CrossChangesEvent::OpenProject(path) => {
-                    cx.emit(ChangesEvent::OpenProject(path.clone()))
-                }
+            cx.subscribe(&cross, |_, _, event: &CrossChangesEvent, cx| {
+                cx.emit(match event {
+                    CrossChangesEvent::OpenDiff { cwd, path, staged } => ChangesEvent::OpenDiff {
+                        cwd: cwd.clone(),
+                        path: path.clone(),
+                        staged: *staged,
+                    },
+                    CrossChangesEvent::ShowPullRequest(pr) => {
+                        ChangesEvent::ShowPullRequest(pr.clone())
+                    }
+                    CrossChangesEvent::Overlays => ChangesEvent::Overlays,
+                    CrossChangesEvent::OpenProject(path) => ChangesEvent::OpenProject(path.clone()),
+                })
             }),
             cx.observe(&cross, |_, _, cx| cx.notify()),
             cx.observe(&git, |this, _, cx| this.index_changed(cx)),
@@ -218,6 +222,10 @@ impl Changes {
     pub(crate) fn set_text_provider(&mut self, provider: Kind, cx: &mut Context<Self>) {
         self.form
             .update(cx, |form, _| form.text_provider = provider);
+        if self.offers_all_projects {
+            self.cross
+                .update(cx, |cross, cx| cross.set_text_provider(provider, cx));
+        }
     }
     fn form_event(
         &mut self,
@@ -663,7 +671,12 @@ impl Changes {
     /// Set by the shell: the title of an agent working in this checkout, if any.
     pub(crate) fn set_blocked(&mut self, reason: Option<String>, cx: &mut Context<Self>) {
         if self.blocked != reason {
-            self.blocked = reason;
+            self.blocked = reason.clone();
+            if self.offers_all_projects {
+                // The current project's panel in "All open projects" too.
+                self.cross
+                    .update(cx, |cross, cx| cross.set_blocked(reason, cx));
+            }
             cx.notify();
         }
     }

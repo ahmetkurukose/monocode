@@ -198,7 +198,12 @@ impl Shell {
                                 cx,
                             ),
                             Target::File { path, location } => {
-                                let cwd = this.working_copy().to_owned();
+                                // A file from another open project opens as that project's.
+                                let here = this.working_copy().to_owned();
+                                let roots = crate::open_projects::local_projects(cx, Some(&here));
+                                let cwd = crate::open_projects::owning_root(&roots, path)
+                                    .cloned()
+                                    .unwrap_or(here);
                                 this.open_review(
                                     crate::review::ReviewTab::File {
                                         cwd,
