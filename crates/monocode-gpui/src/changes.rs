@@ -24,20 +24,17 @@ use gpui::{
     Role, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use monocode_core::{
-    agent::{AccessMode, Settings},
+    agent::Settings,
     integrations::{
         self, Provider,
         writeback::{self, Outcome, PrEvent},
     },
-    provider::{self, Event, Kind, Request},
+    provider::{self, Kind, Request},
     scm::{self, DiffIndex, Pr, UpdateMethod},
 };
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -55,6 +52,8 @@ pub(crate) enum ChangesEvent {
     ShowPullRequest(crate::inbox::RevealPr),
     /// "All open projects" asked to switch to this project, to commit there.
     OpenProject(String),
+    /// The "All open projects" checkbox in a project's panel inside that view.
+    AllProjects(bool),
 }
 
 /// Where the branch switcher opens.
@@ -148,6 +147,9 @@ pub(crate) struct Changes {
     /// The right panel offers "All open projects"; a Mono's tabs already
     /// show its projects.
     pub(crate) offers_all_projects: bool,
+    /// This is a project's panel inside "All open projects": its commit box
+    /// shows the checkbox ticked, to leave that view.
+    pub(crate) in_all_projects: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<ChangesEvent> for Changes {}
@@ -161,7 +163,11 @@ impl Changes {
         let form = cx.new(|cx| CommitForm::new(git.clone(), window, cx));
         let cross = cx.new(|cx| CrossChanges::new(git.read(cx).project().to_owned(), cx));
         let subscriptions = vec![
-            cx.subscribe(&cross, |_, _, event: &CrossChangesEvent, cx| {
+            cx.subscribe(&cross, |this, _, event: &CrossChangesEvent, cx| {
+                if let CrossChangesEvent::AllProjects(on) = event {
+                    this.set_all_projects(*on, cx);
+                    return;
+                }
                 cx.emit(match event {
                     CrossChangesEvent::OpenDiff { cwd, path, staged } => ChangesEvent::OpenDiff {
                         cwd: cwd.clone(),
@@ -173,6 +179,7 @@ impl Changes {
                     }
                     CrossChangesEvent::Overlays => ChangesEvent::Overlays,
                     CrossChangesEvent::OpenProject(path) => ChangesEvent::OpenProject(path.clone()),
+                    CrossChangesEvent::AllProjects(on) => ChangesEvent::AllProjects(*on),
                 })
             }),
             cx.observe(&cross, |_, _, cx| cx.notify()),
@@ -212,6 +219,7 @@ impl Changes {
             cross,
             all_projects: false,
             offers_all_projects: false,
+            in_all_projects: false,
             _subscriptions: subscriptions,
         };
         this.index_changed(cx);
@@ -308,6 +316,22 @@ impl Changes {
             self.sync_cross(cx);
             cx.notify();
         }
+    }
+    /// "All open projects", beside "Amend last commit": off in the panel,
+    /// ticked in a project's panel inside that view.
+    fn all_projects_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let on = self.in_all_projects;
+        (self.offers_all_projects || on).then(|| {
+            crate::open_projects::toggle("changes-all-projects", on, 0)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.in_all_projects {
+                        cx.emit(ChangesEvent::AllProjects(false));
+                    } else {
+                        this.set_all_projects(true, cx);
+                    }
+                }))
+                .into_any_element()
+        })
     }
     fn showing_all_projects(&self) -> bool {
         self.all_projects && self.offers_all_projects
@@ -1243,7 +1267,15 @@ impl Changes {
                     )
                     .when(!dialog_open, |d| d.child(generate)),
             )
-            .child(div().mt(px(6.)).child(amend_toggle))
+            .child(
+                div()
+                    .mt(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(amend_toggle)
+                    .children(self.all_projects_toggle(cx)),
+            )
             .child(
                 div()
                     .relative()
@@ -1488,8 +1520,8 @@ impl Changes {
 pub(crate) type TextHarness = (Kind, PathBuf, Option<String>);
 
 /// pickTextHarness: `chosen` (the background model picked in Settings) when
-/// installed, else `preferred`, then Claude Code, then Codex on their default
-/// models.
+/// installed, else `preferred`, then Claude Code, then Codex on their quick
+/// models (Haiku for Claude Code), like session titles.
 pub(crate) fn pick_text_harness(
     preferred: Kind,
     chosen: Option<(Kind, Option<String>)>,
@@ -1499,7 +1531,15 @@ pub(crate) fn pick_text_harness(
         .or_else(|| {
             [preferred, Kind::Claude, Kind::Codex]
                 .into_iter()
-                .find_map(|kind| provider::resolve(kind).map(|binary| (kind, binary, None)))
+                .find_map(|kind| {
+                    provider::resolve(kind).map(|binary| {
+                        let quick = monocode_core::session_title::TextModel::automatic(
+                            kind,
+                            Default::default(),
+                        );
+                        (kind, binary, quick.model)
+                    })
+                })
         })
 }
 
@@ -1569,41 +1609,26 @@ pub(crate) fn create_pr_blocking(
     scm::pr_create(cwd, &title, &body, &range.base, &range.head)
 }
 
-/// A read-only one-shot turn, as the React text harness runs: the final
-/// assistant message's text. Blocking.
+/// A one-shot text turn on the bounded background path session titles use:
+/// no tools, MCP servers or hooks, one turn, nothing persisted. Blocking.
 pub(crate) fn text_prompt(
     (kind, binary, model): TextHarness,
     cwd: PathBuf,
     prompt: String,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
-    let request = Request {
-        kind,
-        binary,
-        cwd,
-        prompt,
-        provider_id: None,
-        model,
-        settings: Settings {
-            access: AccessMode::ReadOnly,
-            ..Default::default()
+    provider::run_text(
+        Request {
+            kind,
+            binary,
+            cwd,
+            prompt,
+            provider_id: None,
+            model,
+            settings: Settings::default(),
         },
-    };
-    let mut text = String::new();
-    provider::run(request, cancel.clone(), |events| {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("Cancelled".into());
-        }
-        for event in events {
-            match event {
-                Event::BeginAssistant => text.clear(),
-                Event::Text(chunk) => text.push_str(&chunk),
-                _ => {}
-            }
-        }
-        Ok(())
-    })?;
-    Ok(text)
+        cancel,
+    )
 }
 
 impl Render for Changes {
@@ -1620,19 +1645,6 @@ impl Render for Changes {
         }
         let index = self.git.read(cx).index.clone();
         let all_projects = self.showing_all_projects();
-        let toggle = self.offers_all_projects.then(|| {
-            div()
-                .flex_shrink_0()
-                .px(px(6.))
-                .py(px(3.))
-                .border_b_1()
-                .border_color(stroke())
-                .child(
-                    crate::open_projects::toggle("changes-all-projects", all_projects, 0).on_click(
-                        cx.listener(|this, _, _, cx| this.set_all_projects(!this.all_projects, cx)),
-                    ),
-                )
-        });
         let empty = match &index {
             None => Some("Loading changes…".to_owned()),
             Some(i) if i.files.is_empty() => Some(if i.ahead > 0 || i.behind > 0 {
@@ -1659,8 +1671,8 @@ impl Render for Changes {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(self.header(cx))
-            .children(toggle)
+            // The open project's own panel has the branch bar; one is enough.
+            .when(!all_projects, |d| d.child(self.header(cx)))
             .when(all_projects, |d| d.child(self.cross.clone()))
             .when(!all_projects, |d| {
                 d.child(self.commit_box(window, cx))

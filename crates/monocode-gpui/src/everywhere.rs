@@ -323,6 +323,11 @@ pub(crate) struct Everywhere {
     flags: ContentFlags,
     index: Option<Arc<FileIndex>>,
     index_loading: bool,
+    /// Files and contents are searched in every project open in the rail.
+    all_projects: bool,
+    /// The other open projects' file indexes, in rail order, once listed.
+    other_indexes: Vec<(String, Arc<FileIndex>)>,
+    others_loading: bool,
     generation: u64,
     /// Set by each new query: what still runs for the one before stops.
     cancel: Arc<AtomicBool>,
@@ -430,6 +435,11 @@ impl Everywhere {
             field
         });
         let subscriptions = vec![
+            cx.observe_global::<crate::open_projects::OpenProjects>(|this: &mut Self, cx| {
+                if this.all_projects {
+                    this.load_other_indexes(cx);
+                }
+            }),
             cx.subscribe(&input, |this, _, _: &input::Changed, cx| {
                 this.active = 0;
                 this.refresh(cx);
@@ -457,6 +467,9 @@ impl Everywhere {
             flags: ContentFlags::default(),
             index,
             index_loading: false,
+            all_projects: false,
+            other_indexes: Vec::new(),
+            others_loading: false,
             generation: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             index_cancel: Arc::new(AtomicBool::new(false)),
@@ -508,6 +521,60 @@ impl Everywhere {
                     this.search_files(cx);
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The open projects other than this one, in rail order.
+    fn other_roots(&self, cx: &App) -> Vec<String> {
+        crate::open_projects::local_projects(cx, Some(&self.cwd))
+            .into_iter()
+            .skip(1)
+            .collect()
+    }
+
+    pub(crate) fn set_all_projects(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.all_projects == on {
+            return;
+        }
+        self.all_projects = on;
+        if on {
+            self.load_other_indexes(cx);
+        }
+        self.refresh(cx);
+    }
+
+    /// Lists the other open projects, from the shared cache when it has them.
+    fn load_other_indexes(&mut self, cx: &mut Context<Self>) {
+        let roots = self.other_roots(cx);
+        let include_ignored = self.include_ignored;
+        let cancel = self.index_cancel.clone();
+        self.others_loading = true;
+        let work = cx.background_executor().spawn(async move {
+            roots
+                .into_iter()
+                .filter_map(|root| {
+                    let fresh = fast::cached_index(&root, include_ignored).filter(|index| {
+                        monocode_core::time::now_ms().saturating_sub(index.built_at())
+                            < INDEX_FRESH_MS
+                    });
+                    let index = match fresh {
+                        Some(index) => index,
+                        None => fast::load_index(&root, include_ignored, &cancel).ok()?,
+                    };
+                    Some((root, index))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let indexes = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.others_loading = false;
+                this.other_indexes = indexes;
+                if this.all_projects {
+                    this.refresh(cx);
+                }
             });
         })
         .detach();
@@ -631,15 +698,52 @@ impl Everywhere {
         let cancel = self.cancel.clone();
         let recent = self.recent_files.clone();
         let limit = FILE_ROWS;
+        // Other projects' files join once a name is typed; recent files are this project's.
+        let others = if self.all_projects {
+            self.other_indexes.clone()
+        } else {
+            Vec::new()
+        };
         self.files.loading = true;
         let work = cx.background_executor().spawn(async move {
             let started = Instant::now();
             let (name, at) = fast::split_location(&query);
-            let hits = index.search(name, &recent, limit, &cancel);
+            let mut hits: Vec<(Option<String>, Arc<FileIndex>, fast::FileHit)> = index
+                .search(name, &recent, limit, &cancel)
+                .into_iter()
+                .map(|hit| (None, index.clone(), hit))
+                .collect();
+            if !name.is_empty() {
+                for (root, other) in &others {
+                    let project = crate::open_projects::project_name(root);
+                    hits.extend(
+                        other
+                            .search(name, &[], limit, &cancel)
+                            .into_iter()
+                            .map(|hit| (Some(project.clone()), other.clone(), hit)),
+                    );
+                }
+                hits.sort_by(|a, b| b.2.score.cmp(&a.2.score));
+                hits.truncate(limit);
+            }
             let rows: Vec<Row> = hits
                 .into_iter()
-                .filter_map(|hit| {
+                .filter_map(|(project, index, hit)| {
                     let file = index.files().get(hit.index)?;
+                    // Another project's files say whose they are.
+                    let (detail, detail_ranges) = match &project {
+                        Some(project) => {
+                            let shift = project.len() + 1;
+                            (
+                                format!("{project}/{}", file.relative),
+                                hit.path_ranges
+                                    .iter()
+                                    .map(|r| r.start + shift..r.end + shift)
+                                    .collect(),
+                            )
+                        }
+                        None => (file.relative.clone(), hit.path_ranges.clone()),
+                    };
                     Some(Row {
                         section: if name.is_empty() {
                             Section::RecentFiles
@@ -648,8 +752,8 @@ impl Everywhere {
                         },
                         title: file.name.clone().into(),
                         title_ranges: hit.name_ranges,
-                        detail: file.relative.clone().into(),
-                        detail_ranges: hit.path_ranges,
+                        detail: detail.into(),
+                        detail_ranges,
                         mark: Mark::File(file.name.clone().into()),
                         code: false,
                         keys: None,
@@ -707,6 +811,11 @@ impl Everywhere {
         let options = self.content_options(&query, cx);
         let flags = self.flags;
         let root = self.cwd.clone();
+        let others = if self.all_projects {
+            self.other_roots(cx)
+        } else {
+            Vec::new()
+        };
         let limit = CONTENT_ROWS;
         self.content.loading = true;
         self.tasks.push(cx.spawn(async move |this, cx| {
@@ -727,13 +836,40 @@ impl Everywhere {
                         &flag,
                     );
                     result.map(|result| {
-                        let rows: Vec<Row> = result
+                        let mut rows: Vec<Row> = result
                             .matches
                             .into_iter()
                             .take(limit)
                             .map(|m| content_row(m, &options.query, flags))
                             .collect();
-                        (rows, result.truncated, started.elapsed())
+                        let mut truncated = result.truncated;
+                        // Then each other open project, while there is room.
+                        for other in &others {
+                            if rows.len() >= limit || flag.load(Ordering::Acquire) {
+                                truncated |= rows.len() >= limit;
+                                break;
+                            }
+                            let options = SearchOptions {
+                                cwd: other.clone(),
+                                ..options.clone()
+                            };
+                            let Ok(found) = fast::content_searcher().search(
+                                std::path::Path::new(other),
+                                &options,
+                                &flag,
+                            ) else {
+                                continue;
+                            };
+                            truncated |= found.truncated;
+                            let project = crate::open_projects::project_name(other);
+                            let room = limit - rows.len();
+                            rows.extend(found.matches.into_iter().take(room).map(|m| {
+                                let mut row = content_row(m, &options.query, flags);
+                                row.detail = format!("{project}/{}", row.detail).into();
+                                row
+                            }));
+                        }
+                        (rows, truncated, started.elapsed())
                     })
                 })
                 .await;
@@ -1708,6 +1844,32 @@ impl Everywhere {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_tab(target, cx)))
             }))
+            .child(
+                div()
+                    .ml_auto()
+                    .flex_shrink_0()
+                    .pl(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(self.all_projects && self.others_loading, |d| {
+                        d.child(crate::right_panel::spinner(
+                            "everywhere-all-projects-loading",
+                            "loader",
+                            12.,
+                        ))
+                    })
+                    .child(
+                        crate::open_projects::toggle(
+                            "everywhere-all-projects",
+                            self.all_projects,
+                            0,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_all_projects(!this.all_projects, cx)
+                        })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2184,4 +2346,109 @@ fn empty_message(text: String) -> AnyElement {
                 .child(text),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod all_projects_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn all_open_projects_join_files_and_contents(cx: &mut TestAppContext) {
+        let one = tempfile::Builder::new()
+            .prefix("evw-one")
+            .tempdir()
+            .unwrap();
+        let two = tempfile::Builder::new()
+            .prefix("evw-two")
+            .tempdir()
+            .unwrap();
+        let path = |d: &tempfile::TempDir| {
+            d.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (a, b) = (path(&one), path(&two));
+        std::fs::write(one.path().join("wombat_here.rs"), "// wombat\n").unwrap();
+        std::fs::write(two.path().join("wombat_there.rs"), "// wombat\n").unwrap();
+        let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let window = cx.update(|cx| {
+            input::bind(cx);
+            crate::open_projects::publish(&[a.clone(), b.clone()], cx);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    Everywhere::new(
+                        Sources {
+                            cwd: a.clone(),
+                            store: Arc::new(std::sync::Mutex::new(store)),
+                            summaries: vec![],
+                            live: HashMap::new(),
+                            projects: vec![],
+                            recent_files: vec![],
+                            logos: HashMap::new(),
+                            actions: vec![],
+                            include_ignored: false,
+                        },
+                        Tab::Files,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        let view = window.root(cx).unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("everywhere-all-projects").is_some());
+        let files = |cx: &mut gpui::VisualTestContext| -> Vec<String> {
+            cx.update(|_, cx| {
+                view.read(cx)
+                    .files
+                    .rows
+                    .iter()
+                    .filter_map(|r| match &r.pick {
+                        Pick::File { path, .. } => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+        };
+        let wait = |cx: &mut gpui::VisualTestContext, done: &dyn Fn(&[String]) -> bool| {
+            for _ in 0..300 {
+                cx.executor().advance_clock(Duration::from_millis(250));
+                cx.run_until_parked();
+                if done(&files(cx)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("files never settled: {:?}", files(cx));
+        };
+        visual.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.input.update(cx, |i, cx| i.set_text("wombat".into(), cx))
+            })
+        });
+        wait(visual, &|f| f.len() == 1);
+        visual.update(|_, cx| view.update(cx, |v, cx| v.set_all_projects(true, cx)));
+        wait(visual, &|f| f.len() == 2);
+        let found = files(visual);
+        assert!(found.iter().any(|p| p.starts_with(&b)), "{found:?}");
+        // The other project's row names it.
+        let detail = visual.update(|_, cx| {
+            view.read(cx)
+                .files
+                .rows
+                .iter()
+                .find(|r| matches!(&r.pick, Pick::File { path, .. } if path.starts_with(&b)))
+                .map(|r| r.detail.to_string())
+                .unwrap()
+        });
+        assert!(
+            detail.starts_with(&crate::open_projects::project_name(&b)),
+            "{detail}"
+        );
+    }
 }

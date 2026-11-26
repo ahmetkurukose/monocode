@@ -2258,9 +2258,11 @@ impl Shell {
             &explorer,
             window,
             |this, _, event: &crate::explorer::OpenSearchMatch, window, cx| {
+                // A match in another open project opens in that project.
+                let cwd = this.switch_to_file_project(&event.matched.path, window, cx);
                 this.open_review_tab(
                     crate::review::ReviewTab::File {
-                        cwd: event.cwd.clone(),
+                        cwd,
                         path: event.matched.path.clone(),
                     },
                     OpenIn::preview(!event.pin),
@@ -2350,6 +2352,7 @@ impl Shell {
                 crate::changes::ChangesEvent::OpenProject(path) => {
                     this.select_project(path.clone(), window, cx)
                 }
+                crate::changes::ChangesEvent::AllProjects(_) => {}
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review_tab(
                         crate::review::ReviewTab::Changes {
@@ -4361,6 +4364,28 @@ impl Shell {
         }
     }
     /// Opens `path` (absolute) in a file tab, at `location` when there is one.
+    /// The checkout a search result's file belongs to. A file of another
+    /// open project switches to that project first, so it opens in its own
+    /// workspace rather than among this one's tabs.
+    pub(super) fn switch_to_file_project(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let here = self.working_copy().to_owned();
+        let roots = crate::open_projects::local_projects(cx, Some(&here));
+        let Some(root) = crate::open_projects::owning_root(&roots, path).cloned() else {
+            return here;
+        };
+        let key = monocode_core::files::path_key;
+        if key(&root) != key(&here) && key(&root) != key(&self.workspace.project) {
+            self.select_project(root.clone(), window, cx);
+            self.persist(cx);
+        }
+        root
+    }
+
     pub(super) fn open_file_at(
         &mut self,
         cwd: String,

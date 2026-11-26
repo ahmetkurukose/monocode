@@ -33,6 +33,7 @@ pub(crate) enum CrossChangesEvent {
     ShowPullRequest(crate::inbox::RevealPr),
     Overlays,
     OpenProject(String),
+    AllProjects(bool),
 }
 
 /// A project's own Git status and Changes panel, kept while its fold has been opened.
@@ -134,7 +135,11 @@ impl CrossChanges {
             return;
         }
         let git = cx.new(|cx| ProjectGit::new(root.to_owned(), cx));
-        let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
+        let changes = cx.new(|cx| {
+            let mut changes = Changes::new(git.clone(), window, cx);
+            changes.in_all_projects = true;
+            changes
+        });
         if let Some(provider) = self.provider {
             changes.update(cx, |changes, cx| changes.set_text_provider(provider, cx));
         }
@@ -155,6 +160,7 @@ impl CrossChanges {
                     }
                     ChangesEvent::Overlays => CrossChangesEvent::Overlays,
                     ChangesEvent::OpenProject(path) => CrossChangesEvent::OpenProject(path.clone()),
+                    ChangesEvent::AllProjects(on) => CrossChangesEvent::AllProjects(*on),
                 })
             }),
             // A commit, stage or branch switch there updates its count here.
@@ -464,6 +470,14 @@ impl Render for CrossChanges {
             .text_color(content(0.45))
             .when(self.loading, |d| {
                 d.child(spinner("cross-changes-spinner", "loader", 12.))
+            })
+            // With no project open there is no commit box to leave from.
+            .when(open.is_none(), |d| {
+                d.child(
+                    crate::open_projects::toggle("cross-changes-all-projects", true, 0).on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(CrossChangesEvent::AllProjects(false))),
+                    ),
+                )
             })
             .child(div().min_w_0().flex_1().truncate().child(summary))
             .child(

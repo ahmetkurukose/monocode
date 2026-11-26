@@ -73,14 +73,10 @@ pub(crate) fn toggle(id: &'static str, on: bool, count: usize) -> Stateful<gpui:
         .min_w_0()
         .flex()
         .items_center()
-        .gap(px(6.))
-        .h(px(22.))
-        .px_1()
-        .rounded(px(4.))
+        .gap_2()
         .cursor_pointer()
-        .text_size(px(11.))
-        .text_color(content(if on { 0.9 } else { 0.55 }))
-        .hover(|s| s.bg(content(0.05)))
+        .text_size(px(12.))
+        .text_color(content(0.75))
         .child(CommitForm::checkbox(
             SharedString::from(format!("{id}-box")),
             if on {

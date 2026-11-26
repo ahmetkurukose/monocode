@@ -478,7 +478,8 @@ impl Shell {
                 match event {
                     E::Close => {}
                     E::OpenFile { path, at } => {
-                        let cwd = this.working_copy().to_owned();
+                        // A file from another open project opens in that project.
+                        let cwd = this.switch_to_file_project(path, window, cx);
                         let at = at.map(|(line, column)| (line as usize, column as usize));
                         this.open_file_at(cwd, path.clone(), at, window, cx);
                     }
@@ -1199,5 +1200,38 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn a_file_of_another_open_project_opens_in_that_project(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            super::super::bind_keys(cx);
+            crate::popover::bind(cx);
+        });
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        let path = |d: &tempfile::TempDir| d.path().to_string_lossy().into_owned();
+        let (a, b) = (path(&one), path(&two));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.projects = vec![a.clone(), b.clone()];
+                shell.select_project(a.clone(), w, cx);
+                shell.persist(cx);
+                // This project's file: no switch.
+                let cwd = shell.switch_to_file_project(&format!("{a}/src/x.rs"), w, cx);
+                assert_eq!(cwd, a);
+                assert_eq!(shell.workspace.project, a);
+                // Another open project's file: its project comes to the front.
+                let cwd = shell.switch_to_file_project(&format!("{b}/src/y.rs"), w, cx);
+                assert_eq!(cwd, b);
+                assert_eq!(shell.workspace.project, b);
+                // A file in no open project stays here.
+                let cwd = shell.switch_to_file_project("/elsewhere/z.rs", w, cx);
+                assert_eq!(cwd, shell.working_copy());
+                assert_eq!(shell.workspace.project, b);
+            })
+            .unwrap();
     }
 }
