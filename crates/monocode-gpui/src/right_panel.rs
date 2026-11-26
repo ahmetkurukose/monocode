@@ -326,6 +326,7 @@ impl RightPanel {
         let changes = cx.new(|cx| {
             let mut changes = Changes::new(git.clone(), window, cx);
             changes.overlays_in_shell = true;
+            changes.offers_all_projects = true;
             changes
         });
         let history = cx.new(|cx| History::new(git.clone(), window, cx));

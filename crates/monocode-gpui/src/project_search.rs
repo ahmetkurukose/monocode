@@ -59,6 +59,9 @@ struct Match {
 }
 
 struct Group {
+    /// The project the file is in, and its name when several are searched.
+    cwd: String,
+    project: Option<String>,
     relative: String,
     name: String,
     matches: Vec<Match>,
@@ -76,9 +79,13 @@ pub(crate) struct ProjectSearch {
     mode: Mode,
     cwd: String,
     active: bool,
+    /// Search every project open in the rail, not only this checkout.
+    all_projects: bool,
+    /// The folders the last search looked in: this checkout, or every open project.
+    roots: Vec<String>,
     /// The project's files, listed once per folder, for matching names.
     files: Arc<Vec<ProjectFile>>,
-    files_key: Option<(String, bool)>,
+    files_key: Option<(Vec<String>, bool)>,
     files_task: Option<Task<()>>,
     /// Files whose name or path matches the query, best first.
     name_hits: Vec<ProjectFile>,
@@ -136,11 +143,21 @@ impl ProjectSearch {
         let subscriptions = [&query, &include, &exclude]
             .into_iter()
             .map(|input| cx.subscribe(input, |this, _, _: &input::Changed, cx| this.refresh(cx)))
-            .collect();
+            .collect::<Vec<_>>();
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe_global::<crate::open_projects::OpenProjects>(
+            |this: &mut Self, cx| {
+                if this.all_projects {
+                    this.refresh(cx);
+                }
+            },
+        ));
         Self {
             mode: Mode::Files,
+            roots: vec![cwd.clone()],
             cwd,
             active,
+            all_projects: false,
             files: Arc::new(Vec::new()),
             files_key: None,
             files_task: None,
@@ -196,6 +213,22 @@ impl ProjectSearch {
         }
     }
 
+    /// Where a search looks: this checkout, or every open project with it first.
+    fn search_roots(&self, cx: &App) -> Vec<String> {
+        if self.all_projects {
+            crate::open_projects::local_projects(cx, Some(&self.cwd))
+        } else {
+            vec![self.cwd.clone()]
+        }
+    }
+
+    fn set_all_projects(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.all_projects != on {
+            self.all_projects = on;
+            self.refresh(cx);
+        }
+    }
+
     fn options(&self, cx: &App) -> SearchOptions {
         let filter = |input: &Entity<Input>| {
             let text = input.read(cx).content.trim();
@@ -229,6 +262,7 @@ impl ProjectSearch {
         self.error = None;
         self.truncated = false;
         let options = self.options(cx);
+        self.roots = self.search_roots(cx);
         let nothing = options.query.is_empty() || self.cwd.is_empty() || self.cwd == "~";
         if nothing || self.mode == Mode::Files {
             // File names are matched here, from a list kept in memory; no
@@ -255,7 +289,10 @@ impl ProjectSearch {
                     .timer(Duration::from_millis(200))
                     .await;
                 if !check.load(Ordering::Acquire) {
-                    let _ = this.update(cx, |this, cx| this.start(options, cx));
+                    let _ = this.update(cx, |this, cx| {
+                        let roots = this.roots.clone();
+                        this.start(options, roots, cx)
+                    });
                 }
             }));
         }
@@ -264,14 +301,32 @@ impl ProjectSearch {
 
     /// Lists the project's files once (again if the excluded-files setting changes).
     fn load_files(&mut self, cx: &mut Context<Self>) {
-        let key = (self.cwd.clone(), crate::settings::show_excluded_files(cx));
+        let key = (self.roots.clone(), crate::settings::show_excluded_files(cx));
         if self.files_key.as_ref() == Some(&key) {
             return;
         }
         self.files_key = Some(key.clone());
-        let (cwd, include_ignored) = key.clone();
+        let (roots, include_ignored) = key.clone();
         let work = cx.background_executor().spawn(async move {
-            monocode_core::files::list_project_files_with(&cwd, None, include_ignored)
+            if let [cwd] = roots.as_slice() {
+                return monocode_core::files::list_project_files_with(cwd, None, include_ignored);
+            }
+            // Across projects a file's path starts with its project's name, so
+            // typing the name narrows to that project.
+            let mut all = Vec::new();
+            for root in &roots {
+                let name = crate::open_projects::project_name(root);
+                let Ok(files) =
+                    monocode_core::files::list_project_files_with(root, None, include_ignored)
+                else {
+                    continue;
+                };
+                all.extend(files.into_iter().map(|mut file| {
+                    file.relative = format!("{name}/{}", file.relative);
+                    file
+                }));
+            }
+            Ok(all)
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -304,11 +359,21 @@ impl ProjectSearch {
 
     fn pick_file(&self, index: usize, pin: bool, cx: &mut Context<Self>) {
         if let Some(file) = self.name_hits.get(index) {
+            let cwd = crate::open_projects::owning_root(&self.roots, &file.path)
+                .unwrap_or(&self.cwd)
+                .clone();
+            let relative = if self.roots.len() > 1 {
+                file.relative
+                    .split_once('/')
+                    .map_or(file.relative.clone(), |(_, rest)| rest.to_owned())
+            } else {
+                file.relative.clone()
+            };
             cx.emit(SearchEvent::Open {
-                cwd: self.cwd.clone(),
+                cwd,
                 matched: SearchMatch {
                     path: file.path.clone(),
-                    relative: file.relative.clone(),
+                    relative,
                     line: 1,
                     column: 1,
                     preview: String::new(),
@@ -318,35 +383,59 @@ impl ProjectSearch {
         }
     }
 
-    fn start(&mut self, options: SearchOptions, cx: &mut Context<Self>) {
+    fn start(&mut self, options: SearchOptions, roots: Vec<String>, cx: &mut Context<Self>) {
         self.loading = true;
         let flag = self.cancel.clone();
         let check = flag.clone();
         let work = cx.background_executor().spawn(async move {
-            let result =
-                project::search_project(std::path::Path::new(&options.cwd), &options, &flag)?;
-            let ranges = project::preview_ranges(&result.matches, &options);
+            let several = roots.len() > 1;
             let mut groups: Vec<Group> = Vec::new();
             let mut by_path = HashMap::new();
-            let count = result.matches.len();
-            for (source, highlight) in result.matches.into_iter().zip(ranges) {
-                let index = *by_path.entry(source.path.clone()).or_insert_with(|| {
-                    let index = groups.len();
-                    groups.push(Group {
-                        name: source
-                            .relative
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&source.relative)
-                            .to_owned(),
-                        relative: source.relative.clone(),
-                        matches: Vec::new(),
+            let mut count = 0;
+            let mut truncated = false;
+            for root in roots {
+                if flag.load(Ordering::Acquire) {
+                    break;
+                }
+                let options = SearchOptions {
+                    cwd: root.clone(),
+                    ..options.clone()
+                };
+                let result =
+                    match project::search_project(std::path::Path::new(&root), &options, &flag) {
+                        Ok(result) => result,
+                        // One project failing (moved, unreadable) leaves the others' results.
+                        Err(error) if several => {
+                            log::debug!("search in {root} failed: {error}");
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let ranges = project::preview_ranges(&result.matches, &options);
+                count += result.matches.len();
+                truncated |= result.truncated;
+                let project = several.then(|| crate::open_projects::project_name(&root));
+                for (source, highlight) in result.matches.into_iter().zip(ranges) {
+                    let index = *by_path.entry(source.path.clone()).or_insert_with(|| {
+                        let index = groups.len();
+                        groups.push(Group {
+                            cwd: root.clone(),
+                            project: project.clone(),
+                            name: source
+                                .relative
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&source.relative)
+                                .to_owned(),
+                            relative: source.relative.clone(),
+                            matches: Vec::new(),
+                        });
+                        index
                     });
-                    index
-                });
-                groups[index].matches.push(Match { source, highlight });
+                    groups[index].matches.push(Match { source, highlight });
+                }
             }
-            Ok::<_, String>((groups, count, result.truncated))
+            Ok::<_, String>((groups, count, truncated))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -376,13 +465,13 @@ impl ProjectSearch {
     }
 
     fn pick(&self, group: usize, index: usize, pin: bool, cx: &mut Context<Self>) {
-        if let Some(matched) = self
+        if let Some((group, matched)) = self
             .groups
             .get(group)
-            .and_then(|group| group.matches.get(index))
+            .and_then(|group| Some((group, group.matches.get(index)?)))
         {
             cx.emit(SearchEvent::Open {
-                cwd: self.cwd.clone(),
+                cwd: group.cwd.clone(),
                 matched: matched.source.clone(),
                 pin,
             });
@@ -465,12 +554,28 @@ impl Render for ProjectSearch {
         } else if self.count == 0 {
             "No results".to_owned()
         } else {
+            let projects = if self.roots.len() > 1 {
+                let mut seen: Vec<&str> = Vec::new();
+                for group in &self.groups {
+                    if !seen.contains(&group.cwd.as_str()) {
+                        seen.push(&group.cwd);
+                    }
+                }
+                format!(
+                    " across {} project{}",
+                    seen.len(),
+                    if seen.len() == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} result{} in {} file{}{}",
+                "{} result{} in {} file{}{}{}",
                 self.count,
                 if self.count == 1 { "" } else { "s" },
                 self.groups.len(),
                 if self.groups.len() == 1 { "" } else { "s" },
+                projects,
                 if self.truncated { " (limited)" } else { "" }
             )
         };
@@ -555,6 +660,21 @@ impl Render for ProjectSearch {
                                     .text_size(px(12.))
                                     .child(group.name.clone()),
                             )
+                            .when_some(group.project.clone(), |d, project| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .max_w(px(120.))
+                                        .truncate()
+                                        .rounded(px(4.))
+                                        .bg(content(0.08))
+                                        .px(px(5.))
+                                        .py(px(1.))
+                                        .text_size(px(10.))
+                                        .text_color(content(0.6))
+                                        .child(project),
+                                )
+                            })
                             .child(
                                 div()
                                     .rounded_full()
@@ -813,7 +933,21 @@ impl Render for ProjectSearch {
                     .when(self.mode == Mode::Content, |d| {
                         d.child(Self::filter(self.include.clone()))
                             .child(Self::filter(self.exclude.clone()))
-                    }),
+                    })
+                    .child(
+                        crate::open_projects::toggle(
+                            "project-search-all-projects",
+                            self.all_projects,
+                            if self.all_projects {
+                                self.roots.len()
+                            } else {
+                                0
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_all_projects(!this.all_projects, cx)
+                        })),
+                    ),
             )
             .child(
                 div()
@@ -865,6 +999,8 @@ mod tests {
     fn results(groups: usize, per_group: usize) -> Vec<Group> {
         (0..groups)
             .map(|g| Group {
+                cwd: "/p".into(),
+                project: None,
                 relative: format!("src/module_{g}/file_{g}.py"),
                 name: format!("file_{g}.py"),
                 matches: (0..per_group)
@@ -1118,5 +1254,81 @@ mod tests {
             "{row:?} inside {list:?}"
         );
         assert!(row.size.width > px(100.), "{row:?}");
+    }
+
+    #[gpui::test]
+    fn all_open_projects_are_searched_and_open_in_their_own_project(cx: &mut TestAppContext) {
+        cx.update(input::bind);
+        let one = tempfile::Builder::new().prefix("alpha").tempdir().unwrap();
+        let two = tempfile::Builder::new().prefix("beta").tempdir().unwrap();
+        let path = |dir: &tempfile::TempDir| {
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (a, b) = (path(&one), path(&two));
+        std::fs::write(one.path().join("first.rs"), "fn needle_here() {}\n").unwrap();
+        std::fs::write(two.path().join("second.rs"), "// needle_here too\n").unwrap();
+        cx.update(|cx| crate::open_projects::publish(&[a.clone(), b.clone()], cx));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| ProjectSearch::new(a.clone(), true, cx))
+            })
+            .unwrap()
+        });
+        let search = window.root(cx).unwrap();
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        cx.update(|cx| {
+            let opened = opened.clone();
+            cx.subscribe(&search, move |_, event: &SearchEvent, _| {
+                if let SearchEvent::Open { cwd, .. } = event {
+                    opened.borrow_mut().push(cwd.clone());
+                }
+            })
+            .detach();
+            search.update(cx, |s, cx| {
+                s.mode = Mode::Content;
+                s.set_all_projects(true, cx);
+                s.set_query("needle_here".into(), cx);
+            });
+        });
+        let settle = |cx: &mut TestAppContext, done: &dyn Fn(&ProjectSearch) -> bool| {
+            for _ in 0..300 {
+                cx.executor().advance_clock(Duration::from_millis(250));
+                cx.run_until_parked();
+                if cx.update(|cx| done(search.read(cx))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the search never finished");
+        };
+        settle(cx, &|s| !s.loading && s.groups.len() == 2);
+        cx.update(|cx| {
+            let s = search.read(cx);
+            assert_eq!(s.roots, [a.clone(), b.clone()], "this project first");
+            assert_eq!(s.count, 2);
+            assert_eq!(s.groups[1].cwd, b);
+            assert!(s.groups[1].project.is_some(), "results name their project");
+        });
+        cx.update(|cx| search.update(cx, |s, cx| s.pick(1, 0, false, cx)));
+        assert_eq!(opened.borrow().last(), Some(&b));
+
+        // File names: the project's name is part of the path matched.
+        cx.update(|cx| {
+            search.update(cx, |s, cx| {
+                s.set_mode(Mode::Files, cx);
+                s.set_query("second".into(), cx);
+            })
+        });
+        settle(cx, &|s| !s.name_hits.is_empty());
+        cx.update(|cx| search.update(cx, |s, cx| s.pick_file(0, false, cx)));
+        assert_eq!(opened.borrow().last(), Some(&b));
+
+        // Off again: only this checkout.
+        cx.update(|cx| search.update(cx, |s, cx| s.set_all_projects(false, cx)));
+        assert_eq!(cx.update(|cx| search.read(cx).roots.clone()), [a.clone()]);
     }
 }

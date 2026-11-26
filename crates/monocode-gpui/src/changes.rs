@@ -7,6 +7,7 @@ use crate::{
     branch_popup::{BranchPopup, PopupEvent},
     commit_dialog::{CommitDialog, CommitDialogEvent},
     commit_form::{CommitForm, CommitFormEvent, Surface},
+    cross_changes::{CrossChanges, CrossChangesEvent},
     git_status::{GitChanged, ProjectGit},
     popover::{
         Align, Anchor, AnchorSlot, Menu, MenuAction, MenuEvent, MenuItem, MenuStyle, Side,
@@ -52,6 +53,8 @@ pub(crate) enum ChangesEvent {
     /// Show this pull request selected in the Inbox: the New Pull Request
     /// dialog created it, or found the branch already has it.
     ShowPullRequest(crate::inbox::RevealPr),
+    /// "All open projects" asked to switch to this project, to commit there.
+    OpenProject(String),
 }
 
 /// Where the branch switcher opens.
@@ -138,6 +141,13 @@ pub(crate) struct Changes {
     /// show from the menu bar; other hosts leave them to the panel.
     pub(crate) overlays_in_shell: bool,
     switch_anchor: AnchorSlot,
+    /// Every open project's changes, shown instead of this checkout's while
+    /// `all_projects` is on.
+    cross: Entity<CrossChanges>,
+    all_projects: bool,
+    /// The right panel offers "All open projects"; a Mono's tabs already
+    /// show its projects.
+    pub(crate) offers_all_projects: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl EventEmitter<ChangesEvent> for Changes {}
@@ -149,7 +159,19 @@ impl Changes {
         cx: &mut Context<Self>,
     ) -> Self {
         let form = cx.new(|cx| CommitForm::new(git.clone(), window, cx));
+        let cross = cx.new(|cx| CrossChanges::new(git.read(cx).project().to_owned(), cx));
         let subscriptions = vec![
+            cx.subscribe(&cross, |_, _, event: &CrossChangesEvent, cx| match event {
+                CrossChangesEvent::OpenDiff { cwd, path } => cx.emit(ChangesEvent::OpenDiff {
+                    cwd: cwd.clone(),
+                    path: Some(path.clone()),
+                    staged: None,
+                }),
+                CrossChangesEvent::OpenProject(path) => {
+                    cx.emit(ChangesEvent::OpenProject(path.clone()))
+                }
+            }),
+            cx.observe(&cross, |_, _, cx| cx.notify()),
             cx.observe(&git, |this, _, cx| this.index_changed(cx)),
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.index_changed(cx)),
             cx.observe(&form, |_, _, cx| cx.notify()),
@@ -183,6 +205,9 @@ impl Changes {
             footer_anchor: AnchorSlot::default(),
             overlays_in_shell: false,
             switch_anchor: AnchorSlot::default(),
+            cross,
+            all_projects: false,
+            offers_all_projects: false,
             _subscriptions: subscriptions,
         };
         this.index_changed(cx);
@@ -248,6 +273,7 @@ impl Changes {
             return;
         }
         self.enabled = enabled;
+        self.sync_cross(cx);
         if enabled {
             let request = self.pr_request;
             self.index_changed(cx);
@@ -259,7 +285,24 @@ impl Changes {
     pub(crate) fn resume(&mut self, cx: &mut Context<Self>) {
         if self.enabled {
             self.load_pr(cx);
+            if self.all_projects {
+                self.cross.update(cx, |cross, cx| cross.refresh(cx));
+            }
         }
+    }
+    fn sync_cross(&mut self, cx: &mut Context<Self>) {
+        let on = self.enabled && self.all_projects && self.offers_all_projects;
+        self.cross.update(cx, |cross, cx| cross.set_enabled(on, cx));
+    }
+    pub(crate) fn set_all_projects(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.all_projects != on {
+            self.all_projects = on;
+            self.sync_cross(cx);
+            cx.notify();
+        }
+    }
+    fn showing_all_projects(&self) -> bool {
+        self.all_projects && self.offers_all_projects
     }
     fn index(&self, cx: &App) -> Option<DiffIndex> {
         self.git.read(cx).index.clone()
@@ -269,7 +312,9 @@ impl Changes {
         let project = git.project().to_owned();
         if project != self.cwd {
             // The form resets itself for the new checkout.
-            self.cwd = project;
+            self.cwd = project.clone();
+            self.cross
+                .update(cx, |cross, cx| cross.set_current(project, cx));
             self.pr = None;
             self.pr_branch = None;
             self.form.update(cx, |form, _| form.has_open_pr = false);
@@ -1561,6 +1606,20 @@ impl Render for Changes {
                 .into_any_element();
         }
         let index = self.git.read(cx).index.clone();
+        let all_projects = self.showing_all_projects();
+        let toggle = self.offers_all_projects.then(|| {
+            div()
+                .flex_shrink_0()
+                .px(px(6.))
+                .py(px(3.))
+                .border_b_1()
+                .border_color(stroke())
+                .child(
+                    crate::open_projects::toggle("changes-all-projects", all_projects, 0).on_click(
+                        cx.listener(|this, _, _, cx| this.set_all_projects(!this.all_projects, cx)),
+                    ),
+                )
+        });
         let empty = match &index {
             None => Some("Loading changes…".to_owned()),
             Some(i) if i.files.is_empty() => Some(if i.ahead > 0 || i.behind > 0 {
@@ -1588,47 +1647,55 @@ impl Render for Changes {
             .flex_col()
             .overflow_hidden()
             .child(self.header(cx))
-            .child(self.commit_box(window, cx))
-            .children(self.tracker_banner(cx))
-            .map(|d| match empty {
-                Some(text) => d.child(
-                    div().py_1().child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_size(px(12.))
-                            .text_color(content(0.45))
-                            .child(text),
-                    ),
-                ),
-                None => d.child(
-                    div()
-                        .id("change-files")
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .track_focus(&self.list_focus)
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, _, window, cx| window.focus(&this.list_focus, cx)),
-                        )
-                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                            if this
-                                .form
-                                .update(cx, |form, cx| form.key(Surface::Panel, event, cx))
-                            {
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .when(self.form.read(cx).busy.is_some(), |d| d.opacity(0.6))
-                        .child(
-                            CommitForm::file_list(&self.form, Surface::Panel, cx)
-                                .py_1()
-                                .flex_1()
-                                .min_h_0(),
+            .children(toggle)
+            .when(all_projects, |d| d.child(self.cross.clone()))
+            .when(!all_projects, |d| {
+                d.child(self.commit_box(window, cx))
+                    .children(self.tracker_banner(cx))
+            })
+            .when(!all_projects, |d| {
+                d.map(|d| match empty {
+                    Some(text) => d.child(
+                        div().py_1().child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(px(12.))
+                                .text_color(content(0.45))
+                                .child(text),
                         ),
-                ),
+                    ),
+                    None => d.child(
+                        div()
+                            .id("change-files")
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .track_focus(&self.list_focus)
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.list_focus, cx)
+                                }),
+                            )
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if this
+                                    .form
+                                    .update(cx, |form, cx| form.key(Surface::Panel, event, cx))
+                                {
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .when(self.form.read(cx).busy.is_some(), |d| d.opacity(0.6))
+                            .child(
+                                CommitForm::file_list(&self.form, Surface::Panel, cx)
+                                    .py_1()
+                                    .flex_1()
+                                    .min_h_0(),
+                            ),
+                    ),
+                })
             })
             .children(row_menu)
             .children(menu)

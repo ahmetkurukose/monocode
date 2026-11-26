@@ -1902,6 +1902,7 @@ impl Shell {
             && (self.mono_active(cx) || self.git.read(cx).available())
     }
     fn sync_right_panel(&mut self, cx: &mut Context<Self>) {
+        crate::open_projects::publish(&self.workspace.projects, cx);
         let opening = self.right_slide.as_ref().is_some_and(PaneSlide::opening);
         let shown = !self.mono_active(cx)
             && (!self.workspace.classic_layout || self.project_rail_tree_on())
@@ -2345,6 +2346,9 @@ impl Shell {
                 crate::changes::ChangesEvent::Overlays => cx.notify(),
                 crate::changes::ChangesEvent::ShowPullRequest(pr) => {
                     this.reveal_pull_request(pr.clone(), window, cx)
+                }
+                crate::changes::ChangesEvent::OpenProject(path) => {
+                    this.select_project(path.clone(), window, cx)
                 }
                 crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
                     this.open_review_tab(

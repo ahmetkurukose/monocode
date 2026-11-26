@@ -27,6 +27,7 @@ mod composer_motion;
 mod composer_runner;
 mod context_meter;
 mod conversation;
+mod cross_changes;
 mod database;
 mod debug_ui;
 #[cfg(debug_assertions)]
@@ -73,6 +74,7 @@ mod modes;
 mod monos;
 mod notes;
 mod notifications;
+mod open_projects;
 mod pane_layout;
 mod pane_motion;
 mod particle_text;
